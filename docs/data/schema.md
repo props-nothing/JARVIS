@@ -1,0 +1,542 @@
+# Conceptual Relational Schema
+
+Status: PROPOSED
+Last updated: 2026-09-20
+
+## Conventions
+
+- Primary IDs are typed UUIDv7 strings once the implementation dependency is
+  verified.
+- All tables containing workspace-owned data or authority carry `workspace_id`
+  directly, even when it could be inferred through joins. This supports safe
+  query APIs and composite constraints.
+- Global principal roots (`users`, external `user_identities`, and devices) may
+  span workspaces but contain no workspace-private payload or grant. Membership,
+  session active scope, credential, policy, and resource rows bind their use to
+  a workspace.
+- Truly global definitions/operational metadata declare system scope and cannot
+  contain tenant payloads, references, embeddings, credentials, or authority.
+- Mutable aggregates carry `version` for optimistic transitions.
+- Timestamps are UTC and include `created_at`; mutable rows include `updated_at`.
+- Soft deletion is used only when restore/audit semantics require it. It is not a
+  substitute for actual deletion workflows.
+- Extensible payloads include a schema version and are size-bounded.
+- Secret values never live in these tables; rows store `secret_ref` identifiers.
+- Large content lives in artifacts/object storage with relational metadata.
+
+## Identity and Workspaces
+
+### `users`
+
+```text
+id, status, display_name, locale, timezone, created_at, updated_at
+```
+
+### `user_identities`
+
+```text
+id, user_id, issuer, subject, identity_type, metadata_json, created_at, last_used_at
+UNIQUE(issuer, subject)
+```
+
+External subjects are issuer-scoped.
+
+### `workspaces`
+
+```text
+id, kind, name, status, policy_version, retention_policy_id,
+created_at, updated_at
+```
+
+### `workspace_memberships`
+
+```text
+workspace_id, user_id, role_id, status, created_at, updated_at
+PRIMARY KEY(workspace_id, user_id)
+```
+
+### `roles`, `capability_grants`, `policy_bindings`
+
+Roles bundle grants. Grants bind subject, workspace, capability/resource,
+constraints, validity, issuer, and revocation. Policy bindings reference a
+versioned deterministic policy.
+
+### `devices`
+
+```text
+id, user_id, name, platform, credential_public_ref, status,
+enrolled_at, last_seen_at, revoked_at
+```
+
+### `client_credentials`
+
+```text
+id, workspace_id, principal_type, principal_id, device_id nullable,
+service_client_id nullable, credential_family_id, verifier_algorithm,
+verifier_hash, scopes_json, status, issued_at, expires_at,
+last_used_at, revoked_at, rotated_from_id nullable
+```
+
+The plaintext opaque credential is held by the client in an OS credential store
+or approved protected fallback. JARVIS stores only a one-way verifier. Constraints
+bind the credential to exactly one valid principal/client subject and workspace;
+rotation creates a new row and revokes the old family member without changing
+historical attribution.
+
+### `sessions`
+
+```text
+id, principal_type, principal_id, device_id, active_workspace_id,
+channel, assurance, status, issued_at, expires_at, revoked_at,
+credential_family_id, metadata_json
+```
+
+Session credential hashes/references are protected and separated as required by
+the auth implementation.
+
+### `service_clients`
+
+```text
+id, workspace_id, name, client_type, status, credential_ref,
+allowed_protocols_json, issued_at, expires_at, revoked_at
+```
+
+`credential_ref` identifies asymmetric key material or a secret-manager record
+when that client type requires it. Bearer credential verifiers use
+`client_credentials`; no plaintext credential is stored in either table.
+
+### `api_idempotency_records`
+
+```text
+id, workspace_id, principal_id, client_credential_id, api_major,
+operation, key_digest, request_fingerprint, state,
+resource_type nullable, resource_id nullable,
+http_status nullable, response_ref nullable, error_code nullable,
+created_at, updated_at, expires_at
+UNIQUE(workspace_id, principal_id, client_credential_id,
+  api_major, operation, key_digest)
+```
+
+The key digest and canonical request fingerprint are recorded before or in the
+same transaction as the acknowledged mutation. Reuse with different material
+input is a conflict. Completed and ambiguous outcomes remain long enough to
+cover client retries and downstream reconciliation.
+
+## Conversations and Agent Runs
+
+### `conversations`
+
+```text
+id, workspace_id, owner_user_id, title, status, channel_origin,
+created_at, updated_at, archived_at
+```
+
+### `messages`
+
+```text
+id, workspace_id, conversation_id, role, content_schema_version,
+content_ref_or_json, sensitivity, source, sequence, created_at, deleted_at
+UNIQUE(conversation_id, sequence)
+```
+
+Tool calls/results use typed content items and stable pairing IDs.
+
+### `agent_runs`
+
+```text
+id, workspace_id, conversation_id, parent_run_id, principal_id,
+objective_ref, state, version, runtime_id, runtime_version,
+context_manifest_id, plan_summary_ref, waiting_kind, waiting_ref,
+deadline_at, budget_json, result_ref, error_code, error_ref,
+created_at, started_at, updated_at, completed_at
+```
+
+State and waiting fields have constraints preventing incompatible combinations.
+
+### `agent_steps`
+
+```text
+id, workspace_id, run_id, sequence, kind, state, version,
+idempotency_key, input_fingerprint, input_ref, output_ref,
+attempt_count, max_attempts, timeout_ms, next_attempt_at,
+error_code, created_at, started_at, completed_at
+UNIQUE(run_id, sequence)
+UNIQUE(workspace_id, run_id, idempotency_key)
+```
+
+### `run_activity_events`
+
+Append-oriented public activity projection with run sequence, event type,
+payload reference, visibility, and timestamp. It is not the private model trace.
+
+### `model_calls`
+
+```text
+id, workspace_id, run_id, step_id, logical_call_id, attempt,
+provider_id, model_id, model_revision, route_decision_id,
+state, request_fingerprint, provider_request_id, continuation_ref,
+usage_json, estimated_cost_microunits, finish_reason,
+error_code, started_at, first_output_at, completed_at
+UNIQUE(logical_call_id, attempt)
+```
+
+Prompt/output content uses protected artifact/content references under retention
+policy rather than being duplicated in telemetry rows.
+
+### `model_route_decisions`
+
+Records requirements, candidates, selected route, rejected reason codes,
+fallback chain, model data policy ID/version, requested/effective data policy,
+provider capability evidence references, exception reference, policy version,
+and safe metadata.
+
+### `model_data_policies`
+
+```text
+id, workspace_id, owner_principal_id nullable, name, version, status,
+rules_schema_version, rules_json, created_by, created_at, activated_at,
+superseded_at
+UNIQUE(workspace_id, id, version)
+```
+
+Policy versions are immutable. One active version per policy identity/workspace
+is selected through an optimistic transition.
+
+### `model_policy_exceptions`
+
+```text
+id, workspace_id, policy_id, policy_version, granting_principal_id,
+rule_key, constrained_value_json, provider_model_task_scope_json,
+reason_ref, assurance, state, issued_at, expires_at, revoked_at,
+consumed_at nullable
+```
+
+Exceptions cannot alter their scope after issue and are evaluated/revoked
+server-side.
+
+## Tools, Policy, and Approvals
+
+### `tool_sources`
+
+```text
+id, workspace_id nullable, kind, source_key, version, publisher,
+configuration_fingerprint, status, health, last_seen_at
+```
+
+Built-in sources can be global; grants and discovered availability remain
+workspace/account scoped.
+
+### `tool_definitions`
+
+```text
+id, canonical_tool_id, source_id, semantic_version, schema_fingerprint,
+definition_json, effects_json, risk, status, created_at, superseded_at
+UNIQUE(canonical_tool_id, source_id, schema_fingerprint)
+```
+
+### `tool_availability`
+
+Maps definition/source to workspace, connector account/runtime/export context,
+health, discovered metadata version, and last verified time. Availability is not
+permission.
+
+### `policy_decisions`
+
+```text
+id, workspace_id, principal_id, run_id, tool_call_id,
+policy_version, decision, reason_codes_json, constraints_json,
+input_fingerprint, created_at
+```
+
+### `tool_calls`
+
+```text
+id, workspace_id, run_id, step_id, runtime_call_ref,
+tool_definition_id, source_id, principal_id, state, version,
+arguments_ref, argument_fingerprint, idempotency_key,
+policy_decision_id, approval_id, attempt_count,
+provider_reference, result_ref, effect_summary, error_code,
+created_at, reserved_at, started_at, completed_at
+UNIQUE(workspace_id, tool_definition_id, idempotency_key)
+```
+
+The uniqueness scope may include connector account/operation after tool-specific
+idempotency analysis.
+
+### `approvals`
+
+```text
+id, workspace_id, requesting_principal_id, deciding_principal_id,
+run_id, tool_call_id, state, version, action_fingerprint,
+risk, effects_json, preview_ref, allowed_channels_json,
+decision_channel, assurance, expires_at, decided_at, consumed_at,
+created_at
+```
+
+One-shot consumption and tool reservation occur atomically.
+
+## Memory, Entities, and Context
+
+### `memories`
+
+```text
+id, workspace_id, subject_id nullable, memory_type, schema_version,
+content_ref, canonical_text, confidence, importance, sensitivity,
+confirmation_state, valid_from, valid_until,
+created_at, updated_at, last_accessed_at, archived_at, deleted_at
+```
+
+### `memory_sources`
+
+```text
+memory_id, source_kind, source_id, source_timestamp, extraction_ref,
+reliability, created_at
+```
+
+### `memory_relations`
+
+Relations such as `supersedes`, `contradicts`, `derived_from`, and `reinforces`,
+with source and confidence.
+
+### `entities`
+
+```text
+id, workspace_id, entity_type, canonical_name, status, confidence,
+created_at, updated_at, merged_into_id nullable
+```
+
+### `entity_aliases`, `entity_external_ids`, `entity_relations`, `memory_entities`
+
+Aliases/external IDs are source/account scoped. Merge/split lineage is retained.
+
+### `embeddings`
+
+```text
+id, workspace_id, owner_type, owner_id, model_provider,
+model_id, model_revision, dimensions, content_hash,
+vector_or_blob, created_at
+UNIQUE(owner_type, owner_id, model_provider, model_id, content_hash)
+```
+
+PostgreSQL uses pgvector for the vector column/index. SQLite representation is a
+researched adapter choice; no extension is assumed in this conceptual schema.
+
+### `context_manifests`, `context_manifest_items`
+
+Store policy/version, budgets, item references, reasons, rank components,
+sensitivity, token estimates, truncation/exclusion summaries, and tool catalog
+projection.
+
+## Documents and Artifacts
+
+### `documents`
+
+```text
+id, workspace_id, source_kind, source_id, title, media_type,
+content_artifact_id, content_hash, sensitivity, status,
+created_at, updated_at, deleted_at
+```
+
+### `document_chunks`
+
+```text
+id, workspace_id, document_id, sequence, locator_json,
+text_ref, content_hash, token_count, created_at
+UNIQUE(document_id, sequence)
+```
+
+### `artifacts`
+
+```text
+id, workspace_id, owner_principal_id, storage_backend, storage_key,
+media_type, byte_length, sha256, sensitivity, retention_class,
+encryption_profile, provenance_json, created_at, expires_at, deleted_at
+```
+
+## Connectors
+
+### `connector_definitions`
+
+Registry metadata for connector ID/version/manifest fingerprint/quality and
+compatibility. No credential values.
+
+### `connector_accounts`
+
+```text
+id, workspace_id, connector_id, external_tenant_id, external_account_id,
+display_name, auth_strategy, credential_ref, granted_scopes_json,
+status, health, config_version, config_json,
+created_at, updated_at, last_verified_at
+```
+
+External IDs have composite uniqueness under connector and tenant as appropriate.
+
+### `oauth_flows`
+
+Short-lived state/PKCE/nonce records bound to principal, workspace, connector,
+redirect target, expiry, and consumed state. Verifier/secret material uses a
+protected reference or encrypted short-lived store.
+
+### `sync_cursors`
+
+```text
+id, workspace_id, connector_account_id, resource_type,
+cursor_version, cursor_ref, watermark_at, completeness,
+last_attempt_at, last_success_at, error_code, backfill_state_json
+UNIQUE(connector_account_id, resource_type)
+```
+
+### `webhook_subscriptions`, `webhook_deliveries`
+
+Subscriptions track provider remote identity/state and secret reference.
+Deliveries track scoped external delivery ID, signature outcome, raw artifact
+reference under retention, received/processed state, and normalized event ID.
+
+## Events, Jobs, and Workflows
+
+### `events`
+
+```text
+id, workspace_id, event_type, schema_version, aggregate_type,
+aggregate_id, aggregate_version, principal_id nullable,
+correlation_id, causation_id, payload_ref, sensitivity,
+occurred_at, recorded_at
+```
+
+Index workspace/type, aggregate/version, correlation/causation, and recorded
+time. System events use the explicit system workspace and contain no tenant
+payload.
+
+### `event_outbox`
+
+```text
+id, workspace_id, event_id, destination_or_handler, state, attempt_count,
+available_at, lease_owner, lease_token, lease_expires_at,
+last_error_code, delivered_at, created_at
+UNIQUE(workspace_id, event_id, destination_or_handler)
+```
+
+### `event_inbox`
+
+```text
+workspace_id, event_id, handler_id, handler_version, state, attempt_count,
+result_ref, processed_at
+PRIMARY KEY(workspace_id, event_id, handler_id, handler_version)
+```
+
+### `workflow_definitions`
+
+```text
+id, workspace_id nullable, key, version, definition_json,
+schema_fingerprint, status, created_at
+UNIQUE(workspace_id, key, version)
+```
+
+### `workflow_runs`
+
+```text
+id, workspace_id, definition_id, owner_principal_id, state, version,
+input_ref, output_ref, correlation_id, current_wait_kind/ref,
+deadline_at, created_at, started_at, updated_at, completed_at
+```
+
+### `workflow_steps`
+
+Mirrors durable step fields with node key, dependency state, activity/tool/run
+reference, retry/timeout/compensation, lease/fencing, and result/error.
+
+### `scheduled_jobs`
+
+```text
+id, workspace_id, owner_principal_id, schedule_kind, schedule_expression,
+timezone, next_fire_at, misfire_policy, overlap_policy, jitter_ms,
+command_template_ref, policy_ref, status, version,
+lease_owner, lease_token, lease_expires_at, last_fire_at
+```
+
+## Runtimes and Plugins
+
+### `runtime_definitions`, `runtime_instances`
+
+Track runtime ID/version/protocol/capabilities, install/provenance, process/remote
+identity, status/health, restart/quarantine state, and last heartbeat.
+
+### `runtime_run_bindings`
+
+Maps JARVIS run/attempt to runtime instance/run/checkpoint, acknowledged sequence,
+state, and timestamps.
+
+### `plugin_installations`, `plugin_grants`
+
+Track manifest/package hash/signature/publisher/source, compatibility, enabled/
+quarantine state, config ref, requested capabilities, and separately approved
+workspace grants.
+
+## Voice and Notifications
+
+### `voice_calls`
+
+```text
+id, workspace_id, owner_user_id nullable, acting_principal_id nullable, provider_id,
+provider_call_id, provider_conversation_id, direction, state, version,
+identity_assurance, reason_ref, related_run_or_workflow,
+consent_policy_ref, idempotency_key, usage_json, estimated_cost,
+transcript_artifact_id, audio_artifact_id, outcome_ref,
+created_at, connected_at, completed_at
+```
+
+The configured inbound number/agent/route or outbound workflow resolves the
+workspace server-side before this row is created. An unknown caller has a guest
+or null acting principal and minimal assurance; workspace association records
+ownership and retention but grants no access. A callback that cannot resolve a
+configured route is rejected or retained only in a workspace-scoped security
+quarantine, never as an unscoped canonical call.
+
+### `voice_call_events`, `voice_turns`, `voice_callback_deliveries`
+
+`voice_call_events` stores workspace/call/sequence, expected/new version, event
+type, source, source delivery reference, correlation/causation, bounded payload
+reference, and occurred/observed/recorded timestamps. Exactly one terminal event
+is enforced per call.
+
+`voice_turns` stores call/turn identity, state/version, finalized input/output
+references, current model/tool/TTS bindings, latency/deadline fields, and terminal
+outcome. Partial transcripts are ephemeral unless retention policy explicitly
+permits a protected diagnostic artifact.
+
+`voice_callback_deliveries` stores workspace, provider connection, scoped
+delivery ID, signature/timestamp outcome, call binding, raw protected artifact
+reference, received/processed state, and reconciliation result.
+
+### `notifications`
+
+Records channel, recipient reference, content artifact, urgency, quiet-hour
+decision, state, idempotency, provider reference, and delivery/read timestamps.
+
+## Audit and Operations
+
+### `audit_logs`
+
+Append-oriented actor/action/resource/policy/approval/outcome records with
+correlation and safe metadata. Payloads and secrets are not copied here.
+
+### `schema_migrations`, `application_locks`, `diagnostic_events`
+
+Track migration checksums/status, scoped maintenance locks, and bounded safe
+operational findings.
+
+## Critical Constraints and Indexes
+
+- Foreign keys include workspace where practical to prevent cross-workspace
+  association.
+- Unique keys for idempotency, external webhook deliveries, event handling, and
+  run/tool sequences.
+- Partial indexes for pending approvals, runnable jobs, outbox deliveries,
+  active runs, reauth connectors, and non-deleted memory.
+- Check constraints for valid state/timestamp combinations.
+- FTS indexes are scoped/joined through workspace-owned rows.
+- Vector indexes/queries apply workspace filter at query time.
+- Audit/outbox tables use retention/partition strategy in PostgreSQL after
+  measured volume; SQLite uses bounded archival/vacuum policy.
+
+Executable migrations must prove these invariants on both backends.

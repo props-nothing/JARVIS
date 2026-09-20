@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "policy": "docs/research/integration-research-policy.md",
+  "allowed_states": [
+    "REQUIRED",
+    "ARCHITECTURE_ONLY",
+    "IMPLEMENTATION_READY",
+    "STALE",
+    "BLOCKED"
+  ],
+  "external_integration_paths": [
+    "adapters/**",
+    "integrations/**",
+    "runtimes/**",
+    "plugins/**",
+    "extensions/**",
+    "crates/**/src/adapters/**",
+    "crates/**/src/integrations/**",
+    "crates/**/src/providers/**",
+    "crates/**/src/external-runtimes/**",
+    "crates/**/src/external_runtimes/**",
+    "crates/**/src/runtime_adapters/**",
+    "crates/**/src/connector_adapters/**",
+    "crates/**/src/model_providers/**",
+    "crates/**/src/voice_providers/**",
+    "crates/**/src/storage_adapters/**",
+    "deploy/**"
+  ],
+  "integrations": [
+    {
+      "id": "rust-foundation",
+      "todos": ["FND-000", "FND-001", "FND-003", "FND-005", "FND-006", "FND-007", "FND-009", "FND-011", "FND-012", "FND-013", "FND-014"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "apps/**", "crates/**", "migrations/**", "installers/**"]
+    },
+    {
+      "id": "openai-compatible-model",
+      "todos": ["BRN-003", "BRN-009", "BRN-010"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["adapters/models/openai-compatible/**", "crates/**/src/adapters/models/openai-compatible/**", "crates/**/src/providers/openai-compatible/**", "crates/**/src/model_providers/openai-compatible/**", "tests/integration/openai-compatible/**"]
+    },
+    {
+      "id": "mcp",
+      "todos": ["TLS-008", "TLS-009", "TLS-010"],
+      "evidence": "docs/research/integrations/mcp.md",
+      "state": "ARCHITECTURE_ONLY",
+      "implementation_ready": false,
+      "last_verified": "2026-09-20",
+      "revalidate_by": "2026-12-19",
+      "implementation_paths": ["adapters/mcp/**", "crates/**/mcp/**", "crates/**/src/adapters/mcp/**", "tests/integration/mcp/**"]
+    },
+    {
+      "id": "embedding-provider",
+      "todos": ["MEM-004"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["adapters/embeddings/**", "crates/**/src/adapters/embeddings/**", "crates/**/src/providers/embeddings/**", "tests/integration/embeddings/**"]
+    },
+    {
+      "id": "google-workspace",
+      "todos": ["CON-005", "CON-006", "CON-007"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["integrations/google/**", "adapters/connectors/google/**", "crates/**/src/adapters/connectors/google/**", "crates/**/src/connector_adapters/google/**", "tests/integration/google/**"]
+    },
+    {
+      "id": "microsoft-graph",
+      "todos": ["CON-005", "CON-006", "CON-007"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["integrations/microsoft/**", "adapters/connectors/microsoft/**", "crates/**/src/adapters/connectors/microsoft/**", "crates/**/src/connector_adapters/microsoft/**", "tests/integration/microsoft/**"]
+    },
+    {
+      "id": "github",
+      "todos": ["CON-008"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["integrations/github/**", "adapters/connectors/github/**", "crates/**/src/adapters/connectors/github/**", "crates/**/src/connector_adapters/github/**", "tests/integration/github/**"]
+    },
+    {
+      "id": "openclaw-runtime",
+      "todos": ["RTM-004"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["runtimes/openclaw/**", "adapters/runtimes/openclaw/**", "crates/**/src/adapters/runtimes/openclaw/**", "crates/**/src/external_runtimes/openclaw/**", "crates/**/src/runtime_adapters/openclaw/**", "tests/integration/openclaw/**"]
+    },
+    {
+      "id": "openai-agents-runtime",
+      "todos": ["RTM-005"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["runtimes/openai-agents/**", "adapters/runtimes/openai-agents/**", "crates/**/src/adapters/runtimes/openai-agents/**", "crates/**/src/external_runtimes/openai-agents/**", "crates/**/src/runtime_adapters/openai-agents/**", "tests/integration/openai-agents/**"]
+    },
+    {
+      "id": "agent-client-protocol",
+      "todos": ["RTM-006"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["adapters/runtimes/acp/**", "crates/**/src/adapters/runtimes/acp/**", "crates/**/src/external_runtimes/acp/**", "crates/**/src/runtime_adapters/acp/**", "tests/integration/acp/**"]
+    },
+    {
+      "id": "langgraph-runtime",
+      "todos": ["RTM-007"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["runtimes/langgraph/**", "adapters/runtimes/langgraph/**", "crates/**/src/adapters/runtimes/langgraph/**", "crates/**/src/external_runtimes/langgraph/**", "crates/**/src/runtime_adapters/langgraph/**", "tests/integration/langgraph/**"]
+    },
+    {
+      "id": "elevenlabs",
+      "todos": ["VOI-002", "VOI-003", "VOI-004", "VOI-005", "VOI-006", "VOI-007", "VOI-008", "VOI-009", "VOI-010", "VOI-011"],
+      "evidence": "docs/research/integrations/elevenlabs.md",
+      "state": "ARCHITECTURE_ONLY",
+      "implementation_ready": false,
+      "last_verified": "2026-09-20",
+      "revalidate_by": "2026-12-19",
+      "implementation_paths": ["integrations/elevenlabs/**", "adapters/voice/elevenlabs/**", "crates/**/src/adapters/voice/elevenlabs/**", "crates/**/src/voice_providers/elevenlabs/**", "tests/integration/elevenlabs/**"]
+    },
+    {
+      "id": "tauri",
+      "todos": ["UI-001", "UI-002", "UI-003", "UI-007", "UI-008"],
+      "evidence": "docs/research/integrations/tauri.md",
+      "state": "ARCHITECTURE_ONLY",
+      "implementation_ready": false,
+      "last_verified": "2026-09-20",
+      "revalidate_by": "2027-03-19",
+      "implementation_paths": ["apps/jarvis-desktop/**", "ui/**", "tests/e2e/desktop/**"]
+    },
+    {
+      "id": "postgres-pgvector",
+      "todos": ["PRD-001", "PRD-009"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["adapters/storage/postgres/**", "crates/**/src/adapters/storage/postgres/**", "crates/**/src/storage_adapters/postgres/**", "migrations/postgres/**", "tests/integration/postgres/**"]
+    },
+    {
+      "id": "container-platform",
+      "todos": ["PRD-008"],
+      "evidence": null,
+      "state": "REQUIRED",
+      "implementation_ready": false,
+      "last_verified": null,
+      "revalidate_by": null,
+      "implementation_paths": ["deploy/**", "tests/e2e/server-container/**"]
+    }
+  ]
+}
