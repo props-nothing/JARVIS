@@ -633,20 +633,41 @@ The parts that belong in this note, because they concern JARVIS's own behavior:
   privileges a real user does not have. The service lane keeps asserting the
   **absence** of elevation in the plan and the **content** of the definition.
 - The `#[cfg(unix)]` owner-only permission assertions, typechecked but never
-  executed on the Windows authoring host, run explicitly in the native lane. Until
-  that has happened, they are typechecked only, and the TODO says so.
+  executed on the Windows authoring host, run explicitly in the native lane. Those
+  assertions **did not in fact run** until 2026-09-21, because the lane produced
+  zero jobs; they were confirmed by hand in a Linux container instead, where 8
+  `paths::` tests execute including the permission ones.
 - No workflow references a secret, every job declares `permissions: contents:
   read`, and `persist-credentials: false` keeps the job token out of the working
   tree's `.git/config`.
 
 The workflows and journey are committed and pushed, so the lanes execute on every
-push. **No document here records their result**, deliberately: this repository is
-private, the runs API is unreadable from the authoring host without a token, and
-handling a token to check a badge is not justified by the value. A valid workflow
-file is not evidence that it passed, so the result stays unasserted rather than
-assumed. Read the Actions tab, and read the `Native targets` matrix in particular:
-it is the first real evidence for the Unix permission assertions and for four of
-the five target builds.
+push. **The result was first read on 2026-09-21, and every one of the 12 runs had
+failed.** The earlier note in this file claimed the repository was private and the
+runs API unreadable without a token; it is **public**, and the runs API returns the
+runs unauthenticated. The failures were not subtle:
+
+- `native.yml` contained a YAML parse error (`paths:: storage::` left unquoted,
+  where `: ` is a mapping separator in a plain scalar), so GitHub created runs with
+  **zero jobs**. The native lane never executed a single step while reporting a
+  failure with no step to inspect.
+- The same step's command was invalid regardless: `cargo test` accepts exactly one
+  positional filter, so `paths:: storage::` is a usage error.
+- Linux `clippy -D warnings` failed on three items that a Windows compiler cannot
+  see: an unused import of a constant used only under `not(unix)`, an unused `mut`
+  in a `#[cfg(unix)]` block, and a `verbose_bit_mask` lint that only compiles where
+  the Unix permission code does.
+- The clean-machine journey asserted the service preview matched `jarvisd"`, which
+  holds on Windows (task definitions quote paths) and not on Linux
+  (`ExecStart=/path/jarvisd`).
+
+A `rust:1.98-slim-bookworm` container with the pinned toolchain,
+`scripts/linux-verify.sh`, now reproduces the CI environment locally and runs the
+same commands the lane does. That is what made the last two items findable: no
+amount of re-reading Windows-only output can surface a defect in code the compiler
+never sees.
+
+Read the Actions tab; the runs API is also readable without a token.
 
 The documentation audit that followed the push also found that `docs/README.md`
 had drifted: `ci-gates.md`, `rust-foundation.md`, and `github-actions.md` existed
@@ -812,7 +833,7 @@ cancel-safe under a real race.
 - [~] Unix: state directories are created `0o700` and files `0o600`, and a
   relaxed directory is rejected. The tests are written and typecheck for
   `x86_64-unknown-linux-gnu`. The `Native targets` lane now runs them explicitly
-  with `cargo test -p jarvis-infrastructure paths:: storage::` on the three
+  with `cargo test -p jarvis-infrastructure paths::` on the three
   non-Windows runners. They remain **unexecuted** until that workflow first runs
   on GitHub's infrastructure, and are not claimed as proven before then.
 - [ ] Windows x86_64: Known Folders, owner DACL, Credential Manager,

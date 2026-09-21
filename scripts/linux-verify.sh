@@ -30,7 +30,7 @@ echo "tests: OK"
 grep -c "test result: ok" /tmp/test.log
 
 echo "=== unix permission and storage tests (run only on non-Windows) ==="
-cargo test -p jarvis-infrastructure --all-features "paths::" "storage::" 2>&1 | tail -6
+cargo test -p jarvis-infrastructure --all-features "paths::" 2>&1 | tail -6
 
 echo "=== build release binaries ==="
 cargo build --release -p jarvisd -p jarvis-cli >/tmp/build.log 2>&1

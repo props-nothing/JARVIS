@@ -142,18 +142,32 @@ that work is `FND-011` and must not inherit this decision.
 | `CI-C007` | The clean-machine journey passes from an empty profile directory | VERIFIED live on Windows | `node scripts/clean-machine-smoke.mjs target/debug` | The journey depends on ambient profile state |
 | `CI-C008` | The daemon becomes ready against a profile created by a previous run | VERIFIED live on Windows | The smoke script restarts the daemon against the same profile | A restart depends on a clean directory, or state is lost |
 | `CI-C009` | The smoke journey leaves no daemon behind when it fails | VERIFIED by construction | `finally` block terminates the child and removes the profile | A leaked daemon poisons a later step |
-| `CI-C010` | The Unix owner-only permission assertions actually execute somewhere | VERIFIED in the native lane definition | `cargo test -p jarvis-infrastructure paths:: storage::` on non-Windows runners | `#[cfg(unix)]` assertions are typechecked but never run, as they are on the authoring host |
+| `CI-C010` | The Unix owner-only permission assertions actually execute somewhere | **FALSE as first recorded, now VERIFIED locally on Linux** — the native lane never ran (see `CI-C013`) and its command was invalid; `cargo test -p jarvis-infrastructure paths::` now runs 8 tests including `created_directories_are_owner_only` and `a_group_readable_directory_is_flagged_unsafe` | `cargo test -p jarvis-infrastructure paths::` on a Linux runner; confirmed in a `rust:1.98-slim-bookworm` container | `#[cfg(unix)]` assertions are typechecked but never run, as they are on the authoring host |
 | `CI-C011` | A native target builds with its own C toolchain and no cross-compilation | VERIFIED by workflow construction | Host target equals matrix target; the C compiler is checked in its own step | A "supported target" that has never actually been built |
 | `CI-C012` | A platform failure is visible rather than masked | VERIFIED | `fail-fast: false` | One broken platform hides the state of the other four |
-| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **UNVERIFIED from the authoring host** — the repository is private, so the runs API is not readable without a token, and no token was handled | Must be read from the Actions tab | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **VERIFIED READABLE, and every run had FAILED.** The repository is **public**, so the runs API is readable without a token; 12 runs existed and all 12 concluded `failure` | `GET /repos/props-nothing/JARVIS/actions/runs` and `.../check-runs` | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C015` | The native lane produces jobs at all | **FALSE until fixed.** `native.yml` had a YAML parse error, so GitHub created runs with **zero jobs** and the run name fell back to the file path instead of `Native targets` | The runs API reported `jobs=0`; `js-yaml` reproduced it locally | An entire lane that silently does nothing while reporting a failure |
+| `CI-C016` | The lane can observe defects the Windows authoring host cannot | **VERIFIED after fixing.** Linux clippy failed on an unused import, an unused `mut`, and a `verbose_bit_mask` lint, and the clean-machine journey failed on a quote-dependent assertion | `rust:1.98-slim-bookworm` container with the pinned toolchain | Three real defects that passed every local Windows check |
 | `CI-C014` | Every document is reachable from the top-level index | VERIFIED by validator and a fail-closed test | `validateIndexCompleteness` in `scripts/validate-docs.mjs`, falsified with a temporary unlinked file | A document nobody links to, which is effectively unreviewed |
 
-`CI-C013` is the honest gap. Every other claim is either verified from official
-documentation or verified by running the journey locally. The workflows are
-committed and pushed, so their lanes are executing, but no document here records
-their result: a valid workflow file is not evidence that it passed. Read the
-Actions tab, and treat the `Native targets` matrix as the first real evidence for
-the Unix permission assertions and for four of the five target builds.
+`CI-C013` and `CI-C015` were the honest gap, and both were worse than recorded. The
+note said the repository was private and the runs API unreadable; it is **public**,
+the API returned the runs without a token, and **all 12 runs had failed**. The native
+lane was worse than failing: a YAML parse error meant it produced **zero jobs**, so it
+reported a failure with no step to inspect and nothing ever executed in it. That is
+why `CI-C010` — which claimed the Unix permission assertions executed in the native
+lane — was false, and why the command in it was an invalid `cargo` invocation that
+would have matched nothing if the lane had run.
+
+A working Linux environment was the missing capability: the authoring host has no Unix
+runtime, so the `#[cfg(unix)]` code was never compiled, let alone linted or tested. A
+`rust:1.98-slim-bookworm` container with the pinned toolchain now reproduces the CI
+environment locally, and `scripts/linux-verify.sh` runs the same commands the lane
+does. It immediately found three clippy defects (an unused import that is only used on
+Windows, an unused `mut` in a `#[cfg(unix)]` branch, and a `verbose_bit_mask` lint that
+only fires where Unix permission code compiles) and a journey assertion that depended
+on Windows quoting. No amount of re-reading the Windows-only output could have found
+them: they are invisible to a compiler that never sees the code.
 
 `CI-C014` was added after this audit found the top-level index had drifted twice:
 a document was added, linked from its own section index, and never linked from
@@ -196,4 +210,5 @@ failure mechanical rather than something a reader has to notice.
 | --- | --- | --- |
 | 2026-09-21 | Initial note; `CI` and `Native targets` workflows added; clean-machine smoke journey added | `FND-010`: no CI existed, and the Unix permission assertions and per-target builds had never executed anywhere |
 | 2026-09-21 | Action majors corrected to `checkout@v7`, `cache@v6`, `setup-node@v7` | The release API showed the initially written `@v5`/`@v4` pins were outdated |
-| 2026-09-21 | Post-push audit: `CI-C013` reworded, `CI-C014` added, index drift fixed | The workflows were committed and pushed (commit `930e1d5`), so "never executed" was no longer accurate; the runs API is unreadable for this private repository without a token, so the result stays unasserted rather than assumed. The audit also found `docs/README.md` omitted `ci-gates.md`, `rust-foundation.md`, and `github-actions.md` |
+| 2026-09-21 | Post-push audit: `CI-C013` reworded, `CI-C014` added, index drift fixed | The workflows were committed and pushed (commit `930e1d5`), so "never executed" was no longer accurate. **This audit also asserted the repository was private and the runs API unreadable; that was wrong** — see the entry below |
+| 2026-09-21 | **Real CI results read for the first time.** Four defects found and fixed: a YAML parse error that made the native lane produce zero jobs; an invalid two-filter `cargo test` command; three Linux-only clippy failures; and a platform-dependent journey assertion. `CI-C010` corrected from VERIFIED-in-definition to FALSE-as-recorded; `CI-C015` and `CI-C016` added; `CI-C013` corrected | The repository is public, the runs API IS readable without a token, and **every one of the 12 runs had failed**. The previous note's "unverified" framing understated it: the native lane never executed anything at all. A `rust:1.98-slim-bookworm` container and `scripts/linux-verify.sh` now make the Unix-only defects reproducible |

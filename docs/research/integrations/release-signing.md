@@ -243,7 +243,9 @@ a CLI surface.
   the three failures attributable to the tampering rather than to a broken fixture.
 - [ ] Native execution on all five tier-1 lanes: the journey is wired into
   `Native targets`, but that workflow's result is not observable from the
-  authoring host (private repository, no token). Recorded as `UNVERIFIED`.
+  authoring host. The lane produced zero jobs on every run until a YAML parse
+  error in `native.yml` was fixed, so this is verified locally and against a Linux
+  container instead; the first post-fix run is the remaining evidence.
 
 ## Operational Readiness
 

@@ -51,8 +51,19 @@ typechecked on Windows but never executed there, so the native lane runs them
 explicitly:
 
 ```bash
-cargo test -p jarvis-infrastructure --all-features paths:: storage::
+cargo test -p jarvis-infrastructure --all-features paths::
 ```
+
+Two details here are each a real bug when got wrong, and both were found by
+reading the first real CI results rather than by reasoning:
+
+- `cargo test` accepts exactly **one** positional filter. `paths:: storage::` is a
+  usage error rather than two filters, so the step ran no tests and failed the
+  lane.
+- The argument must be quoted in YAML. Unquoted, the `: ` (colon then space) is
+  read as a mapping separator inside a plain scalar, the workflow file fails to
+  parse, and GitHub then creates a run with **zero jobs** — a failure with no step
+  to inspect, which is why this looked like a code problem for several commits.
 
 Until that step runs in CI, those assertions are typechecked only, and the
 Foundation TODO records them as such rather than as proven.
@@ -141,6 +152,30 @@ reachable through the same single flag as a safe uninstall, are the two failure
 modes this journey exists to catch. Step 7 asserts the database *contents*, because
 an uninstall that left an empty file behind would pass a presence check while still
 destroying user data.
+
+## Reproducing The Linux Lanes Locally
+
+The authoring host is Windows, so `#[cfg(unix)]` code is never compiled there and
+Unix-only defects are invisible to `cargo clippy` and `cargo test`. Four CI
+failures were exactly that class, and none of them could have been found by
+re-reading Windows output.
+
+`scripts/linux-verify.sh` runs the lane's commands in a Linux container with the
+pinned toolchain, which makes those defects reproducible:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src rust:1.98-slim-bookworm sh /src/scripts/linux-verify.sh
+```
+
+It runs `cargo fmt --check`, `clippy -D warnings`, the workspace tests under the
+workflow's `RUSTFLAGS`, the `paths::` filter that covers the Unix permission
+assertions, a release build, and all three journeys. Its value is that it is
+**differently blind** from the host: it found an unused import that only exists
+under `not(unix)`, an unused `mut` that only exists under `unix`, and a clippy lint
+that only compiles where the permission code does.
+
+It is a developer aid, not a gate: CI remains the authority, because only CI proves
+that the workflow file itself parses and that the jobs actually run.
 
 ## Running The Gates Locally
 

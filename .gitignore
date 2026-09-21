@@ -1,5 +1,17 @@
 /target/
 
+# Scratch output captured while running gates locally: a command's combined
+# output held in a file so it can be searched, or a one-off diagnostic script.
+#
+# A dedicated directory is used rather than a glob over dot-files, and that is a
+# deliberate choice. A pattern such as `.[a-z]*` would be too broad (it would
+# silently ignore a legitimate future dot-file, which is worse than a stray
+# scratch file), while a narrower one such as `.[a-z]*[0-9]` misses the names
+# that actually leaked. One of these files was committed by accident, so the
+# practice is to write them **here** and the rule makes that safe. Prefer the
+# OS temporary directory for anything that does not need to be greppable.
+/.scratch/
+
 .env
 .env.*
 !.env.example

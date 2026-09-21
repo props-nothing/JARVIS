@@ -298,10 +298,21 @@ async function main() {
 
     // 6. The service preview must name the daemon binary, not the client. A
     //    service pointing at the client would start and never serve.
+    //
+    //    The match is on the executable *path* (`ExecStart=` on Unix, the task
+    //    command on Windows) rather than on any occurrence of the name, because
+    //    the unit description also contains the word "jarvisd" in quotes. Matching
+    //    a quoted occurrence passed on Windows, where the task definition quotes
+    //    its paths, and failed on Linux, where `ExecStart=/path/jarvisd` has no
+    //    quote after it — an assertion that depended on the platform's formatting
+    //    rather than on the property being tested.
     const service = run(client, ["--profile", profile, "service", "show"]);
+    const namesDaemon = ["ExecStart=", "command:", "args:"].some((line) =>
+      new RegExp(`${line}[^\\n]*[\\\\/]jarvisd(\\.exe)?\\b`).test(service.stdout),
+    );
     if (service.status !== 0) {
       fail("the service preview failed", `${service.stdout}${service.stderr}`);
-    } else if (!/jarvisd(\.exe)?"/.test(service.stdout)) {
+    } else if (!namesDaemon) {
       fail("the service preview does not name the jarvisd daemon", service.stdout);
     } else if (!/no elevation/.test(service.stdout)) {
       fail("the service preview does not state the no-elevation mode", service.stdout);

@@ -251,7 +251,7 @@ Dependencies: all Milestone 0 exit criteria.
   cross-compile: bundled SQLite needs each target's own C toolchain. The Unix
   owner-only permission assertions, which are only typechecked on the Windows
   authoring host, are executed there explicitly via `cargo test -p
-  jarvis-infrastructure paths:: storage::`. A new dependency-free
+  jarvis-infrastructure paths::`. A new dependency-free
   `scripts/clean-machine-smoke.mjs` implements the `ACC-001` journey: start the
   daemon on a fresh `--profile` directory, require readiness and a clean
   `jarvis doctor`, assert the profile actually contains the credential, database,
@@ -269,12 +269,25 @@ Dependencies: all Milestone 0 exit criteria.
   verified against the release API after the initially written `@v5`/`@v4` pins
   proved outdated. 240 workspace tests pass; `fmt` and `clippy -D warnings` are
   clean. The workflows and journey are committed and pushed (commit `930e1d5`),
-  so the lanes are executing. **PARTIAL**: their result is not asserted here — the
-  repository is private, so the runs API is unreadable from the authoring host
-  without a token, and no token was handled; a valid workflow file is not evidence
-  that it passed (`CI-C013`). Read the Actions tab, and treat the `Native targets`
-  matrix as the first real evidence for the Unix permission assertions and for four
-  of the five target builds. No CI has verified a packaged artifact, because no
+  so the lanes are executing. **PARTIAL, and worse than first recorded**: the CI
+  result was read for the first time on 2026-09-21 and **every one of the 12 runs
+  had failed**. The earlier note claimed the repository was private and the runs
+  API unreadable; it is **public** and the API returns the runs without a token.
+  Four real defects were found and fixed: (1) `native.yml` had a YAML parse error
+  (`paths:: storage::` unquoted, where `: ` is read as a mapping separator), so
+  GitHub created runs with **zero jobs** and the native lane **never executed
+  anything**; (2) the same step's command was invalid regardless, because
+  `cargo test` accepts exactly one positional filter; (3) Linux `clippy -D
+  warnings` failed on an unused import, an unused `mut`, and a `verbose_bit_mask`
+  lint — all invisible to a Windows compiler that never sees `#[cfg(unix)]` code;
+  (4) the clean-machine journey's service assertion matched `jarvisd"` and so
+  passed on Windows (task definitions quote paths) and failed on Linux
+  (`ExecStart=/path/jarvisd`). A `rust:1.98-slim-bookworm` container and
+  `scripts/linux-verify.sh` now reproduce the CI environment locally, which is
+  what made (3) and (4) findable. Read the Actions tab; the runs API is public and
+  readable. Treat the `Native targets` matrix as the first real evidence for the
+  Unix permission assertions and for four of the five target builds. No CI has
+  verified a packaged artifact, because no
   installer exists yet (that is `FND-011`/`FND-012`), and real per-user service
   registration is still asserted as a plan rather than performed anywhere. Native
   service lifecycle proof remains the other half of this item.
@@ -311,8 +324,10 @@ Dependencies: all Milestone 0 exit criteria.
   validly-signed-but-superseded release being replayed, because rollback defense
   needs versioned metadata (TUF-style) and belongs with `FND-012`'s update
   channel. Native execution of the journey on the five tier-1 lanes is wired
-  into `Native targets` but its result is unreadable from the authoring host
-  (private repository, no token), so it stays `UNVERIFIED`.
+  into `Native targets`. That lane produced **zero jobs** on every run until
+  2026-09-21 (a YAML parse error, fixed), so it is verified locally on Windows and
+  against a Linux container via `scripts/linux-verify.sh` rather than claimed from
+  a CI result; the first post-fix run is the remaining evidence.
 - [~] `FND-012` Implement install, update, rollback, portable mode, and uninstall
   tests that preserve user data unless explicitly removed. Public promotion
   depends on `OWN-001` through `OWN-005`.
