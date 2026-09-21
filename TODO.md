@@ -2,7 +2,7 @@
 
 Status: ACCEPTED
 Tracking state: ACTIVE
-Last updated: 2026-09-20
+Last updated: 2026-09-21
 
 Checkboxes describe repository state, not aspiration. An item is checked only
 when its acceptance evidence exists and required validation passes.
@@ -79,28 +79,201 @@ test-signing. An AI agent must not invent the decision or resource. See
 
 Dependencies: all Milestone 0 exit criteria.
 
-- [ ] `FND-000` Research the exact Rust toolchain, targets, crates, SQLite
+- [x] `FND-000` Research the exact Rust toolchain, targets, crates, SQLite
   behavior, OS facilities, licenses, and versions proposed for Foundation;
   record current official evidence before dependency selection.
-- [ ] `FND-001` Create Cargo workspace, pinned toolchain, workspace lint policy,
+  Evidence: `docs/research/integrations/rust-foundation.md`, implementation-
+  ready manifest metadata, official source/version/license review, and passing
+  documentation gate tests.
+- [x] `FND-001` Create Cargo workspace, pinned toolchain, workspace lint policy,
   dependency policy, and minimal crate boundaries. Depends on `FND-000`.
-- [ ] `FND-002` Implement typed IDs, clock, cancellation, correlation, and domain
+  Evidence: Rust/Cargo `1.98.1`, edition 2024, resolver 3, seven minimal
+  packages, dependency-free domain, and `publish = false`; format, Clippy,
+  tests, dependency-tree checks, and compile checks for all five supported
+  targets pass. Those compile checks were valid for the dependency-light
+  workspace as it stood here; `FND-006` later added bundled SQLite, which needs
+  a native C toolchain per target, so per-target proof now comes from native CI.
+  Native packaged/runtime journeys remain assigned to `FND-010`.
+- [x] `FND-002` Implement typed IDs, clock, cancellation, correlation, and domain
   error primitives with serialization tests.
-- [ ] `FND-003` Implement platform config/data/cache/log/runtime path resolver with
+  Evidence: `jarvis-domain` typed lowercase-UUIDv7 IDs, RFC 3339 `Z` time,
+  injected `Clock`/`IdGenerator` ports, and coded errors; `jarvis-application`
+  cancellation scopes and server-derived `RequestContext`; `jarvis-infrastructure`
+  system clock and UUIDv7 generator adapters. ID and time serialization tests
+  reject non-canonical lookalikes, and cancellation propagation/race tests cover
+  parent/child behavior and cancel-safe `cancelled()`. `jiff 0.2.37` is recorded
+  in the Foundation evidence note; format, Clippy, and tests pass, and the
+  domain crate depends only on `jiff`, `serde`, `thiserror`, and `uuid`.
+- [~] `FND-003` Implement platform config/data/cache/log/runtime path resolver with
   permissions and migration tests on Windows, macOS, and Linux.
-- [ ] `FND-004` Implement layered configuration with schema, environment overrides,
+  Evidence (PARTIAL): `jarvis-infrastructure` resolves standard and portable
+  profiles from `directories 6.0.0`, maps mutable state to local (non-roaming)
+  paths, derives runtime/state from the local data root on Windows/macOS where
+  XDG-style dirs are absent, rejects rooted/absolute/`..`/separator/drive
+  components, and verifies profile containment lexically. Unix directories are
+  created `0o700` and files `0o600` and the mode is queried back, so a
+  group/other-accessible directory is reported as `jarvis.unsafe_permissions`.
+  10 tests pass on Windows; the Unix permission tests exist and typecheck for
+  Linux but have not been executed (no Linux runtime on the authoring host).
+  Not done: explicit Windows DACL write/query is deferred pending an ADR,
+  because it requires `unsafe` FFI that every crate forbids; native execution of
+  the Unix tests belongs to `FND-010` CI. Config *schema migration* tests remain
+  with `FND-004`.
+- [x] `FND-004` Implement layered configuration with schema, environment overrides,
   secret references, atomic writes, and version migration.
-- [ ] `FND-005` Implement structured tracing, redaction, rotating local logs, and a
+  Evidence: `jarvis-infrastructure::config` implements defaults -> file ->
+  environment allowlist -> command-line precedence (order asserted end to end),
+  a versioned TOML schema with `deny_unknown_fields` at every level, an explicit
+  three-key environment allowlist that reports non-allowlisted `JARVIS_*`
+  variables as ignored, secret *references* (`env:JARVIS_*` only) that can never
+  hold a value, a bounded 64 KiB read, and an atomic write (owner-only temp file,
+  `create_new`, write, `sync_all`, rename, directory flush). An unsupported
+  `schema_version` is refused and the file is left byte-identical; a raw secret
+  pasted where a reference belongs fails to parse and never appears in text,
+  `Debug`, or the error. 26 config tests pass; format, Clippy, and the full
+  workspace suite pass, and the workspace compiled for all five targets at that
+  time (cross-target compilation from one host stopped being possible once
+  `FND-006` added bundled SQLite, which needs a native C toolchain per target).
+  `toml::Value` is avoided because it needs the `unbounded` feature. Not done:
+  crash-injection under an interrupted write and a link-swap fixture (deferred to
+  `FND-012` failure testing).
+- [x] `FND-005` Implement structured tracing, redaction, rotating local logs, and a
   test that seeded secrets never appear in logs or errors.
-- [ ] `FND-006` Implement SQLite connection, migrations, migration lock, health,
+  Evidence: `jarvis-observability` installs a newline-delimited JSON file sink via
+  `tracing-subscriber` with an `env-filter` directive, a time-based
+  `tracing-appender` rotation with a retained-file bound, and a bounded
+  `lossy(false)` queue whose dropped-line counter is exposed so degraded
+  observability is visible. Redaction is applied at the **writer**, so a format
+  change cannot bypass it: registered values are removed wherever they appear
+  (the guarantee, proved by a seeded canary test), while authorization headers,
+  `key=value` credential pairs, and URL userinfo are covered best-effort. Control
+  characters and ANSI escapes are stripped, and an embedded newline cannot forge
+  a second record. Values under 8 bytes are refused at registration rather than
+  over-redacting. 21 tests pass; `tracing-appender` is pinned exactly to the
+  reviewed `0.2.4` after `^0.2.4` resolved to an unreviewed `0.2.5`. Not done:
+  console-format parity and JARVIS-owned log retention/cleanup (later slices);
+  the canary scan currently covers the file sink, not yet errors, diagnostics,
+  or support bundles (`ACC-070`).
+- [x] `FND-006` Implement SQLite connection, migrations, migration lock, health,
   integrity check, backup, and restore.
-- [ ] `FND-007` Implement `jarvisd` startup, graceful drain, health, readiness,
+  Evidence: `jarvis-infrastructure::storage` opens SQLite with the reviewed
+  profile (bundled library, foreign keys on, WAL, synchronous FULL,
+  `trusted_schema` OFF, 5s busy timeout, statement logging off) and re-reads each
+  safety pragma instead of assuming it applied. The connection refuses a library
+  below `3.51.3` by numeric comparison, since a string compare ranks `3.9` above
+  `3.51`. Migrations are embedded from `migrations/sqlite` with a build-script
+  rerun guard; `has_pending` distinguishes "migrate safely" from "report not
+  ready", and a checksum mismatch is never ignored. A `schema_version` record
+  makes a newer-written database refuse rather than modify itself.
+  `integrity_check` **and** `foreign_key_check` both run, because a
+  structurally sound file can still hold dangling references. Locks are scoped
+  and expiring so a crashed holder cannot block maintenance forever, and the
+  release is ownership-checked. Backup uses the online backup API (the three
+  files are one state), verifies the copy before reporting success, and restore
+  verifies before overwriting so a corrupt backup cannot destroy the live
+  database. 44 storage tests pass; the Foundation note's previously open
+  `libsqlite3-sys`/SQLite runtime gate item is now closed. Not done: upgrade from
+  a prior supported schema, checksum-drift and `BUSY`/`FULL` injection,
+  corrupt-database repair, checkpoint starvation, and abrupt-termination
+  recovery (owner: `FND-012` failure testing and native CI).
+  Side effect: bundled SQLite needs a native C toolchain per target, so the
+  workspace no longer cross-compiles from one host; per-target proof moves to
+  native CI (`FND-010`).
+- [x] `FND-007` Implement `jarvisd` startup, graceful drain, health, readiness,
   single-instance lock, and authenticated local transport.
-- [ ] `FND-008` Implement `jarvis status`, `config`, `service`, `logs`, and `doctor`.
-- [ ] `FND-009` Implement per-user service install/remove for systemd, launchd, and
-  Windows with no elevation-dependent interactive flow.
-- [ ] `FND-010` Build clean-machine CI smoke tests for the exact tier-1 target
+  Evidence: `jarvis-protocol` defines the versioned discovery file and error
+  envelope; `jarvis-infrastructure` adds single-instance ownership (a held
+  exclusive lock, released by the operating system on process exit, with PID text
+  treated as diagnostic only), atomic discovery publication with a read-back
+  validation and ownership-checked removal, 32-byte `getrandom` credentials
+  stored only as SHA-256 verifiers compared with `subtle`, and an axum surface
+  with global 64 KiB request limiting. Startup is a fixed fail-closed order
+  (lock, database, migrate, bind loopback, publish, ready), so readiness can
+  never be true while migrations are pending or the schema is unsupported.
+  Liveness and readiness are separate flags, `/health/*` exposes only a status
+  token, every `/api/v1` route requires a credential and an API major, browser
+  `Origin` is rejected on all routes, and unknown/wrong/revoked credentials
+  return one indistinguishable response. 50 new tests (175 workspace-wide) pass
+  across lock contention, discovery validation and unsafe-authority rejection,
+  credential generation/verification/revocation and enrollment round trip,
+  health/readiness, version negotiation, origin rejection, drain, and
+  startup-failure paths. `jarvisd` builds and wires this into a composition root
+  with bounded drain on Ctrl-C/SIGTERM. Not done: the serve loop is not yet bound
+  to the router because the run resources it needs arrive with Brain;
+  service-manager facilities are `FND-009`; the OS credential store is replaced
+  by an owner-only file until the keyring slice (`FND-008`), which is recorded in
+  the Foundation evidence note rather than left implicit.
+- [x] `FND-008` Implement `jarvis status`, `config`, `service`, `logs`, and `doctor`.
+  Evidence: `jarvis` parses its subcommands with `try_parse` (a typo is a typed
+  error, never a process exit) and reaches the daemon through the published
+  discovery file plus the enrolled local credential. `status` presents only the
+  contract-shaped fields it parsed, so arbitrary daemon text cannot reach the
+  operator's terminal. `config` prints secret *references* and never values;
+  `logs` lists names and sizes only; `service` reports the platform backend, the
+  registration state, and the exact install preview; `doctor` runs deterministic
+  checks for profile directories, database integrity, SQLite version, schema
+  compatibility, daemon reachability, credential presence, and service
+  registration, separating blocking findings from warnings and exiting `1` when
+  the operator must act. The Foundation HTTP
+  client is a bounded minimal loopback exchange that re-validates the numeric
+  loopback authority at call time. 5 CLI tests plus a live end-to-end check pass:
+  `jarvis status` against a real running `jarvisd` reported `state: ready` with
+  the daemon's own instance id and PID. Closing the `FND-007` gap, the serve loop
+  is now bound: `RunningDaemon::serve_until` drives `axum::serve` with graceful
+  shutdown and then drains, proved by a real-socket integration test. Not done:
+  `config` does not yet write or migrate configuration, and the keyring adapter,
+  service lifecycle, and native permission proof remain outstanding.
+- [~] `FND-009` Implement per-user service install/remove for systemd, launchd, and
+  Windows with no elevation-dependent interactive flow. Three controllers exist
+  behind one trait, and every plan is asserted exactly on every host because
+  planning never executes: `systemctl --user enable`, `launchctl bootstrap
+  gui/<uid>`, and `schtasks /create /sc ONLOGON /rl LIMITED /it /f`. Definitions
+  are escaped for their format (systemd quoting, XML entities) in addition to
+  rejecting control characters, no definition contains a secret or an environment
+  block, `LaunchAgent` `Label` matches its filename and bootstrap target, and
+  captured service-manager output is bounded. `jarvis service` prints the backend,
+  the state, and the exact install preview naming the resolved `jarvisd`; verified
+  live on Windows, where the read-only `schtasks /query` of an absent task was
+  confirmed to exit non-zero and map to `not_installed`. **PARTIAL**: no service
+  was installed, started, stopped, or removed on any platform, the `systemd` and
+  `launchd` controllers are asserted as plans only, and no `systemctl`/`launchctl`
+  invocation has been observed. Those native proofs are `FND-010`. 232 workspace
+  tests pass; `fmt` and `clippy -D warnings` are clean.
+- [~] `FND-010` Build clean-machine CI smoke tests for the exact tier-1 target
   matrix, service lifecycle, profile paths, and owner-only permissions.
+  Evidence (PARTIAL): two workflows now exist. `CI` runs the documentation gate
+  **after** the validator's own test suite (so a weakened validator cannot pass
+  the gate it implements), then `cargo fmt --all --check`, `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings`, and `cargo test
+  --workspace --all-features`. `Native targets` runs the five tier-1 targets on
+  matching runners (`windows-2025`, `macos-14`, `macos-15-intel`, `ubuntu-24.04`,
+  `ubuntu-24.04-arm`) with `fail-fast: false`, because this workspace does not
+  cross-compile: bundled SQLite needs each target's own C toolchain. The Unix
+  owner-only permission assertions, which are only typechecked on the Windows
+  authoring host, are executed there explicitly via `cargo test -p
+  jarvis-infrastructure paths:: storage::`. A new dependency-free
+  `scripts/clean-machine-smoke.mjs` implements the `ACC-001` journey: start the
+  daemon on a fresh `--profile` directory, require readiness and a clean
+  `jarvis doctor`, assert the profile actually contains the credential, database,
+  discovery file, and lock (asserting contents, not only exit codes), assert the
+  credential is mode `0600` on Unix, stop and require a bounded drain, restart
+  against the same profile, and assert `jarvis service show` names `jarvisd`. It
+  passes locally on Windows, including the restart, and terminates the daemon in
+  a `finally` block so a failed assertion cannot leak a process. To make any of
+  this possible, profile resolution was unified in `jarvis_infrastructure::profile`
+  and both binaries gained `--profile <DIR>`, which is what lets a clean run avoid
+  the real profile entirely; an environment override was deliberately **not**
+  added, because it would be a way to redirect durable state, credentials, and the
+  discovery file of an installed product. The `CI` and `Native targets` lanes were
+  pinned to `actions/checkout@v7`, `actions/cache@v6`, and `actions/setup-node@v7`,
+  verified against the release API after the initially written `@v5`/`@v4` pins
+  proved outdated. 240 workspace tests pass; `fmt` and `clippy -D warnings` are
+  clean. **PARTIAL**: the workflows have never run on GitHub's infrastructure, so
+  their first real execution is unproven (`CI-C013`, `UNVERIFIED`); no CI has
+  verified a packaged artifact, because no installer exists yet (that is
+  `FND-011`/`FND-012`); and real per-user service registration is still asserted as
+  a plan rather than performed anywhere. Native service lifecycle proof is the
+  remaining half of this item.
 - [ ] `FND-011` Build native release matrix, checksums, isolated test signatures,
   SBOM, and provenance attestations. Production signing depends on `OWN-003`.
 - [ ] `FND-012` Implement install, update, rollback, portable mode, and uninstall

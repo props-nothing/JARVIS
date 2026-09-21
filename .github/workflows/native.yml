@@ -1,0 +1,129 @@
+name: Native targets
+
+# Native per-target proof (`FND-010`). Bundled SQLite compiles a vendored C file
+# through `cc`, so a build for a non-host target needs that target's native C
+# toolchain. Cross-compilation from one host is therefore not supported and each
+# target's compile-and-test proof must come from a native runner.
+#
+# This workflow exists because "Rust can compile" is not platform support. It
+# proves, on real hardware for each tier-1 target:
+#
+#   * the workspace builds and its tests pass;
+#   * a clean-machine daemon journey works in an empty profile directory;
+#   * the Unix owner-only permission assertions execute (they are typechecked but
+#     never run on the authoring host, which has no Unix runtime).
+#
+# Everything here is read-only with respect to the repository. There is no
+# signing, no artifact publication, and no secret. Release artifacts, signing, and
+# promotion are `FND-011` and are owner-controlled.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The tier-1 matrix from `docs/architecture/installation-release.md`. The
+  # `x86_64-apple-darwin` lane is included because JARVIS supports it only while
+  # Apple supports it, and it needs its own native proof.
+  native:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      # One failing target must not hide the state of the others: a platform
+      # break is exactly the news this lane exists to deliver.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            os: windows
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os: macos
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            os: macos
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            os: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os: linux
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The build script compiles vendored SQLite. A missing or broken C compiler
+      # must be an explicit failure here rather than a confusing link error later.
+      - name: Verify the native C toolchain is present
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cc --version || cl 2>&1 | head -1
+          else
+            cc --version
+          fi
+
+      - name: Cache the Cargo registry and build outputs
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # The target is part of the key because two matrix entries share a
+          # runner OS label family; a shared key would cross-contaminate them.
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-
+
+      # The host target is the matrix target on every runner in this matrix, so
+      # no `--target` is needed and no cross-compilation is attempted.
+      - name: Run the workspace test suite natively
+        run: cargo test --workspace --all-features
+
+      # The Unix permission assertions live in `#[cfg(unix)]` tests and are
+      # skipped on the authoring host. This lane is where they actually run.
+      - name: Run the path and permission tests explicitly
+        if: matrix.os != 'windows'
+        run: cargo test -p jarvis-infrastructure --all-features paths:: storage::
+
+      - name: Build the binaries for the clean-machine journey
+        run: cargo build --release -p jarvisd -p jarvis-cli
+
+      - name: Run the clean-machine smoke journey
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/clean-machine-smoke.mjs target/release
+
+      # Provenance for the evidence note: the exact versions a reviewer can
+      # reproduce against.
+      - name: Record toolchain and target facts
+        shell: bash
+        run: |
+          rustc --version --verbose
+          cargo --version
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            systeminfo | grep -i "OS Name" || true
+          else
+            uname -a
+          fi

@@ -4,8 +4,24 @@ JARVIS is a planned cross-platform personal AI operating system: a durable,
 installable control plane for models, agent runtimes, tools, memory, workflows,
 events, and voice.
 
-Project state: **Milestone 0 specification complete; implementation has not
-started. The next ready task is `FND-000` Foundation dependency research.**
+Project state: **Milestone 0 specification and `FND-001`, `FND-002`, `FND-004`
+through `FND-010` are complete or partially complete, with the path resolver,
+the service lifecycle, and the CI lanes partially complete. The
+Rust control plane now has typed IDs, UTC time, cancellation, request context,
+domain errors, platform paths, layered versioned configuration with secret
+references, structured JSON logging with sink-level secret redaction, SQLite
+storage with embedded migrations and verified backup/restore, a daemon that
+starts fail-closed, serves an authenticated local API, and drains within a bound,
+a CLI whose `status` command was verified end-to-end against a running
+daemon, per-user service lifecycle planning for systemd, launchd, and Windows
+with no elevation, and a two-workflow CI pipeline whose native matrix builds,
+tests, and runs a clean-machine journey on every tier-1 target. Bundled SQLite
+needs a native C toolchain per target, which is why that proof runs natively rather
+than by cross-compilation. Native Unix permission proof, the Windows ACL binding,
+the OS credential store, native service registration, and the first real execution
+of the CI workflows are still outstanding. `FND-010` is implemented as workflows
+and a locally verified journey; `FND-011` release artifacts is the next ready
+task.**
 
 The design goal is not another chat wrapper. JARVIS should remain stable while
 models, providers, agent frameworks, databases, voice vendors, and interfaces
@@ -61,6 +77,9 @@ flowchart TB
 5. Select the first ready item in [TODO.md](TODO.md).
 6. Complete upstream research and its manifest gate before touching an external
     integration or boundary-affecting dependency.
+7. Run `cargo fmt --check`,
+    `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
+    `cargo test --workspace` for Rust changes.
 
 The root agent instructions are mandatory for human and AI-assisted changes.
 They require current official documentation or `llms.txt` discovery for every
@@ -92,25 +111,25 @@ external integration.
 | [SECURITY.md](SECURITY.md) | Security policy and baseline |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow and quality bar |
 
-## Target Repository Shape
+## Repository Shape
 
-The detailed crate boundaries will be created during Foundation, after contract
-ADRs are accepted. The intended high-level layout is:
+The first Foundation boundary is now present:
 
 ```text
-apps/             daemon, CLI, desktop
-crates/           Rust domain and application subsystems
-adapters/         storage, models, runtimes, tools, connectors, voice
-ui/               shared web frontend
-migrations/       SQLite and PostgreSQL migrations
-installers/       platform installers and service definitions
-deploy/           optional server deployment assets
-docs/             architecture, contracts, ADRs, research, plans, runbooks
-tests/            cross-crate integration, contract, installer, and end-to-end tests
+apps/
+    jarvisd/                 daemon composition root
+    jarvis-cli/              thin `jarvis` client composition root
+crates/
+    jarvis-domain/           infrastructure-free domain types and ports
+    jarvis-application/      application orchestration
+    jarvis-protocol/         versioned process-boundary types
+    jarvis-infrastructure/   storage and operating-system adapters
+    jarvis-observability/    local structured diagnostics
+tests/e2e/                 packaged cross-process acceptance tests
 ```
 
-This is a specification repository today. Commands shown in planning documents
-become valid only after the relevant milestone creates them.
+This is a compiling ownership scaffold, not a runnable daemon claim. Later
+directories are added only with the behavior that exercises them.
 
 ## License
 

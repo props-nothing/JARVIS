@@ -1,0 +1,6 @@
+msrv = "1.98.1"
+# Panicking helpers are denied in production code (see the workspace lint
+# policy) but are the idiomatic way to assert in tests, where a panic is a
+# failure rather than a runtime hazard.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true

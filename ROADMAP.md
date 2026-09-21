@@ -1,8 +1,8 @@
 # JARVIS Roadmap
 
 Status: ACCEPTED
-Last updated: 2026-09-20
-Current milestone: Milestone 1 - Installable Foundation (`FND-000` next)
+Last updated: 2026-09-21
+Current milestone: Milestone 1 - Installable Foundation (`FND-010` partial, `FND-011` next; `FND-003`, `FND-009` partial)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.

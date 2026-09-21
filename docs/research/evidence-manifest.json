@@ -30,11 +30,11 @@
     {
       "id": "rust-foundation",
       "todos": ["FND-000", "FND-001", "FND-003", "FND-005", "FND-006", "FND-007", "FND-009", "FND-011", "FND-012", "FND-013", "FND-014"],
-      "evidence": null,
-      "state": "REQUIRED",
-      "implementation_ready": false,
-      "last_verified": null,
-      "revalidate_by": null,
+      "evidence": "docs/research/integrations/rust-foundation.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-21",
+      "revalidate_by": "2027-03-20",
       "implementation_paths": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "apps/**", "crates/**", "migrations/**", "installers/**"]
     },
     {
@@ -46,6 +46,16 @@
       "last_verified": null,
       "revalidate_by": null,
       "implementation_paths": ["adapters/models/openai-compatible/**", "crates/**/src/adapters/models/openai-compatible/**", "crates/**/src/providers/openai-compatible/**", "crates/**/src/model_providers/openai-compatible/**", "tests/integration/openai-compatible/**"]
+    },
+    {
+      "id": "github-actions-ci",
+      "todos": ["FND-010"],
+      "evidence": "docs/research/integrations/github-actions.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-21",
+      "revalidate_by": "2027-03-20",
+      "implementation_paths": [".github/workflows/**", "scripts/clean-machine-smoke.mjs"]
     },
     {
       "id": "mcp",

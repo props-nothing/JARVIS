@@ -10,6 +10,7 @@ has implementation evidence.
 
 - [Foundation implementation handoff](foundation-handoff.md)
 - [Release readiness and owner decisions](release-readiness.md)
+- [CI gates and native lanes](ci-gates.md)
 
 ## Required Before Each Product Surface Ships
 

@@ -139,20 +139,37 @@ assertions. Redact nondeterministic IDs/times explicitly and review diffs.
 
 ## Planned CI Lanes
 
+`FND-010` implements the first five lanes. The `[x]` markers below mean the lane
+exists in `.github/workflows`; they do not mean every behavior it will eventually
+cover is present. `docs/operations/ci-gates.md` is the operator description of
+what currently runs and what remains unproven.
+
 ```text
-docs            links, structure, generated docs
-rust-fast       fmt, clippy, unit
-rust-workspace  all features/targets where practical
-sqlite          migrations/repository/integration
-postgres        migrations/repository/integration
-protocol        schema golden, runtime, MCP conformance
-security        audit, deny, secret canary, fuzz smoke
-ui              lint, type, unit, build
-e2e-local       real daemon with fakes
-install-<os>    packaged clean-machine journey
-live-<provider> manual/scheduled protected test account
-release         signatures, SBOM, provenance, upgrade journey
+docs            [x] links, structure, generated docs
+rust-fast       [x] fmt, clippy, unit
+rust-workspace  [x] all features/targets where practical (host target per lane)
+sqlite          [x] migrations/repository/integration
+postgres        [ ] migrations/repository/integration
+protocol        [ ] schema golden, runtime, MCP conformance
+security        [ ] audit, deny, secret canary, fuzz smoke
+ui              [ ] lint, type, unit, build
+e2e-local       [x] real daemon with fakes
+install-<os>    [x] packaged clean-machine journey (binaries, not yet a package)
+live-<provider> [ ] manual/scheduled protected test account
+release         [ ] signatures, SBOM, provenance, upgrade journey
 ```
+
+Two lanes are native rather than host-agnostic. `rust-workspace` runs per tier-1
+target on a matching runner (`aarch64-unknown-linux-gnu`
+on `ubuntu-24.04-arm`, `aarch64-apple-darwin` on `macos-14`, and
+`x86_64-apple-darwin` on `macos-15-intel`), because bundled SQLite needs each
+target's own C toolchain and the workspace does not cross-compile from one host.
+`install-<os>` currently stages the release binaries into an empty profile
+directory; it does not yet install a package, which is `FND-011`/`FND-012`.
+
+A lane marked `[x]` that never executes on a real runner is not proven. The
+`Native targets` matrix is where the `#[cfg(unix)]` permission assertions finally
+run; on the Windows authoring host they are typechecked only.
 
 ## Coverage and Completion
 

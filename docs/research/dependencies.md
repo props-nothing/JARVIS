@@ -1,7 +1,7 @@
 # Routine Dependency Evidence
 
 Status: ACCEPTED
-Last reviewed: 2026-09-20
+Last reviewed: 2026-09-21
 
 This ledger is the shortened evidence path allowed by the
 [integration research policy](integration-research-policy.md). It is only for a
@@ -34,7 +34,7 @@ the reason the standard library or an existing dependency is insufficient.
 
 | Package | Exact version | Official source and release notes | License evidence | Purpose and enabled features | Replacement boundary | Reviewed | Revalidate | TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| None selected | N/A | N/A | N/A | Foundation dependency selection has not started | N/A | 2026-09-20 | At `FND-000` | `FND-000` |
+| None eligible to date | N/A | N/A | N/A | Every Foundation dependency failed an eligibility criterion below | N/A | 2026-09-21 | At the next dependency change | `FND-000` |
 
 ## Review Rules
 

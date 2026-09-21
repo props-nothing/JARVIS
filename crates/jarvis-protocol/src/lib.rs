@@ -1,0 +1,12 @@
+//! Versioned transport types at JARVIS process boundaries.
+//!
+//! These types are the wire contract between `jarvisd` and its clients. They are
+//! versioned explicitly and serialization-tested, so a change is a deliberate
+//! contract change rather than an incidental one.
+#![forbid(unsafe_code)]
+
+pub mod discovery;
+pub mod error;
+
+pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
+pub use error::{ErrorEnvelope, ErrorResponse};
