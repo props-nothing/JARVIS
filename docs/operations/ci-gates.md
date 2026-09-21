@@ -47,8 +47,10 @@ support.
 ## What Runs Only On Unix Runners
 
 The owner-only permission assertions live in `#[cfg(unix)]` tests. They are
-typechecked on Windows but never executed there, so the native lane runs them
-explicitly:
+typechecked on Windows but never executed there, and the full workspace suite on a
+Linux runner already compiles and runs them. The native lane also names them
+explicitly, so a regression in `paths::` is attributable from the log rather than
+by reading thousands of test lines:
 
 ```bash
 cargo test -p jarvis-infrastructure --all-features paths::
@@ -59,7 +61,7 @@ reading the first real CI results rather than by reasoning:
 
 - `cargo test` accepts exactly **one** positional filter. `paths:: storage::` is a
   usage error rather than two filters, so the step ran no tests and failed the
-  lane.
+  lane with `unexpected argument 'storage::'`.
 - The argument must be quoted in YAML. Unquoted, the `: ` (colon then space) is
   read as a mapping separator inside a plain scalar, the workflow file fails to
   parse, and GitHub then creates a run with **zero jobs** — a failure with no step

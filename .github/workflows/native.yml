@@ -100,14 +100,17 @@ jobs:
       - name: Run the workspace test suite natively
         run: cargo test --workspace --all-features
 
-      # The Unix permission assertions live in `#[cfg(unix)]` tests and are
-      # skipped on the authoring host. This lane is where they actually run.
+      # The Unix permission assertions live in `#[cfg(unix)]` tests, which are
+      # skipped entirely on the Windows authoring host. The full workspace suite
+      # above already compiles and runs them on this lane; this step exists so
+      # they are **named** in the log rather than buried, and so a regression in
+      # `paths::` is attributable without reading thousands of test lines.
       #
       # Two details here are each a real bug when got wrong:
       #
       #   * `cargo test` accepts exactly **one** positional filter. Passing
-      #     `paths:: storage::` is a usage error, so this ran nothing and failed
-      #     the lane. One filter covers both modules instead.
+      #     `paths:: storage::` is a usage error, so this step ran nothing and
+      #     failed the lane with "unexpected argument".
       #   * the argument must be **quoted**. Unquoted, `: ` (colon then space)
       #     inside a plain YAML scalar is read as a mapping separator, the whole
       #     file fails to parse, and GitHub then creates a run with **zero jobs**
