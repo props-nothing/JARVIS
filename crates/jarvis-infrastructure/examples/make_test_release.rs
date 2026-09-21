@@ -52,20 +52,23 @@ fn run(directory: &Path, target: &str, version: &str, channel: &str) -> Result<(
 
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let files = [
-        format!("jarvis{version}-{target}{suffix}"),
-        format!("jarvisd{version}-{target}{suffix}"),
+        (
+            format!("jarvis{version}-{target}{suffix}"),
+            format!("jarvis{suffix}"),
+        ),
+        (
+            format!("jarvisd{version}-{target}{suffix}"),
+            format!("jarvisd{suffix}"),
+        ),
     ];
 
     let mut artifacts = Vec::with_capacity(files.len());
-    for file in &files {
+    for (published, installed) in &files {
         // The release packages a copy under the versioned name, so the manifest
-        // describes the bytes that will actually be published.
-        let source = directory.join(if file.contains("jarvisd") {
-            format!("jarvisd{suffix}")
-        } else {
-            format!("jarvis{suffix}")
-        });
-        let destination = directory.join(file);
+        // describes the bytes that will actually be published, while `name`
+        // records the stable name an install gives it.
+        let source = directory.join(installed);
+        let destination = directory.join(published);
         std::fs::copy(&source, &destination)
             .map_err(|error| format!("could not stage {}: {error}", destination.display()))?;
 
@@ -74,7 +77,8 @@ fn run(directory: &Path, target: &str, version: &str, channel: &str) -> Result<(
         artifacts.push(ArtifactEntry {
             target: target.to_owned(),
             kind: "binary".to_owned(),
-            file: file.clone(),
+            file: published.clone(),
+            name: installed.clone(),
             sha256: sha256_file(&destination)
                 .map_err(|error| format!("could not hash artifacts: {error}"))?,
             size: metadata.len(),

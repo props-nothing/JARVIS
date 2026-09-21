@@ -116,6 +116,32 @@ that ever handles production signing or publication must pin its actions by full
 commit SHA rather than the mutable major tags the read-only lanes use; see the
 [release signing evidence note](../research/integrations/release-signing.md).
 
+## The Install Journey
+
+`scripts/install-smoke.mjs` proves the installed-version lifecycle (`FND-012`). It
+uses only the built binaries, the committed test key, and a temporary root, and it
+publishes and registers nothing:
+
+1. install 0.1.0 from a verified release and require it to become active;
+2. assert the binary is staged under its **stable installed name**, not the
+   version-named download, because a service definition points at the stable name;
+3. seed user data that every later step must preserve;
+4. update to 0.2.0 and require the previous version to be recorded;
+5. remove the rollback target and require the rollback to be **refused**, and
+   require the refusal to leave the active version unchanged;
+6. restore the target and roll back, requiring the old version to be active and the
+   new version to still be installed;
+7. uninstall and require the program files gone while the database is present and
+   **byte-identical**;
+8. refuse a purge without `--acknowledge-purge`, then prove an acknowledged purge
+   removes the data it named.
+
+Steps 5 and 8 carry the weight. A rollback that quietly did nothing, and a purge
+reachable through the same single flag as a safe uninstall, are the two failure
+modes this journey exists to catch. Step 7 asserts the database *contents*, because
+an uninstall that left an empty file behind would pass a presence check while still
+destroying user data.
+
 ## Running The Gates Locally
 
 ```bash
@@ -127,6 +153,7 @@ cargo test --workspace
 cargo build -p jarvisd -p jarvis-cli
 node scripts/clean-machine-smoke.mjs target/debug
 node scripts/release-verify-smoke.mjs target/debug
+node scripts/install-smoke.mjs target/debug
 ```
 
 The changed-path gate applies when a change touches an external integration path:

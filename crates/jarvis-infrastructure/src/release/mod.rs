@@ -127,8 +127,17 @@ pub struct ArtifactEntry {
     pub target: String,
     /// The artifact kind, for example `archive` or `installer`.
     pub kind: String,
-    /// The artifact file name, relative to the manifest and never a path.
+    /// The published download file name, relative to the manifest and never a path.
     pub file: String,
+    /// The file name this artifact is installed **as**.
+    ///
+    /// A published download is usually version-named (`jarvisd0.1.0-x86_64.exe`),
+    /// but an installed program must have a stable name, because a service
+    /// definition points at it and an update must not leave the service starting a
+    /// stale version-named path. The installed name is therefore recorded in the
+    /// signed document rather than derived from the download name by string
+    /// matching, which would break the first time a naming convention changed.
+    pub name: String,
     /// The lowercase hex `SHA-256` of the artifact bytes.
     pub sha256: String,
     /// The exact artifact size in bytes.
@@ -436,6 +445,13 @@ impl ReleaseManifest {
                     file: artifact.file.clone(),
                 });
             }
+            // The installed name is a file name the installer writes, so it is a
+            // path component and is validated as one.
+            if !is_plain_file_name(&artifact.name) {
+                return Err(ReleaseError::UnsafeArtifactName {
+                    file: artifact.name.clone(),
+                });
+            }
             if seen.contains(&artifact.file.as_str()) {
                 return Err(ReleaseError::DuplicateArtifact {
                     file: artifact.file.clone(),
@@ -468,6 +484,16 @@ impl ReleaseManifest {
     #[must_use]
     pub fn artifact(&self, file: &str) -> Option<&ArtifactEntry> {
         self.artifacts.iter().find(|entry| entry.file == file)
+    }
+
+    /// Returns the installed file name for a published download file.
+    ///
+    /// An installer installs `jarvisd` (a stable name), even though the download
+    /// was `jarvisd0.1.0-x86_64-linux` (a version-named one). The mapping is
+    /// recorded in the signed document, so it cannot be inferred incorrectly.
+    #[must_use]
+    pub fn installed_name(&self, file: &str) -> Option<&str> {
+        self.artifact(file).map(|entry| entry.name.as_str())
     }
 }
 
@@ -614,8 +640,10 @@ impl TrustStore {
 /// One artifact that was verified, for the operator's report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedArtifact {
-    /// The artifact file name.
+    /// The published download file name.
     pub file: String,
+    /// The file name the artifact is installed as.
+    pub name: String,
     /// The platform target the artifact is for.
     pub target: String,
     /// The verified size in bytes.
@@ -663,6 +691,7 @@ pub fn verify_artifacts(
         }
         verified.push(VerifiedArtifact {
             file: artifact.file.clone(),
+            name: artifact.name.clone(),
             target: artifact.target.clone(),
             size: metadata.len(),
         });

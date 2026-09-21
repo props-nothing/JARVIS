@@ -50,6 +50,7 @@ fn manifest_for(directory: &Path, files: &[(&str, &[u8])]) -> ReleaseManifest {
                 target: "x86_64-pc-windows-msvc".to_owned(),
                 kind: "archive".to_owned(),
                 file: (*file).to_owned(),
+                name: (*file).to_owned(),
                 sha256,
                 size,
             }
@@ -492,6 +493,42 @@ fn the_same_manifest_bytes_sign_and_verify_across_a_write() {
         signature_path.extension().and_then(|value| value.to_str()),
         Some("sig")
     );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_path_shaped_installed_name_is_refused() {
+    // The installed name is written as a file at install time, so it is a path
+    // component and must be validated exactly like the download name.
+    let directory = temp_dir("installed-name");
+    let mut manifest = manifest_for(&directory, &[("jarvis.zip", b"payload")]);
+
+    for bad in ["../evil", "a/b", r"a\b", "/abs", ".hidden", ""] {
+        manifest.artifacts[0].name = bad.to_owned();
+        assert_eq!(
+            manifest.validate(),
+            Err(ReleaseError::UnsafeArtifactName {
+                file: bad.to_owned()
+            }),
+            "{bad:?} must be refused as an installed name",
+        );
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn the_installed_name_is_exposed_separately_from_the_download_name() {
+    let directory = temp_dir("installed-lookup");
+    let mut manifest = manifest_for(&directory, &[("jarvisd0.1.0-x86_64.zip", b"payload")]);
+    manifest.artifacts[0].name = "jarvisd".to_owned();
+    manifest.validate().expect("valid");
+
+    assert_eq!(
+        manifest.installed_name("jarvisd0.1.0-x86_64.zip"),
+        Some("jarvisd"),
+        "a service points at the stable installed name, not the versioned download",
+    );
+    assert_eq!(manifest.installed_name("absent.zip"), None);
     std::fs::remove_dir_all(&directory).ok();
 }
 

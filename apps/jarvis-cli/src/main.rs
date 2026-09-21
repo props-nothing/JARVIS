@@ -19,6 +19,10 @@ use jarvis_infrastructure::diagnostics::{
     DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor, add_log_tails, apply,
     collect, daemon_summary, export_bundle, plan_bundle, plans_for, unrepairable,
 };
+use jarvis_infrastructure::install::{
+    ExistingInstall, InstallError, InstallLayout, InstallMode, VerifiedRelease,
+    apply as apply_install, plan_install, plan_rollback, plan_uninstall, plan_update,
+};
 use jarvis_infrastructure::paths::ProfilePaths;
 use jarvis_infrastructure::release::{
     MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, ReleaseError, TEST_KEY_ID, TrustStore,
@@ -100,6 +104,64 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         artifacts: Option<PathBuf>,
     },
+    /// Report or change the installed program version.
+    ///
+    /// Every mutating action is a named subcommand and previews unless
+    /// `--confirm` is passed, so a bare `jarvis install` can never change an
+    /// installed product. User data is never touched except by `--purge`, which
+    /// additionally requires its own acknowledgement.
+    Install {
+        #[command(subcommand)]
+        action: Option<InstallAction>,
+        /// Use an explicit install root instead of the standard per-user location.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
+}
+
+/// Installed-version changes a caller can request explicitly.
+#[derive(Debug, Subcommand)]
+enum InstallAction {
+    /// Report the installed and active versions.
+    Status,
+    /// Plan an install or update from a verified release.
+    Update {
+        /// The release manifest to install from.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// The detached signature. Defaults to `<manifest>.sig`.
+        #[arg(long, value_name = "FILE")]
+        signature: Option<PathBuf>,
+        /// The directory holding the listed artifacts. Defaults to the
+        /// manifest's own directory.
+        #[arg(long, value_name = "DIR")]
+        artifacts: Option<PathBuf>,
+        /// The platform target to install. Defaults to the release's own target.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Apply the plan. Without this the command only previews it.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Plan a return to the previous version.
+    Rollback {
+        /// Apply the plan. Without this the command only previews it.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Plan removal of installed program files.
+    Uninstall {
+        /// Also remove the user profile, including the database. Requires
+        /// `--acknowledge-purge` as well, because this destroys user data.
+        #[arg(long)]
+        purge: bool,
+        /// Acknowledge that `--purge` destroys user data. Ignored without it.
+        #[arg(long = "acknowledge-purge")]
+        acknowledge_purge: bool,
+        /// Apply the plan. Without this the command only previews it.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Registration changes a caller can request explicitly.
@@ -161,6 +223,7 @@ async fn run(cli: Cli) -> ExitCode {
             signature,
             artifacts,
         } => verify_release(&manifest, signature, artifacts),
+        Command::Install { action, root } => install(paths, action, root),
     }
 }
 
@@ -540,6 +603,235 @@ async fn support_bundle(
     }
 }
 
+/// Reports or changes the installed program version.
+///
+/// The command is plan-first and read-only by default. `status` reports the active
+/// version, and every mutating action previews its exact effect unless `--confirm`
+/// is passed. The install root and the profile are separate: user data is never
+/// touched except by `--purge`, which additionally requires its own
+/// acknowledgement, so there is no single flag that silently destroys the database.
+fn install(paths: &ProfilePaths, action: Option<InstallAction>, root: Option<PathBuf>) -> ExitCode {
+    let layout = match root {
+        Some(root) => InstallLayout::new(InstallMode::Portable, root),
+        None => match InstallLayout::standard() {
+            Ok(layout) => layout,
+            Err(error) => return report_install_error(&error),
+        },
+    };
+
+    println!("install root: {}", layout.root().display());
+    println!("install mode: {}", layout.mode().token());
+    println!("profile:      {}", paths.data_dir().display());
+
+    let state = ExistingInstall::observe(&layout);
+
+    match action.unwrap_or(InstallAction::Status) {
+        InstallAction::Status => {
+            match &state.state.active {
+                Some(active) => println!("active:       {active}"),
+                None => println!("active:       (none)"),
+            }
+            match &state.state.previous {
+                Some(previous) => println!("rollback to:  {previous}"),
+                None => println!("rollback to:  (none recorded)"),
+            }
+            println!("installed:    {}", state.state.installed.len());
+            for version in &state.state.installed {
+                let marker = if Some(version) == state.state.active.as_ref() {
+                    " (active)"
+                } else if Some(version) == state.state.previous.as_ref() {
+                    " (rollback target)"
+                } else {
+                    ""
+                };
+                println!("  {version}{marker}");
+            }
+            // The data path is printed last so an operator always sees where their
+            // data is, including after an uninstall that retained it.
+            println!("user data:    {}", paths.data_dir().display());
+            ExitCode::from(EXIT_OK)
+        }
+        InstallAction::Update {
+            manifest,
+            signature,
+            artifacts,
+            target,
+            confirm,
+        } => install_update(
+            &layout, paths, &state, &manifest, signature, artifacts, target, confirm,
+        ),
+        InstallAction::Rollback { confirm } => install_rollback(&layout, paths, &state, confirm),
+        InstallAction::Uninstall {
+            purge,
+            acknowledge_purge,
+            confirm,
+        } => install_uninstall(&layout, paths, &state, purge, acknowledge_purge, confirm),
+    }
+}
+
+/// Builds and optionally applies an install or update from a verified release.
+#[allow(clippy::too_many_arguments)]
+fn install_update(
+    layout: &InstallLayout,
+    paths: &ProfilePaths,
+    state: &ExistingInstall<'_>,
+    manifest: &Path,
+    signature: Option<PathBuf>,
+    artifacts: Option<PathBuf>,
+    target: Option<String>,
+    confirm: bool,
+) -> ExitCode {
+    let signature = signature.unwrap_or_else(|| default_signature_path(manifest));
+    let directory = artifacts.unwrap_or_else(|| {
+        manifest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    });
+
+    let manifest_bytes =
+        match read_release_file(manifest, MAX_MANIFEST_BYTES, ReleaseError::ManifestTooLarge) {
+            Ok(bytes) => bytes,
+            Err(error) => return report_release_error(&error),
+        };
+    let signature_bytes = match read_release_file(
+        &signature,
+        MAX_SIGNATURE_BYTES,
+        ReleaseError::SignatureTooLarge,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => return report_release_error(&error),
+    };
+
+    // The release must verify before a plan can exist. There is deliberately no
+    // path that installs unverified bytes.
+    let release = match VerifiedRelease::verify(&manifest_bytes, &signature_bytes, &directory) {
+        Ok(release) => release,
+        Err(error) => return report_install_error(&error),
+    };
+    let target = target.unwrap_or_else(|| release.manifest().target.clone());
+
+    // An update when something is active, a first install otherwise. The library
+    // decides which, so the CLI cannot mislabel one as the other.
+    let planned = if state.state.is_installed() {
+        plan_update(
+            state,
+            paths,
+            release.manifest(),
+            release.artifacts(),
+            &target,
+        )
+    } else {
+        plan_install(
+            state,
+            paths,
+            release.manifest(),
+            release.artifacts(),
+            &target,
+        )
+    };
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(error) => return report_install_error(&error),
+    };
+
+    print!("{}", plan.render());
+
+    if !confirm {
+        println!("\npreview only; pass --confirm to apply");
+        return ExitCode::from(EXIT_OK);
+    }
+
+    match apply_install(layout, paths, &plan, Some(&release), true, false) {
+        Ok(outcome) => {
+            println!(
+                "\nresult:  ok ({} staged, {} removed; {})",
+                outcome.staged, outcome.removed, outcome.detail
+            );
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => report_install_error(&error),
+    }
+}
+
+/// Builds and optionally applies a rollback to the recorded previous version.
+fn install_rollback(
+    layout: &InstallLayout,
+    paths: &ProfilePaths,
+    state: &ExistingInstall<'_>,
+    confirm: bool,
+) -> ExitCode {
+    let plan = match plan_rollback(state, paths) {
+        Ok(plan) => plan,
+        Err(error) => return report_install_error(&error),
+    };
+    print!("{}", plan.render());
+
+    if !confirm {
+        println!("\npreview only; pass --confirm to apply");
+        return ExitCode::from(EXIT_OK);
+    }
+
+    // A rollback stages nothing: it only moves the pointer, and the target version
+    // was already verified when it was installed.
+    match apply_install(layout, paths, &plan, None, true, false) {
+        Ok(outcome) => {
+            println!("\nresult:  ok ({})", outcome.detail);
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => report_install_error(&error),
+    }
+}
+
+/// Builds and optionally applies an uninstall, with or without a purge.
+fn install_uninstall(
+    layout: &InstallLayout,
+    paths: &ProfilePaths,
+    state: &ExistingInstall<'_>,
+    purge: bool,
+    acknowledge_purge: bool,
+    confirm: bool,
+) -> ExitCode {
+    let plan = match plan_uninstall(state, paths, purge) {
+        Ok(plan) => plan,
+        Err(error) => return report_install_error(&error),
+    };
+    print!("{}", plan.render());
+
+    if !confirm {
+        println!("\npreview only; pass --confirm to apply");
+        if purge && !acknowledge_purge {
+            println!("note: a purge also requires --acknowledge-purge");
+        }
+        return ExitCode::from(EXIT_OK);
+    }
+
+    match apply_install(layout, paths, &plan, None, true, acknowledge_purge) {
+        Ok(outcome) => {
+            println!("\nresult:  ok ({} removed)", outcome.removed);
+            if !purge {
+                // The retained path is the operator's most important fact here.
+                println!("user data retained at {}", paths.data_dir().display());
+            }
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => report_install_error(&error),
+    }
+}
+
+/// Reports an install failure with its code and the reason.
+///
+/// The code and the reason both come from the library, so the CLI cannot invent a
+/// cause the operation did not actually observe.
+fn report_install_error(error: &InstallError) -> ExitCode {
+    eprintln!("error:  {}", error.code());
+    eprintln!("reason: {error}");
+    if !error.retryable() {
+        eprintln!("note:   this is deterministic; repeating it will not change the outcome");
+    }
+    ExitCode::from(EXIT_ATTENTION)
+}
+
 /// Builds the environment record printed into a bundle manifest.
 fn environment_summary(paths: &ProfilePaths) -> EnvironmentSummary {
     EnvironmentSummary::current(paths.mode().token(), API_MAJOR)
@@ -743,7 +1035,7 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, StatusBody, parse_status};
+    use super::{Cli, Command, InstallAction, StatusBody, parse_status};
     use clap::Parser as _;
 
     #[test]
@@ -760,6 +1052,7 @@ mod tests {
                 vec!["jarvis", "verify-release", "--manifest", "m.json"],
                 "verify-release",
             ),
+            (vec!["jarvis", "install"], "install"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -771,8 +1064,129 @@ mod tests {
                 Command::SupportBundle { .. } => "support-bundle",
                 Command::Repair { .. } => "repair",
                 Command::VerifyRelease { .. } => "verify-release",
+                Command::Install { .. } => "install",
             };
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn a_bare_install_command_requests_no_change() {
+        // The safety property: the default action is read-only, so the shortest
+        // invocation cannot change an installed product.
+        let cli = Cli::try_parse_from(["jarvis", "install"]).expect("parses");
+        assert!(
+            matches!(
+                cli.command,
+                Command::Install { action: None, .. }
+                    | Command::Install {
+                        action: Some(InstallAction::Status),
+                        ..
+                    }
+            ),
+            "a bare `install` must not select a change",
+        );
+
+        // Every mutating action must default to preview, so `--confirm` is the only
+        // way to apply one.
+        for arguments in [
+            vec!["jarvis", "install", "rollback"],
+            vec!["jarvis", "install", "uninstall"],
+            vec!["jarvis", "install", "uninstall", "--purge"],
+        ] {
+            let cli = Cli::try_parse_from(arguments.clone()).expect("parses");
+            let Command::Install {
+                action:
+                    Some(
+                        InstallAction::Rollback { confirm }
+                        | InstallAction::Uninstall { confirm, .. },
+                    ),
+                ..
+            } = cli.command
+            else {
+                unreachable!("expected a mutating install action");
+            };
+            assert!(!confirm, "{arguments:?} must not confirm by default");
+        }
+    }
+
+    #[test]
+    fn a_purge_requires_its_own_acknowledgement_and_a_confirmation() {
+        // Two separate flags, because a purge destroys the database. One flag that
+        // did both would let "confirm" be reached without the destructive intent.
+        let cli = Cli::try_parse_from(["jarvis", "install", "uninstall", "--purge", "--confirm"])
+            .expect("parses");
+        match cli.command {
+            Command::Install {
+                action:
+                    Some(InstallAction::Uninstall {
+                        purge,
+                        acknowledge_purge,
+                        confirm,
+                    }),
+                ..
+            } => {
+                assert!(purge, "--purge must select a purge");
+                assert!(confirm, "--confirm must select application");
+                assert!(
+                    !acknowledge_purge,
+                    "the acknowledgement must be a separate, deliberate flag",
+                );
+            }
+            _ => unreachable!("expected an uninstall action"),
+        }
+
+        let acknowledged = Cli::try_parse_from([
+            "jarvis",
+            "install",
+            "uninstall",
+            "--purge",
+            "--acknowledge-purge",
+        ])
+        .expect("parses");
+        match acknowledged.command {
+            Command::Install {
+                action:
+                    Some(InstallAction::Uninstall {
+                        acknowledge_purge, ..
+                    }),
+                ..
+            } => assert!(acknowledge_purge),
+            _ => unreachable!("expected an uninstall action"),
+        }
+
+        // A bare uninstall must not imply a purge.
+        let bare = Cli::try_parse_from(["jarvis", "install", "uninstall"]).expect("parses");
+        match bare.command {
+            Command::Install {
+                action: Some(InstallAction::Uninstall { purge, .. }),
+                ..
+            } => assert!(!purge, "a bare uninstall must retain user data"),
+            _ => unreachable!("expected an uninstall action"),
+        }
+    }
+
+    #[test]
+    fn an_explicit_install_root_is_accepted_before_the_install_subcommand() {
+        // The root belongs to the `install` group, so it precedes the action. The
+        // install root is also separate from the global `--profile`: they are
+        // different directories and must not be conflated.
+        let cli = Cli::try_parse_from(["jarvis", "install", "--root", "/tmp/i", "status"])
+            .expect("parses");
+        match cli.command {
+            Command::Install { root, .. } => {
+                assert_eq!(root, Some(std::path::PathBuf::from("/tmp/i")));
+            }
+            _ => unreachable!("expected an install command"),
+        }
+        assert_eq!(cli.profile, None, "the profile root is a separate option");
+
+        // Without it, the standard per-user location is used, so the common
+        // invocation stays one word.
+        let standard = Cli::try_parse_from(["jarvis", "install", "status"]).expect("parses");
+        match standard.command {
+            Command::Install { root, .. } => assert!(root.is_none()),
+            _ => unreachable!("expected an install command"),
         }
     }
 
@@ -909,7 +1323,8 @@ mod tests {
                     | Command::Doctor
                     | Command::SupportBundle { .. }
                     | Command::Repair { .. }
-                    | Command::VerifyRelease { .. } => String::from("unexpected"),
+                    | Command::VerifyRelease { .. }
+                    | Command::Install { .. } => String::from("unexpected"),
                 }
             })
             .collect();

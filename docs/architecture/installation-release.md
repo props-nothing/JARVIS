@@ -76,6 +76,57 @@ the update channel. Until production identities exist, the compiled-in store
 contains only a committed **non-production test key**, every `verify-release` run
 says so, and any test-signed build identity is prefixed `non-production-test/`.
 
+### Implemented installed-version lifecycle (Milestone 1)
+
+The part of install, update, rollback, and uninstall that can exist before
+packaging and publication (`FND-012`):
+
+- **The install root and the user profile are separate roots.** Installed program
+  files live under a versioned install tree; durable user state lives under the
+  profile. Every install operation refuses a path inside the profile, which is what
+  makes "uninstall retains user data" *structural*: removing versioned program
+  directories cannot reach the database because the database is not under any of
+  them. The one exception is an explicit purge, which names the profile directories
+  deliberately and requires its own acknowledgement.
+- **A version becomes active atomically.** Versions live in `versions/v<version>/`,
+  and activation replaces a single pointer: a symlink on Unix, or an atomically
+  renamed `current.version` on Windows, where creating a symlink needs elevation or
+  developer mode and an install must require neither. A reader observes the old
+  version or the new one, never a mixture, and the parent directory is flushed so a
+  completed switch survives a crash.
+- **The plan is a pure value, and applying is separate.** `InstallPlan` names the
+  action, the version, the exact files with their sizes, the paths it removes, and
+  whether it is destructive; it renders for review and is asserted on any host. A
+  bare `jarvis install` is read-only, every mutating action previews unless
+  `--confirm` is passed, and `apply` re-validates the plan's paths because a plan is
+  data that may have travelled.
+- **Installing requires a verified release.** `plan_install`/`plan_update` take a
+  `VerifiedRelease`, which exists only if a signed manifest and every artifact
+  digest verified, and `apply` re-verifies the bytes from disk immediately before
+  staging. A manifest records the **stable installed name** of each artifact
+  separately from its version-named download, because a service definition points
+  at the stable name and inferring it by string matching would break the first time
+  a naming convention changed.
+- **Refusals are specific.** An already-active version, an update with nothing
+  installed, a rollback whose target is gone, a held instance lock, an unsafe
+  version string, a path inside the profile, and an unacknowledged purge are
+  separate codes, because they need different operator responses. A plan whose
+  outcome already holds is refused rather than reported as success, and a failed
+  postcondition rewrites the pointer back so the previous version stays active.
+- **A purge needs two flags.** `--purge` selects the destructive action and
+  `--acknowledge-purge` acknowledges destroying user data, so a safe uninstall
+  cannot become a purge through one argument. A bare uninstall is refused outright
+  when nothing is installed rather than reporting a successful removal of nothing.
+
+Not implemented, and therefore not claimed: no packaged installer, archive, MSI,
+PKG, deb, or rpm — the journey stages an install directory directly, so this is
+install *semantics* rather than packaging; no service-definition refresh on update,
+so a service created by `jarvis service install` still points at the stable
+launcher path but nothing yet re-runs the service manager; no update channel, so a
+downgrade is not defended; no signature over the installed tree itself beyond the
+verified release it came from; and interrupted-install recovery is idempotent
+convergence rather than a tested crash-point matrix.
+
 ## Installation Methods
 
 Offer in order of platform convention and security:

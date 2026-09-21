@@ -130,6 +130,18 @@ jobs:
           set -euo pipefail
           node scripts/release-verify-smoke.mjs target/release
 
+      # Install/update/rollback/uninstall (`FND-012`). This proves that a version
+      # change is atomic, that a rollback with a missing target is refused rather
+      # than silently doing nothing, and above all that an uninstall retains user
+      # data while an acknowledged purge is the only path that removes it.
+      - name: Run the install journey
+        shell: bash
+        env:
+          JARVIS_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          node scripts/install-smoke.mjs target/release
+
       # Provenance for the evidence note: the exact versions a reviewer can
       # reproduce against.
       - name: Record toolchain and target facts

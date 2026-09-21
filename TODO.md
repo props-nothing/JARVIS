@@ -313,9 +313,47 @@ Dependencies: all Milestone 0 exit criteria.
   channel. Native execution of the journey on the five tier-1 lanes is wired
   into `Native targets` but its result is unreadable from the authoring host
   (private repository, no token), so it stays `UNVERIFIED`.
-- [ ] `FND-012` Implement install, update, rollback, portable mode, and uninstall
+- [~] `FND-012` Implement install, update, rollback, portable mode, and uninstall
   tests that preserve user data unless explicitly removed. Public promotion
   depends on `OWN-001` through `OWN-005`.
+  Evidence (PARTIAL): install, update, rollback, prune, and uninstall now exist as
+  `jarvis_infrastructure::install` with a plan-first CLI (`jarvis install
+  status|update|rollback|uninstall`). The install root and the user profile are
+  **separate roots**, and every operation refuses a path inside the profile, so
+  "uninstall retains user data" is structural rather than intended: removing
+  versioned program directories cannot reach the database. A version becomes
+  active by replacing a pointer (a symlink on Unix; an atomically renamed
+  `current.version` on Windows, because a symlink there needs elevation or
+  developer mode), so a reader sees the old version or the new one, never a
+  mixture, and a failed activation rewrites the pointer back. A rollback target is
+  recorded only when a version actually existed to replace, and rollback refuses a
+  target whose directory is gone rather than silently doing nothing. A purge is the
+  one destructive action that touches user data and needs **two** flags
+  (`--purge` and `--acknowledge-purge`), so a safe uninstall cannot become a purge
+  by passing one argument. 21 install tests pass. Verified live by
+  `scripts/install-smoke.mjs`, which installs 0.1.0, updates to 0.2.0, refuses a
+  rollback to a removed version (and proves the refusal changed nothing), rolls
+  back to 0.1.0 while keeping 0.2.0, uninstalls and asserts the database is present
+  and **byte-identical**, refuses an unacknowledged purge, then proves an
+  acknowledged purge removes the data it named. Installing also requires a
+  **verified release**: `plan_install`/`plan_update` take a `VerifiedRelease`,
+  which can only be built by verifying a signed manifest and every artifact, and
+  `apply` re-verifies the bytes from disk immediately before staging. **Four
+  findings from running it:** (1) `binary_path` appended the executable suffix, so
+  a manifest name that already carried it produced `jarvisd.exe.exe` and a service
+  definition pointing at nothing; (2) the first staging step wrote each file onto
+  its own destination instead of copying from the verified download, which cannot
+  work and would have destroyed the bytes it had just verified; (3) a version was
+  accepted without a leading digit, so the directory `vv1.0` was read as version
+  `v1.0`; (4) a release needed a stable installed name distinct from its
+  version-named download, now recorded in the signed manifest as `name` rather
+  than inferred by string matching. **Not done**: no packaged installer or archive
+  (the journey stages an install directory directly), no MSI/PKG/deb/rpm, no
+  service-definition refresh on update, no update channel or versioned metadata so
+  there is no downgrade defense, no signature on the *installed* tree beyond the
+  verified release it came from, and interrupted-install recovery is limited to
+  idempotent convergence rather than a tested crash-point matrix. Those are
+  `FND-011`'s publication half and the owner gates.
 - [~] `FND-013` Implement bounded diagnostics collection and a reviewable,
   redactable support-bundle preview/export with secret-canary tests.
   Evidence (PARTIAL): diagnostics moved out of the `jarvis` binary into

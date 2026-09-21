@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod http;
 pub mod ids;
+pub mod install;
 pub mod lifecycle;
 pub mod paths;
 pub mod profile;
