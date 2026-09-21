@@ -8,16 +8,24 @@
 //! than an unexpected process exit, and secret values are never accepted as
 //! command-line arguments (process listings and shell history would expose them).
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jarvis_infrastructure::auth::ClientCredentialPath;
 use jarvis_infrastructure::client::{ClientError, discover, get_authenticated, read_credential};
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
+use jarvis_infrastructure::diagnostics::{
+    DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor, add_log_tails, collect,
+    daemon_summary, export_bundle, plan_bundle,
+};
 use jarvis_infrastructure::paths::ProfilePaths;
 use jarvis_infrastructure::service::{
     DEFAULT_SERVICE_NAME, ServiceError, ServiceSpec, ServiceState, current_controller,
 };
-use jarvis_infrastructure::storage::{Database, schema};
+
+/// The API major version this client speaks.
+const API_MAJOR: u32 = 1;
 
 /// Exit code for a successful command.
 const EXIT_OK: u8 = 0;
@@ -37,7 +45,7 @@ struct Cli {
 
     /// Use an explicit portable profile root instead of the standard profile.
     #[arg(long, global = true, value_name = "DIR")]
-    profile: Option<std::path::PathBuf>,
+    profile: Option<PathBuf>,
 }
 
 /// The supported Foundation commands.
@@ -56,6 +64,15 @@ enum Command {
     },
     /// Run deterministic diagnostics and print actionable findings.
     Doctor,
+    /// Preview or export a reviewable, redacted diagnostics bundle.
+    SupportBundle {
+        /// Write the bundle here. Without this the command only previews it.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Exclude an optional item by its path from the preview.
+        #[arg(long = "exclude", value_name = "PATH")]
+        exclude: Vec<String>,
+    },
 }
 
 /// Registration changes a caller can request explicitly.
@@ -110,6 +127,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
         Command::Doctor => doctor(paths).await,
+        Command::SupportBundle { output, exclude } => support_bundle(paths, output, exclude).await,
     }
 }
 
@@ -354,116 +372,144 @@ fn service_spec() -> Result<ServiceSpec, ServiceError> {
 /// contain, and a task or unit that received it would be hard to read and to
 /// migrate. `\\?\UNC\server\share` becomes `\\server\share`.
 #[must_use]
-fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     let Some(rest) = text.strip_prefix(r"\\?\") else {
         return path.to_path_buf();
     };
     match rest.strip_prefix("UNC\\") {
-        Some(unc) => std::path::PathBuf::from(format!(r"\\{unc}")),
-        None => std::path::PathBuf::from(rest),
+        Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+        None => PathBuf::from(rest),
     }
 }
 
 /// Deterministic diagnostics with actionable findings.
+///
+/// The checks themselves live in `jarvis_infrastructure::diagnostics`, so they
+/// can be tested without spawning a process and reused by the support bundle.
+/// This function only resolves the injectable environment (a running daemon, a
+/// service controller, a service spec) and prints the report.
 async fn doctor(paths: &ProfilePaths) -> ExitCode {
-    let mut findings = 0_usize;
+    let discovered = discover(&discovery_path_for(paths));
+    let (daemon, discovery_error) = match &discovered {
+        Ok(discovered) => (Some(DaemonDescriptor::from(discovered)), None),
+        Err(error) => (None, Some(error.code())),
+    };
 
-    // 1. Profile directories and permissions.
-    if paths.ensure_directories().is_ok() {
-        println!("ok      profile directories");
-    } else {
-        println!("error   profile directories: check ownership of the profile root");
-        findings += 1;
-    }
+    let controller = current_controller();
+    let spec = service_spec();
+    let environment = DiagnosticsEnvironment {
+        daemon,
+        discovery_error,
+        controller: controller.as_deref().ok(),
+        service_spec: spec.as_ref().ok(),
+        service_spec_error: spec.as_ref().err().map(ServiceError::code),
+        controller_error: controller.as_ref().err().map(ServiceError::code),
+    };
 
-    // 2. Database presence, integrity, and schema compatibility.
-    let database_path = paths.database_dir().join("jarvis.sqlite");
-    if database_path.exists() {
-        match Database::open(&database_path).await {
-            Ok(database) => {
-                match database.check_integrity().await {
-                    Ok(()) => println!("ok      database integrity"),
-                    Err(error) => {
-                        println!("error   database integrity: {}", error.code());
-                        findings += 1;
-                    }
-                }
-                match database.sqlite_version().await {
-                    Ok(version) => println!("ok      sqlite {version}"),
-                    Err(error) => {
-                        println!("error   sqlite version: {}", error.code());
-                        findings += 1;
-                    }
-                }
-                match schema::read_compatibility(database.pool()).await {
-                    Ok(compatibility) => println!(
-                        "ok      schema version {} (writer {})",
-                        compatibility.schema_version, compatibility.writer_version
-                    ),
-                    Err(error) => {
-                        println!("error   schema compatibility: {}", error.code());
-                        findings += 1;
-                    }
-                }
-                database.close().await;
-            }
-            Err(error) => {
-                println!("error   database open: {}", error.code());
-                findings += 1;
-            }
-        }
-    } else {
-        println!("ok      database not created yet (first daemon start creates it)");
-    }
+    let report = collect(paths, &environment).await;
+    print!("{}", report.render());
+    ExitCode::from(report.exit_code())
+}
 
-    // 3. Daemon reachability.
-    match discover(&discovery_path_for(paths)) {
-        Ok(discovered) => println!(
-            "ok      daemon running (instance {}, pid {})",
-            discovered.instance_id, discovered.pid
-        ),
+/// Builds and optionally exports a reviewable, redacted support bundle.
+///
+/// Without `--output` this is a preview only: nothing is written and the user
+/// sees exactly what a bundle would contain, including which items are optional.
+/// With `--output` the same plan is materialized and written, so what was
+/// previewed and what was exported cannot diverge.
+async fn support_bundle(
+    paths: &ProfilePaths,
+    output: Option<PathBuf>,
+    exclude: Vec<String>,
+) -> ExitCode {
+    let discovered = discover(&discovery_path_for(paths));
+    let (daemon, discovery_error) = match &discovered {
+        Ok(discovered) => (Some(DaemonDescriptor::from(discovered)), None),
+        Err(error) => (None, Some(error.code())),
+    };
+    let controller = current_controller();
+    let spec = service_spec();
+    let environment = DiagnosticsEnvironment {
+        daemon,
+        discovery_error,
+        controller: controller.as_deref().ok(),
+        service_spec: spec.as_ref().ok(),
+        service_spec_error: spec.as_ref().err().map(ServiceError::code),
+        controller_error: controller.as_ref().err().map(ServiceError::code),
+    };
+
+    let report = collect(paths, &environment).await;
+    let summary = daemon_summary(&environment);
+    let mut plan = plan_bundle(paths.mode().token(), API_MAJOR, &report, &summary);
+    add_log_tails(&mut plan, paths.log_dir());
+
+    // Exclusions are validated against the plan, so an unknown or required name
+    // is an error rather than a silently ignored argument.
+    let excluded = match plan.resolve_exclusions(&exclude) {
+        Ok(excluded) => excluded,
         Err(error) => {
-            println!("warn    daemon: {} -- {}", error.code(), error.advice());
+            eprintln!("error: {} -- {}", error.code(), error);
+            return ExitCode::from(EXIT_ATTENTION);
+        }
+    };
+
+    print!("{}", plan.render());
+
+    let Some(destination) = output else {
+        println!("\npreview only; pass --output <FILE> to write the bundle");
+        return ExitCode::from(EXIT_OK);
+    };
+
+    // The redactor is created here and has the enrolled credential registered,
+    // because the client legitimately holds it and a bundle must never carry it.
+    let redactor = match Redactor::new() {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            eprintln!("error: jarvis.redactor_unavailable -- {error}");
+            return ExitCode::from(EXIT_ATTENTION);
+        }
+    };
+    let credential_path = ClientCredentialPath::in_config_dir(paths.config_dir());
+    let mut registered = 0_usize;
+    if let Ok(credential) = read_credential(credential_path.path())
+        && redactor.register(&credential).is_ok()
+    {
+        registered += 1;
+    }
+
+    // The whole export is one library call, so the digest recorded in the
+    // manifest is guaranteed to describe the archive that is written.
+    match export_bundle(
+        &plan,
+        &excluded,
+        &redactor,
+        &environment_summary(paths),
+        &summary,
+        &destination,
+    ) {
+        Ok(outcome) => {
+            println!(
+                "\nwrote {} ({} bytes)",
+                destination.display(),
+                outcome.bytes_written
+            );
+            println!("  items:    {} of {}", outcome.included, plan.items().len());
+            println!("  excluded: {}", outcome.excluded);
+            println!("  secrets registered for redaction: {registered}");
+            println!("  content sha256: {}", outcome.digest);
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => {
+            eprintln!("error: {} -- {}", error.code(), error);
+            ExitCode::from(EXIT_ATTENTION)
         }
     }
+}
 
-    // 4. Credential presence, without printing it.
-    let credential_path = paths.config_dir().join("client-credential");
-    match read_credential(&credential_path) {
-        Ok(_) => println!("ok      client credential present (owner-only file)"),
-        Err(error) => println!("warn    credential: {} -- {}", error.code(), error.advice()),
-    }
-
-    // 5. Service registration. A missing service is not a blocking finding: the
-    // daemon is equally valid started in the foreground. An unusable facility is
-    // reported as a warning with the portable alternative.
-    match current_controller() {
-        Ok(controller) => match service_spec() {
-            Ok(spec) => match controller.status(&spec) {
-                Ok(state) => println!(
-                    "ok      service {} ({})",
-                    state.name(),
-                    controller.backend().name(),
-                ),
-                Err(error) => println!("warn    service: {} -- {}", error.code(), error.advice()),
-            },
-            Err(error) => println!("warn    service: {} -- {}", error.code(), error.advice()),
-        },
-        Err(error) => println!(
-            "warn    service facility: {} -- {}",
-            error.code(),
-            error.advice(),
-        ),
-    }
-
-    if findings == 0 {
-        println!("\nno blocking findings");
-        ExitCode::from(EXIT_OK)
-    } else {
-        println!("\n{findings} blocking finding(s)");
-        ExitCode::from(EXIT_ATTENTION)
-    }
+/// Builds the environment record printed into a bundle manifest.
+fn environment_summary(paths: &ProfilePaths) -> EnvironmentSummary {
+    EnvironmentSummary::current(paths.mode().token(), API_MAJOR)
 }
 
 /// Prints a client error with its code and actionable advice.
@@ -475,7 +521,7 @@ fn report_client_error(error: &ClientError) -> ExitCode {
 
 /// Returns the runtime discovery path for a profile.
 #[must_use]
-fn discovery_path_for(paths: &ProfilePaths) -> std::path::PathBuf {
+fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
     paths.runtime_dir().join("discovery.json")
 }
 
@@ -492,6 +538,7 @@ mod tests {
             (vec!["jarvis", "logs"], "logs"),
             (vec!["jarvis", "service"], "service"),
             (vec!["jarvis", "doctor"], "doctor"),
+            (vec!["jarvis", "support-bundle"], "support-bundle"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -500,8 +547,46 @@ mod tests {
                 Command::Logs => "logs",
                 Command::Service { .. } => "service",
                 Command::Doctor => "doctor",
+                Command::SupportBundle { .. } => "support-bundle",
             };
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn support_bundle_previews_unless_an_output_path_is_given() {
+        // The safety property: the shortest form must not write a file anywhere.
+        // A bundle the user has not reviewed is exactly the kind of accidental
+        // disclosure this command exists to prevent.
+        let cli = Cli::try_parse_from(["jarvis", "support-bundle"]).expect("parses");
+        match cli.command {
+            Command::SupportBundle { output, exclude } => {
+                assert!(output.is_none(), "a bare support-bundle must not write");
+                assert!(exclude.is_empty());
+            }
+            _ => unreachable!("support-bundle must parse to its own variant"),
+        }
+    }
+
+    #[test]
+    fn support_bundle_accepts_repeated_exclusions_and_an_output_path() {
+        let cli = Cli::try_parse_from([
+            "jarvis",
+            "support-bundle",
+            "--output",
+            "bundle.zip",
+            "--exclude",
+            "environment.json",
+            "--exclude",
+            "daemon.json",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::SupportBundle { output, exclude } => {
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("bundle.zip")));
+                assert_eq!(exclude, vec!["environment.json", "daemon.json"]);
+            }
+            _ => unreachable!("support-bundle must parse to its own variant"),
         }
     }
 
@@ -534,9 +619,11 @@ mod tests {
                 let cli = Cli::try_parse_from(["jarvis", "service", word]).expect("parses");
                 match cli.command {
                     Command::Service { action } => format!("{action:?}"),
-                    Command::Status | Command::Config | Command::Logs | Command::Doctor => {
-                        String::from("unexpected")
-                    }
+                    Command::Status
+                    | Command::Config
+                    | Command::Logs
+                    | Command::Doctor
+                    | Command::SupportBundle { .. } => String::from("unexpected"),
                 }
             })
             .collect();

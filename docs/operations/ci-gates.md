@@ -72,8 +72,7 @@ built binaries and an empty directory:
 6. assert `jarvis service show` names `jarvisd` and states the per-user mode.
 
 It asserts directory contents, not only exit codes, because an exit code of 0
-with nothing written would still be a failure. It terminates the daemon in a
-`finally` block so a failed assertion cannot leak a process into a later step.
+with nothing written would still be a failure. It terminates the daemon in a`finally` block so a failed assertion cannot leak a process into a later step.
 
 The journey deliberately does **not** register a real service. Hosted runners are
 administrators with UAC disabled on Windows and have passwordless `sudo` on Unix,
@@ -104,29 +103,34 @@ invocation as any changed dependency manifest, or the gate refuses the change.
 ## Limitations And Residual Risk
 
 - **`docs/research-telephony/` is excluded from the repository and from the docs
-  gate.** It is a telephony/LiveKit spike with its own Node toolchain, lockfile,
-  and a nested `.gitignore` protecting its `.env`; it is not part of the JARVIS
-  control plane. Nothing in it was ever tracked, and `.gitignore` now excludes the
-  whole directory so a broad `git add` cannot publish it or its `.env`. The docs
-  validator also skips it explicitly, so its Markdown cannot satisfy a status or
-  index check and a scratch file cannot change the validated file count.
+  gate, and the durable findings have been promoted, so the folder is now
+  disposable and absent from a clean checkout.** It was a telephony/LiveKit spike
+  with its own Node toolchain, lockfile, and a nested `.gitignore` protecting its
+  `.env`; it is not part of the JARVIS control plane. Nothing in it was ever
+  tracked. Two protections keep it from coming back unnoticed:
+  `.gitignore` excludes the whole directory so a broad `git add` cannot publish
+  it or its `.env`, and the docs validator skips it explicitly so its Markdown
+  cannot satisfy a status or index check and a scratch file cannot change the
+  validated file count.
   Two consequences are worth stating plainly:
-  **a repository ignore rule is not a security control** — the `.env` there is
+  **a repository ignore rule is not a security control** — the `.env` there was
   protected only by the file not being added, so if a secret ever passed through
   it, it should be rotated rather than merely untracked; and the exclusion is a
   visible, reviewable entry in both `.gitignore` and the validator rather than a
   `--force`-able convention.
-  **The durable findings have been promoted and the folder is now disposable.**
+  **The folder may be deleted, and the gate must not depend on it existing.**
   The measured latency baseline, the carrier attribute table and mode-exclusivity
-  trap, and the framework review were moved into
+  trap, and the framework review live in
   [the Twilio telephony note](../research/integrations/telephony-twilio.md) and
   [the LiveKit note](../research/integrations/livekit.md), with the sources
   registered in `source-registry.md` and the entries added to
-  `evidence-manifest.json`. What remains in the excluded folder is a runnable
-  harness, not evidence. Deleting the folder is expected and safe once nobody needs
-  to re-run the spike; re-capture any fixture that a promoted note claims as
+  `evidence-manifest.json`. Re-capture any fixture that a promoted note claims as
   `OBSERVED` before relying on it, because a note is not a substitute for the raw
-  capture.
+  capture. The exclusion probe in `scripts/validate-docs.test.mjs` **creates the
+  directory it needs and removes only what it creates**, because a test that
+  required the scratch folder to exist made deleting a disposable folder a red
+  build — the test now fails only if the `EXCLUDED_DIRECTORIES` entry is removed,
+  which is the behavior it is meant to protect.
 - **The workflow results are not verified by any document here.** The lanes are
   being triggered; read the Actions tab, and read the `Native targets` matrix in
   particular, since it is the only place the Unix permission assertions and four of

@@ -158,6 +158,36 @@ It excludes secret values, authorization headers, raw environment, full database
 prompts, messages, documents, tool payloads, transcripts/audio, and personal
 identifiers unless the user explicitly selects a separately warned attachment.
 
+### Implemented subset (Milestone 1)
+
+The Foundation slice in `jarvis_infrastructure::diagnostics` implements the parts
+of this section that can exist before the model, tool, connector, workflow, and
+voice subsystems do:
+
+- `jarvis doctor` runs named checks over the profile directories, the database
+  (integrity, SQLite version, schema compatibility), daemon reachability, the
+  enrolled credential, the configuration file, and service registration. Each
+  finding carries a stable check name, a severity, a bounded fact, and fixed
+  advice, and warnings are counted separately from blocking findings. A daemon
+  that is simply not running is a **warning**, because foreground and portable
+  use are supported and a healthy profile must not exit non-zero.
+- `jarvis support-bundle` is preview-first. The plan is rendered before anything
+  is written, a bare invocation writes nothing, `--exclude` names optional items,
+  and the required manifest is refused by name rather than silently dropped.
+- An export is one library call so the manifest's `content_sha256` is guaranteed
+  to describe the archive that is written; the archive is a dependency-free
+  stored ZIP with a fixed timestamp, so the same inputs produce identical bytes.
+  Log tails are bounded to 256 KiB per file over at most 5 files and begin on a
+  record boundary, and every member passes through the log writer's redactor.
+- Excluded classes are recorded in the manifest as
+  `excluded_classes`, not only asserted in prose.
+
+Not implemented yet, and therefore not claimed: trace/metric/health summaries,
+runtime and plugin inventory, schema-migration state in the bundle, a
+user-selected run attachment path, a redaction self-test command, and
+retention/cleanup of previously exported bundles. Those need the owning
+subsystems and their TODO IDs.
+
 ## Cost and Privacy
 
 Observability itself has retention, storage, network, and provider cost budgets.

@@ -31,6 +31,17 @@ pub enum ProfileMode {
     Portable,
 }
 
+impl ProfileMode {
+    /// Returns the stable token used in diagnostics output and bundle manifests.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Portable => "portable",
+        }
+    }
+}
+
 /// A resolved set of JARVIS directories for one profile.
 ///
 /// All paths are absolute unless the profile is portable, in which case they are
@@ -98,7 +109,6 @@ impl ProfilePaths {
     pub const fn mode(&self) -> ProfileMode {
         self.mode
     }
-
     /// Returns the configuration directory.
     #[must_use]
     pub fn config_dir(&self) -> &Path {

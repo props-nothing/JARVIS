@@ -8,6 +8,7 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod diagnostics;
 pub mod error;
 pub mod http;
 pub mod ids;

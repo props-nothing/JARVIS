@@ -950,6 +950,7 @@ dependencies = [
  "getrandom",
  "http-body-util",
  "jarvis-domain",
+ "jarvis-observability",
  "jarvis-protocol",
  "jiff",
  "log",

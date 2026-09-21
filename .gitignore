@@ -7,8 +7,10 @@
 # Out-of-repo scratch area: a telephony/LiveKit spike with its own Node toolchain,
 # lockfile, and dependencies. It is not part of the JARVIS control plane, its
 # contents are third-party `node_modules` trees, and it carries its own nested
-# `.gitignore` and `.env`. Excluded wholesale so nothing from it can be published
-# accidentally by a broad `git add`. This only prevents untracked files from being
-# added; it does not make the directory invisible to repository tooling, which is
-# handled separately.
+# `.gitignore` and `.env`. The durable findings were promoted into
+# `docs/research/integrations/`, so the directory is disposable and absent from a
+# clean checkout; this rule stays so the area cannot be published accidentally if
+# it is recreated. Excluding it prevents untracked files from being added; it does
+# not make the directory invisible to repository tooling, which is handled
+# separately by the docs validator.
 docs/research-telephony/

@@ -3,9 +3,10 @@
 // This does what `ACC-001` describes, using only the two built binaries and an
 // empty directory: start the per-user daemon, run `jarvis status` and
 // `jarvis doctor`, stop it, then start it again against the same profile to prove
-// state survives a restart. It deliberately does NOT register a real service:
-// native service registration mutates the runner's logon state and is asserted
-// separately.
+// state survives a restart. It also exercises the support-bundle preview and
+// export with a planted secret canary. It deliberately does NOT register a real
+// service: native service registration mutates the runner's logon state and is
+// asserted separately.
 //
 // Two properties make this a clean-machine test rather than a "the suite passed"
 // test:
@@ -20,9 +21,18 @@
 // termination order so a failing assertion cannot leave a daemon behind.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import process from "node:process";
 
 const READY_TIMEOUT_MS = 30_000;
@@ -214,6 +224,65 @@ async function main() {
       fail("the service preview does not state the no-elevation mode", service.stdout);
     } else {
       pass("service: the preview names jarvisd and states the per-user mode");
+    }
+
+    // 7. The support bundle must be preview-first and must not carry the enrolled
+    //    credential, even when the credential is sitting in a log file. This is
+    //    the canary: a secret is planted in a real log, and the exported archive
+    //    is searched for it. An implementation whose redaction never ran would
+    //    still pass a "does it produce a zip" check, which is why the assertion
+    //    is on the planted value and not on the archive existing.
+    const preview = run(client, ["--profile", profile, "support-bundle"]);
+    if (preview.status !== 0) {
+      fail("the bundle preview failed", `${preview.stdout}${preview.stderr}`);
+    } else if (!/nothing has been written yet/.test(preview.stdout)) {
+      fail("the bundle preview did not state that nothing was written", preview.stdout);
+    } else if (!/excluded from every bundle/.test(preview.stdout)) {
+      // A bare preview must not write a file anywhere.
+      fail("the bundle preview did not state its exclusions", preview.stdout);
+    } else {
+      pass("bundle: a bare invocation previewed and wrote nothing");
+    }
+
+    const credential = readFileSync(join(profile, "config", "client-credential"), "utf8").trim();
+    if (credential.length < 16) {
+      fail("the enrolled credential is too short to serve as a canary");
+    }
+    const logDirectory = join(profile, "log");
+    const logNames = existsSync(logDirectory) ? readdirSync(logDirectory) : [];
+    if (logNames.length === 0) {
+      fail("no log file exists to plant the canary in", readdirSync(profile).join(", "));
+    }
+    const logPath = join(logDirectory, basename(logNames[0]));
+    // Plant the credential where a logged secret would appear: inside a log line.
+    appendFileSync(logPath, `{"level":"INFO","message":"canary ${credential} leaked"}\n`);
+    if (!readFileSync(logPath, "utf8").includes(credential)) {
+      fail("the canary was not written to the log, so the test would be vacuous");
+    }
+
+    const bundlePath = join(profile, "bundle.zip");
+    const exported = run(client, [
+      "--profile",
+      profile,
+      "support-bundle",
+      "--output",
+      bundlePath,
+    ]);
+    if (exported.status !== 0) {
+      fail("the bundle export failed", `${exported.stdout}${exported.stderr}`);
+    } else if (!existsSync(bundlePath)) {
+      fail("the bundle export reported success but wrote no file");
+    } else {
+      // The archive is searched as raw bytes rather than unpacked, so the check
+      // does not depend on a ZIP reader being available on every runner.
+      const archive = readFileSync(bundlePath, "utf8");
+      if (archive.includes(credential)) {
+        fail("the exported bundle contains the enrolled credential");
+      } else if (!archive.includes("manifest.json")) {
+        fail("the exported bundle has no manifest entry");
+      } else {
+        pass("bundle: the exported archive omits the planted credential");
+      }
     }
   } catch (error) {
     fail(error.message);

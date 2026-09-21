@@ -283,8 +283,47 @@ Dependencies: all Milestone 0 exit criteria.
 - [ ] `FND-012` Implement install, update, rollback, portable mode, and uninstall
   tests that preserve user data unless explicitly removed. Public promotion
   depends on `OWN-001` through `OWN-005`.
-- [ ] `FND-013` Implement bounded diagnostics collection and a reviewable,
+- [~] `FND-013` Implement bounded diagnostics collection and a reviewable,
   redactable support-bundle preview/export with secret-canary tests.
+  Evidence (PARTIAL): diagnostics moved out of the `jarvis` binary into
+  `jarvis_infrastructure::diagnostics`, so the checks are a pure function of a
+  profile plus an injected `DiagnosticsEnvironment` and are testable without a
+  running daemon, a service manager, or a clock. Findings carry a stable check
+  name, a severity, a bounded fact, and fixed advice, and **warnings are counted
+  separately from blocking findings** so "no blocking findings" cannot be read as
+  "nothing is wrong"; a daemon that is simply not running is deliberately a
+  warning, because foreground and portable use are supported. The support bundle
+  is plan-first: `BundlePlan::render` prints what a bundle would contain and
+  which items are optional, `resolve_exclusions` refuses an unknown name or the
+  required manifest by name, and `export_bundle` materializes, renders the
+  manifest from the members' digest, and writes the archive in that order, so the
+  digest recorded in the manifest is guaranteed to describe the archive that is
+  written. Content passes through the existing `jarvis_observability::Redactor`
+  (registered-value removal is the guarantee), log tails are bounded to 256 KiB
+  per file over at most 5 files and start on a record boundary, and the archive
+  path of a log file is sanitized so a hostile name cannot forge a traversal.
+  There is no compression dependency: `diagnostics/archive.rs` writes a
+  dependency-free stored (method 0) ZIP with a fixed DOS timestamp, so the same
+  input produces byte-identical output and the bytes in the archive are exactly
+  the bytes that were redacted. **Verified live on real binaries**: `jarvis
+  doctor` reported every check plus `no blocking findings (0 warning(s))`,
+  `support-bundle` previewed without writing, and an export produced an archive
+  that **.NET `ZipFile::OpenRead` successfully opened** (4 members, manifest
+  included). With the live 43-character client credential appended to the real
+  log, the raw file contained it and the exported bundle did **not** — the member
+  read `presented credential [REDACTED] while enrolling` — so the canary holds
+  through the whole pipeline, not only in the redactor's own tests. 275 workspace
+  tests pass (34 new); `fmt` and `clippy -D warnings` are clean. The `Cargo.toml`
+  change adds only the already-reviewed `jarvis-observability` crate, which is
+  why the dependency evidence note still applies. **Not done**: the bundle does
+  not yet summarize traces, metrics, subsystem health, runtime/plugin inventory,
+  or schema/migration state, because the model, runtime, tool, connector,
+  workflow, and voice subsystems that would produce them do not exist before
+  Milestones 2 through 8, so `ACC-078`'s "seed diagnostics across every boundary"
+  is only satisfied for the daemon, storage, configuration, and service
+  boundaries that exist today; there is no redaction self-test command, no
+  attachment path for a user-selected run, and no retention/cleanup of previously
+  exported bundles. Repair plans are `FND-014`.
 - [ ] `FND-014` Implement previewed and confirmed repair plans for stale locks,
   service definitions, permissions, config, and recoverable storage faults with
   backup, rollback, and verified postconditions.

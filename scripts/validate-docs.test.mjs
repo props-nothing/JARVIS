@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,22 @@ function runValidator(changedFile) {
     [VALIDATOR, "--changed-file", changedFile],
     { cwd: ROOT, encoding: "utf8" },
   );
+}
+
+/**
+ * Reads the validated-Markdown count out of a validator run.
+ *
+ * The exclusion test asserts the count is unchanged, not merely that the run
+ * passed, because a scratch file that was *counted* while still passing would
+ * mean the exclusion only suppressed errors rather than removing the file from
+ * the gate's world.
+ */
+function validatedFileCount(result) {
+  const match = /Validated (\d+) Markdown files/.exec(
+    `${result.stdout}${result.stderr}`,
+  );
+  assert.ok(match, `no validated file count in output: ${result.stdout}${result.stderr}`);
+  return Number(match[1]);
 }
 
 test("canonicalChangedFile collapses repeated dot segments", () => {
@@ -247,6 +263,12 @@ test("the excluded scratch area is invisible to the validator", () => {
   // `Status:` value or a broken link must not fail the gate, and must not change
   // the validated file count either. If the exclusion entry in
   // `EXCLUDED_DIRECTORIES` is ever removed, this test starts failing.
+  //
+  // The excluded directory is **created by this test when absent** rather than
+  // required to exist. It is an ignored scratch area that may legitimately be
+  // deleted once its runnable harness is no longer needed, and a test that
+  // depended on it being present turned deleting that folder into a red build.
+  // The test owns exactly what it creates and removes it again.
   const excluded = path.join(ROOT, "docs", "research-telephony");
   const probe = path.join(excluded, "temp-validator-probe.md");
   const contents = [
@@ -258,7 +280,12 @@ test("the excluded scratch area is invisible to the validator", () => {
     "",
   ].join("\n");
 
-  assert.ok(existsSync(excluded), "the scratch area should exist for this test");
+  const createdDirectory = !existsSync(excluded);
+  if (createdDirectory) {
+    mkdirSync(excluded, { recursive: true });
+  }
+  const countBefore = validatedFileCount(runValidator("docs/testing/strategy.md"));
+
   writeFileSync(probe, contents, "utf8");
   try {
     const result = runValidator("docs/testing/strategy.md");
@@ -272,9 +299,17 @@ test("the excluded scratch area is invisible to the validator", () => {
       /temp-validator-probe/,
       "the excluded file must not be mentioned at all",
     );
+    assert.equal(
+      validatedFileCount(result),
+      countBefore,
+      "an excluded file must not change the validated file count",
+    );
   } finally {
     rmSync(probe, { force: true });
-    // The probe is the only thing removed; the scratch area itself is left alone.
-    assert.ok(existsSync(excluded), "the scratch area must not be deleted");
+    // Only the directory this test created is removed, and only once it is empty
+    // again, so a real scratch area is never destroyed by a test run.
+    if (createdDirectory && readdirSync(excluded).length === 0) {
+      rmSync(excluded, { force: true, recursive: true });
+    }
   }
 });
