@@ -16,8 +16,9 @@ use jarvis_infrastructure::auth::ClientCredentialPath;
 use jarvis_infrastructure::client::{ClientError, discover, get_authenticated, read_credential};
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
 use jarvis_infrastructure::diagnostics::{
-    DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor, add_log_tails, apply,
-    collect, daemon_summary, export_bundle, plan_bundle, plans_for, unrepairable,
+    ClientReachability, DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor,
+    add_log_tails, apply, collect, daemon_summary, export_bundle, plan_bundle, plans_for,
+    unrepairable,
 };
 use jarvis_infrastructure::install::{
     ExistingInstall, InstallError, InstallLayout, InstallMode, VerifiedRelease,
@@ -494,9 +495,13 @@ async fn doctor(paths: &ProfilePaths) -> ExitCode {
 
     let controller = current_controller();
     let spec = service_spec();
+    let reachability = discovered.as_ref().ok().map(ClientReachability::new);
     let environment = DiagnosticsEnvironment {
         daemon,
         discovery_error,
+        reachability: reachability
+            .as_ref()
+            .map(|probe| probe as &dyn jarvis_infrastructure::diagnostics::DaemonReachability),
         controller: controller.as_deref().ok(),
         service_spec: spec.as_ref().ok(),
         service_spec_error: spec.as_ref().err().map(ServiceError::code),
@@ -526,9 +531,13 @@ async fn support_bundle(
     };
     let controller = current_controller();
     let spec = service_spec();
+    let reachability = discovered.as_ref().ok().map(ClientReachability::new);
     let environment = DiagnosticsEnvironment {
         daemon,
         discovery_error,
+        reachability: reachability
+            .as_ref()
+            .map(|probe| probe as &dyn jarvis_infrastructure::diagnostics::DaemonReachability),
         controller: controller.as_deref().ok(),
         service_spec: spec.as_ref().ok(),
         service_spec_error: spec.as_ref().err().map(ServiceError::code),
@@ -536,7 +545,7 @@ async fn support_bundle(
     };
 
     let report = collect(paths, &environment).await;
-    let summary = daemon_summary(&environment);
+    let summary = daemon_summary(&environment).await;
     let mut plan = plan_bundle(paths.mode().token(), API_MAJOR, &report, &summary);
     add_log_tails(&mut plan, paths.log_dir());
 
@@ -960,9 +969,13 @@ async fn repair(paths: &ProfilePaths, confirm: bool) -> ExitCode {
     };
     let controller = current_controller();
     let spec = service_spec();
+    let reachability = discovered.as_ref().ok().map(ClientReachability::new);
     let environment = DiagnosticsEnvironment {
         daemon,
         discovery_error,
+        reachability: reachability
+            .as_ref()
+            .map(|probe| probe as &dyn jarvis_infrastructure::diagnostics::DaemonReachability),
         controller: controller.as_deref().ok(),
         service_spec: spec.as_ref().ok(),
         service_spec_error: spec.as_ref().err().map(ServiceError::code),

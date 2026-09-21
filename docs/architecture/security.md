@@ -132,6 +132,16 @@ Rules:
 
 - Loopback binding is not authentication.
 - Validate `Host` and browser `Origin`; avoid privileged cookie auth.
+- Bind the address check to the authority the daemon **actually** bound. The port
+  is ephemeral, so a hardcoded value would reject the daemon's own address, and
+  "any loopback host" would admit `localhost`, another `127.0.0.0/8` address, or a
+  DNS name resolving to loopback. A request with no `Host` is refused, and one with
+  two is refused rather than resolved: when a proxy and an origin disagree about
+  which `Host` is authoritative, picking one by convention is request smuggling.
+- Reject forwarding headers outright (`forwarded`, `x-forwarded-host`,
+  `x-forwarded-proto`, `x-real-ip`). No proxy is trusted in local mode, so their
+  presence means the request either traversed infrastructure JARVIS does not have
+  or is lying about its identity.
 - Store local bearer material under owner-only ACLs.
 - Do not put tokens in URLs or command-line arguments.
 - Pair/enroll clients explicitly and support revocation.

@@ -147,6 +147,7 @@ that work is `FND-011` and must not inherit this decision.
 | `CI-C012` | A platform failure is visible rather than masked | VERIFIED | `fail-fast: false` | One broken platform hides the state of the other four |
 | `CI-C013` | The workflows have actually run on GitHub's infrastructure | **VERIFIED GREEN at `7a7d61d`** — `CI` = success and `Native targets` = success with **all five tier-1 jobs green**. Before the fixes below, 12 runs existed and all 12 had failed | `GET /repos/props-nothing/JARVIS/actions/runs` and `.../runs/<id>/jobs` | A workflow that is syntactically valid but fails on a real runner |
 | `CI-C017` | Every tier-1 target builds, tests, and passes its journeys on native hardware | **VERIFIED GREEN**: `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` all `success` | Run `35657958359` job list | A "supported" target that has never run its own tests |
+| `CI-C018` | The service-assertion guard is executed by a lane | VERIFIED by workflow construction: the `docs` lane runs `node scripts/service-assertion-check.mjs`, and the matcher is defined once in `scripts/daemon-assertion.mjs` for the guard and the journey alike | `ci.yml` `docs` job; the script was falsified by applying an `ExecStart=`-keyed matcher, which fails the launchd sample | A guard that exists but is never invoked, or a guard that tests a different matcher than the journey uses |
 | `CI-C015` | The native lane produces jobs at all | **FALSE until fixed.** `native.yml` had a YAML parse error, so GitHub created runs with **zero jobs** and the run name fell back to the file path instead of `Native targets` | The runs API reported `jobs=0`; `js-yaml` reproduced it locally | An entire lane that silently does nothing while reporting a failure |
 | `CI-C016` | The lane can observe defects the Windows authoring host cannot | **VERIFIED after fixing.** Linux clippy failed on an unused import, an unused `mut`, and a `verbose_bit_mask` lint, and the clean-machine journey failed on a quote-dependent assertion | `rust:1.98-slim-bookworm` container with the pinned toolchain | Three real defects that passed every local Windows check |
 | `CI-C014` | Every document is reachable from the top-level index | VERIFIED by validator and a fail-closed test | `validateIndexCompleteness` in `scripts/validate-docs.mjs`, falsified with a temporary unlinked file | A document nobody links to, which is effectively unreviewed |
@@ -181,6 +182,14 @@ one was fixed — a lane that cannot parse reports nothing about its contents:
    three real renderings plus two negative cases, which is how a platform-specific
    assertion is caught without needing that platform.
 
+The round-3 guard was then found to be **inert**: the matcher was a literal
+duplicated in the guard and in the journey, and no lane ran the guard. Two copies
+of one regex can drift, and a check that nothing invokes cannot fail. The matcher
+now has a single definition in `scripts/daemon-assertion.mjs`, both files import
+it, and the `docs` lane runs the guard. That lane is the right home because the
+guard is a plain Node script with no toolchain, so it also runs on a pull request
+before any build.
+
 A working Linux environment was the missing capability for round 2: the authoring
 host has no Unix runtime, so `#[cfg(unix)]` code was never compiled, let alone
 linted or tested. A `rust:1.98-slim-bookworm` container with the pinned toolchain,
@@ -202,6 +211,9 @@ failure mechanical rather than something a reader has to notice.
    non-Windows lanes (they are skipped on the authoring host).
 4. Confirm the clean-machine journey step ran on each native lane.
 5. Re-check the action major versions quarterly, or when a workflow is edited.
+6. Confirm the `docs` lane's service-assertion step ran and passed. It is the only
+   lane that exercises the matcher against all three platform renderings, so if
+   that step is missing from a run the macOS-class defect is unobservable again.
 
 ## Operational Readiness
 

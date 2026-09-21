@@ -93,6 +93,13 @@ Authentication rules:
   are emitted. Native clients normally send no `Origin`.
 - Validate `Host` against the active numeric loopback authority. Reject forwarded
   host/proto headers because no proxy is trusted in local mode.
+- A request with **no** `Host`, or with **more than one**, is rejected. Binding is
+  not an address filter: a loopback socket accepts a connection addressed to
+  `localhost`, to another `127.0.0.0/8` address, or to a DNS name resolving to
+  loopback, so the address is checked rather than inferred from the bind. Two
+  `Host` headers are refused because a proxy and an origin can legitimately
+  disagree about which is authoritative, and picking one by convention is the
+  basis of request smuggling.
 - Authentication failure returns the same safe response for unknown, malformed,
   and revoked credentials.
 
@@ -304,8 +311,11 @@ Minimum codes:
 | HTTP | Code | Retryable |
 | --- | --- | --- |
 | 400 | `request.invalid` | no |
+| 400 | `api.host_not_allowed` | no |
 | 401 | `auth.invalid` | no |
 | 403 | `auth.scope_denied` | no |
+| 403 | `api.origin_not_allowed` | no |
+| 403 | `api.forwarded_header_not_allowed` | no |
 | 404 | `resource.not_found` | no |
 | 409 | `idempotency.conflict` | no |
 | 409 | `stream.replay_unavailable` | no |
@@ -320,6 +330,29 @@ Minimum codes:
 Malformed authentication must be rejected before body parsing or resource
 lookup where the HTTP stack permits. Internal failures return a request ID and
 generic message while preserving structured diagnostics in redacted local logs.
+
+Every refusal on this surface uses this envelope, including the ones that are not
+produced by a route handler:
+
+- an **unknown route** returns `404` with `resource.not_found`. The HTTP framework's
+  own fallback is a bare `404` with an empty body, which would give a client a
+  status it can see and nothing it can parse;
+- a **body over the limit** returns `413` with `request.too_large` as
+  `application/json`. A limiter's own plain-text `413` would satisfy "the body is
+  bounded" while breaking both this rule and the JSON requirement above;
+- a **`Host` refusal** returns `400` with `api.host_not_allowed`, a **browser
+  `Origin`** or a **forwarding header** returns `403`, and all three are JSON.
+
+The refusal names neither the rejected value nor the expected one where the
+rejected value is caller-supplied, because echoing it would reflect untrusted text.
+
+Layer order is part of this contract where it changes which error a caller sees.
+The request-body limit is applied **outside** version negotiation and
+authentication — that is, it is checked first — so an oversized body is reported as
+`request.too_large` regardless of the credentials the caller presented. Ordering it
+after authentication would make the same oversized request report
+`api.version_unsupported` or `auth.credential_rejected` instead, which is true but
+answers the wrong question.
 
 ## Crash and Recovery Semantics
 
@@ -353,3 +386,30 @@ Before `FND-007`, `FND-008`, or `BRN-007` is complete, test:
 12. golden JSON/SSE fixtures and generated OpenAPI drift.
 
 These tests provide evidence for `ACC-002`, `ACC-003`, `ACC-010`, and `ACC-012`.
+
+### Implemented evidence (Milestone 1)
+
+Test 2 (authentication) and test 3 (`Origin`, `Host`, and forwarding headers) are
+implemented in `jarvis-infrastructure`:
+
+- the `http` module's own tests cover the indistinguishable authentication
+  response, the version-negotiation failure, and the rejections below;
+- `tests/daemon_serving.rs` repeats the `Host` rejections over a **real socket**,
+  where a real client chooses the header and a proxy would rewrite it. A router
+  test alone would not prove the control holds on the wire, because a loopback
+  socket accepts a connection addressed to any name that resolves to loopback.
+
+The `Host` check compares against the authority the daemon **actually bound**,
+carried in `ApiState::bound_authority` rather than hardcoded, because the port is
+ephemeral and operating-system assigned. A constant would reject the daemon's own
+address, and accepting any loopback host would admit `localhost`, a different
+`127.0.0.0/8` address, or a foreign port. IPv6 authorities are compared in the
+bracketed form a client sends in `Host`.
+
+Refusals name neither the expected nor the received authority: the expected value
+is the daemon's own address and the received value is attacker-supplied text, so
+echoing either would reflect untrusted input back to the caller.
+
+Test 5 (body and input limits) is implemented as well, and it found a defect in the
+process: the `413` was correct but its body was the limiter's own plain text rather
+than the envelope, so the status was right and the contract was still broken.

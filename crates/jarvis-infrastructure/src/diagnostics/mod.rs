@@ -48,8 +48,13 @@ mod tests;
 
 pub use archive::{ArchiveError, MAX_ARCHIVE_BYTES, ZipArchive};
 pub use collector::{
-    DaemonDescriptor, DiagnosticsEnvironment, collect, daemon_summary, database_file,
+    ClientReachability, DaemonDescriptor, DaemonReachability, DiagnosticsEnvironment, collect,
+    daemon_summary, database_file,
 };
+// The reachability answer is part of this module's public surface, because
+// implementing `DaemonReachability` requires naming it. It is defined beside the
+// probe that produces it in `client`, so it is re-exported rather than duplicated.
+pub use crate::client::DaemonLiveness;
 pub use repair::{
     RepairAction, RepairDiagnosis, RepairError, RepairKind, RepairOutcome, RepairPlan, apply,
     is_protected, plan_for, plans_for, protected_database_path, unrepairable,

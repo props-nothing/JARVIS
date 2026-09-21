@@ -104,6 +104,73 @@ pub fn discover(discovery_path: &Path) -> Result<Discovered, ClientError> {
     })
 }
 
+/// What answered at a published daemon address.
+///
+/// An unreachable address and an address held by a *different* process are
+/// different faults with different operator actions, and collapsing them into one
+/// boolean is what makes a port conflict look like a daemon that simply is not
+/// running. Both are seedable in `ACC-003`, and the second is the one a naive
+/// reachability check reports as a healthy daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonLiveness {
+    /// The daemon answered its own liveness route.
+    Live,
+    /// Nothing is listening on the published address.
+    NothingListening,
+    /// Something is listening, but it is not this daemon: it did not answer the
+    /// liveness route with the contract's token.
+    ForeignListener,
+}
+
+impl DaemonLiveness {
+    /// Returns the stable code for diagnostics.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Live => "jarvis.daemon_live",
+            Self::NothingListening => "jarvis.daemon_unreachable",
+            Self::ForeignListener => "jarvis.port_conflict",
+        }
+    }
+}
+
+/// Probes a published daemon address for liveness, without authentication.
+///
+/// This exists because a discovery file is **not** evidence that a daemon is
+/// alive. It survives an unclean kill and still parses, so anything that reasons
+/// from the file alone reports a dead daemon as running. The lock cannot be used
+/// either: it is released by the operating system on process exit, so a free lock
+/// plus a published discovery file is exactly the stale state, not a live daemon.
+///
+/// The probe is `GET /health/live`, which the local control API already defines as
+/// unauthenticated and which returns only a status token. That matters here: a
+/// diagnostic must not need the credential to answer "is something listening?",
+/// and it must not learn anything but that.
+///
+/// # Errors
+///
+/// Returns the [`ClientError`] for the failed exchange. A refused connection maps
+/// to [`DaemonLiveness::NothingListening`] and a wrong body to
+/// [`DaemonLiveness::ForeignListener`]; a transport failure that is neither (a
+/// timeout, an unparseable response) is reported as an error because it cannot be
+/// attributed to either fault.
+pub async fn probe_liveness(discovered: &Discovered) -> Result<DaemonLiveness, ClientError> {
+    match get_public(discovered, "/health/live").await {
+        Ok(body) => {
+            if body.trim() == r#"{"status":"live"}"# {
+                Ok(DaemonLiveness::Live)
+            } else {
+                // A listener that answers with something else is holding the
+                // published address without being the daemon.
+                Ok(DaemonLiveness::ForeignListener)
+            }
+        }
+        // A refused connection is the ordinary "nothing there" case.
+        Err(ClientError::Transport) => Ok(DaemonLiveness::NothingListening),
+        Err(error) => Err(error),
+    }
+}
+
 /// Reads the enrolled client credential for this profile.
 ///
 /// # Errors
@@ -142,6 +209,60 @@ pub async fn get_authenticated(
     path: &str,
     api_major: u32,
 ) -> Result<String, ClientError> {
+    let request = authenticated_headers(credential, api_major);
+    get_with_headers(discovered, path, &request).await
+}
+
+/// Builds the headers for an authenticated request.
+///
+/// Kept as a named function so the test can assert the credential is present here
+/// and absent in [`public_headers`], which is what makes the two paths different
+/// by construction rather than by which call site remembers to pass what.
+#[must_use]
+fn authenticated_headers(credential: &str, api_major: u32) -> String {
+    format!(
+        "Authorization: Bearer {credential}\r\n\
+         Jarvis-API-Version: {api_major}\r\n"
+    )
+}
+
+/// Builds the headers for an unauthenticated request, which are none.
+///
+/// The local control API exposes exactly two unauthenticated routes, and both
+/// return a status token and nothing else. An empty header block is the structural
+/// guarantee that a probe cannot carry a credential.
+#[must_use]
+const fn public_headers() -> &'static str {
+    ""
+}
+
+/// Fetches an unauthenticated endpoint and returns the body.
+///
+/// This is deliberately a separate function from [`get_authenticated`] rather than
+/// that function with an empty credential: the absence of an `Authorization`
+/// header has to be structural, so a caller cannot accidentally send the owner's
+/// credential to a route that does not require it.
+///
+/// # Errors
+///
+/// Returns the same [`ClientError`] class as [`get_authenticated`].
+pub async fn get_public(discovered: &Discovered, path: &str) -> Result<String, ClientError> {
+    get_with_headers(discovered, path, public_headers()).await
+}
+
+/// Performs one bounded loopback exchange and returns the response body.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Transport`] on a connection failure or when the
+/// published authority is not numeric loopback, [`ClientError::Timeout`] when the
+/// bound elapses, and [`ClientError::MalformedResponse`] when the status line
+/// cannot be read.
+async fn get_with_headers(
+    discovered: &Discovered,
+    path: &str,
+    extra_headers: &str,
+) -> Result<String, ClientError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     // Only a numeric loopback authority is ever dialed; the discovery file was
@@ -165,8 +286,7 @@ pub async fn get_authenticated(
         let request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {host}:{port}\r\n\
-             Authorization: Bearer {credential}\r\n\
-             Jarvis-API-Version: {api_major}\r\n\
+             {extra_headers}\
              Connection: close\r\n\r\n",
         );
         stream
@@ -328,6 +448,50 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_liveness_probe_reports_nothing_listening() {
+        // The property the `daemon` check depends on. A discovery file that parses
+        // is not a running daemon, so the probe must report the absence on an
+        // address where nothing is listening — and this binds nothing, which is the
+        // point: a port nobody holds is the honest way to test "no daemon here".
+        let discovered = super::Discovered {
+            // Port 1 on loopback is not bound by an unprivileged process.
+            base_url: "http://127.0.0.1:1".to_owned(),
+            instance_id: "inst".to_owned(),
+            pid: 1,
+        };
+        assert_eq!(
+            super::probe_liveness(&discovered).await.expect("probe ran"),
+            super::DaemonLiveness::NothingListening
+        );
+    }
+
+    #[test]
+    fn the_public_transport_sends_no_authorization_header() {
+        // The liveness route is unauthenticated, and the absence of the header has
+        // to be structural rather than a caller's choice: a diagnostic must not
+        // hand the owner's credential to a route that does not require it.
+        let authenticated = super::authenticated_headers("secret-credential", 1);
+        assert!(authenticated.contains("Authorization: Bearer secret-credential"));
+        assert!(super::public_headers().is_empty());
+        assert!(!super::public_headers().contains("Authorization"));
+    }
+
+    #[test]
+    fn every_liveness_state_has_a_distinct_code() {
+        // A port conflict reported with the same code as "not running" is
+        // unsearchable and gives the wrong advice, so the codes must differ.
+        let codes = [
+            super::DaemonLiveness::Live.code(),
+            super::DaemonLiveness::NothingListening.code(),
+            super::DaemonLiveness::ForeignListener.code(),
+        ];
+        let mut unique = codes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "{codes:?}");
     }
 
     #[test]

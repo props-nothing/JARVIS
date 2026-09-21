@@ -54,6 +54,16 @@ jobs:
       - name: Validate documentation, requirements, TODO IDs, and evidence
         run: node scripts/validate-docs.mjs
 
+      # The clean-machine journey asserts that the service preview names the
+      # daemon executable. That assertion has been wrong twice in the same way —
+      # it keyed on one platform's formatting — and each fix was only observable
+      # on the platform it broke. This check asserts the matcher against the
+      # recorded rendering of all three backends plus two negative cases, so a
+      # platform-specific matcher is caught without needing the platform. It runs
+      # in this lane because it is a plain Node script with no toolchain.
+      - name: Validate the service assertion against every platform rendering
+        run: node scripts/service-assertion-check.mjs
+
   lint:
     name: format and lints
     runs-on: ubuntu-24.04

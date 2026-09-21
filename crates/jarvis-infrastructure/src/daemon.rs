@@ -170,13 +170,19 @@ impl RunningDaemon {
     }
 
     /// Builds the HTTP state that shares this daemon's readiness and clients.
-    #[must_use]
-    pub fn api_state(&self) -> Arc<ApiState> {
-        Arc::new(ApiState {
-            clients: Arc::clone(&self.clients),
-            readiness: Arc::clone(&self.readiness),
-            instance_id: self.instance_id.clone(),
-        })
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupError::Bind`] when the bound address cannot be read, which
+    /// would leave the `Host` check without an authority to compare against.
+    pub fn api_state(&self) -> Result<Arc<ApiState>, StartupError> {
+        let address = self.local_addr()?;
+        Ok(Arc::new(ApiState::new(
+            Arc::clone(&self.clients),
+            Arc::clone(&self.readiness),
+            self.instance_id.clone(),
+            address,
+        )))
     }
 
     /// Serves until `shutdown` completes, then drains within `grace`.
@@ -188,7 +194,14 @@ impl RunningDaemon {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let app = crate::http::router(self.api_state());
+        // A listener whose local address cannot be read cannot serve a validated
+        // `Host` check, so this is a startup failure rather than a degraded mode.
+        // Nothing has been admitted yet, and the discovery file is unpublished so a
+        // client cannot reach a daemon that will not serve.
+        let Ok(app) = self.api_state().map(crate::http::router) else {
+            let _ = self.begin_drain();
+            return false;
+        };
 
         // Capture what drain needs before the listener is moved into the server,
         // because `self` is consumed by the move.
@@ -367,8 +380,14 @@ fn format_base_url(address: SocketAddr) -> String {
 ///
 /// Prefer [`RunningDaemon::api_state`], which shares the daemon's own clients
 /// rather than requiring a second registry.
-#[must_use]
-pub fn api_state(daemon: &RunningDaemon, _clients: ClientRegistry) -> Arc<ApiState> {
+///
+/// # Errors
+///
+/// Returns [`StartupError::Bind`] when the bound address cannot be read.
+pub fn api_state(
+    daemon: &RunningDaemon,
+    _clients: ClientRegistry,
+) -> Result<Arc<ApiState>, StartupError> {
     daemon.api_state()
 }
 
@@ -549,13 +568,33 @@ mod tests {
     async fn api_state_shares_the_daemons_readiness() {
         let root = temp_root("state");
         let daemon = start_daemon(&root).await;
-        let state = super::api_state(&daemon, clients(&root));
+        let state = super::api_state(&daemon, clients(&root)).expect("state");
 
         assert!(state.readiness.is_ready());
         daemon.begin_drain().expect("drain");
         assert!(
             !state.readiness.is_ready(),
             "api state must observe the same readiness flag",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn api_state_names_the_authority_the_daemon_actually_bound() {
+        // The `Host` check is only meaningful if the expected authority is the
+        // bound one. An ephemeral port cannot be compared against a constant, so
+        // this asserts the state carries the real address rather than a guess.
+        let root = temp_root("authority");
+        let daemon = start_daemon(&root).await;
+        let bound = daemon.local_addr().expect("local address");
+        let state = super::api_state(&daemon, clients(&root)).expect("state");
+
+        assert_eq!(state.bound_authority, crate::http::authority_of(bound));
+        assert!(
+            state.bound_authority.starts_with("127.0.0.1:"),
+            "{}",
+            state.bound_authority
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -13,7 +13,7 @@ claims is
 
 | Workflow | Lane | What it proves |
 | --- | --- | --- |
-| `CI` | `docs` | The documentation, requirement, TODO, contract, and evidence structures are consistent |
+| `CI` | `docs` | The documentation, requirement, TODO, contract, and evidence structures are consistent, and the service assertion holds on every platform's rendering |
 | `CI` | `lint` | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | `CI` | `test` | `cargo test --workspace --all-features` on Linux x86_64 |
 | `Native targets` | `native` | Per-target build, test, and clean-machine journey on each tier-1 target |
@@ -21,6 +21,31 @@ claims is
 The `docs` lane runs `node --test scripts/validate-docs.test.mjs` **before**
 `node scripts/validate-docs.mjs`. The order matters: a weakened validator must not
 be able to pass the gate it implements.
+
+## The Service Assertion Guard
+
+`scripts/daemon-assertion.mjs` owns the single definition of "this service preview
+names the daemon executable". The matcher is defined once and imported by both
+users, so the guard and the journey it guards cannot test different regexes:
+
+- `scripts/clean-machine-smoke.mjs` applies it to the preview produced on the
+  running platform. This is the assertion that matters, and it runs on all five
+  tier-1 targets.
+- `scripts/service-assertion-check.mjs` applies it to the recorded rendering of
+  all three per-user backends plus two negative cases. The `docs` lane runs it,
+  because a platform-specific matcher is otherwise only observable on the platform
+  it breaks.
+
+The assertion has been wrong twice in the same way — it keyed on one platform's
+formatting (`ExecStart=`, a systemd directive). It passed on Windows and Linux and
+failed on macOS, where launchd renders the path inside a `<string>` element. The
+match is on the executable **path**, which every backend must contain, rather than
+on a directive name, which they do not share.
+
+Two negative cases carry the weight. A preview naming only the client would start
+and never serve. A *description* containing the word `jarvisd` in quotes is the
+case that made the first version pass on Windows for the wrong reason: a bare-name
+assertion is satisfied by text that is not the executable.
 
 ## The Native Matrix
 
@@ -82,13 +107,20 @@ built binaries and an empty directory:
 4. stop the daemon and assert it drained within its bound;
 5. start it again against the same profile and assert readiness and a clean
    doctor report;
-6. assert `jarvis service show` names `jarvisd` and states the per-user mode;
+6. assert `jarvis service show` names the daemon executable and states the
+   per-user mode, using the shared matcher described above;
 7. run `jarvis repair --confirm` and require it to converge to a state with
    nothing left to fix, then kill the daemon uncleanly and require `doctor` to
    report `jarvis.stale_discovery` and `repair` to clear it while leaving the
    benign lock file in place;
 8. preview a support bundle (requiring that nothing was written), then export one
    and require it to omit a credential planted in a log file.
+
+Step 7 is what makes the daemon-state repair credible: the discovery file is
+required to have **survived** the unclean kill before `doctor` is asked to detect
+it, so the assertion cannot pass vacuously. The same kill also exercises the
+probed reachability, because a stale file with nothing behind it must report
+`jarvis.daemon_unreachable` rather than a running daemon.
 
 It asserts directory contents, not only exit codes, because an exit code of 0
 with nothing written would still be a failure. It terminates the daemon in a`finally` block so a failed assertion cannot leak a process into a later step.
@@ -184,6 +216,7 @@ that the workflow file itself parses and that the jobs actually run.
 ```bash
 node --test scripts/validate-docs.test.mjs
 node scripts/validate-docs.mjs
+node scripts/service-assertion-check.mjs
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace

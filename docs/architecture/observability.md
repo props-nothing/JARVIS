@@ -165,6 +165,57 @@ repair that rewrote data would be deleting user data), a missing credential (it
 requires the daemon to enroll), configuration content, and service-definition
 drift. A plan is also not atomic against a daemon that starts mid-apply.
 
+### Daemon reachability is probed, not inferred
+
+The `daemon` check does not read the discovery file to decide whether a daemon is
+running. A published file is not evidence that a process exists: it outlives an
+unclean kill and still parses, so a check that reasoned from it alone reported
+`ok daemon: running` in the same report where the lock-based check correctly
+reported the stale state — two findings that disagreed, and the more
+confident-sounding one was the false one.
+
+Reachability is therefore answered by `GET /health/live`, the unauthenticated
+liveness route the local control API already defines, which returns only a status
+token. The answer is a three-state value rather than a boolean, because the states
+need different operator actions:
+
+- `jarvis.daemon_live` — the daemon answered its own liveness route;
+- `jarvis.daemon_unreachable` — nothing is listening at the published address;
+- `jarvis.port_conflict` — something is listening and is **not** the daemon.
+
+A conflict is distinct because "another process holds the published port" is not
+fixed by starting the daemon again, and reporting it as "not running" would send an
+operator to the wrong action. It is a warning rather than a blocking finding for
+the same reason a stopped daemon is: restarting binds a new ephemeral port, so the
+profile recovers without intervention.
+
+### A registered service is not a working service
+
+`ACC-003` seeds a **service-path** fault. `jarvis doctor` therefore does not stop
+at the registration state: after an update that moved the version directory, a
+registered unit, plist, or task still names the old executable, so it reports
+`installed` and serves nothing. The `service` check reads the **installed
+definition** and compares it against the executable this build would register.
+
+Reading what is on disk is the only way to see this. Comparing the intended
+definition to itself always agrees, and the registration state is not the working
+state. Drift is reported with both paths, because an operator needs to know which
+executable is registered and which one is current to choose between reinstalling
+and rolling back.
+
+The three answers are deliberately distinct, and collapsing them is a bug:
+
+- no definition installed — nothing to compare, so no drift is claimed;
+- a definition naming the expected executable — a match;
+- a definition that exists but cannot be read — a fault in its own right, never a
+  match.
+
+The last one is why **Windows reports no drift rather than no problem**: a
+scheduled task is defined by its command line and exposed only through
+`schtasks /query /xml`, so with the current dependency set there is no file to
+read. That is a named gap, and the check reports the registration state it did
+verify rather than a path claim it did not.
+
 ## Support Bundle
 
 A support bundle is generated locally and previewed before export. It includes:
@@ -193,7 +244,10 @@ voice subsystems do:
   finding carries a stable check name, a severity, a bounded fact, and fixed
   advice, and warnings are counted separately from blocking findings. A daemon
   that is simply not running is a **warning**, because foreground and portable
-  use are supported and a healthy profile must not exit non-zero.
+  use are supported and a healthy profile must not exit non-zero. Reachability is
+  established by probing the daemon's unauthenticated liveness route, never by
+  reading the discovery file, which outlives an unclean kill (see
+  [daemon reachability](#daemon-reachability-is-probed-not-inferred)).
 - `jarvis support-bundle` is preview-first. The plan is rendered before anything
   is written, a bare invocation writes nothing, `--exclude` names optional items,
   and the required manifest is refused by name rather than silently dropped.

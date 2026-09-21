@@ -35,6 +35,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import process from "node:process";
 
+import { namesDaemon } from "./daemon-assertion.mjs";
+
 const READY_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
 const SHUTDOWN_TIMEOUT_MS = 20_000;
@@ -262,6 +264,24 @@ async function main() {
         pass("repair: doctor detected the stale discovery file after an unclean kill");
       }
 
+      // The discovery file is still on disk and still parses, so a check that
+      // inferred liveness from it would report a running daemon here. Reachability
+      // is probed instead, and the report must not contain both a stale state and
+      // a running daemon: those two findings contradict each other.
+      if (/daemon:\s*running/.test(afterKill.stdout)) {
+        fail(
+          "doctor reported a running daemon from a stale discovery file",
+          afterKill.stdout,
+        );
+      } else if (!/daemon: jarvis\.(daemon_unreachable|port_conflict)/.test(afterKill.stdout)) {
+        fail(
+          "doctor did not report the daemon as unreachable or conflicting",
+          afterKill.stdout,
+        );
+      } else {
+        pass("repair: the daemon was probed, not inferred from the stale file");
+      }
+
       const repaired = run(client, ["--profile", profile, "repair", "--confirm"]);
       if (repaired.status !== 0) {
         fail("the stale-state repair failed", `${repaired.stdout}${repaired.stderr}`);
@@ -310,11 +330,15 @@ async function main() {
     //    pass on Windows: the unit *description* contains the word "jarvisd"
     //    inside quotes, so any assertion on the bare name can be satisfied by
     //    text that is not the executable.
+    //
+    //    The matcher comes from `daemon-assertion.mjs` rather than being a literal
+    //    here, so this journey and the three-platform check cannot test different
+    //    regexes.
     const service = run(client, ["--profile", profile, "service", "show"]);
-    const namesDaemon = /[\\/]jarvisd(\.exe)?\b/.test(service.stdout);
+    const daemonNamed = namesDaemon(service.stdout);
     if (service.status !== 0) {
       fail("the service preview failed", `${service.stdout}${service.stderr}`);
-    } else if (!namesDaemon) {
+    } else if (!daemonNamed) {
       fail("the service preview does not name the jarvisd daemon", service.stdout);
     } else if (!/no elevation/.test(service.stdout)) {
       fail("the service preview does not state the no-elevation mode", service.stdout);

@@ -11,6 +11,9 @@
 //! service) because the report is read top to bottom and the earlier checks
 //! explain the later ones.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use jarvis_protocol::DiscoveryFile;
 
 use crate::auth::ClientCredentialPath;
@@ -18,7 +21,7 @@ use crate::client::read_credential;
 use crate::config::{Config, config_file_path, read_bounded};
 use crate::lifecycle::appears_unheld;
 use crate::paths::ProfilePaths;
-use crate::service::{ServiceController, ServiceSpec};
+use crate::service::{ServiceController, ServiceSpec, ServiceState};
 use crate::storage::{Database, schema};
 
 use super::{CheckReport, DaemonSummary, Finding};
@@ -41,6 +44,67 @@ const ADVICE_CREDENTIAL_MISSING: &str =
     "Start jarvisd once to enroll a local client credential, then rerun doctor.";
 const ADVICE_DAEMON_NOT_RUNNING: &str =
     "Start jarvisd, or use portable foreground mode. This is not a blocking finding.";
+const ADVICE_PORT_CONFLICT: &str = "Another process holds the published port. Identify it, then restart jarvisd to bind a new one.";
+const ADVICE_SERVICE_DRIFT: &str = "Reinstall the service so it names the current jarvisd, or roll back to the version it points at.";
+
+/// Probes a published daemon address for liveness, without authentication.
+///
+/// This is a port rather than a direct call so the collector stays a pure function:
+/// a test can assert the reachable and unreachable branches without binding a
+/// socket. The production implementation performs the real `GET /health/live`
+/// exchange described in [`crate::client::probe_liveness`].
+///
+/// A probe may only answer whether a live daemon answers here, and must not report
+/// an instance identifier, a version, or a capability: the local control API
+/// deliberately exposes none of those without a credential.
+///
+/// The answer is a three-state value rather than a boolean because "nothing is
+/// listening" and "something else holds the published port" are different faults
+/// with different operator actions, and a boolean forces a port conflict to be
+/// reported as a daemon that is merely stopped.
+///
+/// The method returns a boxed future rather than using `async fn`, because the
+/// collector holds this behind `dyn` and an `async fn` in a trait is not
+/// dyn-compatible. Boxing one future per diagnostic run is not a cost worth
+/// trading a second, test-only trait for.
+pub trait DaemonReachability: Send + Sync {
+    /// Returns what answered at the published daemon address.
+    fn reachability(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::client::DaemonLiveness> + Send + '_>>;
+}
+
+/// A reachability probe backed by the real loopback liveness route.
+///
+/// This is the production [`DaemonReachability`]: it performs the bounded
+/// `GET /health/live` exchange that [`crate::client::probe_liveness`] implements.
+pub struct ClientReachability<'a> {
+    discovered: &'a crate::client::Discovered,
+}
+
+impl<'a> ClientReachability<'a> {
+    /// Wraps a discovered daemon address in a liveness probe.
+    #[must_use]
+    pub fn new(discovered: &'a crate::client::Discovered) -> Self {
+        Self { discovered }
+    }
+}
+
+impl DaemonReachability for ClientReachability<'_> {
+    fn reachability(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = crate::client::DaemonLiveness> + Send + '_>> {
+        Box::pin(async move {
+            crate::client::probe_liveness(self.discovered)
+                .await
+                // A probe that could not be attributed to either fault is reported
+                // as "nothing listening", which is the weaker and more likely
+                // claim. Reporting a conflict the probe did not observe would send
+                // an operator hunting for a squatter that does not exist.
+                .unwrap_or(crate::client::DaemonLiveness::NothingListening)
+        })
+    }
+}
 
 /// The daemon facts a check needs, described without depending on the client
 /// transport type.
@@ -91,6 +155,13 @@ pub struct DiagnosticsEnvironment<'a> {
     pub daemon: Option<DaemonDescriptor<'a>>,
     /// The stable code from the discovery failure, when it failed.
     pub discovery_error: Option<&'static str>,
+    /// The liveness probe for the published daemon address, when one was resolved.
+    ///
+    /// A discovery file alone cannot prove a daemon is alive, so reachability is
+    /// answered by a probe. It is `None` when no probe could be built, in which
+    /// case the daemon check reports that it could not verify liveness rather than
+    /// assuming it.
+    pub reachability: Option<&'a dyn DaemonReachability>,
     /// The service controller for this platform, when one exists.
     pub controller: Option<&'a dyn ServiceController>,
     /// The service spec, when the daemon executable could be resolved.
@@ -114,7 +185,7 @@ pub async fn collect(
     report.push(check_database(paths).await);
     report.push(check_schema(paths).await);
     report.push(check_daemon_state(paths));
-    report.push(check_daemon(environment));
+    report.push(check_daemon(environment).await);
     report.push(check_credential(paths));
     report.push(check_configuration(paths));
     report.push(check_service(environment));
@@ -122,22 +193,29 @@ pub async fn collect(
 }
 
 /// Reduces an environment to the small daemon record a bundle records.
-#[must_use]
-pub fn daemon_summary(environment: &DiagnosticsEnvironment<'_>) -> DaemonSummary {
-    match environment.daemon {
-        Some(descriptor) => DaemonSummary {
+///
+/// Like [`check_daemon`], this probes liveness rather than trusting the discovery
+/// file: a bundle that named an instance identifier for a daemon that is not
+/// running would send a reader looking for a process that does not exist.
+pub async fn daemon_summary(environment: &DiagnosticsEnvironment<'_>) -> DaemonSummary {
+    let descriptor = environment.daemon;
+    let liveness = match (descriptor, environment.reachability) {
+        (Some(_), Some(reachability)) => reachability.reachability().await,
+        _ => crate::client::DaemonLiveness::NothingListening,
+    };
+
+    match descriptor {
+        Some(descriptor) if liveness == crate::client::DaemonLiveness::Live => DaemonSummary {
             instance_id: Some(descriptor.instance_id.to_owned()),
             pid: Some(descriptor.pid),
             server_version: Some(crate::http::SERVER_VERSION.to_owned()),
             unavailable_code: None,
         },
-        None => DaemonSummary {
+        _ => DaemonSummary {
             instance_id: None,
             pid: None,
             server_version: None,
-            unavailable_code: environment
-                .discovery_error
-                .or(Some("jarvis.daemon_unreachable")),
+            unavailable_code: Some(environment.discovery_error.unwrap_or(liveness.code())),
         },
     }
 }
@@ -311,20 +389,53 @@ fn check_daemon_state(paths: &ProfilePaths) -> Finding {
 /// portable use are supported, so this must not force a non-zero exit on a
 /// healthy profile. Reachability answers the client's question ("can I call it?"),
 /// while [`check_daemon_state`] answers "is one alive?" from the lock itself.
-fn check_daemon(environment: &DiagnosticsEnvironment<'_>) -> Finding {
-    match environment.daemon {
-        Some(descriptor) => Finding::ok(
+///
+/// The check does **not** trust the discovery file. A file is not evidence that a
+/// process exists: it survives an unclean kill and still parses, and a diagnostic
+/// that read it alone would report `ok daemon: running` on the same profile where
+/// [`check_daemon_state`] correctly reports a stale state — two contradictory
+/// findings in one report, one of them wrong. The daemon is therefore probed on
+/// its own liveness route, which is the only unauthenticated one and which returns
+/// nothing but a status token.
+async fn check_daemon(environment: &DiagnosticsEnvironment<'_>) -> Finding {
+    let Some(descriptor) = environment.daemon else {
+        return Finding::warning(
+            "daemon",
+            environment
+                .discovery_error
+                .unwrap_or("jarvis.daemon_not_running"),
+            ADVICE_DAEMON_NOT_RUNNING,
+        );
+    };
+
+    let Some(reachability) = environment.reachability else {
+        // No probe was injected, so this run cannot distinguish a live daemon
+        // from a stale file. Reporting `ok` would be a claim the check did not
+        // verify, so it reports the weaker fact instead.
+        return Finding::warning(
+            "daemon",
+            "jarvis.daemon_unprobed",
+            ADVICE_DAEMON_NOT_RUNNING,
+        );
+    };
+
+    match reachability.reachability().await {
+        crate::client::DaemonLiveness::Live => Finding::ok(
             "daemon",
             format!(
                 "running (instance {}, api major {})",
                 descriptor.instance_id, descriptor.api_major
             ),
         ),
-        None => Finding::warning(
+        // A conflict is reported with its own code, because "something else holds
+        // the port" and "nothing is running" need different operator actions, and
+        // only one of them is fixed by simply starting the daemon.
+        crate::client::DaemonLiveness::ForeignListener => {
+            Finding::warning("daemon", "jarvis.port_conflict", ADVICE_PORT_CONFLICT)
+        }
+        crate::client::DaemonLiveness::NothingListening => Finding::warning(
             "daemon",
-            environment
-                .discovery_error
-                .unwrap_or("jarvis.daemon_not_running"),
+            "jarvis.daemon_unreachable",
             ADVICE_DAEMON_NOT_RUNNING,
         ),
     }
@@ -381,6 +492,19 @@ fn check_configuration(paths: &ProfilePaths) -> Finding {
 ///
 /// An unregistered service is a warning: the daemon is equally valid in the
 /// foreground. This check never changes registration.
+///
+/// The check goes beyond the registration state, because "registered" is not the
+/// same as "starts the daemon". `ACC-003` seeds a service-path fault: after an
+/// update that moved the version directory, the registered unit, plist, or task
+/// still names the old executable, so the service reports `installed` and serves
+/// nothing. The installed definition is therefore read and compared against the
+/// executable this build would register, and a mismatch is reported with both
+/// paths.
+///
+/// A backend whose definition cannot be read with the current dependency set
+/// answers `NoDefinition`, so no drift is claimed for it. That is a named gap, not
+/// a clean bill of health, and the check never reports `ok service path` for a
+/// definition it did not read.
 fn check_service(environment: &DiagnosticsEnvironment<'_>) -> Finding {
     let Some(controller) = environment.controller else {
         return Finding::warning(
@@ -401,10 +525,43 @@ fn check_service(environment: &DiagnosticsEnvironment<'_>) -> Finding {
         );
     };
     match controller.status(spec) {
-        Ok(state) => Finding::ok(
-            "service",
-            format!("{} ({})", state.name(), controller.backend().name()),
-        ),
+        Ok(state) => {
+            // Only a registered service can drift: an absent definition has
+            // nothing to disagree with.
+            if state == ServiceState::NotInstalled {
+                return Finding::ok(
+                    "service",
+                    format!("{} ({})", state.name(), controller.backend().name()),
+                );
+            }
+            match crate::service::path_drift(controller, spec) {
+                Ok(drift) if drift.is_drifted() => Finding::warning(
+                    "service",
+                    // The two paths are the actionable fact: an operator needs to
+                    // know which executable is registered and which one is current
+                    // to decide between reinstalling and rolling back.
+                    match &drift {
+                        crate::service::ServicePathDrift::Drifted {
+                            registered,
+                            expected,
+                        } => format!(
+                            "service path drift: registered {}, expected {}",
+                            registered.display(),
+                            expected.display()
+                        ),
+                        _ => "jarvis.service_path_drift".to_owned(),
+                    },
+                    ADVICE_SERVICE_DRIFT,
+                ),
+                // An unreadable or unparseable definition is reported as its own
+                // code rather than as a match, because "unknown" is not "fine".
+                Ok(_) => Finding::ok(
+                    "service",
+                    format!("{} ({})", state.name(), controller.backend().name()),
+                ),
+                Err(error) => Finding::warning("service", error.code(), ADVICE_SERVICE_DRIFT),
+            }
+        }
         Err(error) => Finding::warning(
             "service",
             error.code(),

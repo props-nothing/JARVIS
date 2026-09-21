@@ -193,7 +193,20 @@ Dependencies: all Milestone 0 exit criteria.
   Liveness and readiness are separate flags, `/health/*` exposes only a status
   token, every `/api/v1` route requires a credential and an API major, browser
   `Origin` is rejected on all routes, and unknown/wrong/revoked credentials
-  return one indistinguishable response. 50 new tests (175 workspace-wide) pass
+  return one indistinguishable response. **A gap found and closed later
+  (2026-09-22):** the same contract's required test 3 also names hostile `Host`
+  and forwarding headers, and only `Origin` was implemented — so a request
+  addressed to `localhost`, another `127.0.0.0/8` address, a foreign port, or a
+  DNS name resolving to loopback reached the control surface. Binding is not an
+  address filter, so `ApiState` now carries the authority the daemon **actually
+  bound** and the `Host` is validated against it; `forwarded`,
+  `x-forwarded-host`, `x-forwarded-proto`, and `x-real-ip` are refused outright
+  because no proxy is trusted in local mode. A request with **no** `Host` is
+  refused, and one with **two** is refused as well — that case was found while
+  writing the tests, when a helper that appended a second `Host` was accepted
+  because the first was valid, which is precisely the request-smuggling shape of
+  two parties disagreeing about which header is authoritative. 50 new tests (175
+  workspace-wide) pass
   across lock contention, discovery validation and unsafe-authority rejection,
   credential generation/verification/revocation and enrollment round trip,
   health/readiness, version negotiation, origin rejection, drain, and
@@ -202,7 +215,23 @@ Dependencies: all Milestone 0 exit criteria.
   to the router because the run resources it needs arrive with Brain;
   service-manager facilities are `FND-009`; the OS credential store is replaced
   by an owner-only file until the keyring slice (`FND-008`), which is recorded in
-  the Foundation evidence note rather than left implicit.
+  the Foundation evidence note rather than left implicit. The `Host` and
+  forwarding rejections are proven both at the router and over a **real socket**
+  in `tests/daemon_serving.rs`, because a router test cannot show that a real
+  client's header is what the control actually sees. **Two further contract gaps
+  found by testing the claims the docs already made, 2026-09-22:** an unknown route
+  returned `axum`'s default bare `404` with an **empty body**, so the contract's
+  "unknown routes return the common error envelope" was false — a client got a
+  status it could see and nothing it could parse — and the existing test passed
+  because it asserted only the status; and the request-body limit produced a `413`
+  whose body was `tower_http`'s plain text rather than the envelope, breaking both
+  the envelope rule and the `application/json` rule for `/api/v1`. Both are fixed:
+  the fallback returns `resource.not_found`, and the limit is a middleware that
+  returns `request.too_large` as JSON. Moving the limit to the **outermost** layer
+  was part of the fix, so an oversized body is reported as `request.too_large`
+  rather than as whatever credential error the request would otherwise have hit;
+  the layer order is now documented as part of the contract because it decides which
+  error a caller sees.
 - [x] `FND-008` Implement `jarvis status`, `config`, `service`, `logs`, and `doctor`.
   Evidence: `jarvis` parses its subcommands with `try_parse` (a typo is a typed
   error, never a process exit) and reaches the daemon through the published
@@ -285,7 +314,14 @@ Dependencies: all Milestone 0 exit criteria.
   systemd directive, so it passed on Windows and Linux and failed on **macOS**,
   where launchd renders the path inside a `<string>` element. It now matches the
   executable path, and `scripts/service-assertion-check.mjs` asserts that against
-  all three real platform renderings. A `rust:1.98-slim-bookworm` container and
+  all three real platform renderings. That matcher is defined once in
+  `scripts/daemon-assertion.mjs` and imported by both the guard and the journey,
+  and the guard is **run by the `docs` lane**, because it previously existed as a
+  literal duplicated in two files that nothing invoked — a guard that no lane runs
+  can stop guarding without any build turning red. Its negative cases are the ones
+  that matter: a client-only preview, and a description that merely mentions
+  `jarvisd`, which is why the original matcher passed on Windows for the wrong
+  reason. A `rust:1.98-slim-bookworm` container and
   `scripts/linux-verify.sh` now reproduce the CI environment locally, which is
   what made (3) findable. **Resolved**: commit `7a7d61d` is green — `CI` success
   and `Native targets` success with all five tier-1 jobs green, the first fully
@@ -403,15 +439,44 @@ Dependencies: all Milestone 0 exit criteria.
   through the whole pipeline, not only in the redactor's own tests. 275 workspace
   tests pass (34 new); `fmt` and `clippy -D warnings` are clean. The `Cargo.toml`
   change adds only the already-reviewed `jarvis-observability` crate, which is
-  why the dependency evidence note still applies. **Not done**: the bundle does
-  not yet summarize traces, metrics, subsystem health, runtime/plugin inventory,
-  or schema/migration state, because the model, runtime, tool, connector,
-  workflow, and voice subsystems that would produce them do not exist before
-  Milestones 2 through 8, so `ACC-078`'s "seed diagnostics across every boundary"
-  is only satisfied for the daemon, storage, configuration, and service
-  boundaries that exist today; there is no redaction self-test command, no
-  attachment path for a user-selected run, and no retention/cleanup of previously
-  exported bundles. Repair plans are `FND-014`.
+  why the dependency evidence note still applies. **A defect found by running
+  `doctor` rather than by reading it, 2026-09-22:** the `daemon` check inferred
+  reachability from the parsed **discovery file**, which outlives an unclean kill,
+  so a real report contained both `warn daemon state: jarvis.stale_discovery` and
+  `ok daemon: running (instance …)`. The two findings contradicted each other and
+  the confident-sounding one was false. Reachability is now **probed** on the
+  daemon's own unauthenticated `GET /health/live` route through a
+  `DaemonReachability` port, and the answer is three-state rather than a boolean:
+  `jarvis.daemon_live`, `jarvis.daemon_unreachable`, and `jarvis.port_conflict`,
+  which is `ACC-003`'s port fault and was previously unreportable because any
+  listener at all satisfied the check. Verified live on the built binaries: a live
+  daemon reports `ok daemon: running`, an unclearly-killed one reports
+  `jarvis.daemon_unreachable` with no contradictory `running` line, and a real
+  foreign listener holding the published port reports `jarvis.port_conflict` with
+  advice that is not the "start the daemon" text. **A second `ACC-003` fault
+  closed the same way:** the `service` check no longer stops at the registration
+  state. `jarvis_infrastructure::service::path_drift` reads the **installed** unit
+  or plist and compares it against the executable this build would register, so a
+  service that survived an update pointing at a moved binary is reported as
+  `jarvis.service_path_drift` with both paths instead of as `ok service:
+  installed`. The comparison uses canonical paths when both exist, so a symlinked
+  equivalent is not a false drift, and falls back to the literal paths when the
+  registered binary is gone — which is the fault being detected. A definition that
+  exists but cannot be read is a fault, never a match, because "unknown" must not
+  read as "fine". Detection is **systemd and launchd only**: a Windows task is
+  defined by its command line and exposed solely through `schtasks /query /xml`, so
+  there is no definition file to read, and the check reports the registration state
+  it verified rather than a path claim it did not.
+  `scripts/clean-machine-smoke.mjs` asserts the probe on every tier-1 target.
+  **Not done**: the bundle does not yet
+  summarize traces, metrics, subsystem health, runtime/plugin inventory, or
+  schema/migration state, because the model, runtime, tool, connector, workflow,
+  and voice subsystems that would produce them do not exist before Milestones 2
+  through 8, so `ACC-078`'s "seed diagnostics across every boundary" is only
+  satisfied for the daemon, storage, configuration, and service boundaries that
+  exist today; there is no redaction self-test command, no attachment path for a
+  user-selected run, and no retention/cleanup of previously exported bundles.
+  Repair plans are `FND-014`.
 - [~] `FND-014` Implement previewed and confirmed repair plans for stale locks,
   service definitions, permissions, config, and recoverable storage faults with
   backup, rollback, and verified postconditions.
@@ -453,7 +518,15 @@ Dependencies: all Milestone 0 exit criteria.
   excluded, because repairing corrupt data is a restore (`FND-006`) and a repair
   that rewrote it would be deleting user data; and because the daemon holds no
   live lock during a `repair` run the plan is not atomic against a daemon that
-  starts mid-apply (`ACC-003`'s port and service-path faults also remain).
+  starts mid-apply. `ACC-003`'s port and service-path faults are now **detected**
+  rather than open: `jarvis.port_conflict` reports a foreign listener holding the
+  published address, and the `service` check reads the installed definition and
+  reports `jarvis.service_path_drift` with both paths when it names a moved
+  executable (see `FND-013`). Neither has a repair plan, deliberately: a conflict
+  is resolved by restarting the daemon to bind a new ephemeral port and a drift by
+  reinstalling the service, and neither is a file operation this module should
+  perform on the operator's behalf. The remaining open part of `ACC-003` is the
+  *repair* for those faults, together with configuration migration.
 
 ## Milestone 2: Brain
 

@@ -20,11 +20,13 @@
 //! embedded in a unit file, plist, task command line, or service-manager
 //! environment block.
 
+pub mod drift;
 pub mod exec;
 mod launchd;
 mod systemd;
 mod windows;
 
+pub use drift::{launchd_executable, systemd_executable};
 pub use exec::{CommandOutcome, execute, run_program};
 pub use launchd::LaunchdController;
 pub use systemd::SystemdController;
@@ -350,6 +352,137 @@ pub trait ServiceController: fmt::Debug + Send + Sync {
     /// Returns [`ServiceError::FacilityUnavailable`] when this platform has no
     /// supported facility.
     fn plan_stop(&self, spec: &ServiceSpec) -> Result<ServicePlan, ServiceError>;
+
+    /// Returns the executable the **installed** definition names, if one can be read.
+    ///
+    /// This answers `ACC-003`'s service-path fault: a registered service can point
+    /// at a path that is no longer the installed daemon, in which case it reports
+    /// `installed` and starts nothing. Reading what is on disk is the only way to
+    /// see that, because the intended definition always agrees with itself.
+    ///
+    /// The three answers are deliberately distinct:
+    ///
+    /// - `Ok(Some(path))` — a definition was read and it names `path`;
+    /// - `Ok(None)` — there is no definition to read, so there is nothing to
+    ///   compare and no drift can be claimed;
+    /// - `Err(_)` — a definition exists but could not be read, which is itself a
+    ///   fault and must not be reported as "no drift".
+    ///
+    /// The default implementation reads no definition and therefore reports
+    /// `Ok(None)`, which is the honest answer for a backend whose definition
+    /// cannot be read with the current dependency set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error when a definition exists but could not be read.
+    fn installed_executable(&self, spec: &ServiceSpec) -> Result<Option<PathBuf>, ServiceError> {
+        let _ = spec;
+        Ok(None)
+    }
+}
+
+/// Whether a registered service still names the daemon executable it should.
+///
+/// `ACC-003` seeds a service-path fault: an update that moved the version
+/// directory, or a partial uninstall, leaves a registered service pointing at a
+/// binary that is gone. The service reports `installed` and starts nothing, so
+/// without this check the fault is invisible.
+///
+/// `Unreadable` is a separate answer from `NoDefinition`, and the distinction is
+/// the point: "there is nothing to compare" and "a definition exists that this
+/// build cannot read" need different operator actions, and collapsing them would
+/// report an unreadable definition as a healthy one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServicePathDrift {
+    /// No definition is installed, so there is nothing to compare.
+    NoDefinition,
+    /// The installed definition names the expected executable.
+    Matches,
+    /// The installed definition names a different executable.
+    Drifted {
+        /// The executable the installed definition names.
+        registered: PathBuf,
+        /// The executable this build would register.
+        expected: PathBuf,
+    },
+    /// A definition is installed but could not be read.
+    Unreadable {
+        /// The stable code from the read failure.
+        code: &'static str,
+    },
+}
+
+impl ServicePathDrift {
+    /// Returns the stable code used in diagnostics.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoDefinition => "jarvis.service_not_installed",
+            Self::Matches => "jarvis.service_path_ok",
+            Self::Drifted { .. } => "jarvis.service_path_drift",
+            Self::Unreadable { code } => code,
+        }
+    }
+
+    /// Returns whether the service points at the wrong executable.
+    #[must_use]
+    pub const fn is_drifted(&self) -> bool {
+        matches!(self, Self::Drifted { .. })
+    }
+}
+
+/// Compares the installed service definition against `spec`.
+///
+/// This is the whole `ACC-003` service-path check: read what is on disk, compare it
+/// to the executable this build would register, and report a drift with both paths
+/// so an operator can see which one is wrong.
+///
+/// The comparison is on the **rendered installed path**, not on the file existing.
+/// A definition file that exists is what `status` already reports, and it is
+/// precisely the case that hides this fault.
+///
+/// # Errors
+///
+/// Returns the backend's [`ServiceError`] only when a definition exists but could
+/// not be read; a missing definition is `Ok(NoDefinition)`.
+pub fn path_drift(
+    controller: &dyn ServiceController,
+    spec: &ServiceSpec,
+) -> Result<ServicePathDrift, ServiceError> {
+    spec.validate()?;
+    let Some(registered) = controller.installed_executable(spec)? else {
+        return Ok(ServicePathDrift::NoDefinition);
+    };
+    if paths_match(&registered, &spec.executable) {
+        Ok(ServicePathDrift::Matches)
+    } else {
+        Ok(ServicePathDrift::Drifted {
+            registered,
+            expected: spec.executable.clone(),
+        })
+    }
+}
+
+/// Returns whether two executable paths denote the same file.
+///
+/// Compared as canonical paths when both exist, because the same executable is
+/// routinely reached through a symlink or a different spelling — and a drift
+/// reported for an equivalent path would be a false positive, which is worse than
+/// no check at all. When canonicalization cannot be done (the registered path is
+/// gone, which is one of the faults being detected), the comparison falls back to
+/// the literal paths, so a *missing* registered binary is still reported as drift
+/// rather than silently matching.
+fn paths_match(registered: &std::path::Path, expected: &std::path::Path) -> bool {
+    if registered == expected {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(registered),
+        std::fs::canonicalize(expected),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Returns the controller for the current platform.
@@ -423,6 +556,158 @@ fn is_safe_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[cfg(test)]
+mod drift_tests {
+    //! `ACC-003`'s service-path fault, at the level the check actually runs.
+    //!
+    //! These assert the installed definition is read **from disk**, because the
+    //! fault is a definition that disagrees with what this build would write. A
+    //! test that compared the intended spec to itself would agree and prove
+    //! nothing, which is why the fixture writes a real unit file naming a
+    //! different executable.
+
+    use std::path::PathBuf;
+
+    use super::{ServiceController, ServicePathDrift, ServiceSpec, SystemdController, path_drift};
+
+    fn spec() -> ServiceSpec {
+        let executable = std::env::temp_dir()
+            .join("jarvis-drift-expected")
+            .join("jarvisd");
+        ServiceSpec::new("jarvisd", executable, "JARVIS local daemon (jarvisd)").expect("spec")
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jarvis-drift-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn no_installed_definition_is_not_a_drift() {
+        // "There is nothing to compare" and "it points at the wrong binary" need
+        // different operator actions, so they must not share an answer.
+        let controller = SystemdController::with_paths(temp_dir("absent"), "systemctl");
+        assert_eq!(
+            path_drift(&controller, &spec()).expect("no error"),
+            ServicePathDrift::NoDefinition,
+        );
+    }
+
+    #[test]
+    fn a_definition_naming_the_expected_executable_is_a_match() {
+        let dir = temp_dir("match");
+        let controller = SystemdController::with_paths(&dir, "systemctl");
+        let spec = spec();
+        let unit_path = controller.unit_path(&spec);
+        std::fs::write(
+            &unit_path,
+            format!(
+                "[Service]\nExecStart={}\n",
+                spec.executable.to_string_lossy()
+            ),
+        )
+        .expect("write unit");
+
+        assert_eq!(
+            path_drift(&controller, &spec).expect("no error"),
+            ServicePathDrift::Matches,
+        );
+    }
+
+    #[test]
+    fn a_definition_naming_a_moved_executable_is_a_drift() {
+        // The exact `ACC-003` fault: the registered service survived an update that
+        // moved the version directory, so it names a path that no longer is the
+        // installed daemon. The file still exists, so `status` reports `installed`
+        // and the fault is invisible without reading the definition.
+        let dir = temp_dir("drifted");
+        let controller = SystemdController::with_paths(&dir, "systemctl");
+        let spec = spec();
+        let unit_path = controller.unit_path(&spec);
+        std::fs::write(
+            &unit_path,
+            "[Service]\nExecStart=/old/versions/v0.1.0/bin/jarvisd\n",
+        )
+        .expect("write unit");
+
+        let drift = path_drift(&controller, &spec).expect("no error");
+        // A `match` with an `expect` rather than a `panic!`: the workspace lint
+        // policy denies `panic!` even in a test, because a panic in production
+        // code is the thing the rule exists to prevent and a test is not exempt.
+        let ServicePathDrift::Drifted {
+            registered,
+            expected,
+        } = &drift
+        else {
+            unreachable!("expected a drift, got {drift:?}")
+        };
+        // Both paths are reported: "it drifted" without saying from what to what
+        // is not actionable.
+        assert_eq!(
+            registered,
+            &PathBuf::from("/old/versions/v0.1.0/bin/jarvisd")
+        );
+        assert_eq!(expected, &spec.executable);
+        assert!(drift.is_drifted());
+        assert_eq!(drift.code(), "jarvis.service_path_drift");
+        // And the service still reports as installed, which is why this check has
+        // to exist: the existing state is not the same as the working state.
+        assert_eq!(
+            controller.status(&spec).expect("status"),
+            super::ServiceState::Installed,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_definition_is_not_reported_as_absent() {
+        // A definition that exists but cannot be read must not be answered with
+        // "no definition": that would report an unknown service as a healthy one.
+        let dir = temp_dir("unreadable");
+        let controller = SystemdController::with_paths(&dir, "systemctl");
+        let spec = spec();
+        // A directory at the unit path exists but cannot be read as a file.
+        std::fs::create_dir_all(controller.unit_path(&spec)).expect("create dir");
+
+        let error = path_drift(&controller, &spec).expect_err("must not be Ok");
+        assert_eq!(error.code(), "jarvis.service_definition_write");
+    }
+
+    #[test]
+    fn every_drift_answer_has_a_distinct_code() {
+        let answers = [
+            ServicePathDrift::NoDefinition.code(),
+            ServicePathDrift::Matches.code(),
+            ServicePathDrift::Drifted {
+                registered: PathBuf::from("/a"),
+                expected: PathBuf::from("/b"),
+            }
+            .code(),
+        ];
+        let mut unique = answers.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), answers.len(), "{answers:?}");
+    }
+}
+
+/// Exposes the systemd renderer to the drift tests.
+///
+/// The drift parser must read back what the renderer writes, and that property is
+/// only testable if both are reachable from one place. It is not `pub` outside the
+/// crate: a renderer is an implementation detail of the controller.
+#[cfg(test)]
+fn systemd_unit_for_test(spec: &ServiceSpec) -> String {
+    systemd_unit(spec)
+}
+
+/// Exposes the launchd renderer to the drift tests, for the same reason.
+#[cfg(test)]
+fn launchd_plist_for_test(spec: &ServiceSpec) -> String {
+    launchd_plist(spec)
 }
 
 /// Renders one systemd unit file for `spec`.

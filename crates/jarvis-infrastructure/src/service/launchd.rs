@@ -81,6 +81,22 @@ impl ServiceController for LaunchdController {
         Ok(ServiceState::Installed)
     }
 
+    /// Reads the executable the installed plist names.
+    ///
+    /// A plist that exists but cannot be read is reported as an error rather than
+    /// as "no definition", because the agent is registered and its content is
+    /// unknown: reporting nothing to compare would hide the drift this check is
+    /// for.
+    fn installed_executable(&self, spec: &ServiceSpec) -> Result<Option<PathBuf>, ServiceError> {
+        let path = self.plist_path(spec);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).map_err(|_| ServiceError::DefinitionWrite)?;
+        let text = String::from_utf8(bytes).map_err(|_| ServiceError::DefinitionWrite)?;
+        Ok(super::drift::launchd_executable(&text))
+    }
+
     fn plan_install(&self, spec: &ServiceSpec) -> Result<ServicePlan, ServiceError> {
         spec.validate()?;
         let plist = launchd_plist(spec);

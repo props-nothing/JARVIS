@@ -5,13 +5,116 @@
 //! produced archive. A redaction test that only calls the redactor would prove
 //! the redactor works, not that the bundle uses it.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use jarvis_observability::Redactor;
 
 use super::archive::{ZipArchive, build_stored_archive, crc32};
 use super::*;
 use crate::paths::ProfilePaths;
+
+/// A reachability probe with a fixed answer, so every branch is assertable
+/// without binding a socket.
+struct FixedReachability(DaemonLiveness);
+
+impl DaemonReachability for FixedReachability {
+    fn reachability(&self) -> Pin<Box<dyn Future<Output = DaemonLiveness> + Send + '_>> {
+        Box::pin(async move { self.0 })
+    }
+}
+
+/// Builds a diagnostics environment with no probe, which is the default for a
+/// test that does not exercise the daemon check.
+fn environment_without_probe<'a>(
+    daemon: Option<DaemonDescriptor<'a>>,
+    discovery_error: Option<&'static str>,
+) -> DiagnosticsEnvironment<'a> {
+    DiagnosticsEnvironment {
+        daemon,
+        discovery_error,
+        reachability: None,
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    }
+}
+
+/// Runs a collector future on a throwaway current-thread runtime.
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(future)
+}
+
+/// A service controller that reports a fixed state and executable, so the service
+/// check can be asserted on a host that never installs a service.
+#[derive(Debug)]
+struct StubController {
+    state: crate::service::ServiceState,
+    installed: Option<PathBuf>,
+}
+
+impl crate::service::ServiceController for StubController {
+    fn backend(&self) -> crate::service::ServiceBackend {
+        crate::service::ServiceBackend::SystemdUser
+    }
+
+    fn status(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<crate::service::ServiceState, crate::service::ServiceError> {
+        Ok(self.state)
+    }
+
+    fn plan_install(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<crate::service::ServicePlan, crate::service::ServiceError> {
+        Err(crate::service::ServiceError::FacilityUnavailable)
+    }
+
+    fn plan_uninstall(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<crate::service::ServicePlan, crate::service::ServiceError> {
+        Err(crate::service::ServiceError::FacilityUnavailable)
+    }
+
+    fn plan_start(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<crate::service::ServicePlan, crate::service::ServiceError> {
+        Err(crate::service::ServiceError::FacilityUnavailable)
+    }
+
+    fn plan_stop(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<crate::service::ServicePlan, crate::service::ServiceError> {
+        Err(crate::service::ServiceError::FacilityUnavailable)
+    }
+
+    fn installed_executable(
+        &self,
+        _spec: &crate::service::ServiceSpec,
+    ) -> Result<Option<PathBuf>, crate::service::ServiceError> {
+        Ok(self.installed.clone())
+    }
+}
+
+/// A service spec whose executable is a host-independent absolute path.
+fn service_spec() -> crate::service::ServiceSpec {
+    let executable = std::env::temp_dir()
+        .join("jarvis-doctor-service")
+        .join("jarvisd");
+    crate::service::ServiceSpec::new("jarvisd", executable, "JARVIS local daemon (jarvisd)")
+        .expect("spec")
+}
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("jarvis-fnd013-{tag}-{}", std::process::id()));
@@ -590,6 +693,7 @@ fn a_surviving_discovery_file_over_a_free_lock_is_reported_as_stale() {
     let environment = DiagnosticsEnvironment {
         daemon: None,
         discovery_error: Some("jarvis.daemon_not_running"),
+        reachability: None,
         controller: None,
         service_spec: None,
         service_spec_error: None,
@@ -628,6 +732,7 @@ fn an_idle_daemon_must_not_be_reported_as_stale() {
     let environment = DiagnosticsEnvironment {
         daemon: None,
         discovery_error: Some("jarvis.daemon_not_running"),
+        reachability: None,
         controller: None,
         service_spec: None,
         service_spec_error: None,
@@ -672,6 +777,7 @@ fn a_held_lock_is_reported_as_ok_and_is_not_repairable() {
     let environment = DiagnosticsEnvironment {
         daemon: None,
         discovery_error: Some("jarvis.daemon_not_running"),
+        reachability: None,
         controller: None,
         service_spec: None,
         service_spec_error: None,
@@ -712,6 +818,7 @@ fn the_collector_does_not_create_the_directories_it_reports_on() {
     let environment = DiagnosticsEnvironment {
         daemon: None,
         discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
         controller: None,
         service_spec: None,
         service_spec_error: None,
@@ -752,6 +859,7 @@ fn the_collector_is_pure_for_an_empty_profile_with_no_environment() {
     let environment = DiagnosticsEnvironment {
         daemon: None,
         discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
         controller: None,
         service_spec: None,
         service_spec_error: None,
@@ -769,7 +877,7 @@ fn the_collector_is_pure_for_an_empty_profile_with_no_environment() {
     assert!(report.warnings() >= 2, "{}", report.render());
     assert!(report.render().contains("daemon"));
     assert!(report.render().contains("configuration"));
-    let summary = daemon_summary(&environment);
+    let summary = runtime.block_on(daemon_summary(&environment));
     assert_eq!(summary.unavailable_code, Some("jarvis.discovery_missing"));
 }
 
@@ -784,15 +892,17 @@ fn the_daemon_summary_carries_only_safe_identifiers() {
         started_at: "2026-09-21T00:00:00Z".to_owned(),
     };
     let descriptor = DaemonDescriptor::from(&discovery);
+    let reachability = FixedReachability(DaemonLiveness::Live);
     let environment = DiagnosticsEnvironment {
         daemon: Some(descriptor),
         discovery_error: None,
+        reachability: Some(&reachability),
         controller: None,
         service_spec: None,
         service_spec_error: None,
         controller_error: None,
     };
-    let summary = daemon_summary(&environment);
+    let summary = block_on(daemon_summary(&environment));
     assert_eq!(summary.instance_id.as_deref(), Some("inst-abc"));
     assert_eq!(summary.pid, Some(7));
     let json = summary.to_json();
@@ -817,9 +927,345 @@ fn a_client_discovery_value_converts_to_the_same_descriptor() {
     assert_eq!(descriptor.api_major, crate::http::API_MAJOR);
 }
 
+#[test]
+fn a_live_daemon_is_not_reported_as_running_just_because_a_file_exists() {
+    // The defect this pins was found by *running* doctor on a profile whose daemon
+    // had been killed, not by reasoning about the code: the report contained both
+    // `warn daemon state: jarvis.stale_discovery` and
+    // `ok daemon: running (instance …)`.
+    //
+    // The stale state is right. The `daemon: running` line was wrong, because
+    // reachability was inferred from the parsed discovery file, and that file
+    // survives an unclean kill. Two findings in one report disagreed, and the more
+    // confident-sounding one was the false one.
+    let paths = jarvis_paths("probe-stale");
+    paths.ensure_directories().expect("create");
+    std::fs::write(paths.runtime_dir().join("jarvis.lock"), b"").expect("write lock");
+    let discovery = jarvis_protocol::DiscoveryFile {
+        schema_version: 1,
+        instance_id: "inst-dead".to_owned(),
+        pid: 4242,
+        base_url: "http://127.0.0.1:1".to_owned(),
+        api_major: 1,
+        started_at: "2026-09-22T00:00:00Z".to_owned(),
+    };
+    std::fs::write(
+        paths.runtime_dir().join("discovery.json"),
+        discovery.to_bytes().expect("serialize"),
+    )
+    .expect("write discovery");
+
+    let descriptor = DaemonDescriptor::from(&discovery);
+    // The probe is the authority on liveness, and it says nothing answers.
+    let reachability = FixedReachability(DaemonLiveness::NothingListening);
+    let environment = DiagnosticsEnvironment {
+        daemon: Some(descriptor),
+        discovery_error: None,
+        reachability: Some(&reachability),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+
+    let state = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon state")
+        .expect("the daemon-state check ran");
+    assert_eq!(state.message, "jarvis.stale_discovery");
+
+    let daemon = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon")
+        .expect("the daemon check ran");
+    assert_eq!(
+        daemon.severity,
+        Severity::Warning,
+        "a parsed discovery file is not a running daemon: {}",
+        daemon.message
+    );
+    assert_eq!(daemon.message, "jarvis.daemon_unreachable");
+    // The two findings must agree, which is the whole point: a report that says
+    // both "stale" and "running" is useless to an operator.
+    assert!(
+        !report.render().contains("daemon: running"),
+        "the report contradicted its own stale-state finding:\n{}",
+        report.render()
+    );
+    // And the bundle summary must not name an instance for a daemon that is gone.
+    let summary = block_on(daemon_summary(&environment));
+    assert_eq!(summary.instance_id, None);
+    assert_eq!(summary.unavailable_code, Some("jarvis.daemon_unreachable"));
+}
+
+#[test]
+fn a_live_daemon_that_answers_its_probe_is_reported_as_running() {
+    // The positive half. Without this, the check above would pass on an
+    // implementation that always reported unreachable.
+    let paths = jarvis_paths("probe-live");
+    let discovery = jarvis_protocol::DiscoveryFile {
+        schema_version: 1,
+        instance_id: "inst-live".to_owned(),
+        pid: 7,
+        base_url: "http://127.0.0.1:1234".to_owned(),
+        api_major: 1,
+        started_at: "2026-09-22T00:00:00Z".to_owned(),
+    };
+    let descriptor = DaemonDescriptor::from(&discovery);
+    let reachability = FixedReachability(DaemonLiveness::Live);
+    let environment = DiagnosticsEnvironment {
+        daemon: Some(descriptor),
+        discovery_error: None,
+        reachability: Some(&reachability),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+    let daemon = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon")
+        .expect("the daemon check ran");
+    assert_eq!(daemon.severity, Severity::Ok, "{}", daemon.message);
+    assert!(daemon.message.contains("inst-live"));
+}
+
+#[test]
+fn a_daemon_check_without_a_probe_admits_it_could_not_verify_liveness() {
+    // An unprobed run must not report `ok`. Claiming a daemon is running without
+    // probing it is exactly the false-positive this check was fixed to remove, and
+    // reporting the weaker `jarvis.daemon_unprobed` fact keeps the check honest.
+    let paths = jarvis_paths("probe-missing");
+    let discovery = jarvis_protocol::DiscoveryFile {
+        schema_version: 1,
+        instance_id: "inst-unprobed".to_owned(),
+        pid: 8,
+        base_url: "http://127.0.0.1:9".to_owned(),
+        api_major: 1,
+        started_at: "2026-09-22T00:00:00Z".to_owned(),
+    };
+    let environment = environment_without_probe(Some(DaemonDescriptor::from(&discovery)), None);
+    let report = block_on(collect(&paths, &environment));
+    let daemon = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon")
+        .expect("the daemon check ran");
+    assert_eq!(daemon.severity, Severity::Warning);
+    assert_eq!(daemon.message, "jarvis.daemon_unprobed");
+}
+
+#[test]
+fn a_foreign_listener_on_the_published_port_is_reported_as_a_conflict() {
+    // `ACC-003` seeds a port fault. Before this, that fault was unreportable: any
+    // listener at all satisfied the daemon check, so a squatter holding the
+    // published port was reported as a healthy daemon — the opposite of the truth
+    // — and the conflict had no code of its own to search for.
+    let paths = jarvis_paths("port-conflict");
+    let discovery = jarvis_protocol::DiscoveryFile {
+        schema_version: 1,
+        instance_id: "inst-squatted".to_owned(),
+        pid: 1234,
+        base_url: "http://127.0.0.1:4321".to_owned(),
+        api_major: 1,
+        started_at: "2026-09-22T00:00:00Z".to_owned(),
+    };
+    let reachability = FixedReachability(DaemonLiveness::ForeignListener);
+    let environment = DiagnosticsEnvironment {
+        daemon: Some(DaemonDescriptor::from(&discovery)),
+        discovery_error: None,
+        reachability: Some(&reachability),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+
+    let daemon = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon")
+        .expect("the daemon check ran");
+    assert_eq!(daemon.message, "jarvis.port_conflict");
+    // A warning, not an error: a squatter is not a defective profile, and doctor
+    // must not exit non-zero for a state that restarting the daemon resolves.
+    assert_eq!(daemon.severity, Severity::Warning);
+    assert!(report.is_usable());
+    // The advice must not be the "not running" one: starting the daemon again does
+    // not help while another process holds the port.
+    assert!(
+        !report
+            .render()
+            .contains("Start jarvisd, or use portable foreground mode"),
+        "a port conflict must not give the not-running advice:\n{}",
+        report.render()
+    );
+    // And the states must stay distinguishable by code, or a reader cannot tell
+    // which fault the check actually observed.
+    assert_ne!(
+        DaemonLiveness::ForeignListener.code(),
+        DaemonLiveness::NothingListening.code()
+    );
+}
+
 /// Compile-time proof that the collector's database check uses the profile.
 #[test]
 fn database_file_lives_under_the_data_directory() {
     let paths = jarvis_paths("data");
     assert!(database_file(&paths).starts_with(paths.data_dir()));
+}
+
+#[test]
+fn a_registered_service_pointing_at_a_moved_executable_is_reported_as_drift() {
+    // `ACC-003`'s service-path fault, end to end through the check an operator
+    // reads. The state is `installed`, which is exactly what makes the fault
+    // invisible without comparing the definition: the service exists, so nothing
+    // in a registration-state check is wrong.
+    let paths = jarvis_paths("service-drift");
+    let spec = service_spec();
+    let controller = StubController {
+        state: crate::service::ServiceState::Installed,
+        installed: Some(PathBuf::from("/old/versions/v0.1.0/bin/jarvisd")),
+    };
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
+        controller: Some(&controller),
+        service_spec: Some(&spec),
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+    let service = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "service")
+        .expect("the service check ran");
+
+    assert_eq!(service.severity, Severity::Warning);
+    // Both paths are in the message: "it drifted" without saying from what to what
+    // leaves an operator unable to choose between reinstalling and rolling back.
+    assert!(
+        service.message.contains("service path drift"),
+        "{}",
+        service.message
+    );
+    assert!(
+        service.message.contains("/old/versions/v0.1.0/bin/jarvisd"),
+        "{}",
+        service.message
+    );
+    assert!(
+        service.message.contains("jarvis-doctor-service"),
+        "{}",
+        service.message
+    );
+}
+
+#[test]
+fn a_registered_service_naming_the_current_executable_is_not_flagged() {
+    // The control for the check above. Without it, a check that always reported
+    // drift would pass the drift test.
+    let paths = jarvis_paths("service-ok");
+    let spec = service_spec();
+    let controller = StubController {
+        state: crate::service::ServiceState::Installed,
+        installed: Some(spec.executable.clone()),
+    };
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
+        controller: Some(&controller),
+        service_spec: Some(&spec),
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+    let service = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "service")
+        .expect("the service check ran");
+    assert_eq!(service.severity, Severity::Ok, "{}", service.message);
+    assert!(!service.message.contains("drift"), "{}", service.message);
+}
+
+#[test]
+fn an_installed_service_whose_definition_cannot_be_read_is_not_reported_as_ok() {
+    // A backend that cannot read its definition answers `NoDefinition`, and the
+    // check must not turn that into a clean bill of health: "nothing to compare"
+    // is a named gap, not a match. This is the Windows case, where the task is
+    // exposed through `schtasks /query /xml` and there is no file to read.
+    let paths = jarvis_paths("service-unreadable");
+    let spec = service_spec();
+    let controller = StubController {
+        state: crate::service::ServiceState::Installed,
+        installed: None,
+    };
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
+        controller: Some(&controller),
+        service_spec: Some(&spec),
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+    let service = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "service")
+        .expect("the service check ran");
+    // It reports the registration state, which it did verify, and no path claim.
+    assert_eq!(service.severity, Severity::Ok);
+    assert!(service.message.contains("installed"), "{}", service.message);
+    assert!(
+        !service.message.contains("path"),
+        "an unread definition must not produce a path claim: {}",
+        service.message
+    );
+}
+
+#[test]
+fn an_absent_service_is_not_compared_for_drift() {
+    // A service that was never installed has nothing to disagree with, so the
+    // check must not report drift for it.
+    let paths = jarvis_paths("service-absent");
+    let spec = service_spec();
+    let controller = StubController {
+        state: crate::service::ServiceState::NotInstalled,
+        // Even a stale executable value must not be compared when the service is
+        // not registered.
+        installed: Some(PathBuf::from("/old/bin/jarvisd")),
+    };
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.discovery_missing"),
+        reachability: None,
+        controller: Some(&controller),
+        service_spec: Some(&spec),
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let report = block_on(collect(&paths, &environment));
+    let service = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "service")
+        .expect("the service check ran");
+    assert_eq!(service.severity, Severity::Ok);
+    assert!(
+        service.message.contains("not_installed"),
+        "{}",
+        service.message
+    );
 }

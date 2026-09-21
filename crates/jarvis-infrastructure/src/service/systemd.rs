@@ -83,6 +83,22 @@ impl ServiceController for SystemdController {
         Ok(ServiceState::Installed)
     }
 
+    /// Reads the executable the installed unit names.
+    ///
+    /// A definition file exists but cannot be read is a `DefinitionWrite` error,
+    /// not "no definition": the unit is registered and its content is unknown, so
+    /// claiming there is nothing to compare would hide the fault this check exists
+    /// to find.
+    fn installed_executable(&self, spec: &ServiceSpec) -> Result<Option<PathBuf>, ServiceError> {
+        let path = self.unit_path(spec);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).map_err(|_| ServiceError::DefinitionWrite)?;
+        let text = String::from_utf8(bytes).map_err(|_| ServiceError::DefinitionWrite)?;
+        Ok(super::drift::systemd_executable(&text))
+    }
+
     fn plan_install(&self, spec: &ServiceSpec) -> Result<ServicePlan, ServiceError> {
         spec.validate()?;
         let definition = systemd_unit(spec);
