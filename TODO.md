@@ -278,8 +278,41 @@ Dependencies: all Milestone 0 exit criteria.
   installer exists yet (that is `FND-011`/`FND-012`), and real per-user service
   registration is still asserted as a plan rather than performed anywhere. Native
   service lifecycle proof remains the other half of this item.
-- [ ] `FND-011` Build native release matrix, checksums, isolated test signatures,
+- [~] `FND-011` Build native release matrix, checksums, isolated test signatures,
   SBOM, and provenance attestations. Production signing depends on `OWN-003`.
+  Evidence (PARTIAL): release authenticity now exists and is **proven to
+  falsify**. `jarvis_infrastructure::release` verifies a detached `Ed25519`
+  signature over the manifest's exact bytes and then hashes every listed
+  artifact, and `jarvis verify-release` exposes it as a consumer-side command.
+  The trust store is compiled in, so no `--key` argument exists and a
+  caller-supplied key cannot be a trust anchor; rejection distinguishes an
+  unknown key, an unsupported algorithm, an unsupported schema, a malformed
+  signature, a size mismatch, and a digest mismatch, because those need
+  different operator responses. Verified live on real binaries: a genuine
+  signed release exited `0`, a single flipped artifact byte exited `1` with
+  `jarvis.release_digest_mismatch`, a rewritten manifest body exited `1` with
+  `jarvis.release_signature_mismatch`, and a signature naming an untrusted key
+  exited `1` with `jarvis.release_key_unknown`;
+  `scripts/release-verify-smoke.mjs` asserts all of that plus **restoration**,
+  which is what makes the three refusals attributable to the tampering rather
+  than to a broken fixture. 23 release tests plus 13 CLI tests pass, and the
+  artifact-name check refuses traversal, absolute paths, drive/ADS colons, and
+  dotfiles before any filesystem access. New evidence note
+  `docs/research/integrations/release-signing.md` reviews `ed25519-dalek
+  =3.0.0`, whose BSD-3-Clause license was read from upstream and whose MSRV
+  (`1.85`) is below the workspace `1.98.1`; the enabled feature set is exactly
+  `zeroize`, with `rand_core` deliberately excluded so there is no second
+  entropy path beside the existing `getrandom` use. **PARTIAL**: no SBOM is
+  generated, no provenance attestation is produced, no artifact is published,
+  and no production identity exists. All of that is `OWN-003`/`OWN-004`, and the
+  only key in the repository is the committed **non-production** test key, whose
+  use is disclosed on every `verify-release` run and whose CI build identity is
+  prefixed `non-production-test/`. The signed format also cannot detect a
+  validly-signed-but-superseded release being replayed, because rollback defense
+  needs versioned metadata (TUF-style) and belongs with `FND-012`'s update
+  channel. Native execution of the journey on the five tier-1 lanes is wired
+  into `Native targets` but its result is unreadable from the authoring host
+  (private repository, no token), so it stays `UNVERIFIED`.
 - [ ] `FND-012` Implement install, update, rollback, portable mode, and uninstall
   tests that preserve user data unless explicitly removed. Public promotion
   depends on `OWN-001` through `OWN-005`.
@@ -492,6 +525,15 @@ credentials where MCP is used.
   add a versioned adapter or record a reasoned rejection. Do not adopt framework
   tool, MCP, task, handoff, or fallback features as JARVIS implementations; they
   remain proposals validated against the canonical tool fabric.
+- [ ] `RTM-010` Decide the realtime media platform question on the same
+  runtime-adopter axis but as a **separate decision**: assess whether the
+  candidate transport can be adopted as an external runtime and/or a replaceable
+  media adapter with scoped grants and adapter-state separation from canonical
+  session state, verify its self-hosting prerequisites, and either add a
+  versioned adapter or record a reasoned rejection. This must not be merged with
+  `RTM-009`: [ADR-0011](docs/adr/0011-realtime-media-session-boundary.md)
+  records that the transport decision and the agent-framework decision are
+  separate decisions on separate axes.
 
 ## Milestone 8: Voice
 
@@ -548,6 +590,30 @@ through 6 satisfy the contracts consumed by the desktop client.
 - [ ] `UI-009` Implement a device-bound mobile approval surface with step-up,
   notification expiry, revocation, and the same exact-action contract as CLI,
   API, and desktop.
+- [ ] `MED-001` Define and version the media session contract: session identity,
+  lifecycle states, participant and track records, grants, capture state,
+  recording state, and terminal reconciliation, with the adapter's room/channel
+  name never entering JARVIS state.
+- [ ] `MED-002` Implement workspace-scoped session admission with JARVIS-issued
+  credentials bound to principal, workspace, session, expiry, and role;
+  track-granularity grants; and grant checks repeated at publication rather than
+  only at admission. Transport-native permissions are defense in depth, never
+  JARVIS authorization.
+- [ ] `MED-003` Implement per-session capture consent: microphone, camera, screen,
+  and screen-audio capture off by default, enabled only by an explicit visible
+  user action, revocable immediately and recorded on the session, with platform
+  capture limitations stated rather than hidden.
+- [ ] `MED-004` Mediate the media data plane as policy input: text and byte
+  streams, data tracks, participant attributes, and participant-to-participant
+  method calls reach the canonical tool path only by producing a
+  policy-evaluated intent, with schema-validated arguments and a fixed,
+  non-extensible method set.
+- [ ] `MED-005` Implement a provider-neutral media adapter behind the runtime
+  protocol with scoped grants, adapter state kept separate from canonical session
+  state, per-stage observability (transport connect, capture, perception,
+  context, model, tool wait, first output; dropped frames, reconnects, denied
+  grants, rejected messages), and removal of the adapter without loss of
+  canonical session records, policy, tools, or CLI function.
 
 ## Milestone 10: Production Hardening
 

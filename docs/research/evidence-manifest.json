@@ -58,6 +58,21 @@
       "implementation_paths": [".github/workflows/**", "scripts/clean-machine-smoke.mjs"]
     },
     {
+      "id": "release-signing",
+      "todos": ["FND-011"],
+      "evidence": "docs/research/integrations/release-signing.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-21",
+      "revalidate_by": "2027-03-20",
+      "implementation_paths": [
+        "crates/jarvis-infrastructure/src/release/**",
+        "crates/jarvis-infrastructure/examples/make_test_release.rs",
+        "crates/jarvis-infrastructure/examples/gen_test_key.rs",
+        "scripts/release-verify-smoke.mjs"
+      ]
+    },
+    {
       "id": "mcp",
       "todos": ["TLS-008", "TLS-009", "TLS-010"],
       "evidence": "docs/research/integrations/mcp.md",

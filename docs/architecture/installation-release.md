@@ -42,6 +42,40 @@ Release artifacts include:
 Build on matching native CI where signing, packaging, OS integration, or desktop
 dependencies make cross-compilation unreliable.
 
+### Implemented verification subset (Milestone 1)
+
+The part of this section that can exist before packaging, publishing, and
+production signing identities (`FND-011`):
+
+- A release manifest (`schema_version 1`) records the version, channel, target,
+  API major, minimum data version, build identity, publication instant, and each
+  artifact's file name, digest, and size, with unknown fields refused.
+- Authenticity is a detached `Ed25519` signature over the manifest document's
+  **exact bytes**, stored as a `manifest.json.sig` sidecar. A sidecar is used
+  because a signature cannot cover the document that contains it, and the raw
+  bytes are signed so signer and verifier cannot disagree about canonicalization.
+- `jarvis verify-release` performs the consumer-side check: it verifies the
+  signature against a **compiled-in trust store** and then hashes every listed
+  artifact. There is no `--key` option, because a key the caller supplies proves
+  only that the caller and the signer agreed; it is not a trust decision.
+- Rejection is specific rather than generic: an unknown key, an unsupported
+  algorithm, an unsupported schema, a malformed signature, a size mismatch, and a
+  digest mismatch are separate codes with separate operator responses. Editing a
+  signed document fails the signature before the schema check, which is the
+  correct order.
+- An artifact *name* is untrusted input that becomes a filesystem path, so it must
+  be a plain file name: traversal, absolute paths, drive or alternate-data-stream
+  colons, and dotfiles are refused before any access.
+
+Not implemented, and therefore not claimed: SBOM generation, provenance
+attestation, any publication path, and production signing identities or custody,
+which `OWN-003` and `OWN-004` own. Because the format is a single detached
+signature it also cannot detect a validly-signed-but-superseded release being
+replayed; rollback defense needs versioned metadata (TUF-style) and belongs with
+the update channel. Until production identities exist, the compiled-in store
+contains only a committed **non-production test key**, every `verify-release` run
+says so, and any test-signed build identity is prefixed `non-production-test/`.
+
 ## Installation Methods
 
 Offer in order of platform convention and security:

@@ -15,6 +15,7 @@ pub mod ids;
 pub mod lifecycle;
 pub mod paths;
 pub mod profile;
+pub mod release;
 pub mod service;
 pub mod storage;
 pub mod time;

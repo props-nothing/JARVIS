@@ -115,6 +115,21 @@ jobs:
           set -euo pipefail
           node scripts/clean-machine-smoke.mjs target/release
 
+      # Consumer-side release verification (`FND-011`). This builds a test-key
+      # signed manifest over the release binaries and then REQUIRES `jarvis
+      # verify-release` to refuse a single flipped artifact byte, a rewritten
+      # manifest body, and a signature naming an untrusted key. The failures are
+      # the point: a verifier that accepted everything would pass a
+      # verify-a-good-release check. Nothing here is published or signed with a
+      # production identity, which is `OWN-003`.
+      - name: Run the release verification journey
+        shell: bash
+        env:
+          JARVIS_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          node scripts/release-verify-smoke.mjs target/release
+
       # Provenance for the evidence note: the exact versions a reviewer can
       # reproduce against.
       - name: Record toolchain and target facts

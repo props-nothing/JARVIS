@@ -85,6 +85,37 @@ administrators with UAC disabled on Windows and have passwordless `sudo` on Unix
 so a real registration would both mutate runner logon state and risk passing
 under privileges a real user does not have.
 
+## The Release Verification Journey
+
+`scripts/release-verify-smoke.mjs` proves the consumer side of `FND-011`: that a
+release a user downloads is the release that was signed, and that a modified byte
+is refused. It uses only the two built binaries, the committed
+**non-production test key**, and a temporary directory. It publishes nothing.
+
+1. stage the built binaries as a release directory under their release names;
+2. build and sign a manifest over their real digests with the test key;
+3. require `jarvis verify-release` to **succeed** and to disclose the test key;
+4. flip one artifact byte and require it to **fail** with
+   `jarvis.release_digest_mismatch`;
+5. rewrite a digest in the manifest body and require it to **fail** with
+   `jarvis.release_signature_mismatch`;
+6. present a signature naming an untrusted key and require it to **fail** with
+   `jarvis.release_key_unknown`;
+7. restore the genuine bytes and require success again.
+
+Step 7 is what makes the three refusals credible. Without it, a journey whose
+fixture never verified in the first place would report the same failures and look
+like a pass. A verifier that accepted everything would satisfy a
+verify-a-good-release check, which is why every step after the first requires a
+failure rather than a success.
+
+**No production identity is involved, and none exists** (`OWN-003`). The signing
+key is committed, has no trust outside the built-in store, and signs only
+artifacts whose build identity is prefixed `non-production-test/`. A workflow
+that ever handles production signing or publication must pin its actions by full
+commit SHA rather than the mutable major tags the read-only lanes use; see the
+[release signing evidence note](../research/integrations/release-signing.md).
+
 ## Running The Gates Locally
 
 ```bash
@@ -95,6 +126,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo build -p jarvisd -p jarvis-cli
 node scripts/clean-machine-smoke.mjs target/debug
+node scripts/release-verify-smoke.mjs target/debug
 ```
 
 The changed-path gate applies when a change touches an external integration path:

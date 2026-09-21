@@ -13,6 +13,7 @@ jarvis-protocol.workspace = true
 
 axum.workspace = true
 directories.workspace = true
+ed25519-dalek.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 log.workspace = true

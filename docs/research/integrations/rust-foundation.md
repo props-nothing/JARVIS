@@ -710,7 +710,7 @@ noticed (`CI-C014`).
 | `RF-C009` | Config replacement retains either old or new valid content after a crash | INFERRED | Rust rename and ReplaceFileW docs | Fault test yields absent/partial active config |
 | `RF-C010` | Native secret stores never require plaintext fallback | PARTIAL: no keyring adapter yet; `FND-007` uses a documented owner-only file (see the deviation) | keyring and OS store docs | A *silent* fallback that downgrades after a store failure |
 | `RF-C011` | A 32-byte OS-random credential verifier can be stored as SHA-256 only | INFERRED | getrandom/SHA-2 plus entropy argument | Threat review finds a feasible offline recovery path |
-| `RF-C012` | Secret canaries do not appear in any operator-visible sink | PARTIAL: `FND-005` verifies the file log sink; errors, diagnostics, and support bundles pending | Redaction plan | Seeded sink scan finds a canary |
+| `RF-C012` | Secret canaries do not appear in any operator-visible sink | PARTIAL: `FND-005` verifies the file log sink and `FND-013` verifies the support-bundle archive; error text and console sinks still pending | Redaction plan | Seeded sink scan finds a canary |
 | `RF-C013` | All three OS service facilities install and remove without elevation | DOCUMENTED, native proof pending | OS service docs | Clean-user test prompts or fails for privilege |
 | `RF-C014` | Graceful shutdown drains or records every admitted operation | UNVERIFIED until implementation | Tokio/Axum contracts | Kill/race test loses an admitted operation |
 | `RF-C015` | Backup/restore rejects corrupt or FK-invalid snapshots | DOCUMENTED, native proof pending | SQLite backup/integrity docs | Corrupt fixture activates |
@@ -834,7 +834,12 @@ cancel-safe under a real race.
 - [x] Retry and failure classes recorded.
 - [x] Secret placement and redaction requirements recorded.
 - [ ] Native service operator commands and repair runbooks implemented.
-- [ ] Bounded diagnostics and support-bundle preview implemented.
+- [x] Bounded diagnostics and support-bundle preview implemented (`FND-013`),
+  with previewed repair (`FND-014`). The bundle is preview-first, redaction is
+  proven by a secret canary over the exported bytes, and both were verified live
+  on real binaries. Still missing from a *complete* bundle: trace/metric/health
+  summaries, runtime/plugin inventory, and schema-migration state, which need
+  the Milestone 2-8 subsystems.
 - [ ] Migration, backup, restore, rollback, and uninstall exercised from
   packaged artifacts.
 - [ ] Public signing, release, update, and legal gates resolved by the owner.

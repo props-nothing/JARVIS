@@ -2,7 +2,7 @@
 
 Status: ACCEPTED
 Last updated: 2026-09-21
-Current milestone: Milestone 1 - Installable Foundation (`FND-014` partial, `FND-011` next; `FND-003`, `FND-009`, `FND-010` partial)
+Current milestone: Milestone 1 - Installable Foundation (`FND-011` partial, `FND-012` next; `FND-003`, `FND-009`, `FND-010`, `FND-013`, `FND-014` partial)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.

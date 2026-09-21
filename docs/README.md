@@ -90,6 +90,7 @@ documents.
 - [Upstream project study](research/upstream-projects.md)
 - [Rust Foundation evidence](research/integrations/rust-foundation.md)
 - [GitHub Actions CI evidence](research/integrations/github-actions.md)
+- [Release signing and verification evidence](research/integrations/release-signing.md)
 - [MCP evidence](research/integrations/mcp.md)
 - [ElevenLabs evidence](research/integrations/elevenlabs.md)
 - [Twilio telephony evidence](research/integrations/telephony-twilio.md)

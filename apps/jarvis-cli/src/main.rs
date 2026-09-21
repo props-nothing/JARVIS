@@ -20,6 +20,10 @@ use jarvis_infrastructure::diagnostics::{
     collect, daemon_summary, export_bundle, plan_bundle, plans_for, unrepairable,
 };
 use jarvis_infrastructure::paths::ProfilePaths;
+use jarvis_infrastructure::release::{
+    MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, ReleaseError, TEST_KEY_ID, TrustStore,
+    default_signature_path, read_bounded as read_release_file, verify_artifacts,
+};
 use jarvis_infrastructure::service::{
     DEFAULT_SERVICE_NAME, ServiceError, ServiceSpec, ServiceState, current_controller,
 };
@@ -79,6 +83,23 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Verify a signed release manifest and the artifacts it lists.
+    ///
+    /// This is a consumer-side check: it uses the trust store compiled into this
+    /// binary and never accepts a signing key as an argument, because a key the
+    /// caller supplies proves nothing.
+    VerifyRelease {
+        /// The release manifest to verify.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// The detached signature. Defaults to `<manifest>.sig`.
+        #[arg(long, value_name = "FILE")]
+        signature: Option<PathBuf>,
+        /// The directory holding the listed artifacts. Defaults to the
+        /// manifest's own directory.
+        #[arg(long, value_name = "DIR")]
+        artifacts: Option<PathBuf>,
+    },
 }
 
 /// Registration changes a caller can request explicitly.
@@ -135,6 +156,11 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Doctor => doctor(paths).await,
         Command::SupportBundle { output, exclude } => support_bundle(paths, output, exclude).await,
         Command::Repair { confirm } => repair(paths, confirm).await,
+        Command::VerifyRelease {
+            manifest,
+            signature,
+            artifacts,
+        } => verify_release(&manifest, signature, artifacts),
     }
 }
 
@@ -519,6 +545,109 @@ fn environment_summary(paths: &ProfilePaths) -> EnvironmentSummary {
     EnvironmentSummary::current(paths.mode().token(), API_MAJOR)
 }
 
+/// Verifies a signed release manifest and the artifacts it lists.
+///
+/// This command is the consumer half of `FND-011`. It answers one question the
+/// user actually has: *will the bytes I am about to run be the bytes that were
+/// released?* It performs two checks, and both are required.
+///
+/// 1. The manifest signature is verified against the **trust store compiled into
+///    this binary**. No `--key` argument exists, and that is deliberate: a
+///    verification against a key the caller supplies proves only that the caller
+///    and the signer agreed, not that JARVIS's maintainers signed anything.
+/// 2. Every listed artifact is hashed and compared. A valid manifest with an
+///    altered payload is exactly the case a signature-only check misses.
+///
+/// The report is printed even on failure, because the *reason* is the actionable
+/// part: an unknown key, a schema from the future, and a tampered byte all need
+/// different operator responses and must never collapse into "verification
+/// failed".
+fn verify_release(
+    manifest: &Path,
+    signature: Option<PathBuf>,
+    artifacts: Option<PathBuf>,
+) -> ExitCode {
+    let signature = signature.unwrap_or_else(|| default_signature_path(manifest));
+    let directory = artifacts.unwrap_or_else(|| {
+        manifest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    });
+
+    println!("manifest:   {}", manifest.display());
+    println!("signature:  {}", signature.display());
+    println!("artifacts:  {}", directory.display());
+
+    // The trust store is compiled in and printed, so a verification that used the
+    // non-production test key is visibly different from a production one. A test
+    // key must never be mistaken for a production guarantee.
+    let store = TrustStore::builtin();
+    let test_only = store.contains(TEST_KEY_ID);
+    println!("trust:      {} key(s)", store.len());
+    if test_only {
+        println!("warning:    this build trusts only the NON-PRODUCTION test key");
+        println!("            ({TEST_KEY_ID}); a pass is not a production guarantee");
+    }
+
+    let manifest_bytes =
+        match read_release_file(manifest, MAX_MANIFEST_BYTES, ReleaseError::ManifestTooLarge) {
+            Ok(bytes) => bytes,
+            Err(error) => return report_release_error(&error),
+        };
+    let signature_bytes = match read_release_file(
+        &signature,
+        MAX_SIGNATURE_BYTES,
+        ReleaseError::SignatureTooLarge,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => return report_release_error(&error),
+    };
+
+    let verified = match store.verify_manifest(&manifest_bytes, &signature_bytes) {
+        Ok(verified) => verified,
+        Err(error) => return report_release_error(&error),
+    };
+
+    println!("verified:   signature and manifest shape");
+    println!("version:    {}", verified.version);
+    println!("channel:    {}", verified.channel);
+    println!("target:     {}", verified.target);
+    println!("build:      {}", verified.build);
+    println!("published:  {}", verified.published_at);
+    println!("artifacts:  {}\n", verified.artifacts.len());
+
+    let verified_artifacts = match verify_artifacts(&verified, &directory) {
+        Ok(verified_artifacts) => verified_artifacts,
+        Err(error) => return report_release_error(&error),
+    };
+
+    for artifact in &verified_artifacts {
+        println!(
+            "  ok  {} ({}, {} bytes)",
+            artifact.file, artifact.target, artifact.size
+        );
+    }
+    println!(
+        "\nverified {} artifact(s); every listed byte matches its signed digest",
+        verified_artifacts.len()
+    );
+    ExitCode::from(EXIT_OK)
+}
+
+/// Reports a release verification failure with its code and the reason.
+///
+/// The code and the error both come from the library, so the CLI cannot invent a
+/// cause the verification did not actually observe.
+fn report_release_error(error: &ReleaseError) -> ExitCode {
+    eprintln!("error:  {}", error.code());
+    eprintln!("reason: {error}");
+    if !error.retryable() {
+        eprintln!("note:   this is deterministic; retrying the same bytes will not change it");
+    }
+    ExitCode::from(EXIT_ATTENTION)
+}
+
 /// Previews a repair plan, or applies it after explicit confirmation.
 ///
 /// The preview is the default and the only thing a bare invocation does, because
@@ -627,6 +756,10 @@ mod tests {
             (vec!["jarvis", "doctor"], "doctor"),
             (vec!["jarvis", "support-bundle"], "support-bundle"),
             (vec!["jarvis", "repair"], "repair"),
+            (
+                vec!["jarvis", "verify-release", "--manifest", "m.json"],
+                "verify-release",
+            ),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -637,8 +770,52 @@ mod tests {
                 Command::Doctor => "doctor",
                 Command::SupportBundle { .. } => "support-bundle",
                 Command::Repair { .. } => "repair",
+                Command::VerifyRelease { .. } => "verify-release",
             };
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn verify_release_requires_a_manifest_and_accepts_no_signing_key() {
+        // A manifest is required: a bare `verify-release` has nothing to check.
+        assert!(Cli::try_parse_from(["jarvis", "verify-release"]).is_err());
+
+        // The important property: there is no `--key` option. A verification
+        // against a key the caller supplies proves only that the caller and the
+        // signer agreed, which is not a trust decision. Offering the flag at all
+        // would invite treating it as one.
+        for spelling in ["--key", "--public-key", "--trust"] {
+            assert!(
+                Cli::try_parse_from([
+                    "jarvis",
+                    "verify-release",
+                    "--manifest",
+                    "m.json",
+                    spelling,
+                    "k"
+                ])
+                .is_err(),
+                "{spelling} must not be accepted",
+            );
+        }
+
+        // The optional paths default to the manifest's own location and its
+        // `.sig` sidecar rather than to nothing, so the common invocation is one
+        // argument.
+        let cli = Cli::try_parse_from(["jarvis", "verify-release", "--manifest", "rel/m.json"])
+            .expect("parses");
+        match cli.command {
+            Command::VerifyRelease {
+                manifest,
+                signature,
+                artifacts,
+            } => {
+                assert_eq!(manifest, std::path::PathBuf::from("rel/m.json"));
+                assert!(signature.is_none(), "the sidecar is the default");
+                assert!(artifacts.is_none(), "the manifest directory is the default");
+            }
+            _ => unreachable!("verify-release must parse to its own variant"),
         }
     }
 
@@ -731,7 +908,8 @@ mod tests {
                     | Command::Logs
                     | Command::Doctor
                     | Command::SupportBundle { .. }
-                    | Command::Repair { .. } => String::from("unexpected"),
+                    | Command::Repair { .. }
+                    | Command::VerifyRelease { .. } => String::from("unexpected"),
                 }
             })
             .collect();

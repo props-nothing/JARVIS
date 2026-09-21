@@ -95,6 +95,7 @@ const REQUIRED_FILES = [
   "docs/research/integrations/elevenlabs.md",
   "docs/research/integrations/github-actions.md",
   "docs/research/integrations/mcp.md",
+  "docs/research/integrations/release-signing.md",
   "docs/research/integrations/rust-foundation.md",
   "docs/research/integrations/tauri.md",
   "docs/research/source-registry.md",
