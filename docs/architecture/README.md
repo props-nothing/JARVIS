@@ -21,6 +21,7 @@ together.
 - [Connector platform](connector-platform.md)
 - [API and protocol surfaces](api-protocols.md)
 - [Voice and telephony](voice-telephony.md)
+- [Realtime media sessions](realtime-media.md)
 - [Security architecture](security.md)
 - [Observability and diagnostics](observability.md)
 - [Installation and releases](installation-release.md)

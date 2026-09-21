@@ -21,6 +21,7 @@ documents.
 - [Connector platform](architecture/connector-platform.md)
 - [API and protocol surfaces](architecture/api-protocols.md)
 - [Voice and telephony](architecture/voice-telephony.md)
+- [Realtime media sessions](architecture/realtime-media.md)
 - [Security architecture](architecture/security.md)
 - [Observability and diagnostics](architecture/observability.md)
 - [Installation and releases](architecture/installation-release.md)
@@ -43,6 +44,7 @@ documents.
 - [Event envelope](contracts/event-envelope.md)
 - [Connector manifest](contracts/connector-manifest.md)
 - [Provider-neutral voice call](contracts/voice-call.md)
+- [Provider-neutral media session](contracts/media-session.md)
 - [ElevenLabs compatibility edge](contracts/elevenlabs-edge.md)
 
 ## Data

@@ -67,6 +67,12 @@ verification itself rather than a product wire or persistence contract.
 | `FR-VOI-006` | [Voice/telephony](../architecture/voice-telephony.md) | [Voice call](../contracts/voice-call.md), [ElevenLabs edge](../contracts/elevenlabs-edge.md) | 8 | `VOI-001`, `VOI-007`, `VOI-009`, `VOI-011` | `ACC-060`, `ACC-062` through `ACC-067` |
 | `FR-VOI-007` | [Voice/telephony](../architecture/voice-telephony.md) | [Voice call](../contracts/voice-call.md), [Twilio telephony](../research/integrations/telephony-twilio.md) | 8 | `VOI-001`, `VOI-013` | `ACC-069` |
 | `FR-VOI-008` | [Voice/telephony](../architecture/voice-telephony.md) | [Twilio telephony](../research/integrations/telephony-twilio.md) | 8 | `VOI-012` | `ACC-069` |
+| `FR-MED-001` | [Realtime media](../architecture/realtime-media.md) | [Media session](../contracts/media-session.md) | 9 | `MED-001`, `MED-002` | `ACC-083` |
+| `FR-MED-002` | [Realtime media](../architecture/realtime-media.md), [tool fabric](../architecture/tool-fabric.md) | [Media session](../contracts/media-session.md), [tool](../contracts/tool-contract.md) | 9 | `MED-004` | `ACC-082` |
+| `FR-MED-003` | [Realtime media](../architecture/realtime-media.md), [security](../architecture/security.md) | [Media session](../contracts/media-session.md) | 9 | `MED-003` | `ACC-082` |
+| `FR-MED-004` | [Realtime media](../architecture/realtime-media.md), [identity](../architecture/identity-workspaces.md) | [Media session](../contracts/media-session.md) | 9 | `MED-002` | `ACC-080` |
+| `FR-MED-005` | [Realtime media](../architecture/realtime-media.md), [tool fabric](../architecture/tool-fabric.md) | [Media session](../contracts/media-session.md), [tool](../contracts/tool-contract.md) | 9 | `MED-004` | `ACC-081` |
+| `FR-MED-006` | [Realtime media](../architecture/realtime-media.md), [agent runtime](../architecture/agent-runtime.md) | [Runtime protocol](../contracts/runtime-protocol.md) | 9 | `MED-005`, `RTM-010` | `ACC-083` |
 | `FR-OPS-001` | [Installation/releases](../architecture/installation-release.md) | [Local API](../contracts/local-control-api.md) | 1/9 | `FND-010`, `FND-011`, `UI-007` | `ACC-001`, `ACC-072` |
 | `FR-OPS-002` | [Installation/releases](../architecture/installation-release.md), [migrations](../data/migrations.md) | [Local API](../contracts/local-control-api.md) | 1 | `FND-006`, `FND-012`, `FND-014` | `ACC-003` through `ACC-005`, `ACC-009`, `ACC-072` |
 | `FR-OPS-003` | [Process topology](../architecture/process-topology.md) | [Local API](../contracts/local-control-api.md) | 1/10 | `FND-007`, `FND-009`, `FND-012`, `PRD-003`, `PRD-008` | `ACC-001`, `ACC-006`, `ACC-008` |
@@ -90,6 +96,7 @@ verification itself rather than a product wire or persistence contract.
 | `NFR-TEST-001` | [Testing strategy](../testing/strategy.md), [research policy](../research/integration-research-policy.md) | N/A - verification policy | All | `DOC-015` and every implementation TODO | `ACC-074` plus every applicable `ACC-*`; provider behavior also requires gated live tests |
 | `NFR-VOI-001` | [Voice/telephony](../architecture/voice-telephony.md), [observability](../architecture/observability.md) | [Voice call](../contracts/voice-call.md), [Twilio telephony](../research/integrations/telephony-twilio.md) | 8 | `VOI-001`, `VOI-011`, `VOI-014` | `ACC-068` |
 | `NFR-VOI-002` | [Model gateway](../architecture/model-gateway.md), [voice](../architecture/voice-telephony.md) | [Model stream](../contracts/model-stream.md) | 2/8 | `BRN-011`, `VOI-014` | `ACC-068` |
+| `NFR-MED-001` | [Realtime media](../architecture/realtime-media.md), [observability](../architecture/observability.md) | [Media session](../contracts/media-session.md) | 9 | `MED-002`, `MED-005` | `ACC-083` |
 
 ## Maintenance Rule
 

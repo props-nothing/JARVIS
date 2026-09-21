@@ -22,6 +22,7 @@ release is blocked until the owning source is corrected.
 - [Event envelope](event-envelope.md)
 - [Connector manifest](connector-manifest.md)
 - [Provider-neutral voice call](voice-call.md)
+- [Provider-neutral media session](media-session.md)
 - [ElevenLabs compatibility edge](elevenlabs-edge.md)
 
 ## Contract Lifecycle

@@ -36,6 +36,9 @@ maintainers are assigned.
 | `R-025` | Promoted voice research is mistaken for measured evidence, so a latency or capability claim is cited from a note after the raw capture it came from is deleted | Medium | High | Promoted notes label each claim with its provenance and re-measure in `ACC-068`; keep only runnable harnesses out of the repository and re-capture before citing an `OBSERVED` value | Research/architecture |
 | `R-026` | A voice-agent framework's tools, MCP wiring, or state become a second control plane | Medium | Critical | Runtime adapter with scoped grants, canonical tool validation, ADR-0005/0007 review before adoption | Runtime/architecture |
 | `R-027` | Model "streaming" is treated as a boolean, so a streamed voice pipeline silently degrades to full-generation latency | Medium | High | Measure time-to-first-token **and** token spread per model; treat an unmeasured streaming claim as `UNVERIFIED` | Models/voice |
+| `R-028` | A transport's own permission model, participant attribute, or room metadata is mistaken for JARVIS authorization, letting a peer widen its own scope | Medium | Critical | Track-granular grants re-checked at publication; transport permissions and attributes recorded as observations only; `ACC-080` | Media/security |
+| `R-029` | A realtime transport's peer-to-peer method call becomes an unmediated tool path, giving an untrusted participant a function-call primitive with no policy | Medium | Critical | Fixed JARVIS method set, schema-validated arguments, canonical policy path, bounded payload and timeout, `ACC-081` | Media/tools |
+| `R-030` | A realtime transport is adopted because its agent features are attractive, so a vendor control plane enters through the transport decision | Medium | Critical | Two-axis rule in ADR-0011; transport and framework decided separately under `RTM-009`/`RTM-010`; canonical session state only | Architecture/media |
 
 ## Escalation Rules
 

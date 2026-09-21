@@ -18,6 +18,11 @@ Implementation gate: NOT READY
   2. **The `livekit` Rust crate** is a realtime client/server SDK. It is an
      alternative *transport* that a Rust daemon could use without adopting the
      Python framework at all.
+  3. **Realtime media state is a third decision.** Rooms, participants, tracks,
+     capture, and the data plane are governed by
+     [the media session contract](../../contracts/media-session.md) and
+     [ADR-0011](../../adr/0011-realtime-media-session-boundary.md); the transport
+     is replaceable and its state is not canonical.
 - Proposed version: none pinned. `@livekit/agents` 1.9.0 was exercised in a spike;
   the Rust crates were read but not built here.
 - Supported deployment modes: LiveKit Cloud for the agent server and SIP service,
@@ -76,6 +81,14 @@ read:
 | Rust SDK repository | https://github.com/livekit/rust-sdks | Current | 2026-09-21 | `livekit`, `livekit-api`, `livekit-protocol`, `livekit-token`; Apache-2.0 |
 | Node agents repository | https://github.com/livekit/agents-js | Current | 2026-09-21 | The Node framework exercised in the spike |
 | Python agents repository | https://github.com/livekit/agents | Current | 2026-09-21 | The primary framework |
+| Transport section index | https://docs.livekit.io/transport/llms.txt | 59 pages, rendered 2026-09-21 | 2026-09-21 | Every transport page: media, data, encryption, egress/ingress, self-hosting |
+| Core concepts | https://docs.livekit.io/intro/basics/rooms-participants-tracks | Current | 2026-09-21 | Room, participant, and track model; a screen share is a published video track |
+| Data overview | https://docs.livekit.io/transport/data | Current | 2026-09-21 | Text streams, byte streams, RPC, data tracks, data packets, state sync, and their delivery patterns |
+| Remote procedure calls | https://docs.livekit.io/transport/data/rpc | Current | 2026-09-21 | Peer-to-peer method calls, 15KiB payload limit, 10s default timeout, error codes, hidden participants excluded |
+| Sending text | https://docs.livekit.io/transport/data/text-streams | Current | 2026-09-21 | Topics, per-stream ordering, no server-side persistence, joining mid-stream receives nothing |
+| Screen sharing | https://docs.livekit.io/transport/media/screenshare | Current | 2026-09-21 | Screen published as a video track; tab-audio capture is browser-dependent |
+| Webhooks and events | https://docs.livekit.io/intro/basics/rooms-participants-tracks/webhooks-events | Current | 2026-09-21 | JWT-signed webhook over a sha256 of the payload, no delivery guarantee, sequenced retries, signal vs media connection phases, connection quality |
+| Distributed self-hosting | https://docs.livekit.io/transport/self-hosting/distributed | Current | 2026-09-21 | Redis is required as shared data store and message bus for distributed mode |
 
 Attempted `llms.txt` URLs that did not exist:
 
@@ -93,6 +106,8 @@ Attempted `llms.txt` URLs that did not exist:
 | `livekit-api` (Rust server API) | Not pinned | Current | DOCUMENTED; SIP grants, participant creation, agent dispatch |
 | LiveKit SIP | Cloud or self-hosted service | Current | UNVERIFIED in JARVIS |
 | LiveKit Inference | Not adopted | ElevenLabs retired from the bundle on 2026-08-31 | DOCUMENTED; use your own provider accounts |
+| Realtime transport (rooms, tracks, data) | Not pinned | Current | DOCUMENTED; rooms, participants, tracks, text/byte streams, RPC, data tracks, state sync, E2EE |
+| Self-hosted server (single node) | Not pinned | Current | DOCUMENTED; local mode needs no Redis, distributed mode does |
 
 ## Contract
 
@@ -256,6 +271,11 @@ ADR-0007 forbids.
 | Agent dispatch | Runtime invocation | Map to a JARVIS run; not a run identity |
 | Agent server job | Runtime worker lifecycle | Supervisor-managed, isolated |
 | Session/task state | Runtime checkpoint | Never canonical JARVIS state |
+| Room metadata / participant attributes | Untrusted broadcast observation | Never authorization, a workspace selector, or a secret store |
+| Track (audio, video, screen, data) | Media stream subject to a JARVIS grant | Grant recorded on the track and re-checked at publication |
+| RPC method | Provider-shaped function call between peers | Fixed JARVIS method set, schema-validated, canonical policy path |
+| Text or byte stream | Bounded untrusted message | Never a tool invocation; history is JARVIS-owned |
+| Signal vs media connection | Two distinct session phases | A signalled participant is not one that can carry media |
 
 Do not expose framework or SDK types in JARVIS domain contracts.
 
@@ -272,6 +292,12 @@ Do not expose framework or SDK types in JARVIS domain contracts.
 | `LK-C007` | The Rust realtime crate can be adopted without a development runtime on the target machine | `UNVERIFIED` | Crate documentation notes libwebrtc and `rustflags` requirements | It builds and links from a clean target profile |
 | `LK-C008` | LiveKit telephony latency is comparable to the incumbent carrier's | `UNVERIFIED` | No live measurement | A live call is materially slower or faster |
 | `LK-C009` | Adopting the framework without the runtime protocol creates a second control plane | `INFERRED` | Framework owns tools, MCP, tasks, handoffs, and fallbacks | The framework's proposals are fully mediated by the canonical tool fabric |
+| `LK-C010` | Webhook delivery is not guaranteed and a delivery may be retried | `DOCUMENTED` | The webhook page states delivery has no guarantees and that events are retried with sequencing | A delivery is asserted exactly-once, or a duplicate is not observable |
+| `LK-C011` | A participant can invoke methods on other participants in the same room, with a 15KiB payload limit and a 10s default timeout | `DOCUMENTED` | The RPC page and its error-code table | RPC is not reachable between participants, or the limits differ in practice |
+| `LK-C012` | Text streams have no server-side persistence and a participant joining mid-stream receives none of it | `DOCUMENTED` | The text-stream page, sections "No message persistence" and "Joining mid-stream" | History is retrievable from the transport after the fact |
+| `LK-C013` | The signal connection and the media connection are separate phases, so a participant can be connected and unable to carry media | `DOCUMENTED` | The connection-events section of the webhook page | `participant_joined` fires without an established media connection |
+| `LK-C014` | Distributed self-hosting requires Redis as a shared data store and message bus; single-node local mode does not | `DOCUMENTED` | The distributed self-hosting page | A distributed deployment runs without Redis |
+| `LK-C015` | A screen share is published as an ordinary video track, and tab-audio capture availability depends on the browser | `DOCUMENTED` | The screen-sharing page, including its browser-support note | Screen share requires a distinct track type, or tab audio works everywhere |
 
 ## Test Plan
 
@@ -324,6 +350,13 @@ Do not expose framework or SDK types in JARVIS domain contracts.
 - Is there a Rust path to framework-equivalent behaviour, or does adoption
   necessarily mean a Python/Node process?
 - What is the self-hosting operational cost of the separate SIP service?
+- Does the transport's reconnection support resume a session without ambiguity about
+  media that was missed while disconnected?
+- Can track-level JARVIS grants be enforced so a transport permission bug cannot
+  widen them, and is subscribe authorization observable before the first frame?
+- Is a single-node self-hosted media deployment sufficient for the intended
+  personal-use volume, or does the Redis requirement arrive with the first
+  second node?
 - Is the OpenAI-compatible edge a legitimate runtime-facing surface, or does it
   bypass the runtime protocol's scoped grants?
 - Current Cloud plan pricing and concurrency for the intended personal-use volume.
@@ -333,3 +366,4 @@ Do not expose framework or SDK types in JARVIS domain contracts.
 | Date | Change | Evidence |
 | --- | --- | --- |
 | 2026-09-21 | Initial evidence note; absorbs the headless spike result, the two API traps, and the documented telephony surface from the excluded telephony folder | Official `llms.txt` indexes, turn-handling and OpenAI-compatible pages, telephony reference, Rust SDK repository |
+| 2026-09-21 | Added the realtime media surface: rooms/participants/tracks, the data plane including peer RPC, capture and screen sharing, webhook signature and delivery semantics, connection phases and quality, and the distributed self-hosting Redis requirement. Claims `LK-C010` through `LK-C015` added. Scope widened from telephony-only to the transport axis, which is now owned by [ADR-0011](../../adr/0011-realtime-media-session-boundary.md) and [the media session contract](../../contracts/media-session.md) | `transport/llms.txt`, `intro/llms.txt` and the pages listed in Official Sources |

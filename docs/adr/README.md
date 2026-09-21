@@ -18,5 +18,6 @@ ADR that marks the old one superseded.
 | [0008](0008-native-workflows-before-temporal.md) | ACCEPTED | Native database workflows first |
 | [0009](0009-process-plugins-before-native-abi.md) | ACCEPTED | Process protocols before dynamic libraries |
 | [0010](0010-upstream-evidence-gate.md) | ACCEPTED | Current official evidence precedes integrations |
+| [0011](0011-realtime-media-session-boundary.md) | PROPOSED | Realtime media sessions are a transport boundary |
 
 Use [the template](template.md) for new decisions.

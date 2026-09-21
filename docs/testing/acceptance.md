@@ -443,5 +443,55 @@ For every durable aggregate, inject failure before and after state commit,
 outbox/event publication, acknowledgement, and side-effect reservation. Upgrade
 from every supported prior schema/payload/API fixture on SQLite and PostgreSQL
 where supported, then exercise backup/restore and failed activation rollback.
+
+### `ACC-080`: Media Session Track Authority
+
+Admit participants to a media session with grants naming specific publish and
+subscribe tracks. A participant cannot publish or subscribe a track its grant does
+not name, at admission or after the fact, and cannot widen its own grant. A
+participant attribute, display name, metadata field, or transport-issued token
+naming a different workspace, principal, or role changes nothing: the workspace
+stays the one resolved from the JARVIS credential. A transport-reported
+permission flag is recorded as an observation and never substitutes for a grant
+check. Disabling the transport adapter leaves canonical session records readable
+through the CLI.
+
+### `ACC-081`: Peer Method Call Confinement
+
+With a second participant in the session, attempt a participant-to-participant
+method call. A call to an unregistered method fails with a typed error and no side
+effect. A call to a registered method that would perform a side effect reaches the
+canonical tool policy path, is denied or approved as policy decides, and records
+an outcome; the response never carries a credential, another participant's data,
+or any authority back to the caller. Arguments are schema-validated, and an
+oversized payload, an unbounded response, and a call that exceeds the JARVIS
+timeout each fail closed. A peer cannot extend the method set. A signalled
+participant whose media phase failed is never reported as active.
+
+### `ACC-082`: Capture Consent and Revocation
+
+From a fresh session with no prior consent, microphone, camera, screen, and
+screen-audio capture are all off, including in the configuration read back by the
+user. Enabling one capture is an explicit per-session action, is visible while
+active, and does not enable any other. Revoking capture stops publication
+immediately, is recorded as a session observation, and does not end the session.
+A capture grant does not authorize perception, and a perception result that
+suggests an action produces a policy-evaluated tool intent rather than an effect.
+A platform or browser that cannot capture tab audio reports that state rather than
+silently producing no audio.
+
+### `ACC-083`: Media Session Transport Neutrality and Degradation
+
+A media session is exercised with the transport adapter unavailable. Canonical
+session records, policy, tools, the CLI, and every non-media interface remain
+usable, and no core interface fails. Transport webhook deliveries are replayed,
+duplicated, and delivered out of order: a duplicate produces exactly one state
+change, a late event cannot move the session backwards, an unverifiable signature
+or a payload whose body does not match its signed digest is rejected before
+parsing, and a payload-supplied workspace or user identifier selects nothing.
+Transport-reported degradation and a later reconnect produce distinguishable
+states rather than being inferred from a timeout. Lossy data surfaces drop frames
+without raising reconciliation errors, and guaranteed surfaces are bounded and
+ordered.
 No aggregate becomes falsely terminal, loses workspace ownership, duplicates an
 effect, or is silently rewritten by an incompatible older binary.

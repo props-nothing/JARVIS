@@ -169,13 +169,13 @@
     },
     {
       "id": "livekit",
-      "todos": ["RTM-009", "VOI-001"],
+      "todos": ["RTM-009", "RTM-010", "MED-005", "VOI-001"],
       "evidence": "docs/research/integrations/livekit.md",
       "state": "ARCHITECTURE_ONLY",
       "implementation_ready": false,
       "last_verified": "2026-09-21",
       "revalidate_by": "2027-03-21",
-      "implementation_paths": ["integrations/livekit/**", "runtimes/livekit/**", "adapters/runtimes/livekit/**", "adapters/voice/livekit/**", "crates/**/src/adapters/runtimes/livekit/**", "crates/**/src/external_runtimes/livekit/**", "crates/**/src/runtime_adapters/livekit/**", "crates/**/src/adapters/voice/livekit/**", "crates/**/src/voice_providers/livekit/**", "tests/integration/livekit/**"]
+      "implementation_paths": ["integrations/livekit/**", "runtimes/livekit/**", "adapters/runtimes/livekit/**", "adapters/voice/livekit/**", "adapters/media/livekit/**", "crates/**/src/adapters/media/livekit/**", "crates/**/src/media_transports/livekit/**", "crates/**/src/adapters/runtimes/livekit/**", "crates/**/src/external_runtimes/livekit/**", "crates/**/src/runtime_adapters/livekit/**", "crates/**/src/adapters/voice/livekit/**", "crates/**/src/voice_providers/livekit/**", "tests/integration/livekit/**"]
     },
     {
       "id": "tauri",

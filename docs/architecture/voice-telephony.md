@@ -19,6 +19,13 @@ JARVIS distinguishes three things that are easy to conflate:
 | **Audio pipeline** | text relay vs raw audio vs speech-to-speech | replaceable adapter |
 | **Reasoning** | context, model, tools, policy | **JARVIS** |
 
+The carrier and pipeline above describe a **telephone call**. A session that is not
+a call — a shared screen, a camera, a live multi-participant conversation, or a
+non-telephony realtime channel — is governed separately by
+[realtime media sessions](realtime-media.md) and
+[the media session contract](../contracts/media-session.md). A bridged call is a
+participant inside such a session; the call state machine remains this document's.
+
 The measured baseline comes from a text relay on one carrier; the preferred
 personal mode uses a different pipeline on a different provider. **A latency
 number belongs to a pipeline, not to "voice", and must never be restated as if it

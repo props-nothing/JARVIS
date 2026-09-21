@@ -183,6 +183,30 @@ internal agent loop or storage implementation.
   per call. Provider-supplied defaults that change pipeline semantics are set
   explicitly and asserted rather than inherited.
 
+### Realtime Media Sessions
+
+- `FR-MED-001`: Realtime media sessions are provider-neutral, workspace-scoped
+  JARVIS records with an explicit lifecycle, and the transport is a replaceable
+  adapter whose state is never canonical.
+- `FR-MED-002`: Transport, perception, decision, and effect are separate layers: a
+  transport carrying a stream is not a grant to interpret it, and interpreting it
+  is not authorization to act on it. No captured media reaches a tool without a
+  policy-evaluated tool intent.
+- `FR-MED-003`: Microphone, camera, screen, and screen-audio capture are off by
+  default, opt-in per session, visibly indicated while active, and separately
+  revocable without ending the session.
+- `FR-MED-004`: Publish and subscribe are authorized at track granularity by a
+  JARVIS grant that is re-checked at publication. Transport-native permissions,
+  participant attributes, display names, and room metadata are never
+  authorization inputs or workspace selectors.
+- `FR-MED-005`: Data-plane surfaces are untrusted, bounded, and typed. A
+  participant-to-participant method call executes only against a fixed
+  JARVIS-defined method set, with schema-validated arguments, the canonical tool
+  policy path, and JARVIS-enforced payload and timeout limits.
+- `FR-MED-006`: The media transport decision and the agent-framework decision are
+  separate decisions on separate axes: adopting a platform's realtime transport
+  never implies adopting its agent orchestration, tools, tasks, or session state.
+
 ### Installation and Operations
 
 - `FR-OPS-001`: Signed native artifacts target supported Windows, macOS, and
@@ -220,6 +244,10 @@ internal agent loop or storage implementation.
 - `NFR-VOI-002`: Incremental delivery is a measured model capability, not a
   boolean: a route that requires streaming is only selected for a model whose
   verified time-to-first-token and token-spread both satisfy the voice budget.
+- `NFR-MED-001`: A media session's connection phases, degradation, reconnection,
+  and disconnects are distinguishable in state and in diagnostics, and per-stage
+  timing is reported separately rather than as one figure. No core interface
+  depends on a media adapter being present or healthy.
 
 ## Version 1 Scope
 
