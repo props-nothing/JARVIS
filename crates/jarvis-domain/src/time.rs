@@ -1,13 +1,19 @@
-//! Absolute UTC instants.
+//! Absolute UTC instants and calendar dates.
 //!
 //! JARVIS stores and transmits absolute time as RFC 3339 UTC strings with a
 //! trailing `Z` (see the common contract conventions). [`UtcTimestamp`] is the
 //! single value type for that representation.
+//!
+//! [`IsoDate`] is the calendar-date value used where a day, not an instant, is
+//! the fact: provider capability evidence records when it was `last_verified`
+//! and when it must be `revalidate_by`, and an evidence label is only usable
+//! while the current date has not passed that day.
 
 use std::fmt;
 use std::str::FromStr;
 
 use jiff::Timestamp;
+use jiff::civil::Date;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::DomainError;
@@ -92,7 +98,6 @@ impl<'de> Deserialize<'de> for UtcTimestamp {
 
 /// Accepts a borrowed or owned string form of an instant.
 struct TimestampVisitor;
-
 impl serde::de::Visitor<'_> for TimestampVisitor {
     type Value = UtcTimestamp;
 
@@ -102,6 +107,108 @@ impl serde::de::Visitor<'_> for TimestampVisitor {
 
     fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
         UtcTimestamp::parse(value).map_err(E::custom)
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        self.visit_str(&value)
+    }
+}
+
+/// A calendar date with no time and no zone, as `YYYY-MM-DD`.
+///
+/// Provider capability evidence is dated by day, so a date is the honest unit: a
+/// `revalidate_by` day is inclusive, and comparing instants would make freshness
+/// depend on the hour of an unrelated clock. Only the 4-2-2 zero-padded form is
+/// accepted, because accepting `2026-1-5` would create a second spelling of the
+/// same day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IsoDate(Date);
+
+impl IsoDate {
+    /// Wraps a calendar date.
+    #[must_use]
+    pub const fn from_date(date: Date) -> Self {
+        Self(date)
+    }
+
+    /// Returns the underlying calendar date.
+    #[must_use]
+    pub const fn as_date(&self) -> Date {
+        self.0
+    }
+
+    /// Parses a `YYYY-MM-DD` calendar date.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidTimestamp`] when `value` is not a complete
+    /// zero-padded date, including an out-of-range month or day and any trailing
+    /// data. A missing component is not defaulted, because a defaulted month or
+    /// day would silently date evidence to a day nobody recorded.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        let date: Date = value.parse().map_err(|_| DomainError::InvalidTimestamp)?;
+        if date.strftime("%Y-%m-%d").to_string() != value {
+            return Err(DomainError::InvalidTimestamp);
+        }
+        Ok(Self(date))
+    }
+
+    /// Returns whether `self` is on or after `other`.
+    ///
+    /// Used for freshness, where an evidence label is valid through its
+    /// `revalidate_by` day inclusive.
+    #[must_use]
+    pub fn is_no_earlier_than(self, other: Self) -> bool {
+        self.0 >= other.0
+    }
+}
+
+impl fmt::Display for IsoDate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0.strftime("%Y-%m-%d"))
+    }
+}
+
+impl FromStr for IsoDate {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<&str> for IsoDate {
+    type Error = DomainError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for IsoDate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for IsoDate {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(DateVisitor)
+    }
+}
+
+/// Accepts a borrowed or owned string form of a calendar date.
+struct DateVisitor;
+
+impl serde::de::Visitor<'_> for DateVisitor {
+    type Value = IsoDate;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YYYY-MM-DD calendar date string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        IsoDate::parse(value).map_err(E::custom)
     }
 
     fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
@@ -192,5 +299,51 @@ mod tests {
                 "{json} must be rejected",
             );
         }
+    }
+
+    #[test]
+    fn a_calendar_date_round_trips_and_is_zero_padded() {
+        let date = super::IsoDate::parse("2026-09-21").expect("valid date");
+        assert_eq!(date.to_string(), "2026-09-21");
+        let reparsed: super::IsoDate = date.to_string().parse().expect("display must parse");
+        assert_eq!(reparsed, date);
+
+        let json = serde_json::to_string(&date).expect("serializes");
+        assert_eq!(json, "\"2026-09-21\"");
+    }
+
+    #[test]
+    fn a_non_padded_or_partial_date_is_rejected() {
+        for value in [
+            "",
+            "2026-9-21",            // unpadded month
+            "2026-09-1",            // unpadded day
+            "2026-09",              // missing day
+            "2026",                 // missing month and day
+            "2026-13-01",           // out-of-range month
+            "2026-02-30",           // out-of-range day
+            "2026-09-21T00:00:00Z", // a timestamp is not a date
+            "2026-09-21 ",          // trailing space
+            " 2026-09-21",          // leading space
+        ] {
+            let error = super::IsoDate::parse(value).expect_err("must be rejected");
+            assert_eq!(error.code(), "jarvis.invalid_timestamp", "{value}");
+        }
+    }
+
+    #[test]
+    fn freshness_comparison_includes_the_day_itself() {
+        let revalidate_by = super::IsoDate::parse("2026-09-21").expect("valid");
+        assert!(revalidate_by.is_no_earlier_than(revalidate_by));
+        assert!(
+            super::IsoDate::parse("2026-09-22")
+                .expect("valid")
+                .is_no_earlier_than(revalidate_by)
+        );
+        assert!(
+            !super::IsoDate::parse("2026-09-20")
+                .expect("valid")
+                .is_no_earlier_than(revalidate_by)
+        );
     }
 }

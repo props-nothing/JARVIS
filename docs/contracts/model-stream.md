@@ -133,3 +133,30 @@ requirements never degrade into ignored extension fields.
 - duplicate/provider-replayed events;
 - structured output mismatch;
 - redaction of provider error and request data.
+
+### Implemented evidence (Milestone 2)
+
+`jarvis_domain::model::stream` implements this contract as types, so the rules
+above are enforced rather than restated, and the test names mirror the list:
+
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| sequence increases monotonically | `ModelStreamState::accept` refuses `<` or `==` | a duplicate and a reordered sequence each return `jarvis.stream_sequence_not_monotonic` |
+| exactly one terminal event | a second terminal arrives after the terminal state and is ignored, not applied | `late_frames_after_the_terminal_state_are_ignored_and_counted` |
+| late frames are ignored and counted | `StreamAdmission::IgnoredAfterTerminal` plus a counter | the same test asserts the terminal reason does **not** change |
+| a stream without a terminal is interrupted | `StreamOutcome::Interrupted`, and `is_terminal()` is the only success predicate | `a_stream_without_a_terminal_event_is_interrupted_not_successful` |
+| argument deltas are not executable | `ToolArguments::executable_raw` answers `None` while streaming | `a_streaming_tool_call_exposes_no_executable_arguments` |
+| the completion matches the assembled deltas | `ModelStreamState::accept` compares them | `argument_deltas_are_assembled_and_the_completion_must_match` |
+| unknown usage is not zero | every `Usage` counter is `Option` | `usage_distinguishes_unreported_from_zero` asserts absent stays absent on the wire |
+| a tool result is never orphaned | `InputItems::new` **and** its `Deserialize` | `a_tool_result_that_precedes_its_call_is_refused`, `a_deserialized_item_list_is_held_to_the_same_pairing_rule` |
+
+Two deliberate omissions are visible in the types. A requested output schema is
+carried as bounded `JsonText` instead of a parsed value, because schema subset
+validation belongs to the tool fabric, and there is **no** provider extension map
+on the portable request, because this contract makes extensions adapter-owned and
+namespaced. A test asserts the serialized request contains no provider-owned
+field, which is what stops a provider value from being read as a portable one.
+
+An unknown provider finish reason is preserved with its raw value rather than
+mapped to `stop`, so a new provider reason is visible to an operator instead of
+making an unknown terminal look like a clean one.

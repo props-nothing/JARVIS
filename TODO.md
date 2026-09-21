@@ -533,8 +533,66 @@ Dependencies: all Milestone 0 exit criteria.
 Dependencies: Milestone 1 exit gate. No Brain implementation begins while a
 Foundation TODO remains incomplete.
 
-- [ ] `BRN-001` Define domain model/provider capabilities and normalized model
+- [x] `BRN-001` Define domain model/provider capabilities and normalized model
   stream contract.
+  Evidence: `jarvis-domain::model` is the typed form of the accepted
+  `model-stream` and `model-data-policy` contracts plus the capability half of
+  `model-gateway`. The four concepts the gateway architecture refuses to conflate
+  are separate newtypes: `ProviderId`, `ModelId`, and `ModelRevision` are
+  lowercase dotted slugs (owner-scoped text, since a provider is named by its
+  owner), and `ModelRef` carries provider **and** model because a model ID is only
+  unique inside its provider. Uppercase is rejected rather than folded, so two
+  spellings cannot denote one identity. Three rules are made structural instead of
+  documented: (1) every capability value carries an `Evidence` record, and only
+  `VERIFIED` evidence that has not passed its inclusive `revalidate_by` day can
+  satisfy a hard requirement — `DOCUMENTED`, `OBSERVED`, `INFERRED`, `UNVERIFIED`,
+  and expired evidence all fail closed, because documentation describes the
+  provider's current version while this repository may pin an older one; (2)
+  incremental delivery is an `IncrementalDelivery` measurement of time-to-first-
+  token **and** chunk spread, never a boolean, so a model that advertises
+  streaming and delivers its reply in one burst is reported as a typed refusal
+  rather than as a supported route — the case a `streaming: true` flag cannot
+  express; (3) `RouteRequirements` reuses the same `Capability` vocabulary the
+  descriptor attests and the same `Locality` the policy resolves, so a requirement
+  cannot exist that no capability key could satisfy. `ModelStreamState` enforces
+  the stream contract: a duplicate or reordered sequence is refused rather than
+  applied (applying it fabricates a transcript), a second start and a second
+  terminal are refused, and a frame arriving after the local terminal state is
+  *ignored and counted* rather than treated as a fault, which is what keeps a
+  correct cancellation from looking broken. A stream that ends without a terminal
+  event is `StreamOutcome::Interrupted`, a distinct outcome from success, and
+  `is_terminal()` is the only place that decides. `ToolArguments` exposes a raw
+  string for execution **only** in the complete state, so a half-received argument
+  string cannot be dispatched by a caller that forgot to check, and the completion
+  payload must match the assembled deltas or the call is refused as a lost frame.
+  `Usage` keeps every counter optional so unreported is never recorded as zero, and
+  an unmodelled provider finish reason is preserved with its raw value instead of
+  being flattened into `Stop`. `InputItems` refuses an orphaned or duplicated tool
+  call **through `new` and through deserialization**, so the pairing rule holds for
+  a payload that arrived over the wire and not only for a value built in-crate;
+  a test falsifies the derived-deserializer shortcut. `ResolvedPolicy::merge` folds
+  the six precedence layers strongest-first, where a *later* layer still narrows an
+  earlier one (the case a "first deny wins" shortcut gets wrong), an empty
+  allow-list means "unrestricted at this layer" rather than "nothing allowed", and
+  two disjoint allow-lists are refused as contradictory instead of resolving to an
+  empty set that a later layer would read as unrestricted. A cloud endpoint cannot
+  be recorded as `not_applicable_local` for retention, because that reads as *more*
+  careful than it is and the inconsistency is otherwise invisible.
+  `EffectiveDataPolicy` has no field that could be read as a JARVIS guarantee about
+  provider deletion, which a serialized-shape test asserts. Provider extensions are
+  absent from the
+  portable request because the contract makes them adapter-owned, and a requested
+  output schema is carried as bounded `JsonText` rather than parsed, so
+  `jarvis-domain` keeps the dependency set its evidence note records. The seven
+  `model.*` error codes the policy contract fixes are exposed verbatim, and a test
+  asserts each string so a rename cannot silently change a client-visible code.
+  61 new domain tests (that crate goes 19 -> 80; 456 workspace-wide); `fmt` and
+  `clippy -D warnings` are clean.
+  **Not done**: this is the contract layer only. No adapter, no routing engine, no
+  persistence, and no provider call exists yet — the OpenAI-compatible adapter is
+  `BRN-003` and is blocked on its `REQUIRED` evidence note, the scripted provider
+  is `BRN-002`, repositories are `BRN-004`, and the measured-per-model capability
+  inventory that `NFR-VOI-002` and `BRN-011` need is not collected.
 - [ ] `BRN-002` Implement deterministic scripted model provider for tests.
 - [ ] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
 - [ ] `BRN-004` Implement durable session/message/run/model-call repositories.

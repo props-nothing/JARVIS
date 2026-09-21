@@ -1,8 +1,8 @@
 # JARVIS Roadmap
 
 Status: ACCEPTED
-Last updated: 2026-09-21
-Current milestone: Milestone 1 - Installable Foundation (all `FND-*` partial or done; `FND-011`/`FND-012` partial pending owner gates)
+Last updated: 2026-09-22
+Current milestone: Milestone 2 - Native Brain (started; `BRN-001` done, `BRN-002`+ next. Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.

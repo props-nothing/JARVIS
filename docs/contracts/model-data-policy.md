@@ -227,3 +227,41 @@ degradation.
 9. generated schema/API drift and user-visible requested/effective explanation.
 
 These tests provide evidence for `ACC-013`, `ACC-017`, and `ACC-018`.
+
+### Implemented evidence (Milestone 2)
+
+`jarvis_domain::model::policy` implements the rule and precedence half of this
+contract; `jarvis_domain::model::capability` implements the evidence half. Test 1
+(precedence and non-weakening) and test 3 (stale and `UNVERIFIED` evidence) have
+executable evidence:
+
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| an earlier deny cannot be weakened by a later layer | `PolicyRules::merge_stricter` only narrows, and an absent layer merges against a permissive identity | `an_absent_layer_cannot_loosen_a_deny`; `a_stricter_later_layer_still_narrows_an_earlier_one` is the case a "first deny wins" shortcut gets wrong |
+| the precedence order is the contract's order | `PolicyLayer` declaration order with `ResolvedPolicy::merge` sorting by it | `the_layer_order_matches_the_contracts_precedence_list`, plus layers supplied out of order |
+| allow/deny narrows to the intersection | `PolicyRules::merge_stricter` | `an_allow_list_narrows_to_the_intersection` |
+| a contradictory policy is reported, not permitted | two disjoint allow-lists are `jarvis.invalid_policy_layer` | `two_disjoint_allow_lists_are_refused_rather_than_resolved_empty` |
+| an unrestricted layer is not "nothing allowed" | an empty set means "no restriction at this layer" | `an_unrestricted_layer_does_not_erase_a_restricted_one` |
+| expired and `UNVERIFIED` evidence fail a hard rule | `Evidence::satisfies_hard_requirement_on` is one predicate over label **and** date | `evidence_is_valid_through_its_revalidation_day_and_stale_after_it`, `only_verified_evidence_satisfies_a_hard_requirement` |
+| provider guarantees are not JARVIS guarantees | `EffectiveDataPolicy` has no such field to populate | `the_effective_policy_has_no_provider_guarantee_field` asserts the shape |
+
+The last row is the contract's own distinction made structural rather than
+documented: `model.evidence_missing` and `model.evidence_stale` are reported by
+`RejectionReason::EvidenceMissing` and `RejectionReason::EvidenceStale`, and an
+exception is visible on the decision through `ModelRouteDecision::relied_on_exception`
+rather than inferred from whether the route looks permissive. All seven `model.*`
+codes this contract fixes are exposed verbatim by `jarvis-domain::error`, and a
+test asserts each string so a rename cannot silently change a client-visible code.
+
+`EffectiveDataPolicy::is_self_consistent` refuses the one inconsistency the shape
+does not prevent on its own: a **cloud** endpoint recorded as
+`not_applicable_local` for retention or training use, or a **local** endpoint
+recorded with a provider retention classification. Both read as *more* careful than
+the route is, and neither is visible without a check because the two fields are set
+independently.
+
+**Not done**: tests 2, 4 through 9 have no executable evidence yet. There is no
+persistence for `model_data_policies`, `model_policy_exceptions`, or
+`model_route_decisions` (that is `BRN-004`), so immutable version history,
+concurrent update, idempotency conflict, exception expiry/revocation/replay, and
+generated-schema drift are unimplemented rather than verified.

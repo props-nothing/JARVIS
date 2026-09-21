@@ -153,6 +153,27 @@ identifier!(
     "correlation",
     "Correlates related requests and events."
 );
+identifier!(RunId, "run", "Identifies one durable agent run.");
+identifier!(
+    SessionId,
+    "session",
+    "Identifies a durable conversation session."
+);
+identifier!(
+    ModelCallId,
+    "model_call",
+    "Identifies one logical model call."
+);
+identifier!(
+    ModelStreamEventId,
+    "model_stream_event",
+    "Identifies one event in a normalized model stream."
+);
+identifier!(
+    ModelDataPolicyId,
+    "model_data_policy",
+    "Identifies one immutable version of a model data policy."
+);
 
 /// Generates identifiers for domain records.
 ///
