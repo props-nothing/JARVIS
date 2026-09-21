@@ -336,9 +336,16 @@ fn ensure_private_dir(path: &Path) -> Result<(), InfrastructureError> {
 }
 
 /// Reports whether a directory mode exposes access beyond the owner.
+///
+/// The check is written as an explicit test of the low six bits rather than as a
+/// `trailing_zeros` comparison, because the intent is "no group or other access"
+/// and that is easier to verify against the mode bits than a bit-count.
 #[cfg(unix)]
 fn mode_is_owner_only(mode: u32) -> bool {
-    mode & 0o077 == 0
+    #[allow(clippy::verbose_bit_mask)]
+    {
+        mode & 0o077 == 0
+    }
 }
 
 #[cfg(unix)]

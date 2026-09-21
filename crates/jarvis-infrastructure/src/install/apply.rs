@@ -24,9 +24,12 @@ use crate::lifecycle::appears_unheld;
 use crate::paths::ProfilePaths;
 use crate::release::{ReleaseManifest, VerifiedArtifact, verify_artifacts};
 
-use super::{
-    CURRENT_VERSION_FILE, InstallAction, InstallError, InstallLayout, InstallPlan, Installation,
-};
+use super::{InstallAction, InstallError, InstallLayout, InstallPlan, Installation};
+// The pointer file name is only read on Windows; on Unix the pointer is a symlink
+// whose target names the version, so the constant is unused there and importing it
+// unconditionally fails a Linux build with warnings denied.
+#[cfg(not(unix))]
+use super::CURRENT_VERSION_FILE;
 
 /// What applying a plan did, for the operator's report.
 #[derive(Debug, Clone, PartialEq, Eq)]

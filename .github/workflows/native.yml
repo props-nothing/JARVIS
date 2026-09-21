@@ -102,9 +102,15 @@ jobs:
 
       # The Unix permission assertions live in `#[cfg(unix)]` tests and are
       # skipped on the authoring host. This lane is where they actually run.
+      #
+      # The command is **quoted**, and that is not cosmetic. Unquoted, the
+      # `paths:: storage::` argument contains `: ` (colon then space), which YAML
+      # reads as a mapping separator inside a plain scalar. The file then fails to
+      # parse, GitHub creates a run with **zero jobs**, and the whole native lane
+      # silently does nothing while reporting a failure with no step to inspect.
       - name: Run the path and permission tests explicitly
         if: matrix.os != 'windows'
-        run: cargo test -p jarvis-infrastructure --all-features paths:: storage::
+        run: "cargo test -p jarvis-infrastructure --all-features paths:: storage::"
 
       - name: Build the binaries for the clean-machine journey
         run: cargo build --release -p jarvisd -p jarvis-cli

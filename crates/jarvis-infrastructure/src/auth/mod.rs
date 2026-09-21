@@ -166,8 +166,11 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
         create_private_dir(parent)?;
     }
 
+    // The builder is mutated inside each branch and never after, so the outer
+    // binding is immutable. Only the platform-specific branch needs `mut`, which is
+    // why the branches are separate bindings rather than one shared mutable value.
     #[cfg(unix)]
-    let mut options = {
+    let options = {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
