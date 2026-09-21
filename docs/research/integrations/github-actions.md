@@ -145,29 +145,48 @@ that work is `FND-011` and must not inherit this decision.
 | `CI-C010` | The Unix owner-only permission assertions actually execute somewhere | **FALSE as first recorded, now VERIFIED locally on Linux** — the native lane never ran (see `CI-C013`) and its command was invalid; `cargo test -p jarvis-infrastructure paths::` now runs 8 tests including `created_directories_are_owner_only` and `a_group_readable_directory_is_flagged_unsafe` | `cargo test -p jarvis-infrastructure paths::` on a Linux runner; confirmed in a `rust:1.98-slim-bookworm` container | `#[cfg(unix)]` assertions are typechecked but never run, as they are on the authoring host |
 | `CI-C011` | A native target builds with its own C toolchain and no cross-compilation | VERIFIED by workflow construction | Host target equals matrix target; the C compiler is checked in its own step | A "supported target" that has never actually been built |
 | `CI-C012` | A platform failure is visible rather than masked | VERIFIED | `fail-fast: false` | One broken platform hides the state of the other four |
-| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **VERIFIED READABLE, and every run had FAILED.** The repository is **public**, so the runs API is readable without a token; 12 runs existed and all 12 concluded `failure` | `GET /repos/props-nothing/JARVIS/actions/runs` and `.../check-runs` | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **VERIFIED GREEN at `7a7d61d`** — `CI` = success and `Native targets` = success with **all five tier-1 jobs green**. Before the fixes below, 12 runs existed and all 12 had failed | `GET /repos/props-nothing/JARVIS/actions/runs` and `.../runs/<id>/jobs` | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C017` | Every tier-1 target builds, tests, and passes its journeys on native hardware | **VERIFIED GREEN**: `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` all `success` | Run `35657958359` job list | A "supported" target that has never run its own tests |
 | `CI-C015` | The native lane produces jobs at all | **FALSE until fixed.** `native.yml` had a YAML parse error, so GitHub created runs with **zero jobs** and the run name fell back to the file path instead of `Native targets` | The runs API reported `jobs=0`; `js-yaml` reproduced it locally | An entire lane that silently does nothing while reporting a failure |
 | `CI-C016` | The lane can observe defects the Windows authoring host cannot | **VERIFIED after fixing.** Linux clippy failed on an unused import, an unused `mut`, and a `verbose_bit_mask` lint, and the clean-machine journey failed on a quote-dependent assertion | `rust:1.98-slim-bookworm` container with the pinned toolchain | Three real defects that passed every local Windows check |
 | `CI-C014` | Every document is reachable from the top-level index | VERIFIED by validator and a fail-closed test | `validateIndexCompleteness` in `scripts/validate-docs.mjs`, falsified with a temporary unlinked file | A document nobody links to, which is effectively unreviewed |
 
-`CI-C013` and `CI-C015` were the honest gap, and both were worse than recorded. The
-note said the repository was private and the runs API unreadable; it is **public**,
-the API returned the runs without a token, and **all 12 runs had failed**. The native
-lane was worse than failing: a YAML parse error meant it produced **zero jobs**, so it
-reported a failure with no step to inspect and nothing ever executed in it. That is
-why `CI-C010` — which claimed the Unix permission assertions executed in the native
-lane — was false, and why the command in it was an invalid `cargo` invocation that
-would have matched nothing if the lane had run.
+`CI-C010` was false when first recorded and is now true. It claimed the Unix
+owner-only permission assertions executed in the native lane; the lane never ran,
+and its command was an invalid `cargo` invocation that would have matched nothing
+had it run. Both are fixed, and the assertions are confirmed executing on Linux.
 
-A working Linux environment was the missing capability: the authoring host has no Unix
-runtime, so the `#[cfg(unix)]` code was never compiled, let alone linted or tested. A
-`rust:1.98-slim-bookworm` container with the pinned toolchain now reproduces the CI
-environment locally, and `scripts/linux-verify.sh` runs the same commands the lane
-does. It immediately found three clippy defects (an unused import that is only used on
-Windows, an unused `mut` in a `#[cfg(unix)]` branch, and a `verbose_bit_mask` lint that
-only fires where Unix permission code compiles) and a journey assertion that depended
-on Windows quoting. No amount of re-reading the Windows-only output could have found
-them: they are invisible to a compiler that never sees the code.
+`CI-C013` and `CI-C015` were also worse than recorded. The note said the repository
+was private and the runs API unreadable; it is **public**, the API returned the runs
+without a token, and **all 12 runs had failed**. The native lane was worse than
+failing: a YAML parse error meant it produced **zero jobs**, so it reported a failure
+with no step to inspect and nothing ever executed in it.
+
+The fixes came in three rounds, and each defect was only visible once the previous
+one was fixed — a lane that cannot parse reports nothing about its contents:
+
+1. **The YAML parse error.** `paths:: storage::` unquoted, where `: ` is a mapping
+   separator in a plain scalar. Quoting the `run:` value fixed it, and the lane
+   immediately produced jobs for the first time.
+2. **The invalid command and the Linux-only clippy failures.** `cargo test` accepts
+   exactly one positional filter, so `paths:: storage::` was a usage error; and
+   Linux clippy found an unused import (of a constant used only under `not(unix)`),
+   an unused `mut` in a `#[cfg(unix)]` block, and a `verbose_bit_mask` lint that
+   only compiles where the Unix permission code does.
+3. **A macOS-only journey failure.** The service assertion matched `ExecStart=`,
+   which is a systemd directive; launchd renders the executable path inside a
+   `<string>` element. It now matches the executable **path**, because all three
+   backends must name it and a path is platform-independent where a directive name
+   is not. `scripts/service-assertion-check.mjs` asserts the matcher against all
+   three real renderings plus two negative cases, which is how a platform-specific
+   assertion is caught without needing that platform.
+
+A working Linux environment was the missing capability for round 2: the authoring
+host has no Unix runtime, so `#[cfg(unix)]` code was never compiled, let alone
+linted or tested. A `rust:1.98-slim-bookworm` container with the pinned toolchain,
+and `scripts/linux-verify.sh`, reproduce the CI environment locally. No amount of
+re-reading Windows-only output could have found those defects: they are invisible to
+a compiler that never sees the code.
 
 `CI-C014` was added after this audit found the top-level index had drifted twice:
 a document was added, linked from its own section index, and never linked from

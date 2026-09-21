@@ -273,21 +273,24 @@ Dependencies: all Milestone 0 exit criteria.
   result was read for the first time on 2026-09-21 and **every one of the 12 runs
   had failed**. The earlier note claimed the repository was private and the runs
   API unreadable; it is **public** and the API returns the runs without a token.
-  Four real defects were found and fixed: (1) `native.yml` had a YAML parse error
-  (`paths:: storage::` unquoted, where `: ` is read as a mapping separator), so
-  GitHub created runs with **zero jobs** and the native lane **never executed
+  Four real defects were found and fixed in three rounds, each only visible once
+  the previous one was fixed: (1) `native.yml` had a YAML parse error (`paths::
+  storage::` unquoted, where `: ` is read as a mapping separator), so GitHub
+  created runs with **zero jobs** and the native lane **never executed
   anything**; (2) the same step's command was invalid regardless, because
   `cargo test` accepts exactly one positional filter; (3) Linux `clippy -D
   warnings` failed on an unused import, an unused `mut`, and a `verbose_bit_mask`
   lint — all invisible to a Windows compiler that never sees `#[cfg(unix)]` code;
-  (4) the clean-machine journey's service assertion matched `jarvisd"` and so
-  passed on Windows (task definitions quote paths) and failed on Linux
-  (`ExecStart=/path/jarvisd`). A `rust:1.98-slim-bookworm` container and
+  (4) the clean-machine journey's service assertion matched `ExecStart=`, a
+  systemd directive, so it passed on Windows and Linux and failed on **macOS**,
+  where launchd renders the path inside a `<string>` element. It now matches the
+  executable path, and `scripts/service-assertion-check.mjs` asserts that against
+  all three real platform renderings. A `rust:1.98-slim-bookworm` container and
   `scripts/linux-verify.sh` now reproduce the CI environment locally, which is
-  what made (3) and (4) findable. Read the Actions tab; the runs API is public and
-  readable. Treat the `Native targets` matrix as the first real evidence for the
-  Unix permission assertions and for four of the five target builds. No CI has
-  verified a packaged artifact, because no
+  what made (3) findable. **Resolved**: commit `7a7d61d` is green — `CI` success
+  and `Native targets` success with all five tier-1 jobs green, the first fully
+  passing CI in the project's history. No CI has verified a packaged artifact,
+  because no
   installer exists yet (that is `FND-011`/`FND-012`), and real per-user service
   registration is still asserted as a plan rather than performed anywhere. Native
   service lifecycle proof remains the other half of this item.
@@ -324,10 +327,9 @@ Dependencies: all Milestone 0 exit criteria.
   validly-signed-but-superseded release being replayed, because rollback defense
   needs versioned metadata (TUF-style) and belongs with `FND-012`'s update
   channel. Native execution of the journey on the five tier-1 lanes is wired
-  into `Native targets`. That lane produced **zero jobs** on every run until
-  2026-09-21 (a YAML parse error, fixed), so it is verified locally on Windows and
-  against a Linux container via `scripts/linux-verify.sh` rather than claimed from
-  a CI result; the first post-fix run is the remaining evidence.
+  into `Native targets`, which is now **green on all five targets** at commit
+  `7a7d61d`, so the journey is proven on native Linux, macOS (both architectures),
+  and Windows rather than only on the authoring host.
 - [~] `FND-012` Implement install, update, rollback, portable mode, and uninstall
   tests that preserve user data unless explicitly removed. Public promotion
   depends on `OWN-001` through `OWN-005`.
