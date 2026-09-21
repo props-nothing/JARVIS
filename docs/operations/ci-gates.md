@@ -69,7 +69,13 @@ built binaries and an empty directory:
 4. stop the daemon and assert it drained within its bound;
 5. start it again against the same profile and assert readiness and a clean
    doctor report;
-6. assert `jarvis service show` names `jarvisd` and states the per-user mode.
+6. assert `jarvis service show` names `jarvisd` and states the per-user mode;
+7. run `jarvis repair --confirm` and require it to converge to a state with
+   nothing left to fix, then kill the daemon uncleanly and require `doctor` to
+   report `jarvis.stale_discovery` and `repair` to clear it while leaving the
+   benign lock file in place;
+8. preview a support bundle (requiring that nothing was written), then export one
+   and require it to omit a credential planted in a log file.
 
 It asserts directory contents, not only exit codes, because an exit code of 0
 with nothing written would still be a failure. It terminates the daemon in a`finally` block so a failed assertion cannot leak a process into a later step.

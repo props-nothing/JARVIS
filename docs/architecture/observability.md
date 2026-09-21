@@ -142,6 +142,29 @@ Repair is plan-first: show changes, require confirmation for mutations, back up
 state/config, use locks, and verify postconditions. Doctor never weakens auth or
 deletes user data as an automatic fix.
 
+### Implemented repair (Milestone 1)
+
+`jarvis repair` previews a plan and applies it only with `--confirm`. A plan is a
+pure value: it names a diagnosis, the exact actions and the path each touches, and
+whether it removes anything. `apply` refuses an unconfirmed plan, a path outside
+the profile, a path that would remove user data, and a plan it cannot verify; it
+checks the postcondition before applying and again afterwards, rolling back what it
+changed. Findings with no safe repair are printed, so "nothing to repair" is never
+mistaken for "nothing is wrong".
+
+The repairable conditions today are a missing profile directory and a stale daemon
+runtime state. The stale condition is deliberately precise: a **discovery file that
+survived a free instance lock**. A clean drain releases the lock but leaves the lock
+file on disk, so an unheld lock is the daemon's normal resting state and removing it
+would fix nothing; conversely the discovery file is only a file, so a check that
+trusted it reports a dead daemon as running. The lock is the authority for liveness
+and the discovery file is the evidence of a missing drain.
+
+Not repairable by design: corrupt or unsupported storage (that is a restore, and a
+repair that rewrote data would be deleting user data), a missing credential (it
+requires the daemon to enroll), configuration content, and service-definition
+drift. A plan is also not atomic against a daemon that starts mid-apply.
+
 ## Support Bundle
 
 A support bundle is generated locally and previewed before export. It includes:

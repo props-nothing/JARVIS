@@ -16,6 +16,7 @@ use jarvis_protocol::DiscoveryFile;
 use crate::auth::ClientCredentialPath;
 use crate::client::read_credential;
 use crate::config::{Config, config_file_path, read_bounded};
+use crate::lifecycle::appears_unheld;
 use crate::paths::ProfilePaths;
 use crate::service::{ServiceController, ServiceSpec};
 use crate::storage::{Database, schema};
@@ -112,6 +113,7 @@ pub async fn collect(
     report.push(check_directories(paths));
     report.push(check_database(paths).await);
     report.push(check_schema(paths).await);
+    report.push(check_daemon_state(paths));
     report.push(check_daemon(environment));
     report.push(check_credential(paths));
     report.push(check_configuration(paths));
@@ -140,16 +142,52 @@ pub fn daemon_summary(environment: &DiagnosticsEnvironment<'_>) -> DaemonSummary
     }
 }
 
-/// Checks that the profile directories exist and are owner-only where the
-/// platform can report it.
+/// Checks that the profile directories exist and are owner-only.
 ///
-/// Creating them is deliberate: a fresh profile is a normal state, and doctor is
-/// the supported way to prepare one.
+/// This check is deliberately **non-mutating**, and that is a correction rather
+/// than a style choice. The earlier version called `ensure_directories`, which
+/// creates them, so the check reported `ok` on a profile whose directories it had
+/// just created — meaning a missing-directory fault was **unobservable** and the
+/// repair that exists to fix it could never be offered. A diagnostic that
+/// silently performs the repair it is describing cannot detect anything.
+///
+/// The consequences are deliberate:
+///
+/// - Missing directories are a **warning**, not an error. A profile that has never
+///   been used is a supported state that the daemon creates on first start, and
+///   `doctor` must not report a healthy fresh machine as broken.
+/// - A directory that exists but is not a directory, or that is accessible beyond
+///   its owner, **is** an error: neither is a state the daemon can use.
+/// - `jarvis repair` is what turns the warning into a repair, and its postcondition
+///   is that every managed directory exists and is owner-only.
 fn check_directories(paths: &ProfilePaths) -> Finding {
-    match paths.ensure_directories() {
-        Ok(()) => Finding::ok("profile directories", "present"),
-        Err(error) => Finding::error("profile directories", error.code(), ADVICE_DIRECTORIES),
+    // A path that exists but is not a directory is unusable regardless of mode.
+    for directory in paths.all_dirs() {
+        if directory.exists() && !directory.is_dir() {
+            return Finding::error(
+                "profile directories",
+                "jarvis.directory_create",
+                ADVICE_DIRECTORIES,
+            );
+        }
     }
+
+    if let Err(error) = paths.verify_directories() {
+        return Finding::error("profile directories", error.code(), ADVICE_DIRECTORIES);
+    }
+
+    let missing = paths.missing_directories();
+    if !missing.is_empty() {
+        return Finding::warning(
+            "profile directories",
+            format!("{} managed director(ies) not created yet", missing.len()),
+            // The advice names the repair, because that is what turns this into a
+            // usable profile without starting the daemon.
+            "Run `jarvis repair --confirm` to create them, or start jarvisd once.",
+        );
+    }
+
+    Finding::ok("profile directories", "present and owner-only")
 }
 
 /// Checks that the database exists, opens, and passes integrity plus
@@ -218,11 +256,61 @@ async fn check_schema(paths: &ProfilePaths) -> Finding {
     }
 }
 
+/// Checks the daemon's durable runtime state: the instance lock and the
+/// discovery file.
+///
+/// This is the check that makes an unclearly-terminated daemon recoverable, and
+/// getting its condition right took two corrections, both worth stating because
+/// each looked reasonable and was wrong:
+///
+/// 1. Trusting the discovery file is wrong. It is only a file: it survives an
+///    unclean kill and still parses, so reachability reports "daemon running" for
+///    a daemon that is gone. The instance lock is an operating system lock, so it
+///    cannot lie about whether a process holds it.
+/// 2. Treating *any* unheld lock file as stale is also wrong. A clean drain
+///    releases the lock but leaves the file on disk, so a present-but-unheld lock
+///    is the **normal resting state** of a stopped daemon, not a fault. Reporting
+///    it as a fault made `repair` offer a pointless action after every clean stop.
+///
+/// The precise condition is therefore: a discovery file that survives a *free*
+/// lock. A clean drain unpublishes the discovery file, so its presence alongside
+/// an unheld lock means the daemon did not drain — which is also what misleads
+/// `jarvis status` into claiming a dead daemon is running.
+fn check_daemon_state(paths: &ProfilePaths) -> Finding {
+    let lock = paths.runtime_dir().join("jarvis.lock");
+    let discovery = paths.runtime_dir().join("discovery.json");
+
+    if !lock.exists() {
+        // No lock file means no daemon has ever started for this profile.
+        return Finding::ok("daemon state", "no instance lock (no daemon has run)");
+    }
+
+    if !appears_unheld(&lock) {
+        return Finding::ok("daemon state", "instance lock held by a running process");
+    }
+
+    if discovery.exists() {
+        return Finding::warning(
+            "daemon state",
+            "jarvis.stale_discovery",
+            "Run `jarvis repair --confirm` to remove the stale discovery file.",
+        );
+    }
+
+    // A lock file with no holder and no discovery file is the normal resting
+    // state, so it must not be reported as something to fix.
+    Finding::ok(
+        "daemon state",
+        "idle (lock file present, no holder, no discovery file)",
+    )
+}
+
 /// Checks daemon reachability.
 ///
 /// A daemon that is not running is a **warning**, not an error: foreground and
 /// portable use are supported, so this must not force a non-zero exit on a
-/// healthy profile.
+/// healthy profile. Reachability answers the client's question ("can I call it?"),
+/// while [`check_daemon_state`] answers "is one alive?" from the lock itself.
 fn check_daemon(environment: &DiagnosticsEnvironment<'_>) -> Finding {
     match environment.daemon {
         Some(descriptor) => Finding::ok(

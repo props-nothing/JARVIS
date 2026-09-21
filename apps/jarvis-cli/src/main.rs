@@ -16,8 +16,8 @@ use jarvis_infrastructure::auth::ClientCredentialPath;
 use jarvis_infrastructure::client::{ClientError, discover, get_authenticated, read_credential};
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
 use jarvis_infrastructure::diagnostics::{
-    DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor, add_log_tails, collect,
-    daemon_summary, export_bundle, plan_bundle,
+    DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor, add_log_tails, apply,
+    collect, daemon_summary, export_bundle, plan_bundle, plans_for, unrepairable,
 };
 use jarvis_infrastructure::paths::ProfilePaths;
 use jarvis_infrastructure::service::{
@@ -72,6 +72,12 @@ enum Command {
         /// Exclude an optional item by its path from the preview.
         #[arg(long = "exclude", value_name = "PATH")]
         exclude: Vec<String>,
+    },
+    /// Preview a repair plan, or apply one after explicit confirmation.
+    Repair {
+        /// Apply the plan. Without this the command only previews it.
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -128,6 +134,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Service { action } => service(action).await,
         Command::Doctor => doctor(paths).await,
         Command::SupportBundle { output, exclude } => support_bundle(paths, output, exclude).await,
+        Command::Repair { confirm } => repair(paths, confirm).await,
     }
 }
 
@@ -512,6 +519,86 @@ fn environment_summary(paths: &ProfilePaths) -> EnvironmentSummary {
     EnvironmentSummary::current(paths.mode().token(), API_MAJOR)
 }
 
+/// Previews a repair plan, or applies it after explicit confirmation.
+///
+/// The preview is the default and the only thing a bare invocation does, because
+/// a repair mutates durable local state. `--confirm` is required to apply, and it
+/// is a single explicit flag rather than a `y/n` prompt so the command stays
+/// usable from a script while still requiring a deliberate decision.
+///
+/// Findings with no safe automated repair are reported explicitly. That is the
+/// important half of the output: otherwise "repair found nothing to do" would be
+/// indistinguishable from "repair cannot help you".
+async fn repair(paths: &ProfilePaths, confirm: bool) -> ExitCode {
+    // Repair reasons over the same diagnostics a doctor run produces, so a plan
+    // can never address a problem the checks did not actually observe.
+    let discovered = discover(&discovery_path_for(paths));
+    let (daemon, discovery_error) = match &discovered {
+        Ok(discovered) => (Some(DaemonDescriptor::from(discovered)), None),
+        Err(error) => (None, Some(error.code())),
+    };
+    let controller = current_controller();
+    let spec = service_spec();
+    let environment = DiagnosticsEnvironment {
+        daemon,
+        discovery_error,
+        controller: controller.as_deref().ok(),
+        service_spec: spec.as_ref().ok(),
+        service_spec_error: spec.as_ref().err().map(ServiceError::code),
+        controller_error: controller.as_ref().err().map(ServiceError::code),
+    };
+
+    let report = collect(paths, &environment).await;
+    let plans = plans_for(&report, paths);
+    let refused = unrepairable(&report, paths);
+
+    if plans.is_empty() {
+        println!("no repairable problems were found");
+    }
+    let mut applied = 0_usize;
+    let mut failed = 0_usize;
+    for plan in &plans {
+        println!("{}", plan.render());
+        if confirm {
+            match apply(paths, plan, true) {
+                Ok(outcome) => {
+                    applied += 1;
+                    println!(
+                        "result:    ok ({} action(s); verified: {})",
+                        outcome.applied, outcome.detail
+                    );
+                }
+                Err(error) => {
+                    failed += 1;
+                    println!("result:    refused: {}", error.code());
+                    println!("reason:    {error}");
+                }
+            }
+        } else {
+            println!("result:    preview only; pass --confirm to apply");
+        }
+    }
+
+    if !refused.is_empty() {
+        println!("\nnot repairable by JARVIS (an operator decision or a restore is needed):");
+        for (check, error) in &refused {
+            println!("  {check}: {}", error.code());
+            println!("    {error}");
+        }
+    }
+
+    if failed > 0 {
+        ExitCode::from(EXIT_ATTENTION)
+    } else {
+        println!(
+            "\n{applied} plan(s) applied, {} previewed, {} not repairable",
+            if confirm { 0 } else { plans.len() - applied },
+            refused.len()
+        );
+        ExitCode::from(EXIT_OK)
+    }
+}
+
 /// Prints a client error with its code and actionable advice.
 fn report_client_error(error: &ClientError) -> ExitCode {
     eprintln!("error: {}", error.code());
@@ -539,6 +626,7 @@ mod tests {
             (vec!["jarvis", "service"], "service"),
             (vec!["jarvis", "doctor"], "doctor"),
             (vec!["jarvis", "support-bundle"], "support-bundle"),
+            (vec!["jarvis", "repair"], "repair"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -548,8 +636,27 @@ mod tests {
                 Command::Service { .. } => "service",
                 Command::Doctor => "doctor",
                 Command::SupportBundle { .. } => "support-bundle",
+                Command::Repair { .. } => "repair",
             };
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn repair_previews_unless_confirmed() {
+        // The safety property: a bare `repair` must not mutate anything. A repair
+        // that applied itself because the user typed the shortest form would be
+        // the most damaging possible default in this program.
+        let cli = Cli::try_parse_from(["jarvis", "repair"]).expect("parses");
+        match cli.command {
+            Command::Repair { confirm } => assert!(!confirm, "a bare repair must not confirm"),
+            _ => unreachable!("repair must parse to its own variant"),
+        }
+
+        let confirmed = Cli::try_parse_from(["jarvis", "repair", "--confirm"]).expect("parses");
+        match confirmed.command {
+            Command::Repair { confirm } => assert!(confirm),
+            _ => unreachable!("repair must parse to its own variant"),
         }
     }
 
@@ -623,7 +730,8 @@ mod tests {
                     | Command::Config
                     | Command::Logs
                     | Command::Doctor
-                    | Command::SupportBundle { .. } => String::from("unexpected"),
+                    | Command::SupportBundle { .. }
+                    | Command::Repair { .. } => String::from("unexpected"),
                 }
             })
             .collect();

@@ -573,6 +573,177 @@ fn jarvis_paths(tag: &str) -> ProfilePaths {
 }
 
 #[test]
+fn a_surviving_discovery_file_over_a_free_lock_is_reported_as_stale() {
+    // The state `ACC-003` requires to be recoverable after an unclean kill: the
+    // discovery file survives and parses, so a check that trusted it would report
+    // "daemon running" and the stale state would never be found. A clean drain
+    // unpublishes discovery, so its presence here means the daemon did not drain.
+    let paths = jarvis_paths("stale-discovery");
+    paths.ensure_directories().expect("create");
+    std::fs::write(paths.runtime_dir().join("jarvis.lock"), b"").expect("write lock");
+    std::fs::write(
+        paths.runtime_dir().join("discovery.json"),
+        b"{\"schema_version\":1}",
+    )
+    .expect("write discovery");
+
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.daemon_not_running"),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let report = runtime.block_on(collect(&paths, &environment));
+
+    let state = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon state")
+        .expect("the daemon-state check ran");
+    assert_eq!(state.severity, Severity::Warning);
+    assert_eq!(state.message, "jarvis.stale_discovery");
+    // And it is repairable, which is what makes the finding useful.
+    assert!(plan_for(&paths, state).is_ok());
+}
+
+#[test]
+fn an_idle_daemon_must_not_be_reported_as_stale() {
+    // The correction that mattered most: a clean drain releases the lock but leaves
+    // the lock FILE on disk while unpublishing discovery. Treating any unheld lock
+    // as stale made doctor warn and repair act after every clean stop.
+    let paths = jarvis_paths("idle-daemon");
+    paths.ensure_directories().expect("create");
+    std::fs::write(paths.runtime_dir().join("jarvis.lock"), b"").expect("write lock");
+    assert!(
+        !paths.runtime_dir().join("discovery.json").exists(),
+        "a cleanly stopped daemon has no discovery file"
+    );
+
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.daemon_not_running"),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let report = runtime.block_on(collect(&paths, &environment));
+    let state = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon state")
+        .expect("the daemon-state check ran");
+    assert_eq!(
+        state.severity,
+        Severity::Ok,
+        "an idle daemon is a normal state, not a fault: {}",
+        state.message
+    );
+    assert_eq!(
+        plan_for(&paths, state).err(),
+        Some(RepairError::NotRepairable {
+            code: state.message.clone()
+        }),
+        "there must be nothing to repair"
+    );
+}
+
+#[test]
+fn a_held_lock_is_reported_as_ok_and_is_not_repairable() {
+    // The counterpart: a live holder must never be reported as stale, and repair
+    // must refuse it.
+    let paths = jarvis_paths("held-lock");
+    paths.ensure_directories().expect("create");
+    let lock = paths.runtime_dir().join("jarvis.lock");
+    let guard = crate::lifecycle::InstanceGuard::acquire(&lock).expect("acquire");
+    // A discovery file alongside a HELD lock is a live daemon, not a stale state.
+    std::fs::write(paths.runtime_dir().join("discovery.json"), b"{}").expect("write");
+
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.daemon_not_running"),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let report = runtime.block_on(collect(&paths, &environment));
+    let state = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "daemon state")
+        .expect("the daemon-state check ran");
+    assert_eq!(state.severity, Severity::Ok);
+    // Planning is refused, and the refusal names the reason that matters: a daemon
+    // holds the lock, so the discovery file beside it is live, not stale.
+    assert_eq!(
+        plan_for(&paths, state).err(),
+        Some(RepairError::DaemonRunning),
+        "a live daemon must make the stale-state repair refuse, naming the daemon"
+    );
+    // The discovery file must survive: a live daemon owns it.
+    assert!(paths.runtime_dir().join("discovery.json").exists());
+    drop(guard);
+}
+
+#[test]
+fn the_collector_does_not_create_the_directories_it_reports_on() {
+    // The property that makes the directory check meaningful: a diagnostic must
+    // not perform the repair it describes. The earlier version called
+    // `ensure_directories`, so a missing-directory fault was invisible *and* the
+    // repair for it could never be offered.
+    let paths = jarvis_paths("non-mutating");
+    assert_eq!(paths.missing_directories().len(), 5);
+
+    let environment = DiagnosticsEnvironment {
+        daemon: None,
+        discovery_error: Some("jarvis.discovery_missing"),
+        controller: None,
+        service_spec: None,
+        service_spec_error: None,
+        controller_error: Some("jarvis.service_facility_unavailable"),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let report = runtime.block_on(collect(&paths, &environment));
+
+    assert_eq!(
+        paths.missing_directories().len(),
+        5,
+        "collecting a report must not create anything"
+    );
+    assert!(!paths.config_dir().exists());
+
+    // The missing directories are reported as a warning, not an error: a fresh
+    // profile is a supported state the daemon creates on first start.
+    let directories = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "profile directories")
+        .expect("the check ran");
+    assert_eq!(directories.severity, Severity::Warning);
+    assert!(report.is_usable(), "{}", report.render());
+    // And the finding is repairable, which is the point of reporting it at all.
+    assert!(plan_for(&paths, directories).is_ok());
+}
+
+#[test]
 fn the_collector_is_pure_for_an_empty_profile_with_no_environment() {
     // No daemon, no service controller, no spec: every injectable absence must
     // produce a warning rather than a panic or a blocking error, because doctor
@@ -593,7 +764,8 @@ fn the_collector_is_pure_for_an_empty_profile_with_no_environment() {
     let report = runtime.block_on(collect(&paths, &environment));
     assert!(report.is_usable(), "{}", report.render());
     assert_eq!(report.blocking(), 0);
-    // Daemon, credential, and service are all warnings on a fresh profile.
+    // Directories, daemon, credential, and service are all warnings on a fresh
+    // profile.
     assert!(report.warnings() >= 2, "{}", report.render());
     assert!(report.render().contains("daemon"));
     assert!(report.render().contains("configuration"));

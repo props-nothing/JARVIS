@@ -324,9 +324,48 @@ Dependencies: all Milestone 0 exit criteria.
   boundaries that exist today; there is no redaction self-test command, no
   attachment path for a user-selected run, and no retention/cleanup of previously
   exported bundles. Repair plans are `FND-014`.
-- [ ] `FND-014` Implement previewed and confirmed repair plans for stale locks,
+- [~] `FND-014` Implement previewed and confirmed repair plans for stale locks,
   service definitions, permissions, config, and recoverable storage faults with
   backup, rollback, and verified postconditions.
+  Evidence (PARTIAL): `jarvis_infrastructure::diagnostics::repair` implements
+  repair as a plan value first, so every decision is previewable and assertable on
+  any host. A plan carries a diagnosis, the exact actions with the path each
+  touches, and a `destructive` flag; `apply` requires explicit `--confirm` and
+  refuses an unconfirmed plan, a path outside the profile, a path that would remove
+  user data, and a plan it cannot verify. It checks the postcondition **before**
+  applying (so a plan whose outcome already holds is refused as
+  `AlreadySatisfied` rather than "succeeding" at doing nothing) and **again**
+  afterwards, rolling back every action that recorded an undo step. A failed
+  rollback is reported, not swallowed. `jarvis repair` previews by default and
+  prints the findings it will *not* touch, so "nothing to repair" cannot be read as
+  "everything is fine". 41 repair/diagnostics tests plus live end-to-end runs:
+  on a real profile `repair` created the five missing directories and verified the
+  postcondition, re-running it refused, and after `taskkill /F` it removed the
+  stale discovery file while leaving the benign lock file alone.
+  **Three findings from this slice, each a defect the earlier behaviour hid:**
+  (1) the directory check called `ensure_directories`, so it *created* what it
+  reported and a missing-directory fault was unobservable and unrepairable — it now
+  verifies without mutating and reports a missing directory as a warning (a fresh
+  profile is supported, not broken);
+  (2) the first stale-state repair targeted the lock file, but a clean drain
+  releases the lock and leaves the file, so an unheld lock is the daemon's normal
+  resting state and removing it would fix nothing — the authoritative condition is
+  a discovery file surviving a *free* lock, because a drain unpublishes discovery;
+  (3) the repair must be keyed on the lock-derived check, not on reachability,
+  because the discovery file outlives an unclean kill and still parses, so
+  `jarvis status` claims a dead daemon is running — verified live, where the
+  surviving discovery file made reachability report `ok` while the lock check
+  caught the stale state. 302 workspace tests pass; `fmt` and
+  `clippy -D warnings` are clean. `scripts/clean-machine-smoke.mjs` now asserts
+  convergence rather than a platform-dependent pre-state, because Windows cannot
+  deliver a graceful stop through `child.kill`, so whether a stopped daemon leaves
+  a stale discovery file differs by platform for a reason that is not a defect.
+  **Not done**: service-definition drift, configuration migration, and
+  permission/ACL repair on Windows; recoverable storage faults are deliberately
+  excluded, because repairing corrupt data is a restore (`FND-006`) and a repair
+  that rewrote it would be deleting user data; and because the daemon holds no
+  live lock during a `repair` run the plan is not atomic against a daemon that
+  starts mid-apply (`ACC-003`'s port and service-path faults also remain).
 
 ## Milestone 2: Brain
 

@@ -137,6 +137,28 @@ async function stop(child, label) {
   throw new Error(`${label}: the daemon did not stop within ${SHUTDOWN_TIMEOUT_MS}ms`);
 }
 
+/**
+ * Waits for an already-killed process to be reaped.
+ *
+ * An unclean kill has no drain to wait for, but the operating system still needs a
+ * moment to release the process's file handles. Removing a lock file before the
+ * handle is released is exactly the race this test would otherwise blame on
+ * `repair`.
+ */
+async function waitForExit(child) {
+  const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      // The exit event fires asynchronously; give the runtime a turn so handles
+      // are closed before the next assertion reads them.
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+  throw new Error("the killed daemon was not reaped within the shutdown bound");
+}
+
 async function main() {
   const { daemon, client } = resolveBinaries();
   const profile = mkdtempSync(join(tmpdir(), "jarvis-clean-"));
@@ -195,6 +217,67 @@ async function main() {
     await stop(running, "first start");
     running = null;
     pass("first start: the daemon drained and stopped");
+
+    // 4b. Repair must converge. Whether a stopped daemon leaves a stale discovery
+    //     file depends on the platform: a graceful drain unpublishes it, but
+    //     Windows cannot deliver a graceful signal through `child.kill`, so a stop
+    //     there is an unclean termination and the file survives. This step
+    //     therefore asserts *convergence* — run repair, then require a second run
+    //     to find nothing — rather than assuming which way the stop went. An
+    //     assertion on the pre-state would pass on one platform and fail on the
+    //     other for a reason that is not a defect.
+    const firstRepair = run(client, ["--profile", profile, "repair", "--confirm"]);
+    if (firstRepair.status !== 0) {
+      fail("repair failed after a stop", `${firstRepair.stdout}${firstRepair.stderr}`);
+    }
+    const converged = run(client, ["--profile", profile, "repair", "--confirm"]);
+    if (!/0 plan\(s\) applied/.test(converged.stdout)) {
+      fail(
+        "repair did not converge: a second run still found work to do",
+        converged.stdout,
+      );
+    } else if (existsSync(join(profile, "run", "discovery.json"))) {
+      fail("repair reported convergence but the discovery file is still present");
+    } else {
+      pass("repair: converged to a state with nothing left to fix");
+    }
+
+    // 4c. Unclean termination must be detected from the lock, not the discovery
+    //     file. The kill frees the lock and leaves the discovery file behind, so
+    //     doctor must report the stale state and repair must clear it.
+    const killed = await startAndWait(daemon, client, profile, "unclean");
+    killed.child.kill("SIGKILL");
+    await waitForExit(killed.child);
+    const staleDiscovery = join(profile, "run", "discovery.json");
+    if (!existsSync(staleDiscovery)) {
+      fail("the discovery file did not survive an unclean kill, so this check is vacuous");
+    } else {
+      const afterKill = run(client, ["--profile", profile, "doctor"]);
+      if (!/daemon state: jarvis\.stale_discovery/.test(afterKill.stdout)) {
+        fail(
+          "doctor did not detect the stale daemon state after an unclean kill",
+          afterKill.stdout,
+        );
+      } else {
+        pass("repair: doctor detected the stale discovery file after an unclean kill");
+      }
+
+      const repaired = run(client, ["--profile", profile, "repair", "--confirm"]);
+      if (repaired.status !== 0) {
+        fail("the stale-state repair failed", `${repaired.stdout}${repaired.stderr}`);
+      } else if (existsSync(staleDiscovery)) {
+        fail("the stale discovery file still exists after repair reported success");
+      } else {
+        pass("repair: removed the stale discovery file and verified the postcondition");
+      }
+
+      // The lock FILE is the daemon's resting state and must be left alone.
+      if (!existsSync(join(profile, "run", "jarvis.lock"))) {
+        fail("repair removed the benign lock file, which is not the stale artifact");
+      } else {
+        pass("repair: left the benign instance-lock file in place");
+      }
+    }
 
     // 5. Restart against the same profile: state must survive, and the daemon
     //    must not re-enroll a second credential.

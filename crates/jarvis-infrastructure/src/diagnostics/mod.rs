@@ -42,12 +42,17 @@ use sha2::{Digest as _, Sha256};
 
 mod archive;
 mod collector;
+mod repair;
 #[cfg(test)]
 mod tests;
 
 pub use archive::{ArchiveError, MAX_ARCHIVE_BYTES, ZipArchive};
 pub use collector::{
     DaemonDescriptor, DiagnosticsEnvironment, collect, daemon_summary, database_file,
+};
+pub use repair::{
+    RepairAction, RepairDiagnosis, RepairError, RepairKind, RepairOutcome, RepairPlan, apply,
+    is_protected, plan_for, plans_for, protected_database_path, unrepairable,
 };
 /// The bundle manifest schema version, recorded inside every bundle.
 pub const SUPPORT_BUNDLE_SCHEMA_VERSION: u32 = 1;

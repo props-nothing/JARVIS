@@ -187,6 +187,47 @@ impl ProfilePaths {
         Ok(())
     }
 
+    /// Verifies every managed directory without creating or changing anything.
+    ///
+    /// This is the *postcondition* check for a repair: it must not create a
+    /// missing directory, because a repair that reported success only because
+    /// the check itself did the work would not have fixed anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InfrastructureError::UnsafePermissions`] for a directory that
+    /// exposes access beyond the owner, and
+    /// [`InfrastructureError::DirectoryCreate`] when a managed path exists but
+    /// is not a directory.
+    pub fn verify_directories(&self) -> Result<(), InfrastructureError> {
+        for directory in self.all_dirs() {
+            if !directory.exists() {
+                continue;
+            }
+            if !directory.is_dir() {
+                return Err(InfrastructureError::DirectoryCreate {
+                    path: directory.to_path_buf(),
+                });
+            }
+            #[cfg(unix)]
+            verify_directory_permissions(directory)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the managed directories that do not currently exist.
+    ///
+    /// Used to describe a pending repair precisely, and to prove after the fact
+    /// that it created exactly what it listed.
+    #[must_use]
+    pub fn missing_directories(&self) -> Vec<PathBuf> {
+        self.all_dirs()
+            .iter()
+            .filter(|directory| !directory.is_dir())
+            .map(|directory| (*directory).to_path_buf())
+            .collect()
+    }
+
     /// Creates a file with owner-only permissions and writes `contents`.
     ///
     /// # Errors
