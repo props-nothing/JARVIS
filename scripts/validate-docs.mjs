@@ -79,6 +79,7 @@ const REQUIRED_FILES = [
   "docs/data/migrations.md",
   "docs/data/retention.md",
   "docs/data/schema.md",
+  "docs/operations/ci-gates.md",
   "docs/operations/foundation-handoff.md",
   "docs/operations/README.md",
   "docs/operations/release-readiness.md",
@@ -92,7 +93,9 @@ const REQUIRED_FILES = [
   "docs/research/integration-research-policy.md",
   "docs/research/evidence-manifest.json",
   "docs/research/integrations/elevenlabs.md",
+  "docs/research/integrations/github-actions.md",
   "docs/research/integrations/mcp.md",
+  "docs/research/integrations/rust-foundation.md",
   "docs/research/integrations/tauri.md",
   "docs/research/source-registry.md",
   "docs/research/upstream-projects.md",
@@ -103,6 +106,17 @@ const REQUIRED_FILES = [
   "docs/testing/strategy.md",
 ];
 const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "target"]);
+
+// Directories excluded from the repository by `.gitignore` that must also be
+// invisible to this validator.
+//
+// Walking them would make their contents part of the documented contract: a
+// scratch file with a `Status:` line would fail the status check, and a document
+// would be demanded in the top-level index. They must also be skipped so a
+// scratch-only Markdown file cannot change the validated file count. This list is
+// intentionally explicit rather than derived from `.gitignore`, so a new
+// exclusion is a deliberate, reviewable edit instead of a silent side effect.
+const EXCLUDED_DIRECTORIES = new Set(["docs/research-telephony"]);
 
 function parseArguments() {
   const changedFiles = [];
@@ -153,6 +167,12 @@ function walk(directory) {
       continue;
     }
     const entryPath = path.join(directory, entry.name);
+    if (
+      entry.isDirectory() &&
+      EXCLUDED_DIRECTORIES.has(relative(entryPath))
+    ) {
+      continue;
+    }
     if (entry.isDirectory()) {
       files.push(...walk(entryPath));
     } else if (entry.isFile()) {
@@ -397,6 +417,78 @@ function validateRequiredFiles(errors) {
   for (const relativePath of REQUIRED_FILES) {
     if (!existsSync(path.join(ROOT, relativePath))) {
       errors.push(`missing required file: ${relativePath}`);
+    }
+  }
+}
+
+// Sections whose every document must be reachable from the top-level index.
+//
+// The top-level index is hand-written, and it drifted twice: a new document was
+// added, linked from its own section index, and never linked from here. A
+// document nothing links to is effectively unreviewed, because the index is how a
+// reader discovers it. `adr` is excluded because it indexes itself, and
+// `template.md` files are excluded because they are scaffolding, not documents.
+const INDEXED_SECTIONS = [
+  "architecture",
+  "contracts",
+  "data",
+  "operations",
+  "planning",
+  "research",
+  "security",
+  "testing",
+];
+
+/** Returns every relative Markdown link target found in `text`. */
+function linkTargets(text) {
+  const targets = [];
+  for (const match of text.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) {
+    const target = match[1].trim().split("#", 1)[0];
+    if (!target || /^(https?:\/\/|mailto:|<)/.test(target)) {
+      continue;
+    }
+    try {
+      targets.push(decodeURIComponent(target));
+    } catch {
+      // An undecodable target is reported by the link check instead.
+    }
+  }
+  return targets;
+}
+
+/** Fails when a document exists but the top-level index does not link it. */
+function validateIndexCompleteness(errors) {
+  const indexPath = path.join(ROOT, "docs/README.md");
+  if (!existsSync(indexPath)) {
+    // A missing index is already reported by `validateRequiredFiles`.
+    return;
+  }
+  const indexDirectory = path.dirname(indexPath);
+  const linked = new Set(
+    linkTargets(readFileSync(indexPath, "utf8")).map((target) =>
+      path.resolve(indexDirectory, target),
+    ),
+  );
+
+  for (const section of INDEXED_SECTIONS) {
+    const directory = path.join(indexDirectory, section);
+    if (!existsSync(directory)) {
+      errors.push(`docs/README.md: indexed section ${section} does not exist`);
+      continue;
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) {
+        continue;
+      }
+      if (entry.name === "README.md" || entry.name === "template.md") {
+        continue;
+      }
+      const full = path.join(directory, entry.name);
+      if (!linked.has(full)) {
+        errors.push(
+          `docs/README.md: ${relative(full)} exists but the index does not link it`,
+        );
+      }
     }
   }
 }
@@ -772,6 +864,7 @@ function main() {
 
   const errors = [];
   validateRequiredFiles(errors);
+  validateIndexCompleteness(errors);
   const markdownCount = validateMarkdown(errors);
   const { acceptanceCount, requirementCount, todoCount } =
     validateIdsAndTraceability(errors);

@@ -174,6 +174,14 @@ internal agent loop or storage implementation.
   quiet hours, reason, idempotency, status callbacks, and audit.
 - `FR-VOI-006`: Interruption, end-call, transfer, voicemail, latency, and partial
   transcript behavior are explicit state transitions.
+- `FR-VOI-007`: Turn boundaries are detected by a model-based end-of-turn signal
+  with a configurable confidence threshold and a partial-transcript channel, not
+  by a fixed silence window alone. Partial text is ephemeral observation and can
+  never become a completed instruction or directly execute a tool.
+- `FR-VOI-008`: Telephony carrier and audio pipeline are selected in exactly one
+  place, and a text-in/text-out relay and a raw-audio mode are mutually exclusive
+  per call. Provider-supplied defaults that change pipeline semantics are set
+  explicitly and asserted rather than inherited.
 
 ### Installation and Operations
 
@@ -205,6 +213,13 @@ internal agent loop or storage implementation.
   installation.
 - `NFR-TEST-001`: JARVIS-owned behavior is deterministically testable without
   paid providers; provider-owned behavior has gated contract/live tests.
+- `NFR-VOI-001`: A voice turn's perceived latency from end of caller speech to
+  first agent audio meets a recorded budget at **p50 and p95**, and is reported
+  as separate components (transport/auth, end-of-turn detection, context build,
+  model time to first token, tool wait, speech synthesis first audio).
+- `NFR-VOI-002`: Incremental delivery is a measured model capability, not a
+  boolean: a route that requires streaming is only selected for a model whose
+  verified time-to-first-token and token-spread both satisfy the voice budget.
 
 ## Version 1 Scope
 

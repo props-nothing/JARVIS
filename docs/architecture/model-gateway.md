@@ -24,6 +24,13 @@ A model descriptor records independently verified support for:
 
 - input/output modalities;
 - streaming and terminal usage events;
+- **incremental delivery as a measured property, not a flag**: verified time to
+  first token *and* token spread. A model can advertise streaming and still
+  deliver the whole reply in one burst, which makes a streaming pipeline a silent
+  no-op: the code appears to work, the first-token number looks good, and the
+  caller waits for the complete generation regardless. A descriptor that records
+  `streaming: true` without a spread measurement is `UNVERIFIED` for latency
+  routing purposes;
 - tool/function calling and parallel calls;
 - structured output and supported JSON Schema subset;
 - context and output limits;

@@ -114,6 +114,8 @@ Deliverables:
 - Native run state machine and normalized runtime events
 - Durable sessions, messages, runs, steps, model calls, usage, and errors
 - Context budgeter for identity, conversation, and active task
+- Measured incremental-delivery capability per model (time to first token and
+  token spread), not a streaming boolean
 - Visible model data-use, retention, locality, and telemetry policy
 - HTTP/SSE and CLI chat surfaces
 - Cancellation, timeout, fallback, and restart semantics
@@ -244,8 +246,13 @@ Deliverables:
 - Inbound identity/session binding and post-call webhook verification
 - Outbound call connector, consent/legal policy, quiet hours, budget, and callbacks
 - End, transfer, interruption, voicemail, and partial transcript handling
+- Model-based end-of-turn detection with a confidence threshold and a
+  partial-transcript channel, replacing silence-only turn taking
+- Carrier adapter with explicit pipeline attributes, single-point mode selection,
+  and mode selection asserted in tests
 - Provider-neutral call state controller with callback ordering, latency, and
   bounded cleanup
+- Measured perceived-latency budget reported per component and per pipeline
 - Provider-independent local voice spike after the hosted path is stable
 
 Exit gate:
@@ -253,6 +260,9 @@ Exit gate:
 - Inbound and outbound acceptance scenarios pass in a dedicated test account.
 - No call can access a workspace from unverified caller metadata.
 - Call retries cannot ring the user twice for one idempotency key.
+- The recorded perceived-latency budget passes at p50 and p95 on a real call, with
+  end-of-turn detection reported separately from generation.
+- Partial text never enters durable state and never executes a tool.
 
 ## Milestone 9: Desktop and Product Experience
 

@@ -1,7 +1,7 @@
 # Upstream Project Architecture Study
 
 Status: ACCEPTED
-Review scope: architecture bootstrap
+Review scope: architecture bootstrap; voice framework and carrier added 2026-09-21
 Reviewed: 2026-09-20
 
 ## Method and Scope
@@ -222,6 +222,77 @@ database engine.
 
 ## Cross-Project Synthesis
 
+### LiveKit: Realtime Voice Agent Framework and Transport
+
+Repositories: https://github.com/livekit/agents (Python),
+https://github.com/livekit/agents-js (Node), and
+https://github.com/livekit/rust-sdks
+
+Relevant areas reviewed:
+
+- turn detection, adaptive interruption handling, backchannel distinction, and
+  turn-taking tuning;
+- the text-mode test framework and agent simulations;
+- tool definition, async tools, tool-loop design, toolsets, and MCP client use;
+- tasks, workflows, handoffs, and the agent server lifecycle (dispatch, jobs,
+  graceful shutdown);
+- per-stage fallback strategies for STT, LLM, and TTS;
+- telephony: SIP participants, trunks, dispatch rules, connectors, DTMF, cold and
+  warm transfer, and secure trunking;
+- self-hosting, including the separately deployed SIP service.
+
+Adopt as an **external runtime**, not as a core dependency, and only through the
+runtime protocol:
+
+- the testability pattern — agent behaviour asserted in text mode with no room,
+  no account, and no phone call — is the finding worth borrowing regardless of
+  whether the framework is ever adopted;
+- the turn-handling vocabulary (end-of-turn prediction, overlapping speech, false
+  interruption with resume) is a better-named model than a silence timer and
+  should inform JARVIS's own turn events;
+- async-tool progress so a slow tool does not leave the caller in silence;
+- the telephony feature matrix as a reference for what a SIP carrier must expose.
+
+Do not adopt:
+
+- framework-owned tools, MCP, tasks, handoffs, or fallback as JARVIS
+  implementations; each duplicates a canonical JARVIS capability (ADR-0001/0004)
+  and would create the second control plane ADR-0007 forbids;
+- the framework's session or checkpoint types as JARVIS state;
+- a Python or Node process as the JARVIS reasoning authority.
+
+Two constraints that decide adoption more than features do:
+
+- **There is no Rust Agents SDK.** The framework is Python and Node, so adoption
+  means a separate process behind an adapter.
+- **The Rust realtime crates require libwebrtc and custom `rustflags`.** That
+  conflicts with the installable-foundation exit gate's "no development runtime on
+  the target machine" requirement and must be resolved explicitly before any use.
+
+### Voice Architecture Comparison: Cascaded, Speech-to-Speech, and Framework
+
+The three architectures were measured or reviewed for the voice milestone:
+
+| Architecture | Shape | Measured result |
+| --- | --- | --- |
+| Cascaded | STT → LLM → TTS with a text-in/text-out relay | ~1306 ms perceived on real calls |
+| Speech-to-speech | one model, audio in, audio out | ~1155 ms perceived on real calls |
+| Agent framework | orchestration layer over either | tool calling verified headless only |
+
+Two conclusions worth recording, because they are counterintuitive:
+
+- The speech-to-speech advantage was **inside single-call noise** once streaming
+  was added to the cascaded path, and it is bought with the loss of caller memory,
+  voice selection, barge-in handling, and reconnection.
+- The framework's decisive advantage is **testability**, not latency. Checking a
+  tool call in a hand-rolled pipeline requires a paid call through a public
+  tunnel; in a framework it is a local assertion.
+
+Evidence: [Twilio telephony](integrations/telephony-twilio.md) and
+[LiveKit](integrations/livekit.md).
+
+## Combined Structure
+
 The strongest combined structure is:
 
 ```text
@@ -232,6 +303,7 @@ MCP official SDK       interoperability
 Tauri                  desktop packaging and frontend capability boundary
 Home Assistant         connector manifest and quality lifecycle
 LangGraph/Agents SDK   optional runtime semantics and test patterns
+LiveKit                optional voice framework/transport and turn-handling model
 Temporal               later durable orchestration option
 JARVIS                 canonical identity, memory, policy, tools, workflows, data
 ```

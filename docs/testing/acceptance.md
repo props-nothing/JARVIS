@@ -353,7 +353,29 @@ reordering, timeout, and reconnect where supported. Each becomes an explicit
 normalized transition with bounded cleanup and truthful final outcome; partial
 text never becomes a fabricated completed instruction.
 
-## Security and Operations
+### `ACC-068`: Voice Turn Latency Budget
+
+On real calls per pipeline (text relay, raw audio, speech-to-speech), measure
+perceived latency from end of caller speech to first agent audio and report
+transport/authentication, end-of-turn detection, context build, model
+time-to-first-token, tool wait, and synthesis first audio separately. The
+recorded budget passes at p50 and p95. A turn whose end-of-turn detection time is
+reported inside the total rather than beside it fails this scenario, because the
+two components are additive and hiding the split makes the number
+non-actionable. A pipeline that fails the budget is either degraded explicitly or
+not shipped.
+
+### `ACC-069`: Model-Based Turn Detection and Partial-Transcript Discipline
+
+With a model-based end-of-turn source configured and its partial-transcript
+channel enabled, a caller who pauses mid-thought to complete a request is not cut
+off. The end-of-turn confidence threshold and maximum-silence cap are configured
+and appear in the serialized provider request, because an unknown attribute name
+can be silently dropped and would then look applied. Unfinalized prompts are
+confirmed to reach the application; if the provider withholds them by default,
+enabling that channel is proven rather than assumed. Backchannel utterances
+neither trigger a turn nor interrupt the agent, and a genuine interruption still
+does. Partial text is discarded from durable state and cannot execute a tool.
 
 ### `ACC-070`: Secret Canary
 

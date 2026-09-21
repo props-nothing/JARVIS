@@ -40,6 +40,8 @@ again before concluding none exists.
 | System | AI-readable docs | Schema/source entry | Status and implementation note |
 | --- | --- | --- | --- |
 | ElevenLabs | https://elevenlabs.io/docs/llms.txt | https://elevenlabs.io/docs/openapi.json and https://elevenlabs.io/docs/asyncapi.json | VERIFIED INDEX plus OpenAPI/AsyncAPI; individual pages support `.md` |
+| Twilio | https://www.twilio.com/docs/llms.txt | https://www.twilio.com/docs/voice/twiml/connect/conversationrelay and https://www.twilio.com/docs/voice/media-streams | VERIFIED INDEX; pages resolve as Markdown by appending `.md`; the `<ConversationRelay>` reference carries a `dateModified` |
+| LiveKit | https://docs.livekit.io/llms.txt and https://docs.livekit.io/agents/llms.txt | https://github.com/livekit/rust-sdks and https://github.com/livekit/agents | VERIFIED INDEX plus a docs MCP server at https://docs.livekit.io/mcp/ and an `llms-full.txt` corpus; every page resolves as Markdown by appending `.md`. Note: the agent framework is Python/Node only — there is no Rust Agents SDK |
 | Tauri v2 | https://tauri.app/llms.txt | https://github.com/tauri-apps/tauri and https://v2.tauri.app/ | VERIFIED INDEX; use guides/reference split and native CI |
 
 ## Connectors

@@ -16,6 +16,7 @@ services and authorization but do not share accidental wire contracts.
 | MCP client | External tool servers | Capability import |
 | OpenAI-compatible edge | ElevenLabs and selected compatibility clients | Voice/model-style streamed turns |
 | Webhook ingress | Providers | Authenticated external events/callbacks |
+| Voice control callback | Voice carrier | Call completion, handoff reason, and session status after a call |
 
 Compatibility endpoints are adapters. The internal application must not be
 forced into an OpenAI, MCP, or runtime-provider data model.

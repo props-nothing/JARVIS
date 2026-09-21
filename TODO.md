@@ -268,12 +268,16 @@ Dependencies: all Milestone 0 exit criteria.
   pinned to `actions/checkout@v7`, `actions/cache@v6`, and `actions/setup-node@v7`,
   verified against the release API after the initially written `@v5`/`@v4` pins
   proved outdated. 240 workspace tests pass; `fmt` and `clippy -D warnings` are
-  clean. **PARTIAL**: the workflows have never run on GitHub's infrastructure, so
-  their first real execution is unproven (`CI-C013`, `UNVERIFIED`); no CI has
-  verified a packaged artifact, because no installer exists yet (that is
-  `FND-011`/`FND-012`); and real per-user service registration is still asserted as
-  a plan rather than performed anywhere. Native service lifecycle proof is the
-  remaining half of this item.
+  clean. The workflows and journey are committed and pushed (commit `930e1d5`),
+  so the lanes are executing. **PARTIAL**: their result is not asserted here — the
+  repository is private, so the runs API is unreadable from the authoring host
+  without a token, and no token was handled; a valid workflow file is not evidence
+  that it passed (`CI-C013`). Read the Actions tab, and treat the `Native targets`
+  matrix as the first real evidence for the Unix permission assertions and for four
+  of the five target builds. No CI has verified a packaged artifact, because no
+  installer exists yet (that is `FND-011`/`FND-012`), and real per-user service
+  registration is still asserted as a plan rather than performed anywhere. Native
+  service lifecycle proof remains the other half of this item.
 - [ ] `FND-011` Build native release matrix, checksums, isolated test signatures,
   SBOM, and provenance attestations. Production signing depends on `OWN-003`.
 - [ ] `FND-012` Implement install, update, rollback, portable mode, and uninstall
@@ -306,6 +310,10 @@ Foundation TODO remains incomplete.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider
   disclosures/effective decisions.
+- [ ] `BRN-011` Measure and record incremental-delivery capability per model
+  (time to first token **and** chunk spread) rather than a streaming boolean, and
+  fail a route selection when a pinned model reports streaming but delivers its
+  output in one burst.
 
 ## Milestone 3: Tool Fabric
 
@@ -399,6 +407,13 @@ credentials where MCP is used.
   value.
 - [ ] `RTM-008` Test crash, hang, protocol mismatch, malformed events, and scoped
   tool access.
+- [ ] `RTM-009` Decide the voice-agent-framework question on the runtime-adopter
+  axis: complete the LiveKit evidence gate, verify SIP interoperability and
+  live-audio turn-detection latency, determine whether the Rust transport crates
+  can be built without a development runtime on the target machine, and either
+  add a versioned adapter or record a reasoned rejection. Do not adopt framework
+  tool, MCP, task, handoff, or fallback features as JARVIS implementations; they
+  remain proposals validated against the canonical tool fabric.
 
 ## Milestone 8: Voice
 
@@ -406,8 +421,12 @@ Dependencies: Milestones 2, 3, 4, and 6 exit gates. Telephony live tests also
 require a dedicated test account, explicit spend approval, and applicable
 consent/legal policy.
 
-- [ ] `VOI-001` Define provider-neutral voice/call contracts and latency budgets.
-- [ ] `VOI-002` Refresh ElevenLabs evidence before implementation.
+- [ ] `VOI-001` Define provider-neutral voice/call contracts and latency budgets,
+  including the end-of-turn detection requirement and the separate turn-detection
+  and generation measurements that compose the perceived budget.
+- [ ] `VOI-002` Refresh ElevenLabs, Twilio, and LiveKit evidence before
+  implementation, and record fixtures for the documented system-tool shapes and
+  the `elevenlabs_extra_body`/session-binding placement.
 - [ ] `VOI-003` Implement authenticated OpenAI-compatible Responses SSE endpoint.
 - [ ] `VOI-004` Implement Chat Completions compatibility only where required.
 - [ ] `VOI-005` Implement ElevenLabs Custom LLM inbound voice flow.
@@ -422,6 +441,16 @@ consent/legal policy.
 - [ ] `VOI-011` Implement the provider-neutral call state controller for latency,
   interruption/barge-in, transfer, voicemail, partial transcripts, disconnect,
   timeout, callback ordering, bounded cleanup, and terminal reconciliation.
+- [ ] `VOI-012` Implement the telephony carrier adapter with explicit TwiML
+  attributes asserted in tests, single-point mode selection between the
+  text-relay and raw-audio modes, webhook signature verification over raw bytes,
+  callback deduplication, and geographic/spend controls.
+- [ ] `VOI-013` Implement model-based end-of-turn handling: require an end-of-turn
+  confidence threshold and a partial-transcript channel, keep partial text
+  ephemeral, and measure turn-detection time separately from generation time.
+- [ ] `VOI-014` Measure perceived turn latency on real calls per pipeline (text
+  relay versus raw audio versus speech-to-speech) with components reported
+  separately, and prove the recorded budget passes at p50 and p95.
 
 ## Milestone 9: Desktop
 

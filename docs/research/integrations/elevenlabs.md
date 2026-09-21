@@ -26,13 +26,14 @@ Implementation gate: NOT READY
 | Source | URL | Version/date | Accessed | What it establishes |
 | --- | --- | --- | --- | --- |
 | `llms.txt` | https://elevenlabs.io/docs/llms.txt | Current | 2026-09-20 | Full docs/API index and agent instructions |
-| Custom LLM | https://elevenlabs.io/docs/eleven-agents/customization/llm/custom-llm.md | Current | 2026-09-20 | Chat Completions/Responses endpoints, SSE, tools, extra body |
+| Custom LLM | https://elevenlabs.io/docs/eleven-agents/customization/llm/custom-llm.md | Current | 2026-09-21 | Chat Completions/Responses endpoints, SSE, tools, extra body, reasoning, buffer words |
 | MCP | https://elevenlabs.io/docs/eleven-agents/customization/tools/mcp.md | Current | 2026-09-20 | External MCP server setup, transports, approvals, restrictions |
 | MCP security | https://elevenlabs.io/docs/eleven-agents/customization/tools/mcp/security.md | Current | 2026-09-20 | Third-party MCP risk guidance |
 | SIP trunking | https://elevenlabs.io/docs/eleven-agents/phone-numbers/sip-trunking.md | Current | 2026-09-20 | Telephony setup entry |
 | Twilio outbound | https://elevenlabs.io/docs/eleven-agents/api-reference/integrations/twilio/outbound-call.md | Current | 2026-09-20 | Outbound API entry |
 | SIP outbound | https://elevenlabs.io/docs/eleven-agents/api-reference/sip-trunk/outbound-call.md | Current | 2026-09-20 | Outbound SIP API entry |
 | Post-call webhooks | https://elevenlabs.io/docs/eleven-agents/workflows/post-call-webhooks.md | Current | 2026-09-20 | Completion callback entry |
+| System tools | https://elevenlabs.io/docs/eleven-agents/customization/tools/system-tools | Current | 2026-09-21 | Exact system-tool names and parameter schemas |
 | Agent auth | https://elevenlabs.io/docs/eleven-agents/customization/authentication.md | Current | 2026-09-20 | Agent access/auth entry |
 | Privacy/retention | https://elevenlabs.io/docs/eleven-agents/customization/privacy.md | Current | 2026-09-20 | Recording/history retention entry |
 | OpenAPI | https://elevenlabs.io/docs/openapi.json | OpenAPI 3.1 | 2026-09-20 | HTTP endpoint schema |
@@ -68,16 +69,56 @@ Attempted `llms.txt` URLs that did not exist:
 
 - Custom LLM supports OpenAI-compatible `/v1/chat/completions` and
   `/v1/responses`, both SSE with `Content-Type: text/event-stream`.
+- Current docs state both API formats are **fully supported** for custom LLM
+  integration.
 - Chat Completions chunks use `data: {json}\n\n` and end `data: [DONE]\n\n`.
-- Responses uses typed `event:` plus `data:`; minimum documented text/completion
-  events are `response.output_text.delta` and `response.completed`, followed by
-  `[DONE]`.
+- Responses uses typed `event:` plus `data:`; the documented minimum events are
+  `response.output_text.delta` and `response.completed`, followed by `[DONE]`.
+  An `error` event is the documented failure shape.
+- **Reasoning must be returned separately from the answer**; the provider does not
+  derive it from the final text. Chat Completions streams it in a `reasoning` or
+  `reasoning_content` delta; Responses returns a `reasoning` output item with the
+  text in its `summary` field. With reasoning summary enabled the provider sets
+  `reasoning.summary` to `auto` on the request. Gemini-compatible endpoints are
+  requested with a thinking-config flag and return thought content in a separate
+  marker field. JARVIS stores and returns only a safe summary.
+- **Documented slow-model progress mechanism.** When the endpoint needs longer to
+  produce a full answer, it may return an initial chunk ending with an ellipsis
+  and a **trailing space**; the documentation states the space matters because
+  otherwise the next content is appended to the ellipsis and produces audio
+  distortion. This is the provider-sanctioned progress filler and is preferable to
+  inventing filler that could imply success. It is not a substitute for a durable
+  outcome.
 - Custom LLM receives configured system tools in standard OpenAI tool format and
   must return function calls to use them.
 - MCP integration supports SSE and Streamable HTTP servers and per-server/tool
   approval modes. JARVIS selects Streamable HTTP for new work.
 - Post-call and outbound call exact state/callback semantics need focused page
   and live review before implementation.
+
+### System Tools
+
+Exact names and parameters are documented and can be pinned as contract fixtures.
+They are configured on the agent and arrive as standard OpenAI function
+definitions in the request's `tools` array. JARVIS decides whether the runtime may
+propose each one; the provider executes provider-owned call control only after a
+valid function call is echoed back.
+
+| Tool | Parameters | JARVIS mapping |
+| --- | --- | --- |
+| `end_call` | `reason` (required), `message` (optional) | Call end intent |
+| `language_detection` | `reason` (required), `language` (required, must be in the configured list) | Language-switch observation |
+| `transfer_to_agent` | `reason` (optional), `agent_number` (required, **zero-indexed** per configured transfer rules) | Transfer intent to a configured agent |
+| `transfer_to_number` | `reason` (optional), `transfer_number` (required), `client_message` (required), `agent_message` (required) | Transfer to a human |
+| `skip_turn` | `reason` (optional) | Hold/continue decision |
+| `voicemail_detection` | `reason` (required) | Voicemail evidence |
+
+`transfer_to_number.agent_message` is a **context-leak path**: it is
+model-authored text describing the caller's situation, and it is delivered to the
+human receiving the transfer. It is untrusted content and must not carry private
+JARVIS context, secrets, or memory excerpts. `agent_number` is an index into
+configuration JARVIS owns, so an out-of-range value is a denial, not a lookup.
+General JARVIS tools remain in the canonical tool fabric.
 
 ### Data and Limits
 
@@ -183,9 +224,17 @@ Attempted `llms.txt` URLs that did not exist:
 - Outbound API idempotency/status lookup guarantees.
 - Account/plan support for Custom LLM, MCP, SIP/Twilio, ZRM, and regions.
 - Whether Responses tool-call streaming needs additional required events.
+- `transfer_to_number.agent_message`: what the human recipient actually sees, and
+  whether JARVIS can redact or replace it before delivery.
+
+Resolved 2026-09-21: reasoning must be returned separately and in which fields;
+both API formats are fully supported; the exact system-tool names and parameter
+schemas; the documented slow-model progress mechanism and its trailing-space
+requirement.
 
 ## Change Log
 
 | Date | Change | Evidence |
 | --- | --- | --- |
 | 2026-09-20 | Initial architecture review | Official `llms.txt`, Custom LLM, MCP, OpenAPI/AsyncAPI indexes |
+| 2026-09-21 | Recorded the exact system-tool names and parameters, reasoning-return fields, buffer-word progress mechanism, and the `agent_message` leak path | Official custom LLM and system-tools pages |

@@ -76,18 +76,39 @@ not executable until complete and validated.
 ## System Tools
 
 ElevenLabs can include call-control tools in the request. Supported tools are
-mapped explicitly by configured provider metadata, never name-only. Initial
-categories may include:
+mapped explicitly by configured provider metadata, never name-only. The currently
+documented set, with the parameters each call carries:
 
-- end call;
-- language detection/switch;
-- transfer to agent or number;
-- skip turn;
-- voicemail detection.
+| Tool | Parameters | JARVIS treatment |
+| --- | --- | --- |
+| `end_call` | `reason` (required), `message` (optional) | Call end intent |
+| `language_detection` | `reason` (required), `language` (required) | Language-switch observation; language must be in the configured list |
+| `transfer_to_agent` | `reason` (optional), `agent_number` (required, **zero-indexed**) | Transfer to a configured agent; an out-of-range index is a denial, not a lookup |
+| `transfer_to_number` | `reason` (optional), `transfer_number` (required), `client_message` (required), `agent_message` (required) | Transfer to a human |
+| `skip_turn` | `reason` (optional) | Hold/continue decision |
+| `voicemail_detection` | `reason` (required) | Voicemail evidence |
+
+`transfer_to_number.agent_message` is **model-authored free text delivered to a
+human** receiving the transfer. It is a context-leak path: it must be treated as
+untrusted, must not carry private JARVIS context, secrets, or memory excerpts, and
+is redacted or replaced before delivery if policy requires it.
 
 JARVIS decides whether the runtime/model may propose each call-control action.
 ElevenLabs executes provider-owned call control only after the edge emits a valid
 function call. General JARVIS tools remain in the canonical tool fabric.
+
+## Slow-Model Progress
+
+The provider documents a **sanctioned** progress mechanism for endpoints that need
+longer than usual: return an initial chunk whose content ends with an ellipsis and
+a **trailing space**. The trailing space is load-bearing — without it the next
+content is appended to the ellipsis and the audio is distorted. The edge may use
+this when a turn involves real work.
+
+Two limits apply. It is progress, not a result: it must never imply that an action
+succeeded. And it does not replace a durable outcome — a tool that only drafted or
+proposed something is reported as such, and the provider-reported result is a
+claim that the durable tool outcome overrides.
 
 ## Errors and Disconnects
 
@@ -112,9 +133,11 @@ Maintain redacted captured fixtures for:
 
 - Responses text stream and completion;
 - Chat Completions text stream and `[DONE]`;
-- each supported system-tool call;
+- each supported system-tool call, including `transfer_to_number` with its
+  `agent_message`, and an out-of-range `agent_number`;
 - `elevenlabs_extra_body`/session token placement actually observed;
 - reasoning summary enabled/disabled without exposing hidden reasoning;
+- the ellipsis-plus-trailing-space progress chunk, and its absence;
 - malformed request and auth failure;
 - interruption/disconnect/cancellation;
 - slow first token and tool wait;

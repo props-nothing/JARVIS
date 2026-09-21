@@ -168,8 +168,11 @@ target's own C toolchain and the workspace does not cross-compile from one host.
 directory; it does not yet install a package, which is `FND-011`/`FND-012`.
 
 A lane marked `[x]` that never executes on a real runner is not proven. The
-`Native targets` matrix is where the `#[cfg(unix)]` permission assertions finally
-run; on the Windows authoring host they are typechecked only.
+workflows are committed, so these lanes are being triggered; their results live in
+the Actions tab and are not asserted by any document here. The `Native targets`
+matrix is where the `#[cfg(unix)]` permission assertions finally run and where four
+of the five target builds happen for the first time; on the Windows authoring host
+they are typechecked only.
 
 ## Coverage and Completion
 

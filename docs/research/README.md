@@ -29,8 +29,12 @@ or an unpinned `latest` page. The required workflow is:
 - [Routine dependency evidence](dependencies.md)
 - [Official source registry](source-registry.md)
 - [Upstream project architecture study](upstream-projects.md)
+- [Rust Foundation evidence](integrations/rust-foundation.md)
+- [GitHub Actions CI evidence](integrations/github-actions.md)
 - [MCP evidence](integrations/mcp.md)
 - [ElevenLabs evidence](integrations/elevenlabs.md)
+- [Twilio telephony evidence](integrations/telephony-twilio.md)
+- [LiveKit evidence](integrations/livekit.md)
 - [Tauri evidence](integrations/tauri.md)
 
 ## Manifest States

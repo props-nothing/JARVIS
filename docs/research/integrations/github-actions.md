@@ -145,11 +145,20 @@ that work is `FND-011` and must not inherit this decision.
 | `CI-C010` | The Unix owner-only permission assertions actually execute somewhere | VERIFIED in the native lane definition | `cargo test -p jarvis-infrastructure paths:: storage::` on non-Windows runners | `#[cfg(unix)]` assertions are typechecked but never run, as they are on the authoring host |
 | `CI-C011` | A native target builds with its own C toolchain and no cross-compilation | VERIFIED by workflow construction | Host target equals matrix target; the C compiler is checked in its own step | A "supported target" that has never actually been built |
 | `CI-C012` | A platform failure is visible rather than masked | VERIFIED | `fail-fast: false` | One broken platform hides the state of the other four |
-| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **UNVERIFIED** — cannot be checked from the authoring host | Requires a push to the repository | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C013` | The workflows have actually run on GitHub's infrastructure | **UNVERIFIED from the authoring host** — the repository is private, so the runs API is not readable without a token, and no token was handled | Must be read from the Actions tab | A workflow that is syntactically valid but fails on a real runner |
+| `CI-C014` | Every document is reachable from the top-level index | VERIFIED by validator and a fail-closed test | `validateIndexCompleteness` in `scripts/validate-docs.mjs`, falsified with a temporary unlinked file | A document nobody links to, which is effectively unreviewed |
 
 `CI-C013` is the honest gap. Every other claim is either verified from official
-documentation or verified by running the journey locally. The workflows have never
-executed on GitHub's infrastructure, so their first real run is unproven.
+documentation or verified by running the journey locally. The workflows are
+committed and pushed, so their lanes are executing, but no document here records
+their result: a valid workflow file is not evidence that it passed. Read the
+Actions tab, and treat the `Native targets` matrix as the first real evidence for
+the Unix permission assertions and for four of the five target builds.
+
+`CI-C014` was added after this audit found the top-level index had drifted twice:
+a document was added, linked from its own section index, and never linked from
+`docs/README.md`. Both omissions are now fixed, and the new check makes the
+failure mechanical rather than something a reader has to notice.
 
 ## Verification Plan
 
@@ -187,3 +196,4 @@ executed on GitHub's infrastructure, so their first real run is unproven.
 | --- | --- | --- |
 | 2026-09-21 | Initial note; `CI` and `Native targets` workflows added; clean-machine smoke journey added | `FND-010`: no CI existed, and the Unix permission assertions and per-target builds had never executed anywhere |
 | 2026-09-21 | Action majors corrected to `checkout@v7`, `cache@v6`, `setup-node@v7` | The release API showed the initially written `@v5`/`@v4` pins were outdated |
+| 2026-09-21 | Post-push audit: `CI-C013` reworded, `CI-C014` added, index drift fixed | The workflows were committed and pushed (commit `930e1d5`), so "never executed" was no longer accurate; the runs API is unreadable for this private repository without a token, so the result stays unasserted rather than assumed. The audit also found `docs/README.md` omitted `ci-gates.md`, `rust-foundation.md`, and `github-actions.md` |

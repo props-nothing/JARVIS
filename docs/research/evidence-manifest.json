@@ -158,6 +158,26 @@
       "implementation_paths": ["integrations/elevenlabs/**", "adapters/voice/elevenlabs/**", "crates/**/src/adapters/voice/elevenlabs/**", "crates/**/src/voice_providers/elevenlabs/**", "tests/integration/elevenlabs/**"]
     },
     {
+      "id": "telephony-twilio",
+      "todos": ["VOI-001", "VOI-007", "VOI-008", "VOI-009", "VOI-011", "VOI-012", "VOI-013", "VOI-014"],
+      "evidence": "docs/research/integrations/telephony-twilio.md",
+      "state": "ARCHITECTURE_ONLY",
+      "implementation_ready": false,
+      "last_verified": "2026-09-21",
+      "revalidate_by": "2027-03-21",
+      "implementation_paths": ["integrations/telephony/twilio/**", "integrations/twilio/**", "adapters/voice/twilio/**", "adapters/telephony/twilio/**", "crates/**/src/adapters/voice/twilio/**", "crates/**/src/voice_providers/twilio/**", "crates/**/src/telephony_providers/twilio/**", "tests/integration/twilio/**", "tests/integration/telephony/**"]
+    },
+    {
+      "id": "livekit",
+      "todos": ["RTM-009", "VOI-001"],
+      "evidence": "docs/research/integrations/livekit.md",
+      "state": "ARCHITECTURE_ONLY",
+      "implementation_ready": false,
+      "last_verified": "2026-09-21",
+      "revalidate_by": "2027-03-21",
+      "implementation_paths": ["integrations/livekit/**", "runtimes/livekit/**", "adapters/runtimes/livekit/**", "adapters/voice/livekit/**", "crates/**/src/adapters/runtimes/livekit/**", "crates/**/src/external_runtimes/livekit/**", "crates/**/src/runtime_adapters/livekit/**", "crates/**/src/adapters/voice/livekit/**", "crates/**/src/voice_providers/livekit/**", "tests/integration/livekit/**"]
+    },
+    {
       "id": "tauri",
       "todos": ["UI-001", "UI-002", "UI-003", "UI-007", "UI-008"],
       "evidence": "docs/research/integrations/tauri.md",

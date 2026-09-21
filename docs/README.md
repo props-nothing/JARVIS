@@ -75,6 +75,7 @@ documents.
 - [Operations index](operations/README.md)
 - [Foundation implementation handoff](operations/foundation-handoff.md)
 - [Release readiness and owner decisions](operations/release-readiness.md)
+- [CI gates and native lanes](operations/ci-gates.md)
 
 ## Research
 
@@ -85,8 +86,12 @@ documents.
 - [Routine dependency evidence](research/dependencies.md)
 - [Official source registry](research/source-registry.md)
 - [Upstream project study](research/upstream-projects.md)
+- [Rust Foundation evidence](research/integrations/rust-foundation.md)
+- [GitHub Actions CI evidence](research/integrations/github-actions.md)
 - [MCP evidence](research/integrations/mcp.md)
 - [ElevenLabs evidence](research/integrations/elevenlabs.md)
+- [Twilio telephony evidence](research/integrations/telephony-twilio.md)
+- [LiveKit evidence](research/integrations/livekit.md)
 - [Tauri evidence](research/integrations/tauri.md)
 
 ## Reading Order

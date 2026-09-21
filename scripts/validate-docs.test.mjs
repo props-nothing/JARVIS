@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -209,4 +210,71 @@ test("Foundation readiness is not blanket dependency approval", () => {
     ),
     [],
   );
+});
+
+test("an unlinked document is reported by the index check", () => {
+  // The top-level index drifted twice in this repository: a document was added,
+  // linked from its own section index, and never linked from `docs/README.md`.
+  // A document nothing links to is effectively unreviewed, so this must fail
+  // closed. The fixture is created and removed around the run so the repository
+  // is never left dirty by a failing test.
+  const fixture = path.join(ROOT, "docs", "testing", "temp-index-probe.md");
+  const contents = "# Temporary index probe\n\nStatus: PROPOSED\n";
+  writeFileSync(fixture, contents, "utf8");
+  try {
+    const result = runValidator("docs/testing/strategy.md");
+    assert.equal(result.status, 1, "an unlinked document must fail the gate");
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /temp-index-probe\.md exists but the index does not link it/,
+    );
+  } finally {
+    rmSync(fixture, { force: true });
+  }
+});
+
+test("the index check ignores section indexes and templates", () => {
+  // `README.md` and `template.md` are index and scaffolding files, not documents
+  // a reader is expected to reach from the top level. Excluding them is what
+  // keeps the check from failing on the repository's own structure.
+  const result = runValidator("docs/testing/strategy.md");
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+});
+
+test("the excluded scratch area is invisible to the validator", () => {
+  // `docs/research-telephony/` is excluded from the repository, so its Markdown
+  // must not participate in any check: a scratch file with an unsupported
+  // `Status:` value or a broken link must not fail the gate, and must not change
+  // the validated file count either. If the exclusion entry in
+  // `EXCLUDED_DIRECTORIES` is ever removed, this test starts failing.
+  const excluded = path.join(ROOT, "docs", "research-telephony");
+  const probe = path.join(excluded, "temp-validator-probe.md");
+  const contents = [
+    "# Scratch probe - not part of the repository",
+    "",
+    "Status: NOT_A_VALID_STATUS",
+    "",
+    "[a link into nothing at all](does/not/exist.md)",
+    "",
+  ].join("\n");
+
+  assert.ok(existsSync(excluded), "the scratch area should exist for this test");
+  writeFileSync(probe, contents, "utf8");
+  try {
+    const result = runValidator("docs/testing/strategy.md");
+    assert.equal(
+      result.status,
+      0,
+      `an excluded scratch file must not affect the gate: ${result.stdout}${result.stderr}`,
+    );
+    assert.doesNotMatch(
+      `${result.stdout}${result.stderr}`,
+      /temp-validator-probe/,
+      "the excluded file must not be mentioned at all",
+    );
+  } finally {
+    rmSync(probe, { force: true });
+    // The probe is the only thing removed; the scratch area itself is left alone.
+    assert.ok(existsSync(excluded), "the scratch area must not be deleted");
+  }
 });

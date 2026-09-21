@@ -18,10 +18,10 @@ with no elevation, and a two-workflow CI pipeline whose native matrix builds,
 tests, and runs a clean-machine journey on every tier-1 target. Bundled SQLite
 needs a native C toolchain per target, which is why that proof runs natively rather
 than by cross-compilation. Native Unix permission proof, the Windows ACL binding,
-the OS credential store, native service registration, and the first real execution
-of the CI workflows are still outstanding. `FND-010` is implemented as workflows
-and a locally verified journey; `FND-011` release artifacts is the next ready
-task.**
+the OS credential store, native service registration, and the results of the first
+CI runs are still outstanding. `FND-010` is implemented as workflows and a locally
+verified journey, now committed and pushed; `FND-011` release artifacts is the next
+ready task.**
 
 The design goal is not another chat wrapper. JARVIS should remain stable while
 models, providers, agent frameworks, databases, voice vendors, and interfaces

@@ -190,17 +190,49 @@ FAILED
 CANCELLED
 ```
 
+### End-of-turn detection
+
+A turn ends on a **model-based end-of-turn signal** carrying provider confidence,
+gated by a configured threshold, with a configured maximum-silence cap as a
+backstop. End-of-turn detection is not a lifecycle state; it is an observation
+that produces the transition into `INPUT_FINALIZED`. Its elapsed time is recorded
+as its own metric and is additive to perceived latency rather than folded into it.
+
+Where the provider withholds unfinalized prompts and eager end-of-turn signals by
+default, the adapter must enable that channel explicitly; otherwise end-of-turn
+latency is unmeasurable and the `INPUT_FINALIZED` transition is the first visible
+event of the turn, which hides the caller's pause entirely.
+
+### Partial and final transcripts
+
 - Partial STT text is ephemeral observation by default. Only a provider-marked
   final transcript accepted by the adapter can become a finalized input item.
 - Partial or late text never becomes a fabricated completed instruction and
   cannot directly execute a tool.
+- A partial text that arrives after the turn was finalized is retained only as
+  diagnostic evidence; it cannot mutate the finalized input.
+
+### Interruption
+
 - Barge-in records `call.interruption_detected`, stops/cancels the exact TTS/turn
   where supported, and starts a new listening turn only after controller state
   permits it.
+- **Backchannel filtering and false-interruption recovery are different
+  capabilities.** Filtering prevents a spurious stop; recovery resumes a reply
+  after one. Only the second requires retaining what was already spoken, so their
+  capabilities are declared separately and a provider is not credited with one
+  because it has the other.
 - Interrupting speech does not undo an already reserved external side effect.
   Cancellation/reconciliation follows the tool contract.
-- A tool wait can be held, ended, or continued by policy; filler audio cannot
-  claim success before a durable outcome.
+
+### Tool wait and progress
+
+A tool wait can be held, ended, or continued by policy. Progress filler is
+permitted only through a **provider-documented** mechanism, and a result that only
+drafted or proposed something must never be spoken as completed. A provider-
+reported outcome is a claim; the durable tool outcome is authoritative. Approval
+that cannot complete within voice policy becomes an explicit follow-up or step-up
+response, not an indefinitely open stream.
 
 ## Transfer and Voicemail
 
@@ -217,10 +249,21 @@ policy completes.
 
 ## Latency, Timeouts, and Cleanup
 
-Record bounded metrics/deadlines for ingress auth, STT finalization, context
-build, model first token, tool wait, TTS first audio, interruption stop, transfer,
-and total turn/call duration. Exceeding a deadline produces a typed transition or
-degraded behavior; it never silently extends an approval or budget.
+Record bounded metrics/deadlines for ingress auth, **end-of-turn detection**, STT
+finalization, context build, model first token, tool wait, TTS first audio,
+interruption stop, transfer, and total turn/call duration. Exceeding a deadline
+produces a typed transition or degraded behavior; it never silently extends an
+approval or budget.
+
+Perceived latency is reported **per component, never as one summed number**, and
+is attributed to the pipeline that produced it rather than to "voice". Two rules
+apply to every recorded figure:
+
+- the start of the clock is when the provider reported end of speech, which is
+  earlier than when the caller actually stopped, by up to the configured
+  maximum-silence cap;
+- a figure whose pipeline emits text mid-flight and one whose pipeline has already
+  synthesized audio are not comparable, and the record names which it is.
 
 End/cancel performs bounded provider stop, stream shutdown, child-task
 cancellation, final callback grace, artifact finalization, and credential

@@ -639,6 +639,23 @@ The parts that belong in this note, because they concern JARVIS's own behavior:
   read`, and `persist-credentials: false` keeps the job token out of the working
   tree's `.git/config`.
 
+The workflows and journey are committed and pushed, so the lanes execute on every
+push. **No document here records their result**, deliberately: this repository is
+private, the runs API is unreadable from the authoring host without a token, and
+handling a token to check a badge is not justified by the value. A valid workflow
+file is not evidence that it passed, so the result stays unasserted rather than
+assumed. Read the Actions tab, and read the `Native targets` matrix in particular:
+it is the first real evidence for the Unix permission assertions and for four of
+the five target builds.
+
+The documentation audit that followed the push also found that `docs/README.md`
+had drifted: `ci-gates.md`, `rust-foundation.md`, and `github-actions.md` existed
+and were linked from their own section indexes, but were never linked from the
+top-level index. A document nobody links to is effectively unreviewed. All three
+are now linked, and `scripts/validate-docs.mjs` gained an index-completeness check
+with a fail-closed test so the next drift fails the build instead of waiting to be
+noticed (`CI-C014`).
+
 ## Error and Retry Policy
 
 | Condition | Retry? | JARVIS behavior |

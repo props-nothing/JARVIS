@@ -60,7 +60,10 @@ OpenTelemetry spans cover:
 - tool and connector calls;
 - workflow step and event handling;
 - database transaction/query classes;
-- voice turn stages.
+- voice turn stages, with **end-of-turn detection as its own span** rather than
+  part of a combined turn span. End-of-turn time is additive to perceived
+  latency, so merging it into the total removes the only signal that responds to
+  a turn-detection change.
 
 Do not attach raw prompts, emails, documents, tool output, transcripts, or secret
 headers by default. Content tracing requires explicit development policy and

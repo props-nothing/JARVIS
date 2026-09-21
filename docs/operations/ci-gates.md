@@ -103,9 +103,34 @@ invocation as any changed dependency manifest, or the gate refuses the change.
 
 ## Limitations And Residual Risk
 
-- **The workflows have not run on GitHub's infrastructure.** They are syntactically
-  valid and the journey passes locally on Windows, but the first real run is
-  unproven. This is recorded as `CI-C013`, `UNVERIFIED`.
+- **`docs/research-telephony/` is excluded from the repository and from the docs
+  gate.** It is a telephony/LiveKit spike with its own Node toolchain, lockfile,
+  and a nested `.gitignore` protecting its `.env`; it is not part of the JARVIS
+  control plane. Nothing in it was ever tracked, and `.gitignore` now excludes the
+  whole directory so a broad `git add` cannot publish it or its `.env`. The docs
+  validator also skips it explicitly, so its Markdown cannot satisfy a status or
+  index check and a scratch file cannot change the validated file count.
+  Two consequences are worth stating plainly:
+  **a repository ignore rule is not a security control** — the `.env` there is
+  protected only by the file not being added, so if a secret ever passed through
+  it, it should be rotated rather than merely untracked; and the exclusion is a
+  visible, reviewable entry in both `.gitignore` and the validator rather than a
+  `--force`-able convention.
+  **The durable findings have been promoted and the folder is now disposable.**
+  The measured latency baseline, the carrier attribute table and mode-exclusivity
+  trap, and the framework review were moved into
+  [the Twilio telephony note](../research/integrations/telephony-twilio.md) and
+  [the LiveKit note](../research/integrations/livekit.md), with the sources
+  registered in `source-registry.md` and the entries added to
+  `evidence-manifest.json`. What remains in the excluded folder is a runnable
+  harness, not evidence. Deleting the folder is expected and safe once nobody needs
+  to re-run the spike; re-capture any fixture that a promoted note claims as
+  `OBSERVED` before relying on it, because a note is not a substitute for the raw
+  capture.
+- **The workflow results are not verified by any document here.** The lanes are
+  being triggered; read the Actions tab, and read the `Native targets` matrix in
+  particular, since it is the only place the Unix permission assertions and four of
+  the five target builds have ever executed.
 - **Action pins are mutable major tags.** `@v7` is a moving alias, unlike the exact
   pins required of Rust dependencies. This is accepted for read-only gates and must
   not be inherited by any future signing or publication step, which must pin by
