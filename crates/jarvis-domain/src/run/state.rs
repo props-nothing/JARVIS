@@ -102,9 +102,21 @@ impl RunState {
                 Self::Failed,
                 Self::Cancelled,
             ],
-            Self::AwaitingApproval => &[Self::ExecutingTool, Self::Observing, Self::Cancelled],
+            // `AwaitingApproval --> Failed` and `Observing --> Failed` exist because
+            // they were the only non-terminal states from which `Failed` was
+            // unreachable, which made the restart-recovery rule unimplementable: the
+            // local control API requires a non-terminal run found at startup to be
+            // recovered "to an explicit resumable or failed state", and a run
+            // interrupted while awaiting a decision or while folding back a tool
+            // outcome had no legal way to become either.
+            Self::AwaitingApproval => &[
+                Self::ExecutingTool,
+                Self::Observing,
+                Self::Failed,
+                Self::Cancelled,
+            ],
             Self::ExecutingTool => &[Self::Observing, Self::Failed, Self::Cancelled],
-            Self::Observing => &[Self::Planning, Self::Waiting],
+            Self::Observing => &[Self::Planning, Self::Waiting, Self::Failed],
             Self::Waiting => &[Self::Planning, Self::Failed, Self::Cancelled],
             // A failure or a cancellation *while producing the final answer* is a
             // real outcome, not an impossible one: the provider can fail mid-stream
@@ -166,6 +178,13 @@ pub enum TransitionActor {
     ExternalRuntime,
     /// An operator acted through an administrative surface.
     Operator,
+    /// The daemon's supervision reconciled a run after a restart.
+    ///
+    /// Distinct from [`Controller`](Self::Controller) because a recovery transition was
+    /// not a decision the run made: recording it as one would misattribute it, and an
+    /// operator reading the audit trail needs to see that the daemon, not the run, ended
+    /// it.
+    Supervisor,
 }
 
 impl TransitionActor {
@@ -179,6 +198,7 @@ impl TransitionActor {
             Self::Scheduler => "scheduler",
             Self::ExternalRuntime => "external_runtime",
             Self::Operator => "operator",
+            Self::Supervisor => "supervisor",
         }
     }
 }
@@ -356,6 +376,7 @@ mod tests {
                 &[
                     RunState::ExecutingTool,
                     RunState::Observing,
+                    RunState::Failed,
                     RunState::Cancelled,
                 ],
             ),
@@ -365,7 +386,7 @@ mod tests {
             ),
             (
                 RunState::Observing,
-                &[RunState::Planning, RunState::Waiting],
+                &[RunState::Planning, RunState::Waiting, RunState::Failed],
             ),
             (
                 RunState::Waiting,

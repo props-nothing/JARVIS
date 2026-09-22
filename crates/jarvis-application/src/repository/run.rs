@@ -298,6 +298,52 @@ pub enum IdempotencyClaim {
     Conflict,
 }
 
+/// A run that startup found in a non-terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteRun {
+    /// The workspace that owns it, which a recovery write must name.
+    pub workspace_id: WorkspaceId,
+    /// The run's identity, state, and version.
+    pub run: StoredRun,
+    /// What it was parked on, when it was waiting.
+    pub waiting_kind: Option<String>,
+    /// The specific reference it was waiting for, when it was waiting.
+    pub waiting_ref: Option<String>,
+}
+
+/// The largest number of incomplete runs one reconciliation page may return.
+///
+/// Bounded for the same reason every other read here is: a database left with a very
+/// large number of interrupted runs must not be pulled into memory at once by the
+/// startup path.
+pub const MAX_INCOMPLETE_RUNS: u32 = 500;
+
+/// What a recovery pass did.
+///
+/// Reported rather than logged so the caller can decide how to surface it: a daemon
+/// that started and abandoned runs needs to say so, and the count is what it says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    /// Runs recovered to a terminal failed state.
+    pub abandoned: u64,
+    /// Runs whose work was gone but which were parked on a dependency.
+    pub parked: u64,
+}
+
+impl RecoverySummary {
+    /// Returns the number of runs this pass changed.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.abandoned + self.parked
+    }
+
+    /// Returns whether the pass changed anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 /// A run and its events, for a client stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEventPage {
@@ -541,6 +587,22 @@ pub trait RunRepository: Send + Sync {
         opening_event: NewActivityEvent,
         record: NewIdempotencyRecord,
     ) -> RepositoryFuture<'_, IdempotencyClaim>;
+
+    /// Lists runs that are not in a terminal state, oldest first.
+    ///
+    /// Every workspace is included, because this is a **startup reconciliation** read
+    /// and not a client read: the pass must find every interrupted run in the profile,
+    /// and scoping it to one workspace would silently leave the others non-terminal
+    /// forever. Each entry carries its own workspace so the recovery write can name the
+    /// scope it applies to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Corrupted`] for a stored state this build cannot
+    /// interpret, because a run whose state is unreadable must not be skipped: skipping
+    /// it would leave it non-terminal with nobody aware, which is the exact failure this
+    /// operation exists to prevent.
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<IncompleteRun>>;
 }
 
 #[cfg(test)]

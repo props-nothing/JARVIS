@@ -24,4 +24,5 @@
 //! mapping rather than as a `serde` rename on [`state::RunState`].
 
 pub mod lifecycle;
+pub mod recovery;
 pub mod state;

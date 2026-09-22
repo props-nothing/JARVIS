@@ -31,9 +31,9 @@ use jarvis_application::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, NewModelCall, StoredModelCall,
 };
 use jarvis_application::repository::run::{
-    EventVisibility, IdempotencyClaim, MAX_EVENT_PAGE, NewActivityEvent, NewIdempotencyRecord,
-    NewRun, RunEventPage, RunRepository, RunResumeState, RunWrite, StoredActivityEvent, StoredRun,
-    validate_idempotency_key,
+    EventVisibility, IdempotencyClaim, IncompleteRun, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
+    NewActivityEvent, NewIdempotencyRecord, NewRun, RunEventPage, RunRepository, RunResumeState,
+    RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
@@ -837,6 +837,43 @@ impl RunRepository for SqliteRepositories {
 
             tx.commit().await.map_err(|_| RepositoryError::Query)?;
             Ok(IdempotencyClaim::Claimed)
+        })
+    }
+
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<IncompleteRun>> {
+        Box::pin(async move {
+            // The predicate is on the stored state rather than on `completed_at`, so a
+            // run whose completion instant was somehow absent is still found. Scoping
+            // this read to one workspace would silently leave every other workspace's
+            // interrupted runs non-terminal forever, which is why it is unscoped and
+            // each entry carries its own workspace.
+            let rows = sqlx::query(
+                "SELECT id, workspace_id, conversation_id, principal_id, state, version, \
+                     objective_ref, created_at, started_at, updated_at, completed_at, \
+                     error_code, waiting_kind, waiting_ref \
+                 FROM agent_runs \
+                 WHERE state NOT IN ('completed', 'failed', 'cancelled') \
+                 ORDER BY created_at ASC LIMIT ?",
+            )
+            .bind(i64::from(MAX_INCOMPLETE_RUNS))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+
+            let mut incomplete = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let run = stored_run(row)?;
+                // A state the domain cannot interpret is corruption, and it is reported
+                // rather than skipped: skipping would leave the run non-terminal with
+                // nobody aware, which is the failure this read exists to prevent.
+                incomplete.push(IncompleteRun {
+                    workspace_id: run.workspace_id,
+                    run,
+                    waiting_kind: opt_text(row, "waiting_kind")?,
+                    waiting_ref: opt_text(row, "waiting_ref")?,
+                });
+            }
+            Ok(incomplete)
         })
     }
 }

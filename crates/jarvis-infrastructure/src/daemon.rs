@@ -24,6 +24,7 @@ use crate::http::{ApiState, Readiness};
 use crate::lifecycle::{DiscoveryError, InstanceError, InstanceGuard};
 use crate::storage::StorageError;
 use crate::storage::repositories::SqliteRepositories;
+use jarvis_application::repository::run::RecoverySummary;
 use jarvis_application::run_service::{RunCancellationRegistry, RunService};
 
 /// The default bounded drain grace period.
@@ -78,6 +79,8 @@ pub enum StartupError {
     Bind,
     /// The discovery file could not be published.
     Discovery(DiscoveryError),
+    /// Interrupted runs could not be classified for recovery.
+    Recovery,
 }
 
 impl StartupError {
@@ -89,6 +92,7 @@ impl StartupError {
             Self::Storage(error) => error.code(),
             Self::Bind => "jarvis.bind_failed",
             Self::Discovery(error) => error.code(),
+            Self::Recovery => "jarvis.recovery_failed",
         }
     }
 
@@ -98,7 +102,9 @@ impl StartupError {
         match self {
             Self::Instance(error) => error.retryable(),
             Self::Storage(error) => error.retryable(),
-            Self::Bind => true,
+            // Binding and recovery are both safe to repeat: a port that was busy may be
+            // free, and a pass over a database that was locked may succeed.
+            Self::Bind | Self::Recovery => true,
             Self::Discovery(_) => false,
         }
     }
@@ -111,6 +117,9 @@ impl std::fmt::Display for StartupError {
             Self::Storage(error) => write!(formatter, "{error}"),
             Self::Bind => formatter.write_str("the daemon could not bind a loopback port"),
             Self::Discovery(error) => write!(formatter, "{error}"),
+            Self::Recovery => formatter.write_str(
+                "interrupted runs could not be classified before the daemon reported ready",
+            ),
         }
     }
 }
@@ -125,6 +134,7 @@ pub struct RunningDaemon {
     readiness: Arc<Readiness>,
     clients: Arc<ClientRegistry>,
     runs: Arc<RunService>,
+    recovery: RecoverySummary,
     guard: InstanceGuard,
 }
 
@@ -158,6 +168,18 @@ impl RunningDaemon {
     #[must_use]
     pub fn readiness(&self) -> &Arc<Readiness> {
         &self.readiness
+    }
+
+    /// Returns what the startup recovery pass settled.
+    ///
+    /// Returned to the caller rather than logged here: this crate has no logging
+    /// dependency, and startup order, logging, and exit decisions all live in the
+    /// composition root. A non-empty summary means the previous shutdown left runs
+    /// mid-flight, which an operator should be told rather than have to discover by
+    /// polling.
+    #[must_use]
+    pub fn recovery(&self) -> RecoverySummary {
+        self.recovery
     }
 
     /// Returns the listener for a serve loop.
@@ -346,7 +368,24 @@ pub async fn start(
         return Err(StartupError::Bind);
     }
 
-    // 4. Publish discovery before readiness, so a ready daemon is always
+    // 4. Settle runs the previous daemon left mid-flight, **before** anything is
+    // published or reported ready. The local control API requires a non-terminal run
+    // found at restart to be recovered to an explicit resumable or failed state, and
+    // readiness must stay false until that classification completes — so this cannot
+    // follow the discovery publication, or a client could reach a daemon that has not
+    // yet settled the runs it is about to serve.
+    let ports = run_ports(database.pool().clone());
+    let recovery = jarvis_application::recovery::reconcile(
+        &ports.runs,
+        crate::time::SystemClock::new()
+            .now()
+            .map_err(|_| StartupError::Recovery)?,
+    )
+    .await
+    .map_err(|_| StartupError::Recovery)?;
+    let recovery = recovery.summary;
+
+    // 5. Publish discovery before readiness, so a ready daemon is always
     // discoverable.
     let record = jarvis_protocol::DiscoveryFile {
         schema_version: jarvis_protocol::DISCOVERY_SCHEMA_VERSION,
@@ -359,17 +398,13 @@ pub async fn start(
     crate::lifecycle::publish_discovery(&config.discovery_path(), &record)
         .map_err(StartupError::Discovery)?;
 
-    // 5. Ready only now. Readiness is a separate flag from liveness, so a probe
+    // 6. Ready only now. Readiness is a separate flag from liveness, so a probe
     // can succeed before, during, and after this transition.
     let readiness = Arc::new(Readiness::new());
     readiness.mark_ready();
 
-    // The run service shares the migrated pool. It is composed here rather than in a
-    // binary because the pool must be the one migrations ran against: a second
-    // connection to the same file would work but could not prove the schema was
-    // migrated.
     let runs = Arc::new(RunService::new(
-        run_ports(database.pool().clone()),
+        ports,
         Arc::new(RunCancellationRegistry::new()),
     ));
 
@@ -380,6 +415,7 @@ pub async fn start(
         readiness,
         clients: Arc::new(clients),
         runs,
+        recovery,
         guard,
     })
 }

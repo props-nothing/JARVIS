@@ -88,6 +88,18 @@ async fn run() -> ExitCode {
         }
     };
 
+    // A non-empty summary means the previous shutdown left runs mid-flight. Reported at
+    // startup because abandoning a run is a fact about the operator's own data, and
+    // discovering it only by polling a run that never finishes is worse than being told.
+    let recovery = daemon.recovery();
+    if !recovery.is_empty() {
+        tracing::warn!(
+            abandoned = recovery.abandoned,
+            parked = recovery.parked,
+            "recovered runs left incomplete by the previous shutdown",
+        );
+    }
+
     tracing::info!(instance_id = daemon.instance_id(), "daemon ready");
 
     serve(daemon, config.drain_grace).await

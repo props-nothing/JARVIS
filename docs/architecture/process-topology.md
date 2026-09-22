@@ -145,3 +145,26 @@ silently mixes with installed-profile state.
 
 Forced termination at any point must recover through persisted invariants, not a
 perfect shutdown assumption.
+
+### Implemented evidence (startup order, steps 5–9)
+
+Steps 5, 7, and 9 exist and their **order is asserted**, not merely intended. `start`
+opens and migrates storage, then runs the recovery pass over interrupted runs
+(`jarvis_application::recovery::reconcile`), and only then publishes the discovery file
+and marks readiness. That ordering is the one this document's step 5 asks for and the
+local control API requires literally: readiness must stay false until recovery
+classification completes, so a client cannot reach a daemon that has not yet settled the
+runs it is about to serve.
+
+The pass is a run-level instance of "recover incomplete internal transactions": each
+interrupted run is settled to a terminal state with its public event in the same
+write, through the same fused repository call every other transition uses. The
+recovery count is returned to the composition root rather than logged inside the
+storage layer, because startup order, logging, and exit decisions all live in `main`,
+and because `jarvis-infrastructure` has no logging dependency of its own.
+
+Steps 2, 3, 4, and 8 are partially implemented: the single-instance lock, stderr
+logging, configuration loading, and the scheduler's absence are covered elsewhere in
+this document, and steps 8's workers, connectors, runtime supervisor, and workflow
+recovery are later milestones. **Not implemented at this step:** no interrupted
+external runtime process is reconciled, because no runtime supervisor exists yet.

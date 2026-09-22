@@ -43,6 +43,8 @@ stateDiagram-v2
     ExecutingTool --> Failed
     Waiting --> Failed
     AwaitingApproval --> Cancelled
+    AwaitingApproval --> Failed
+    Observing --> Failed
     AwaitingModel --> Cancelled
     ExecutingTool --> Cancelled
     Waiting --> Cancelled
@@ -51,9 +53,8 @@ stateDiagram-v2
     Completed --> [*]
 ```
 
-Four edges were **added** to this diagram on 2026-09-22, and the reason is worth
-recording because each was a defect the diagram had rather than a stylistic
-choice:
+Six edges have been **added** to this diagram, and the reason is worth recording
+because each was a defect the diagram had rather than a stylistic choice:
 
 - `AwaitingModel --> Responding`. Without it the native runtime's own instruction —
   "ask a model for either a final response or typed tool intent" — had no legal
@@ -72,8 +73,18 @@ choice:
   Without this edge such a run was **permanently non-terminal**: the controller had
   no legal way to record the cancellation, so a client polling the run waited forever
   for an answer that had already been abandoned. This one was found by driving the
-  run service end to end rather than by reading the diagram, and it is the third
-  time an edge absent from this diagram turned out to be a defect in the diagram.
+  run service end to end rather than by reading the diagram.
+- `AwaitingApproval --> Failed` and `Observing --> Failed`. These two were the only
+  non-terminal states from which `Failed` was unreachable, and that made the
+  **restart-recovery rule unimplementable**: the local control API requires a
+  non-terminal run found at startup to be recovered "to an explicit resumable or
+  failed state", and a run interrupted while awaiting a decision or while folding
+  back a tool outcome had no legal way to become either. This is the **fourth** time
+  an edge absent from this diagram turned out to be a defect in the diagram, and the
+  pattern is now worth stating plainly: the diagram has twice omitted the edges
+  needed to record a *failure* or a *cancellation*, so it has been an optimistic
+  diagram — every state could progress, and only some could admit that progress had
+  stopped.
 
 State names are domain concepts, not UI strings. A transition records actor,
 reason, expected prior version, timestamp, and correlation metadata.
@@ -188,6 +199,43 @@ against it would prove only self-consistency.
    approvals and timers are later milestones. Entering `Waiting` with nothing to wait
    on would be the same kind of false record the state machine's consistency rules
    exist to prevent.
+
+### Implemented evidence (`BRN-008`, startup recovery)
+
+The restart half of this document's durability rule now has code: the local control
+API's "non-terminal runs are recovered to an explicit resumable or failed state" is
+implemented as `jarvis_domain::run::recovery` (the classification) plus
+`jarvis_application::recovery::reconcile` (the pass), called from `jarvisd` startup.
+
+The classification is the **domain's**, not the service's. Which states an
+interrupted run may be found in, and what each one means, is a statement about the
+state machine, so putting it beside the machine is what stops the daemon and the
+client disagreeing about it. `classify` is an exhaustive match over the twelve states,
+so a new state fails to compile rather than defaulting to "leave it alone" — and
+"leave it alone" is exactly the wrong default, because it is the one that leaves a run
+non-terminal forever.
+
+Two consequences of this work are worth recording:
+
+1. **Nothing is resumed, and the code says so.** Both classifications settle a run at
+   `Failed`; a parked run is classified separately (`was_resumable`, plus `parked_in`
+   in the event payload) so the distinction is recorded, but the outcome is the same.
+   Resuming means re-running a model call, and nothing knows what the interrupted call
+   produced — inferring a result from partial output is precisely what this document
+   forbids. The state machine models a resumable wait (`Waiting` carries a
+   `WaitingOn`); the recovery path does not yet use it, and that is a gap rather than
+   a design.
+2. **A parked run cannot be re-woken.** `AwaitingApproval` and `Waiting` are settled
+   `Failed` because no dependency a run could be waiting on exists yet, so there is
+   nothing that could satisfy it. When approvals and timers land, the
+   `RecoveryAction::Resumable` classification is already where their resume hook
+   belongs — the payload and the actor already distinguish the case, so the change is
+   to the action's target rather than to the read, the write, or the report.
+
+The pass is safe to run against a live database for one structural reason: the
+transition it writes carries the version it **read**, so a run that completed in
+between is refused rather than overwritten. That is what keeps a real outcome from
+being replaced by a failure, and it is asserted directly.
 
 ## Durable Run Record
 

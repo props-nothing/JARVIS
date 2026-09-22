@@ -941,6 +941,41 @@ Foundation TODO remains incomplete.
   client-visible set — that projection remains `BRN-007`'s, since the architecture
   forbids domain states doubling as UI strings. `BRN-009`'s deterministic
   orchestration tests and the gated provider smoke test are still outstanding.
+  **Daemon-restart behavior is now implemented.** The local control API's rule — "on
+  restart, terminal runs remain terminal; nonterminal runs are recovered to an explicit
+  resumable or failed state" — is `jarvis_domain::run::recovery` (classification) plus
+  `jarvis_application::recovery::reconcile` (the pass), called from `jarvisd` **before**
+  discovery is published and before readiness is marked, because the contract requires
+  readiness to stay false until recovery classification completes. **Two missing
+  diagram edges had to be added before this was expressible**: `AwaitingApproval -->
+  Failed` and `Observing --> Failed` were the only non-terminal states from which
+  `Failed` was unreachable, so a run interrupted while awaiting a decision or while
+  folding a tool result had **no legal terminal exit** — the fourth time in this project
+  that a missing edge, rather than a missing design, made a real outcome unexpressible.
+  The classification is the domain's because which states an interrupted run may be
+  found in is a statement about the machine, and `classify` is an exhaustive match so a
+  new state fails to compile rather than silently defaulting to "leave it alone" — the
+  one default that leaves a run non-terminal forever. `TransitionActor::Supervisor`
+  records that the daemon ended the run, not the run. The new read
+  (`RunRepository::incomplete_runs`) is **deliberately unscoped** and returns each run's
+  workspace, because recovery is a whole-profile startup concern and scoping it to one
+  workspace would leave every other workspace's interrupted runs non-terminal with no
+  symptom. The version read is the version written, so a run that completed between the
+  read and the write is refused (`storage.transition_refused`) rather than having a real
+  outcome replaced by a failure — which is what makes the pass safe against a live
+  database. Each run is written independently, so one unsettleable run cannot leave the
+  rest non-terminal, and the report distinguishes a complete pass from a partial one so
+  a caller cannot read "nothing to do" out of a pass that failed to read. **Nothing is
+  resumed**: both classifications land on `Failed`, because resuming means re-running a
+  model call and nothing knows what the interrupted call produced; a parked run is still
+  classified separately (`was_resumable`, `parked_in` in the payload) so the distinction
+  survives. The startup order is proved end-to-end on a durable database file across
+  **three real daemon starts** — the first leaves a run mid-flight, the second must
+  settle it and report the count, the third must find nothing — and that test was
+  confirmed to **fail** when the pass is made to find nothing, so it falsifies the
+  feature rather than describing it. 11 application tests plus 4 adapter tests against a
+  real migrated SQLite database. **Not claimed:** no run is resumed or re-driven, and no
+  dependency a parked run was waiting on is re-evaluated.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider

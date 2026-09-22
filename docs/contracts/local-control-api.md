@@ -474,5 +474,51 @@ dependency set; adding either is a dependency change the research gate requires
 evidence for, and hand-writing a `Stream` would be an unreviewed async state machine
 on the security-relevant path. Also outstanding: contract test 12's golden JSON/SSE
 fixtures and generated OpenAPI drift, `Idempotency-Key` scoping per principal and
-credential rather than per client, and the E2E disconnect and abrupt-restart cases,
-which are `BRN-008`.
+credential rather than per client, and contract test 8's disconnect case.
+
+### Implemented evidence (Milestone 2, restart recovery)
+
+Contract test 9's **abrupt-termination** half is implemented. The classification rule
+lives in the domain (`jarvis_domain::run::recovery`) and the pass lives in the
+application layer (`jarvis_application::recovery::reconcile`), so the decision about an
+interrupted run has exactly one definition and the client can ask the same question
+without opening the database.
+
+- **The read is deliberately unscoped.** `RunRepository::incomplete_runs` returns every
+  workspace's non-terminal runs with each run's workspace attached, because recovery is
+a startup concern of the whole profile. Scoping it to one workspace would leave every
+  other workspace's interrupted runs non-terminal with no symptom.
+- **The predicate is the stored state**, not `completed_at`. A run whose completion
+  instant was somehow absent is still found, and a state the domain cannot interpret is
+  reported as an error rather than skipped — skipping would leave the run non-terminal
+  with nobody aware, which is the failure the read exists to prevent.
+- **Nothing is resumed.** Both classifications settle the run at `Failed`. Resuming
+  means re-running a model call, and nothing knows what the interrupted call produced;
+  the contract's "never inferred complete from partial text" rule and the
+  cannot-resume case are the same case. A parked run is still *classified* separately
+  (`was_resumable`, and `parked_in` in the payload) so the distinction survives for an
+  operator even though the outcome does not differ yet.
+- **The version read is the version written.** The transition carries the version from
+  the read, so a run that completed between the read and the write is refused
+  (`storage.transition_refused`) rather than having a real outcome replaced by a
+  failure. This is what makes the pass safe to run against a live database.
+- **Each run is written independently.** One failure is recorded in the report and the
+  pass continues, so a single unsettleable run cannot leave the rest non-terminal. The
+  report distinguishes a completed pass from a partial one, so a caller cannot read
+  "nothing to do" out of a pass that could not read.
+- **`TransitionActor::Supervisor`** records that the daemon ended the run, not the run.
+  Recording it as the controller would attribute a decision to the run that the run
+  never made.
+
+The startup order is asserted, not merely intended: `start` migrates, then reconciles,
+**then** publishes discovery and only then marks readiness, which is what this
+contract's "readiness stays false until … recovery classification completes"
+sentence requires. `tests/daemon_serving.rs` proves it end-to-end on a durable
+database file across three real daemon starts — the first leaves a run mid-flight, the
+second must settle it and report the count, and the third must find nothing because the
+second already closed it. That test was confirmed to **fail** when the pass is made to
+find nothing, so it falsifies the feature rather than describing it.
+
+**Not claimed:** the run is not actually resumed or re-driven, and no dependency a
+parked run was waiting on is re-evaluated. Nothing performs recovery of a run whose
+process died mid-model-call beyond settling it as failed.

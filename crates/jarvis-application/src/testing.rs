@@ -424,6 +424,28 @@ impl RunRepository for InMemoryRepositories {
         })
     }
 
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<crate::repository::run::IncompleteRun>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut incomplete: Vec<crate::repository::run::IncompleteRun> = store
+                    .runs
+                    .values()
+                    .filter(|row| !row.lifecycle.state().is_terminal())
+                    .map(|row| crate::repository::run::IncompleteRun {
+                        workspace_id: row.workspace_id,
+                        run: row.stored(),
+                        waiting_kind: row.waiting_kind.clone(),
+                        waiting_ref: row.waiting_ref.clone(),
+                    })
+                    .collect();
+                // Oldest first, matching the adapter's ordering, so a test that asserts
+                // the order is asserting the same order a recovery pass would see.
+                incomplete.sort_by_key(|entry| entry.run.created_at);
+                Ok(incomplete)
+            })
+        })
+    }
+
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,

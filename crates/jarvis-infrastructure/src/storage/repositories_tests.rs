@@ -1477,3 +1477,281 @@ async fn a_delta_for_a_foreign_run_is_refused_rather_than_orphaned() {
         RepositoryError::NotFound,
     );
 }
+
+#[tokio::test]
+async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_sql() {
+    // The whole recovery path against a migrated database: the read that finds the
+    // interrupted run, and the optimistic write that settles it. The in-memory port
+    // double agrees with whatever the code assumed; only the SQL proves the predicate,
+    // the ordering, and the version guard are the ones the daemon will actually use.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::Received,
+                    RunState::ContextBuilding,
+                    RunVersion::FIRST,
+                ),
+                event(run_id(), 2, "run.context_building"),
+            ),
+        )
+        .await
+        .expect("applies");
+
+    let incomplete = repositories
+        .incomplete_runs()
+        .await
+        .expect("the interrupted run is readable");
+    assert_eq!(incomplete.len(), 1, "{incomplete:?}");
+    assert_eq!(incomplete[0].run.id, run_id());
+    // The workspace travels with the entry, because the read is unscoped and the write
+    // needs a scope.
+    assert_eq!(incomplete[0].workspace_id, workspace());
+    assert_eq!(incomplete[0].run.state, RunState::ContextBuilding);
+
+    let settled = repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &RunTransition::new(
+                    RunState::ContextBuilding,
+                    RunState::Failed,
+                    incomplete[0].run.version,
+                    TransitionActor::Supervisor,
+                    reason("interrupted_while_working"),
+                    now(),
+                ),
+                event(run_id(), 3, "run.failed"),
+            ),
+        )
+        .await
+        .expect("the recovery applies");
+    assert_eq!(settled.state, RunState::Failed);
+
+    // And a second pass finds nothing, because the predicate is on the stored state.
+    assert!(
+        repositories
+            .incomplete_runs()
+            .await
+            .expect("readable")
+            .is_empty(),
+        "a settled run must no longer be offered for recovery",
+    );
+}
+
+#[tokio::test]
+async fn recovery_finds_interrupted_runs_in_every_workspace_at_once() {
+    // Scoping this read to one workspace would leave every other workspace's runs
+    // non-terminal forever with no symptom, so the unscoped read is the property to
+    // pin: two workspaces, one query, both runs.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                other_conversation_id(),
+                other_workspace(),
+                principal(),
+                None,
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("created");
+    repositories
+        .create(
+            NewRun::new(
+                other_run_id(),
+                other_workspace(),
+                other_conversation_id(),
+                principal(),
+                None,
+                now(),
+            )
+            .expect("valid"),
+            run_received_event(other_run_id(), now()),
+        )
+        .await
+        .expect("created");
+
+    let incomplete = repositories.incomplete_runs().await.expect("readable");
+    assert_eq!(incomplete.len(), 2, "{incomplete:?}");
+    let workspaces: Vec<WorkspaceId> = incomplete.iter().map(|entry| entry.workspace_id).collect();
+    assert!(workspaces.contains(&workspace()), "{workspaces:?}");
+    assert!(workspaces.contains(&other_workspace()), "{workspaces:?}");
+}
+
+#[tokio::test]
+async fn a_terminal_run_is_never_offered_for_recovery() {
+    // "Terminal runs remain terminal" starts at the read: a completed, failed, or
+    // cancelled run must not appear at all, or the pass would revisit it.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let (run_id, other_run_id) = (run_id(), other_run_id());
+
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(RunState::Received, RunState::Cancelled, RunVersion::FIRST),
+                event(run_id, 2, "run.cancelled"),
+            ),
+        )
+        .await
+        .expect("cancels");
+
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                other_conversation_id(),
+                other_workspace(),
+                principal(),
+                None,
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("created");
+    repositories
+        .create(
+            NewRun::new(
+                other_run_id,
+                other_workspace(),
+                other_conversation_id(),
+                principal(),
+                None,
+                now(),
+            )
+            .expect("valid"),
+            run_received_event(other_run_id, now()),
+        )
+        .await
+        .expect("created");
+    repositories
+        .transition(
+            other_workspace(),
+            RunWrite::new(
+                &transition(RunState::Received, RunState::Failed, RunVersion::FIRST),
+                event(other_run_id, 2, "run.failed"),
+            ),
+        )
+        .await
+        .expect("fails");
+
+    assert!(
+        repositories
+            .incomplete_runs()
+            .await
+            .expect("readable")
+            .is_empty(),
+        "cancelled and failed runs are terminal",
+    );
+}
+
+#[tokio::test]
+async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
+    // A parked run's dependency is what makes it *resumable* rather than lost work, so
+    // the read must carry those two fields. Dropping them would classify every parked
+    // run as abandoned, and the distinction would vanish silently.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::Received,
+                    RunState::ContextBuilding,
+                    RunVersion::FIRST,
+                ),
+                event(run_id(), 2, "run.context_building"),
+            ),
+        )
+        .await
+        .expect("applies");
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::ContextBuilding,
+                    RunState::Planning,
+                    RunVersion::new(2),
+                ),
+                event(run_id(), 3, "run.planning"),
+            ),
+        )
+        .await
+        .expect("applies");
+
+    let incomplete = repositories.incomplete_runs().await.expect("readable");
+    let entry = incomplete.first().expect("the run is interrupted");
+    // A working run has no dependency, which is a real value and not a missing one.
+    assert_eq!(entry.waiting_kind, None, "{entry:?}");
+    assert_eq!(entry.waiting_ref, None, "{entry:?}");
+
+    // Now park it, and prove the fields come back. `Waiting` is reached from
+    // `Observing`, not directly from `AwaitingModel` — the first version of this test
+    // tried the short path and the machine refused it, which is the machine being right.
+    for (from, to, version, sequence, name) in [
+        (
+            RunState::Planning,
+            RunState::AwaitingModel,
+            3,
+            4,
+            "run.awaiting_model",
+        ),
+        (
+            RunState::AwaitingModel,
+            RunState::ExecutingTool,
+            4,
+            5,
+            "run.executing_tool",
+        ),
+        (
+            RunState::ExecutingTool,
+            RunState::Observing,
+            5,
+            6,
+            "run.observing",
+        ),
+    ] {
+        repositories
+            .transition(
+                workspace(),
+                RunWrite::new(
+                    &transition(from, to, RunVersion::new(version)),
+                    event(run_id(), sequence, name),
+                ),
+            )
+            .await
+            .expect("applies");
+    }
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(RunState::Observing, RunState::Waiting, RunVersion::new(6)),
+                event(run_id(), 7, "run.waiting"),
+            )
+            .waiting_on(WaitingOn::new("timer", "wake-1").expect("valid")),
+        )
+        .await
+        .expect("applies");
+
+    let incomplete = repositories.incomplete_runs().await.expect("readable");
+    let entry = incomplete.first().expect("the parked run is found");
+    assert_eq!(entry.waiting_kind.as_deref(), Some("timer"), "{entry:?}");
+    assert_eq!(entry.waiting_ref.as_deref(), Some("wake-1"), "{entry:?}");
+    assert!(
+        jarvis_domain::run::recovery::needs_recovery(entry.run.state),
+        "a waiting run must still be offered for recovery",
+    );
+}
