@@ -1292,13 +1292,80 @@ Foundation TODO remains incomplete.
   the request is accepted with the field having no effect — indistinguishable to a client from
   "accepted and applied". Passing it through needs a plain params struct in
   `jarvis-application` (which cannot depend on `jarvis-protocol`) and is the next increment.
-  **Still not done:** `PUT /api/v1/model-data-policy` has no handler, so a policy is only
-  writable through the repository port even though the store implements the version-conflict
-  precondition; the exception lifecycle (issue/expire/revoke/single-use) has a table and no code,
-  so `ModelRouteDecision::exception_ref` is always absent and no route can relax a hard rule; and
-  the inventory attaches no region, retention, or training-use evidence until `BRN-011` measures
-  capabilities, which makes a policy demanding **documented** evidence refuse every candidate
-  rather than having a claim inferred for it.
+  **The write half is now implemented, which is what made that defect fixable rather than
+  blocked.** `PUT /api/v1/model-data-policy` creates the next immutable version through
+  `PolicyService::put`, and the decision worth recording is that **a request body cannot widen the
+  policy in force**: the submission is merged with what is stored through
+  `PolicyRules::merge_stricter`, which only narrows, so the write endpoint is safe without an
+  approval step. That is contract layer 4 (task/run explicit restrictions) sitting beneath layer 2
+  (workspace policy), and it is the rule the whole precedence order exists to express. Falsified
+  by replacing the merge with the raw submission: **3 service tests and the HTTP test fail, and
+  the failure body shows `approved_cloud_allowed` replacing `local_only`** — a widening that would
+  have been invisible if the test had asserted only the status code. `expected_version` is a
+  **precondition** rather than an instruction and `PutPolicyRequest` has no `version` field at
+  all, because version identity is what keeps a past route decision explainable: a client that
+  named the version could skip numbers or collide with an existing one, and a collision would
+  report "your view is stale" to a caller that never held a view. A mismatch is
+  `resource.version_conflict` (409) and **retryable**, while a contradiction is
+  `jarvis.invalid_policy_layer` and **not** retryable — the first is fixed by re-reading, the
+  second by editing the rules. That distinction was itself a defect: the code was first carried
+  inside a `RepositoryError`, whose own `code()` reports its envelope, so a caller was told
+  *storage* refused a *rule* mistake. **Two defects in this round's own work, both caught by the
+  round-trip test:** `PUT`'s reply rendered the rules through the six-field *statement* shape, so
+  `allow_fallback` was silently dropped from the daemon's own description of what it had stored;
+  and `GET` omitted the same three fields, so a read could not be round-tripped either. Both now
+  render through one nine-field function, and `a_read_after_a_write_describes_the_same_stored_row`
+  asserts a write's reply and a subsequent read agree on every rule.
+  **Still not done:** the exception lifecycle (issue/expire/revoke/single-use) has a table and no
+  code, so `ModelRouteDecision::exception_ref` is always absent and no route can relax a hard
+  rule; the inventory attaches no region, retention, or training-use evidence until `BRN-011`
+  measures capabilities, which makes a policy demanding **documented** evidence refuse every
+  candidate rather than having a claim inferred for it; and the create-run policy reference is
+  still unread — now **possible** to wire rather than blocked, because the `PUT` is what lets an
+  operator create a policy, but still a separate increment since every existing E2E harness
+  submits a policy that has never existed.
+  **The create-run reference is now read, resolved, and enforced.** `RunService::resolve_policy`
+  loads the named version (or the workspace's active one when none is named) and records both the
+  reference and the resolved ceiling on the run, in `RunBudget`, so the run's own row explains
+  *why* content was held back without re-deriving it from a policy that may since have been
+  archived. **The ceiling then reaches context assembly**, which is the half that makes this more
+  than bookkeeping: the controller previously passed a hardcoded permissive value and said in a
+  comment that it did so because the policy merge was not built. Falsified by restoring that
+  hardcoded value — **the confidential content reaches the provider and the run completes**, which
+  is exactly the leak the ceiling exists to prevent. Three rules are structural: a **named**
+  version is honoured exactly and a miss is refused rather than substituted, because falling back
+  to the active policy would apply rules the caller did not name; an **absent** ceiling is not a
+  permissive one, so a run in a policy-less workspace records **no** policy while the manifest
+  still records every label — "a policy permitted this" and "nobody configured a policy" are
+  different facts and only the first is a decision an operator made; and the ceiling is read from
+  the **budget** rather than re-read from the store, because a policy edited mid-run would
+  otherwise change the ceiling a running run is judged against, so two steps of one run could be
+  held to different rules. The field is **optional**, forced by the architecture rather than
+  chosen for leniency: the policy identifier is derived from the workspace and the workspace is
+  resolved server-side, so a client cannot name the active policy without first reading it, and
+  requiring it would make every run uncreatable on a fresh installation. Every existing harness
+  and the CLI submitted `{"policy_id":"scripted-test","version":1}` — an identifier that is not a
+  valid `ModelDataPolicyId`, so a policy **no workspace could hold** — and it went unnoticed only
+  because the daemon ignored the field; reading it turned that fiction into a 422 across four
+  tests, the CLI, and an E2E harness. **A defect this found in itself:** `agent_runs.error_code` is
+  read back, is a column in the schema, and is **never populated** — the transition `UPDATE` sets
+  `state`, `version`, `completed_at`, and the waiting columns but not `error_code`, so a failed
+  run's own row cannot say why it failed. Same "a column that can never be correct" class as the
+  round-16 `deadline_at`/`budget_json` finding; recorded as `BRN-012` below rather than fixed
+  here, because closing it needs the code to travel on the transition rather than on the event's
+  reason string.
+- [ ] `BRN-012` Persist the failure code on a terminal run transition, so a failed run's own
+  row explains its outcome. Found while adding the policy-ceiling test above:
+  `agent_runs.error_code` exists, is selected by `run_columns!()`, is read into
+  `StoredRun::error_code`, and is **never written** — the transition `UPDATE` in
+  `jarvis_infrastructure::storage::repositories` sets `state`, `version`, `completed_at`,
+  `waiting_kind`, and `waiting_ref` only. The consequence is that `GET /api/v1/runs/{id}` reports
+  `error_code: None` for a run that failed, and the recovery pass cannot distinguish "interrupted"
+  from "failed for a reason" without reading the activity events. Closing it needs the code to
+  travel on `RunTransition`/`RunWrite` from the controller's outcome rather than being scraped
+  from the event's reason string, plus a migration-free adapter change. The test in
+  `run_controller/tests.rs` asserts the current `None` **with a comment naming the gap**, so the
+  value is pinned and visible rather than silently tolerated.
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

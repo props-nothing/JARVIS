@@ -30,13 +30,14 @@ use axum::response::{IntoResponse, Response};
 use jarvis_application::request_context::RequestContext;
 use jarvis_application::run_service::{CreatedRun, RunService, RunServiceError};
 use jarvis_domain::ids::{
-    ConversationId, CorrelationId, PrincipalId, RequestId, RunId, WorkspaceId,
+    ConversationId, CorrelationId, ModelDataPolicyId, PrincipalId, RequestId, RunId, WorkspaceId,
 };
+use jarvis_domain::model::policy::PolicyVersionRef;
 use jarvis_domain::run::state::RunState;
 use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
-    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, NATIVE_RUNTIME,
-    RUN_CONTRACT_VERSION, RunEventFrame, RunView, SseEvent,
+    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, ModelPolicyRef,
+    NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame, RunView, SseEvent,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, error_response};
@@ -185,14 +186,64 @@ pub async fn create_run(
         None => None,
     };
 
+    // The policy reference is parsed rather than ignored. Before this the field was accepted and
+    // never read, so a caller's stated policy had no effect while the request succeeded — a
+    // failure mode indistinguishable, from the client's side, from the policy being applied.
+    // A malformed identifier is refused here, because every field the contract makes required is
+    // one the daemon must act on or reject.
+    let requested_policy = match parse_policy_reference(command.model_policy.as_ref()) {
+        Ok(reference) => reference,
+        Err(message) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "request.semantic_invalid",
+                message,
+                false,
+            );
+        }
+    };
+
     let context = context_for(&client);
     match service
-        .create(&context, conversation, input, &key, state.spawner.as_ref())
+        .create(
+            &context,
+            conversation,
+            input,
+            &key,
+            requested_policy,
+            state.spawner.as_ref(),
+        )
         .await
     {
         Ok(created) => created_response(&created),
         Err(error) => service_error_response(&error),
     }
+}
+
+/// Parses the client's model policy reference, when one was supplied.
+///
+/// `None` means the caller did not pin a version, so the workspace's active policy governs the
+/// run — which is the only resolution a client could have named, since the workspace is resolved
+/// server-side and the policy identifier is derived from it.
+fn parse_policy_reference(
+    reference: Option<&ModelPolicyRef>,
+) -> Result<Option<PolicyVersionRef>, &'static str> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let Ok(policy_id) = ModelDataPolicyId::parse(&reference.policy_id) else {
+        return Err("The model policy identifier is not a valid identifier.");
+    };
+    // Version 0 cannot denote a stored version — the contract numbers versions from 1 — so it is
+    // refused rather than passed down to become a not-found, which would report "no such policy"
+    // for a value that could never have named one.
+    if reference.version == 0 {
+        return Err("The model policy version must be at least 1.");
+    }
+    Ok(Some(PolicyVersionRef {
+        policy_id,
+        version: reference.version,
+    }))
 }
 
 /// Handles `GET /api/v1/runs/{run_id}`.
@@ -452,7 +503,11 @@ fn created_response(created: &CreatedRun) -> Response {
 fn service_error_response(error: &RunServiceError) -> Response {
     let status = match error {
         RunServiceError::Invalid { .. } => StatusCode::BAD_REQUEST,
-        RunServiceError::NotFound => StatusCode::NOT_FOUND,
+        // A named policy that does not exist is a 404 like any other absent resource, and it is
+        // the contract's own `model.policy_not_found` rather than a generic not-found: the
+        // caller's remedy is to read the policy list, which a generic "no such resource" would
+        // not suggest.
+        RunServiceError::NotFound | RunServiceError::PolicyNotFound => StatusCode::NOT_FOUND,
         RunServiceError::IdempotencyConflict => StatusCode::CONFLICT,
         RunServiceError::Storage(_) | RunServiceError::Controller(_) => {
             StatusCode::INTERNAL_SERVER_ERROR

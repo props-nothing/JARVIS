@@ -237,7 +237,13 @@ async function createRun(record, credential, text) {
       conversation_id: null,
       input: { type: "text", text },
       runtime: "jarvis-native",
-      model_policy: { policy_id: "scripted-test", version: 1 },
+      // No `model_policy`. The field is optional because only the daemon can resolve a
+      // workspace's active policy — the identifier is derived from the workspace, and the
+      // workspace is resolved server-side — so a client can only send a value it invented. An
+      // earlier version of this harness sent `{"policy_id":"scripted-test","version":1}`, which is
+      // not a valid identifier and named a policy no workspace could hold; it went unnoticed only
+      // because the daemon ignored the field. Omitting it states the truth: this run is governed
+      // by whatever the workspace has in force.
     },
     { "Idempotency-Key": idempotencyKey("disconnect") },
   );

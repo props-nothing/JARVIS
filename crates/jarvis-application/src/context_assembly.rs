@@ -12,13 +12,18 @@
 //! - **The sensitivity ceiling is supplied by the caller and is not defaulted here.**
 //!   `model-data-policy.md` states where it comes from — the merged policy's
 //!   `maximum_sensitivity`, with "workspace policy and data-classification ceiling"
-//!   above "resource/document sensitivity policy" in the precedence order. Resolving
-//!   that merge is `BRN-010` and is not built, so this module refuses to invent one:
-//!   it asserts nothing about sensitivity by default, and the controller passes a
-//!   ceiling that admits each item's own label. An item's label is therefore *recorded*
-//!   in the manifest rather than *acted on*, and saying otherwise would be the
-//!   dangerous direction — a reader would believe confidential content was being held
-//!   back by a policy that does not exist yet.
+//!   above "resource/document sensitivity policy" in the precedence order. This module
+//!   still refuses to invent one, and that is why the parameter is required rather than
+//!   optional: the controller resolves it from the **stored** policy and carries it in the
+//!   run's budget, so a caller that has no policy passes the permissive value *deliberately*
+//!   and the reason is visible at the call site.
+//!
+//!   An item's label is therefore both *recorded* in the manifest and, when a policy is in
+//!   force, *acted on*: a candidate above the ceiling is refused before it is ranked, so it
+//!   never reaches the provider. A run created with no policy in force is the case where the
+//!   label is recorded only, and the run's own budget row says so by carrying no policy
+//!   reference — which is what keeps "nobody configured a policy" distinguishable from "a
+//!   policy permitted this".
 //! - **A message whose label JARVIS cannot interpret is refused, not assumed.** An
 //!   unreadable label is not "ordinary internal content"; the run fails with a typed
 //!   error instead, because the two ways to guess have opposite safety consequences and
@@ -277,9 +282,11 @@ pub fn parse_sensitivity(label: &str) -> Option<Sensitivity> {
 /// Assembles the model input from `transcript` and `objective` under `ceiling_tokens`.
 ///
 /// `data_policy_ceiling` is the merged policy's `maximum_sensitivity`. It is a required
-/// parameter rather than a default because this module has no basis on which to choose
-/// one: `BRN-010` owns that resolution, and a default here would be an invented policy
-/// that reads exactly like a real one.
+/// parameter rather than a default because this module has no basis on which to choose one: a
+/// default would be an invented policy that reads exactly like a real one. The controller
+/// resolves it from the stored policy — `jarvis_application::policy_service` and the run's
+/// budget — and passes the permissive value only when no policy is in force, which the run's
+/// own record then shows by carrying no policy reference.
 ///
 /// The items are offered as candidates in transcript order, so two messages that cost
 /// the same are ordered by the domain's recency tiebreak rather than by whichever the

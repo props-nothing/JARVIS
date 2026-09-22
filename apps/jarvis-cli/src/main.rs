@@ -304,10 +304,18 @@ async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
         Ok(state) => Arc::new(state),
         Err(error) => return report_client_error(&error),
     };
+    // `model_policy` is omitted rather than sent, so the daemon resolves the workspace's active
+    // policy for the run. The CLI cannot name it: the policy identifier is derived from the
+    // workspace, and the workspace is resolved server-side from this client's credential, so the
+    // only value the CLI could send is one it invented. It previously sent
+    // `{"policy_id":"default","version":1}` — a policy that has never existed in any workspace —
+    // and because the daemon ignored the field the request succeeded anyway, which meant the
+    // run's record described a policy nobody had configured. Omission states the truth: this run
+    // is governed by whatever the workspace has in force.
     let body = format!(
         concat!(
             r#"{{"conversation_id":null,"input":{{"type":"text","text":{}}},"#,
-            r#""runtime":"jarvis-native","model_policy":{{"policy_id":"default","version":1}}}}"#
+            r#""runtime":"jarvis-native"}}"#
         ),
         json_string(text),
     );

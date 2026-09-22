@@ -31,6 +31,7 @@ use jarvis_domain::ids::{
     ContextManifestId, ConversationId, CorrelationId, MessageId, PrincipalId, RequestId, RunId,
     WorkspaceId,
 };
+use jarvis_domain::model::policy::{PolicyRules, PolicyVersionRef};
 use jarvis_domain::model::stream::Role;
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::RunState;
@@ -43,6 +44,7 @@ use crate::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation,
 };
 use crate::repository::model_call::ModelCallRepository;
+use crate::repository::policy::ModelDataPolicyRepository;
 use crate::repository::run::{
     IdempotencyClaim, NewIdempotencyRecord, NewRun, RunRepository, run_received_event,
 };
@@ -91,6 +93,12 @@ pub enum RunServiceError {
     Storage(RepositoryError),
     /// The run was created but could not be driven to a terminal state.
     Controller(ControllerError),
+    /// The policy named for the run does not exist in the caller's scope.
+    ///
+    /// A run that named a policy version must not fall back to the workspace's active one: the
+    /// caller asked to be governed by *those* rules, and silently applying different ones would
+    /// make the run's own record describe a decision nobody made.
+    PolicyNotFound,
 }
 
 impl RunServiceError {
@@ -109,6 +117,7 @@ impl RunServiceError {
             Self::IdempotencyConflict => "idempotency.conflict",
             Self::Storage(error) => error.code(),
             Self::Controller(error) => error.code(),
+            Self::PolicyNotFound => "model.policy_not_found",
         }
     }
 
@@ -116,7 +125,13 @@ impl RunServiceError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         match self {
-            Self::Invalid { .. } | Self::NotFound | Self::IdempotencyConflict => false,
+            // None of these is fixed by resending the same request. A named policy that does not
+            // exist will not exist on a retry either — only a fresh read helps, and that is a
+            // different request.
+            Self::Invalid { .. }
+            | Self::NotFound
+            | Self::IdempotencyConflict
+            | Self::PolicyNotFound => false,
             Self::Storage(error) => error.retryable(),
             Self::Controller(error) => error.retryable(),
         }
@@ -133,6 +148,7 @@ impl RunServiceError {
             }
             Self::Storage(_) => "The run could not be persisted.",
             Self::Controller(error) => error.message(),
+            Self::PolicyNotFound => "No such model data policy.",
         }
     }
 }
@@ -246,6 +262,13 @@ pub struct RunPorts {
     pub provider: Arc<dyn ModelProvider>,
     /// Supplies instants.
     pub clock: Arc<dyn Clock>,
+    /// Resolves the policy a run executes under, when a store is configured.
+    ///
+    /// Optional so the composition can build a run service without a policy store, which is the
+    /// state the Foundation surfaces and several tests need. `None` is not a permissive default:
+    /// a run created without this port records **no policy**, and the controller treats that as
+    /// "hold nothing back but record every label" rather than as "a policy permitted everything".
+    pub policies: Option<Arc<dyn ModelDataPolicyRepository>>,
 }
 
 /// Orchestrates run creation, execution, and cancellation.
@@ -308,6 +331,7 @@ impl RunService {
         conversation_id: Option<ConversationId>,
         objective: &str,
         idempotency_key: &str,
+        requested_policy: Option<PolicyVersionRef>,
         spawn: &dyn RunSpawner,
     ) -> Result<CreatedRun, RunServiceError> {
         if objective.is_empty() || objective.len() > MAX_OBJECTIVE_BYTES || objective.contains('\0')
@@ -327,22 +351,18 @@ impl RunService {
         let run_id = RunId::from_uuid(uuid::Uuid::now_v7());
         let created_at = self.now()?;
 
-        // Every run gets a budget, derived here rather than left unset. An unset budget
-        // is not a neutral default: it means the run has no deadline at all, so a
-        // provider that hangs would hold it open indefinitely and the run would never
-        // reach a terminal state on its own. The default is bounded and finite, and a
-        // caller that needs a different one can supply it once the schema carries
-        // typed overrides.
-        let budget =
-            RunBudget::expiring_after(created_at, DEFAULT_RUN_BUDGET_MS).map_err(|error| {
-                // A fixed message rather than the budget error's own text: the error is a
-                // bound on a constant, so a caller can do nothing about it, and the
-                // client-visible message must not carry developer detail.
-                RunServiceError::invalid(
-                    error.code(),
-                    "The run's time budget could not be established.",
-                )
-            })?;
+        // The policy is resolved **before** the budget is finished, because the ceiling the run
+        // executes under is one of the budget's terms. Resolving it after creating the run would
+        // mean a run exists whose rules are not yet known — the state the contract's "the run
+        // records the policy it resolved and authorized" rule exists to prevent.
+        //
+        // Resolution is deliberately *not* an error when no policy exists. A workspace with no
+        // policy is a real state, and refusing to create a run in it would make the daemon
+        // unusable until an operator wrote a policy — while silently applying a permissive one
+        // would attribute a decision to nobody. Instead the run records **no** policy, and the
+        // controller holds nothing back while recording every label.
+        let resolved = self.resolve_policy(context, requested_policy).await?;
+        let budget = budget_for(created_at, resolved)?;
 
         // The key is checked *before* anything is created, because a replay must not
         // leave an orphan conversation behind. The digest is over the inputs that
@@ -622,6 +642,49 @@ impl RunService {
             .await?)
     }
 
+    /// Resolves the policy this run executes under.
+    ///
+    /// A named version is honoured exactly, and an absent one means the workspace's active
+    /// policy. The difference matters: a caller that named a version is asking to be governed by
+    /// *those* rules, so falling back to the active policy when the named one is gone would apply
+    /// rules it never named and record a decision nobody made. An absent name is the ordinary
+    /// case — the request did not choose — and there the active policy is exactly what is meant.
+    ///
+    /// Returns `None` when no policy is in force, which is a real state rather than an error. The
+    /// distinction between "no policy" and "a permissive policy" is preserved into the stored
+    /// budget, because only the first is a configuration an operator should be told about.
+    async fn resolve_policy(
+        &self,
+        context: &RequestContext,
+        requested: Option<PolicyVersionRef>,
+    ) -> Result<Option<(PolicyVersionRef, PolicyRules)>, RunServiceError> {
+        let Some(policies) = self.ports.policies.as_ref() else {
+            // No policy store is configured, which is the Foundation composition and several
+            // tests. Reported as "no policy in force" rather than as a fault: the run is
+            // creatable, and its record says plainly that no policy governed it.
+            return Ok(None);
+        };
+        let stored = match requested {
+            Some(reference) => policies
+                .load_version(context.workspace_id, reference)
+                .await
+                // A named version that does not exist is a refusal, not a fallback. Mapped from
+                // the store's `NotFound`, which is also what a version owned by another
+                // workspace returns — the two are indistinguishable by design.
+                .map_err(|error| match error {
+                    RepositoryError::NotFound => RunServiceError::PolicyNotFound,
+                    other => RunServiceError::Storage(other),
+                })?,
+            None => match policies.load_active(context.workspace_id).await {
+                Ok(stored) => stored,
+                // No active policy is the ordinary empty workspace, not a fault.
+                Err(RepositoryError::NotFound) => return Ok(None),
+                Err(other) => return Err(RunServiceError::Storage(other)),
+            },
+        };
+        Ok(Some((stored.reference(), stored.rules)))
+    }
+
     /// Loads or creates the conversation for a new run.
     async fn load_conversation(
         &self,
@@ -687,6 +750,37 @@ impl RunService {
             .now()
             .map_err(|_| RunServiceError::Storage(RepositoryError::Query))
     }
+}
+/// Builds the budget a newly created run starts with.
+///
+/// Every run gets a budget, derived rather than left unset. An unset budget is not a neutral
+/// default: it means the run has no deadline at all, so a provider that hangs would hold it open
+/// indefinitely and the run would never reach a terminal state on its own. The default is bounded
+/// and finite, and a caller that needs a different one can supply it once the schema carries typed
+/// overrides.
+///
+/// The resolved policy is folded in here rather than at the call site, so the recorded budget and
+/// the policy it came from are set in one place. A later reader can then explain why content was
+/// held back without re-deriving it from a policy that may since have been archived; a run created
+/// with no policy records none, which is a fact an operator can act on rather than a permissive
+/// default they cannot see.
+fn budget_for(
+    created_at: jarvis_domain::time::UtcTimestamp,
+    resolved: Option<(PolicyVersionRef, PolicyRules)>,
+) -> Result<RunBudget, RunServiceError> {
+    let budget = RunBudget::expiring_after(created_at, DEFAULT_RUN_BUDGET_MS).map_err(|error| {
+        // A fixed message rather than the budget error's own text: the error is a bound on a
+        // constant, so a caller can do nothing about it, and the client-visible message must
+        // not carry developer detail.
+        RunServiceError::invalid(
+            error.code(),
+            "The run's time budget could not be established.",
+        )
+    })?;
+    Ok(match resolved {
+        Some((reference, rules)) => budget.with_policy(reference, rules.maximum_sensitivity),
+        None => budget,
+    })
 }
 
 /// Starts a background task for a run.

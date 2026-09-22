@@ -357,7 +357,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // parseable envelope rather than the generic unknown-route refusal.
         .route(
             "/api/v1/model-data-policy",
-            authenticated(get(policy::read_active_policy)),
+            authenticated(get(policy::read_active_policy).put(policy::put_active_policy)),
         )
         .route(
             "/api/v1/model-data-policy/effective",
@@ -1354,6 +1354,10 @@ mod tests {
                 deltas: Arc::clone(&repositories) as Arc<dyn StreamDeltaSink>,
                 provider,
                 clock: Arc::new(crate::time::SystemClock::new()),
+                // The run fixture attaches its policy store so a create can resolve the policy it
+                // records, which is what makes the policy reference in a create request reach the
+                // run. `None` here would make every run in these tests policy-less.
+                policies: Some(Arc::clone(&repositories) as Arc<dyn ModelDataPolicyRepository>),
             },
             Arc::new(RunCancellationRegistry::new()),
         ));
@@ -1417,9 +1421,16 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// A create body without a policy reference, which is the ordinary case.
+    ///
+    /// The field is optional because only the daemon can resolve a workspace's active policy: the
+    /// identifier is derived from the workspace, and the workspace is resolved server-side. An
+    /// earlier version of this fixture sent `{"policy_id":"scripted-test","version":1}` — an
+    /// identifier that is not a valid `ModelDataPolicyId`, so it was a policy no workspace could
+    /// ever hold. It went unnoticed because the daemon ignored the field.
     fn create_body(text: &str) -> String {
         format!(
-            r#"{{"conversation_id":null,"input":{{"type":"text","text":"{text}"}},"runtime":"jarvis-native","model_policy":{{"policy_id":"scripted-test","version":1}}}}"#
+            r#"{{"conversation_id":null,"input":{{"type":"text","text":"{text}"}},"runtime":"jarvis-native"}}"#
         )
     }
 
@@ -2093,9 +2104,212 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         // A workspace with no policy is a real state. Reporting a permissive default instead
-        // would say "everything is allowed" on behalf of an operator who never said so.
+        // would say "everything is allowed" on an operator's behalf who never said so.
         assert!(body.contains("model.policy_not_found"), "{body}");
         let _ = std::fs::remove_dir_all(temp_dir("policy-none"));
+    }
+
+    /// A submission body, so the write tests differ only in the fields they vary.
+    fn policy_body(expected_version: u32, locality: &str) -> String {
+        format!(
+            r#"{{"name":"operator policy","expected_version":{expected_version},"rules":{{"locality":"{locality}","maximum_provider_retention":"provider_default_allowed","provider_training_use":"provider_default_allowed","telemetry":"local_only","allowed_residency_regions":[],"maximum_sensitivity":"confidential","allow_fallback":"denied"}}}}"#
+        )
+    }
+
+    /// Writes a policy as an authenticated local client.
+    async fn policy_put(
+        app: &axum::Router,
+        token: &str,
+        body: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut headers = policy_headers(token);
+        headers.push(("content-type", "application/json".to_owned()));
+        if let Some(key) = key {
+            headers.push(("idempotency-key", key.to_owned()));
+        }
+        send(app, "PUT", "/api/v1/model-data-policy", &headers, body).await
+    }
+
+    #[tokio::test]
+    async fn a_put_creates_the_first_policy_and_reports_the_version_it_chose() {
+        let (app, token, _) = policy_fixture("policy-put-first").await;
+
+        let (status, body) =
+            policy_put(&app, &token, &policy_body(0, "local_only"), Some("key-1")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Version 1, chosen by the daemon: the request carried no version at all, and the reply
+        // is where a client learns what it created. A client that had named the version could
+        // collide or skip, which is why the shape has no such field.
+        assert!(body.contains(r#""version":1"#), "{body}");
+        assert!(body.contains(r#""locality":"local_only""#), "{body}");
+
+        // And it is in force, read back through the other route rather than trusted from the
+        // write's own response — a write that answered correctly without storing anything would
+        // pass a single-request assertion.
+        let (read_status, read_body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(read_status, StatusCode::OK, "{read_body}");
+        assert!(read_body.contains(r#""version":1"#), "{read_body}");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-first"));
+    }
+
+    #[tokio::test]
+    async fn a_put_without_an_idempotency_key_is_refused_before_it_writes() {
+        let (app, token, _) = policy_fixture("policy-put-nokey").await;
+
+        let (status, body) = policy_put(&app, &token, &policy_body(0, "local_only"), None).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("request.invalid"), "{body}");
+        // Nothing was written, so a client that retries with a key starts from version 0 rather
+        // than discovering a version it never intended to create.
+        let (read_status, _) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(read_status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-nokey"));
+    }
+
+    #[tokio::test]
+    async fn a_put_refuses_a_locality_this_build_does_not_support() {
+        let (app, token, _) = policy_fixture("policy-put-badvalue").await;
+
+        let (status, body) = policy_put(
+            &app,
+            &token,
+            &policy_body(0, "send_it_anywhere"),
+            Some("key-1"),
+        )
+        .await;
+
+        // A refusal rather than a stored-but-unapplied rule. The merge can only narrow a rule it
+        // understands, so an unrecognized value would be one this layer wrote and the selector
+        // never enforced — which is the edit direction that widens a policy.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("request.semantic_invalid"), "{body}");
+        let (read_status, _) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(read_status, StatusCode::NOT_FOUND, "nothing was stored");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-badvalue"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_put_is_a_conflict_and_leaves_the_policy_in_force() {
+        let (app, token, _) = policy_fixture("policy-put-stale").await;
+        policy_put(&app, &token, &policy_body(0, "local_only"), Some("key-1"))
+            .await
+            .0
+            .is_success()
+            .then_some(())
+            .expect("the first write succeeds");
+
+        // The caller still believes nothing exists. A conflict, not a second version created on
+        // a stale base.
+        let (status, body) = policy_put(
+            &app,
+            &token,
+            &policy_body(0, "approved_cloud_allowed"),
+            Some("key-2"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("resource.version_conflict"), "{body}");
+        // The submitted rules were LOOSER than what is in force, and the stored policy must be
+        // untouched — asserting only the status would pass against an implementation that wrote
+        // the row and then reported a conflict.
+        let (_, read_body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert!(read_body.contains(r#""version":1"#), "{read_body}");
+        assert!(
+            read_body.contains(r#""locality":"local_only""#),
+            "{read_body}"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-stale"));
+    }
+
+    #[tokio::test]
+    async fn a_put_cannot_widen_the_policy_already_in_force() {
+        let (app, token, _) = policy_fixture("policy-put-widen").await;
+        let (first, first_body) =
+            policy_put(&app, &token, &policy_body(0, "local_only"), Some("key-1")).await;
+        assert_eq!(first, StatusCode::OK, "{first_body}");
+
+        // Version 2 is accepted — the precondition is satisfied — but the merge keeps the
+        // stricter locality. This is the assertion that makes the write endpoint safe without an
+        // approval step: a request body can only narrow a workspace policy.
+        let (second, second_body) = policy_put(
+            &app,
+            &token,
+            &policy_body(1, "approved_cloud_allowed"),
+            Some("key-2"),
+        )
+        .await;
+
+        assert_eq!(second, StatusCode::OK, "{second_body}");
+        assert!(second_body.contains(r#""version":2"#), "{second_body}");
+        assert!(
+            second_body.contains(r#""locality":"local_only""#),
+            "a submission must not widen the policy in force: {second_body}",
+        );
+        assert!(
+            !second_body.contains("approved_cloud_allowed"),
+            "{second_body}",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-widen"));
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_write_describes_the_same_stored_row() {
+        // A client that PUTs and immediately GETs must see one document, so the two paths render
+        // through one function. Reading back the allow-lists matters too: they were absent on the
+        // write, and the read must not turn "this layer restricts no provider" into an empty set
+        // that would narrow the policy to nothing on a read-modify-write.
+        let (app, token, _) = policy_fixture("policy-round-trip").await;
+        let (put_status, put_body) =
+            policy_put(&app, &token, &policy_body(0, "local_only"), Some("key-1")).await;
+        assert_eq!(put_status, StatusCode::OK, "{put_body}");
+
+        let (get_status, get_body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(get_status, StatusCode::OK, "{get_body}");
+
+        assert!(!put_body.contains("allowed_providers"), "{put_body}");
+        assert!(!get_body.contains("allowed_providers"), "{get_body}");
+        assert!(
+            get_body.contains(r#""allow_fallback":"denied""#),
+            "{get_body}"
+        );
+        // The read must agree with the write on every rule it reports, so the two bodies cannot
+        // describe different stored state.
+        for fragment in [
+            r#""locality":"local_only""#,
+            r#""maximum_sensitivity":"confidential""#,
+            r#""allow_fallback":"denied""#,
+        ] {
+            assert!(put_body.contains(fragment), "write: {put_body}");
+            assert!(get_body.contains(fragment), "read: {get_body}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir("policy-round-trip"));
+    }
+
+    #[tokio::test]
+    async fn the_put_route_requires_authentication_like_every_other_api_route() {
+        let (app, _, _) = policy_fixture("policy-put-auth").await;
+
+        let (status, body) = send(
+            &app,
+            "PUT",
+            "/api/v1/model-data-policy",
+            &[
+                ("jarvis-api-version", "1".to_owned()),
+                ("content-type", "application/json".to_owned()),
+                ("idempotency-key", "key-1".to_owned()),
+            ],
+            &policy_body(0, "local_only"),
+        )
+        .await;
+
+        // A write is the operation where a missing authorization check is worst: an unauthenticated
+        // caller could install rules for a workspace it does not own.
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-auth"));
     }
 
     #[tokio::test]

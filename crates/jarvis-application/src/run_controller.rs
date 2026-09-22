@@ -659,11 +659,20 @@ impl RunController {
             &transcript,
             objective,
             effective_context_ceiling(&budget),
-            // Admits every label JARVIS writes. The merged data policy's ceiling is
-            // `BRN-010` and is not built, so asserting a stricter one here would be an
-            // invented policy that reads like a real one; the manifest records each
-            // item's label either way, so the gap is visible rather than hidden.
-            Sensitivity::Restricted,
+            // The ceiling the run was created under, resolved from the stored policy and carried
+            // in the budget. An absent ceiling means **no policy was in force**, and only then is
+            // the permissive value used — with the manifest recording each item's label either
+            // way, so the gap stays visible. The two cases are kept apart deliberately: a policy
+            // that permits everything is a decision an operator made, while no policy at all is
+            // not, and collapsing them would report an unconfigured daemon as a permissive one.
+            //
+            // Read from the budget rather than from the store on purpose. Re-reading per call
+            // would let a policy edited mid-run change the ceiling a running run is judged
+            // against, so two steps of one run could be held to different rules — and the run's
+            // own record would no longer explain its own decision.
+            budget
+                .context_sensitivity_ceiling()
+                .unwrap_or(Sensitivity::Restricted),
             self.now()?,
         ) {
             Ok(assembled) => assembled,

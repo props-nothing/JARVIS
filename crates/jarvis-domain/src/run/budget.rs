@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::policy::{PolicyVersionRef, Sensitivity};
 use crate::model::stream::{CallLimits, Usage};
 use crate::run::retry::RetryPolicy;
 use crate::time::UtcTimestamp;
@@ -82,6 +83,30 @@ pub struct RunBudget {
     /// The maximum estimated cost across the run, in millionths of the billing unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_microunits: Option<u64>,
+    /// When the run started, as an absolute instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<UtcTimestamp>,
+    /// The policy version this run was created under, when one was in force.
+    ///
+    /// Recorded with the budget for the same reason the deadline is: the request that created
+    /// the run may be long gone when someone asks *why* confidential content was held back or
+    /// permitted. A run that recorded only the ceiling would leave an operator unable to explain
+    /// the number, and one that recorded only the reference would make a manifest unreadable
+    /// after the policy was archived. Both are stored, and the reference is what makes the
+    /// decision replayable under the contract's historical-record rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyVersionRef>,
+    /// The most sensitive content this run's context may carry.
+    ///
+    /// The merged policy's `maximum_sensitivity`, resolved from the stored policy at creation and
+    /// carried here because the controller needs it while assembling the model input and must not
+    /// re-read the policy per call: a policy edited mid-run would otherwise change the ceiling a
+    /// running run is judged against, so two steps of one run could be held to different rules.
+    ///
+    /// Serialized as the contract's spelling in `budget_json`, so an operator reading a run's row
+    /// sees the same word the API returns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_sensitivity: Option<Sensitivity>,
     /// How a failed model call may be retried.
     ///
     /// Carried with the budget rather than configured on the controller, because a run
@@ -103,8 +128,39 @@ impl RunBudget {
             max_output_tokens: None,
             max_context_tokens: None,
             max_cost_microunits: None,
+            started_at: None,
+            policy: None,
+            // `None`, not a permissive value. A run created with no policy in force is judged
+            // against nothing, and the controller treats an absent ceiling as "record the label
+            // but hold nothing back" — the honest state, rather than a default that would read
+            // exactly like a real policy while constraining nothing.
+            max_context_sensitivity: None,
             retry: RetryPolicy::none(),
         }
+    }
+
+    /// Returns this budget with the policy this run executes under.
+    ///
+    /// Both fields are set together rather than separately, because a recorded ceiling without
+    /// the version that produced it cannot be explained and a version without its resolved
+    /// ceiling forces a later reader to re-derive a decision from data that may since have been
+    /// archived. The pair is one fact: "this run was held to *this* policy's ceiling".
+    #[must_use]
+    pub const fn with_policy(mut self, policy: PolicyVersionRef, ceiling: Sensitivity) -> Self {
+        self.policy = Some(policy);
+        self.max_context_sensitivity = Some(ceiling);
+        self
+    }
+
+    /// Returns the sensitivity ceiling an assembly should apply.
+    ///
+    /// `None` means **no policy was in force**, which is different from a permissive ceiling: a
+    /// caller must be able to tell "a policy said everything is permitted" from "nobody set a
+    /// policy", because only the first is a decision an operator made. This distinction is why
+    /// the field is an `Option` rather than defaulting to the most permissive variant.
+    #[must_use]
+    pub const fn context_sensitivity_ceiling(&self) -> Option<Sensitivity> {
+        self.max_context_sensitivity
     }
 
     /// Returns this budget with a context-token ceiling applied.

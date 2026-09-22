@@ -14,7 +14,7 @@ pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 pub use error::{ErrorEnvelope, ErrorResponse};
 pub use policy::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
-    RejectedCandidateView,
+    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
 };
 pub use run::{
     CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, ModelPolicyRef,

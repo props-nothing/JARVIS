@@ -56,7 +56,19 @@ pub struct CreateRunRequest {
     /// The requested runtime.
     pub runtime: String,
     /// The model policy to resolve and authorize.
-    pub model_policy: ModelPolicyRef,
+    ///
+    /// **Optional**, and the reason is structural rather than lenient: the policy identifier is
+    /// derived from the workspace, and the workspace is resolved **server-side** from the
+    /// authenticated client. A client therefore cannot name its own workspace's active policy
+    /// without first reading it, and requiring the field would make every run uncreatable until an
+    /// operator had configured a policy — including on a fresh installation.
+    ///
+    /// Absent means "govern this run by the workspace's active policy", which is the only
+    /// resolution a client could have named. Present means the caller pinned a version, and it is
+    /// honoured exactly: a named version that does not exist is refused rather than falling back to
+    /// the active one, because falling back would apply rules the caller did not name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ModelPolicyRef>,
 }
 
 /// The public input of a run.
@@ -309,8 +321,28 @@ mod tests {
         assert_eq!(request.conversation_id, None);
         assert_eq!(request.input.text_value(), "hello");
         assert_eq!(request.runtime, NATIVE_RUNTIME);
-        assert_eq!(request.model_policy.policy_id, "scripted-test");
-        assert_eq!(request.model_policy.version, 1);
+        let policy = request.model_policy.expect("a pinned policy is carried");
+        assert_eq!(policy.policy_id, "scripted-test");
+        assert_eq!(policy.version, 1);
+    }
+
+    #[test]
+    fn a_create_request_without_a_policy_is_the_workspace_active_one() {
+        // The field is optional because only the daemon can resolve a workspace's active policy:
+        // the identifier is derived from the workspace, which is resolved server-side, so a client
+        // cannot name it without first reading it. Omitting the field is therefore the ordinary
+        // case — and it must parse, because requiring it would make every run uncreatable until an
+        // operator had configured a policy.
+        let json = r#"{
+            "conversation_id": null,
+            "input": {"type":"text","text":"hello"},
+            "runtime": "jarvis-native"
+        }"#;
+        let request: CreateRunRequest = serde_json::from_str(json).expect("parses");
+        assert!(
+            request.model_policy.is_none(),
+            "an absent policy means the active one, not a parse failure",
+        );
     }
 
     #[test]

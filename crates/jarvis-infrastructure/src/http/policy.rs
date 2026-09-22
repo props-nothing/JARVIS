@@ -30,21 +30,22 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jarvis_application::policy_service::{EvaluationRequest, PolicyServiceError};
+use jarvis_application::repository::policy::StoredPolicyVersion;
 use jarvis_application::request_context::{
     AuthenticationAssurance, RequestChannel, RequestContext,
 };
 use jarvis_domain::ids::{CorrelationId, RequestId};
 use jarvis_domain::model::identity::EndpointClass;
 use jarvis_domain::model::policy::{
-    EffectiveResidency, EffectiveRetention, EffectiveTrainingUse, Locality, ModelRouteDecision,
-    PolicyRules, PolicyVersionRef, ProviderRetention, RequestedDataPolicy, Sensitivity, Telemetry,
-    TrainingUse,
+    EffectiveResidency, EffectiveRetention, EffectiveTrainingUse, FallbackPermission, Locality,
+    ModelRouteDecision, PolicyRules, PolicyVersionRef, ProviderRetention, RequestedDataPolicy,
+    Sensitivity, Telemetry, TrainingUse,
 };
 use jarvis_domain::model::stream::{Modality, RouteRequirements};
 use jarvis_domain::time::{IsoDate, UtcTimestamp};
 use jarvis_protocol::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
-    RejectedCandidateView,
+    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, error_response, runs};
@@ -71,17 +72,243 @@ pub async fn read_active_policy(
     };
     let context = context_for(&client);
     match service.active(&context).await {
+        Ok(stored) => json_response(StatusCode::OK, &active_view(&stored)),
+        Err(error) => policy_error_response(&error),
+    }
+}
+
+/// Handles `PUT /api/v1/model-data-policy`.
+///
+/// The rules are written through a service call that **merges** them against what is already in
+/// force, so a request body can only narrow the workspace policy. That is why the handler parses
+/// into typed values and refuses an unsupported spelling rather than passing the body along: the
+/// merge can only narrow a rule it understands, so a value this build did not parse would be a
+/// rule the write silently dropped — the one edit direction that widens a policy.
+pub async fn put_active_policy(
+    State(state): State<Arc<ApiState>>,
+    client: AuthenticatedClient,
+    headers: axum::http::HeaderMap,
+    body: axum::Json<PutPolicyRequest>,
+) -> Response {
+    let Some(service) = state.policies.as_ref() else {
+        return not_ready();
+    };
+
+    // `Idempotency-Key` is required by the contract. Without it a client that retries a timed-out
+    // write creates a second version of the same rules, and the workspace's version number
+    // advances for a change that was already applied — so a caller can no longer tell how many
+    // distinct policies it has made. The key is checked for presence only; the store's
+    // `expected_version` precondition is what actually prevents a duplicate, so recording the key
+    // would be a second mechanism for the same guarantee.
+    if !headers.contains_key("idempotency-key") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "request.invalid",
+            "An idempotency key is required.",
+            false,
+        );
+    }
+
+    let rules = match submitted_rules(&body.rules) {
+        Ok(rules) => rules,
+        Err(code) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                code,
+                "The submitted rules contain a value this build does not support.",
+                false,
+            );
+        }
+    };
+
+    let context = context_for(&client);
+    // The instant comes from the inventory's build time when the daemon recorded one, so the
+    // version's `created_at` matches the instant the rest of the surface evaluates against. A
+    // clock failure is a 500 rather than a defaulted timestamp: a policy row whose creation
+    // instant was invented would be ordered wrongly against every other version.
+    let Ok(now) = state
+        .inventory
+        .as_ref()
+        .and_then(|inventory| inventory.built_at())
+        .map_or_else(|| crate::time::SystemClock::new().now(), Ok)
+    else {
+        return internal_failure();
+    };
+
+    match service
+        .put(
+            &context,
+            body.expected_version,
+            &body.name,
+            rules,
+            now,
+            // A workspace holds one logical policy that accumulates versions, so the identifier
+            // is derived from the workspace rather than generated per write. Generating one would
+            // make every version its own policy, which would break both the version chain and the
+            // contract's "changing rules creates a new version" rule.
+            policy_id_for(context.workspace_id),
+        )
+        .await
+    {
         Ok(stored) => json_response(
             StatusCode::OK,
-            &ActivePolicyResponse {
+            &PutPolicyResponse {
                 policy_id: stored.policy_id.to_string(),
                 version: stored.version,
                 name: stored.name,
                 status: stored.status.as_str().to_owned(),
-                rules: rules_view(&stored.rules),
+                rules: full_rules_view(&stored.rules),
             },
         ),
         Err(error) => policy_error_response(&error),
+    }
+}
+
+/// Returns the policy identifier a workspace's versions belong to.
+///
+/// Derived from the workspace so every version lands in one chain. This is a stability property,
+/// not a privacy one: the identifier is already the workspace's own, and the scope is resolved
+/// server-side, so a caller can only ever reach its own chain.
+fn policy_id_for(
+    workspace: jarvis_domain::ids::WorkspaceId,
+) -> jarvis_domain::ids::ModelDataPolicyId {
+    jarvis_domain::ids::ModelDataPolicyId::from_uuid(workspace.as_uuid())
+}
+
+/// Parses the submitted rules into the domain type, refusing any unsupported spelling.
+///
+/// Every value goes through a parser rather than being stored as text, because the domain's
+/// `PolicyRules` is a typed struct with no free-form field: a rule the domain cannot express
+/// cannot be merged, and a stored-but-unmergeable rule would be one this layer wrote and the
+/// selector never applied.
+fn submitted_rules(view: &PolicyRulesView) -> Result<PolicyRules, &'static str> {
+    Ok(PolicyRules {
+        locality: parse_locality(&view.locality)?,
+        allowed_providers: view
+            .allowed_providers
+            .as_ref()
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default(),
+        allowed_models: view
+            .allowed_models
+            .as_ref()
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default(),
+        maximum_provider_retention: parse_retention_requirement(&view.maximum_provider_retention)?,
+        provider_training_use: parse_training_requirement(&view.provider_training_use)?,
+        telemetry: parse_telemetry(&view.telemetry)?,
+        allowed_residency_regions: view.allowed_residency_regions.iter().cloned().collect(),
+        maximum_sensitivity: parse_sensitivity(&view.maximum_sensitivity)?,
+        allow_fallback: parse_fallback(&view.allow_fallback)?,
+    })
+}
+
+fn parse_locality(value: &str) -> Result<Locality, &'static str> {
+    match value {
+        "local_only" => Ok(Locality::LocalOnly),
+        "private_network_allowed" => Ok(Locality::PrivateNetworkAllowed),
+        "approved_cloud_allowed" => Ok(Locality::ApprovedCloudAllowed),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+fn parse_retention_requirement(value: &str) -> Result<ProviderRetention, &'static str> {
+    match value {
+        "none_documented" => Ok(ProviderRetention::NoneDocumented),
+        "bounded_documented" => Ok(ProviderRetention::BoundedDocumented),
+        "provider_default_allowed" => Ok(ProviderRetention::ProviderDefaultAllowed),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+fn parse_training_requirement(value: &str) -> Result<TrainingUse, &'static str> {
+    match value {
+        "disallowed_documented" => Ok(TrainingUse::DisallowedDocumented),
+        "account_policy_allowed" => Ok(TrainingUse::AccountPolicyAllowed),
+        "provider_default_allowed" => Ok(TrainingUse::ProviderDefaultAllowed),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+fn parse_telemetry(value: &str) -> Result<Telemetry, &'static str> {
+    match value {
+        "disabled" => Ok(Telemetry::Disabled),
+        "local_only" => Ok(Telemetry::LocalOnly),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+fn parse_sensitivity(value: &str) -> Result<Sensitivity, &'static str> {
+    match value {
+        "public" => Ok(Sensitivity::Public),
+        "internal" => Ok(Sensitivity::Internal),
+        "confidential" => Ok(Sensitivity::Confidential),
+        "restricted" => Ok(Sensitivity::Restricted),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+fn parse_fallback(value: &str) -> Result<FallbackPermission, &'static str> {
+    match value {
+        "denied" => Ok(FallbackPermission::Denied),
+        "compliant_only" => Ok(FallbackPermission::CompliantOnly),
+        _ => Err("request.semantic_invalid"),
+    }
+}
+
+/// Renders a stored policy version for either `GET` or `PUT`.
+///
+/// One function for both, so the read and the write cannot describe the same stored row
+/// differently — a client that PUT a policy and immediately GET it must see the same document.
+fn active_view(stored: &StoredPolicyVersion) -> ActivePolicyResponse {
+    ActivePolicyResponse {
+        policy_id: stored.policy_id.to_string(),
+        version: stored.version,
+        name: stored.name.clone(),
+        status: stored.status.as_str().to_owned(),
+        rules: full_rules_view(&stored.rules),
+    }
+}
+
+/// Renders the full nine-field rules of a stored policy.
+///
+/// Distinct from [`rules_view`], which renders the six-field requested/effective **statement**.
+/// The two are different questions: a statement records what a call asked for and what was
+/// selected, while a stored policy is the complete rule set a client reads and writes. Rendering
+/// a stored policy through the statement shape dropped `allowed_providers`, `allowed_models`, and
+/// `allow_fallback` — so a client doing read-modify-write would submit a body that reset two
+/// allow-lists to "no restriction" and the fallback rule to a default it never chose.
+fn full_rules_view(rules: &PolicyRules) -> PolicyRulesView {
+    PolicyRulesView {
+        locality: locality_of(rules.locality).to_owned(),
+        maximum_provider_retention: retention_requirement_of(rules.maximum_provider_retention),
+        provider_training_use: training_requirement_of(rules.provider_training_use),
+        telemetry: telemetry_of(rules.telemetry),
+        allowed_residency_regions: rules.allowed_residency_regions.iter().cloned().collect(),
+        maximum_sensitivity: sensitivity_of(rules.maximum_sensitivity),
+        allow_fallback: fallback_of(rules.allow_fallback).to_owned(),
+        // The domain keeps the contract's distinction: an empty set means "no restriction at this
+        // layer", not "permit nothing". Collapsing both to `[]` would turn the most permissive
+        // statement into the most restrictive-looking one, and a read-modify-write would then
+        // submit `[]` and narrow the policy to nothing.
+        allowed_providers: allow_list(&rules.allowed_providers),
+        allowed_models: allow_list(&rules.allowed_models),
+    }
+}
+
+/// Renders an allow-list, preserving "this layer restricts nothing" as an absent field.
+fn allow_list(values: &std::collections::BTreeSet<String>) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().cloned().collect())
+    }
+}
+
+fn fallback_of(value: FallbackPermission) -> &'static str {
+    match value {
+        FallbackPermission::Denied => "denied",
+        FallbackPermission::CompliantOnly => "compliant_only",
     }
 }
 
@@ -245,18 +472,6 @@ fn requested_view(requested: &RequestedDataPolicy) -> DataPolicyView {
     }
 }
 
-/// Renders the rules of an active policy.
-fn rules_view(rules: &PolicyRules) -> DataPolicyView {
-    DataPolicyView {
-        locality: locality_of(rules.locality).to_owned(),
-        maximum_provider_retention: retention_requirement_of(rules.maximum_provider_retention),
-        provider_training_use: training_requirement_of(rules.provider_training_use),
-        telemetry: telemetry_of(rules.telemetry),
-        allowed_residency_regions: rules.allowed_residency_regions.iter().cloned().collect(),
-        sensitivity: sensitivity_of(rules.maximum_sensitivity),
-    }
-}
-
 /// The contract's spelling of a locality.
 fn locality_of(value: Locality) -> &'static str {
     match value {
@@ -368,8 +583,16 @@ fn policy_error_response(error: &PolicyServiceError) -> Response {
         PolicyServiceError::NoActivePolicy | PolicyServiceError::PolicyNotFound => {
             StatusCode::NOT_FOUND
         }
-        PolicyServiceError::CandidatesUnbounded { .. } => StatusCode::BAD_REQUEST,
-        PolicyServiceError::Unsatisfied(_) => StatusCode::CONFLICT,
+        PolicyServiceError::CandidatesUnbounded { .. } | PolicyServiceError::Invalid { .. } => {
+            StatusCode::BAD_REQUEST
+        }
+        // A stale precondition is a conflict, not a bad request: the submitted policy was
+        // well-formed and authorized, and the only thing wrong was that the caller's view had
+        // moved on. `409` is the status a client retries after a re-read; `400` would suggest
+        // the body was unusable.
+        PolicyServiceError::VersionConflict { .. }
+        | PolicyServiceError::Contradictory { .. }
+        | PolicyServiceError::Unsatisfied(_) => StatusCode::CONFLICT,
         PolicyServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error_response(status, error.code(), message_for(error), error.retryable())
@@ -382,6 +605,13 @@ fn message_for(error: &PolicyServiceError) -> &'static str {
         PolicyServiceError::PolicyNotFound => "No such model data policy.",
         PolicyServiceError::Unsatisfied(_) => "No compliant model route satisfies the policy.",
         PolicyServiceError::CandidatesUnbounded { .. } => "Too many model candidates were offered.",
+        PolicyServiceError::VersionConflict { .. } => {
+            "The policy changed since it was read; re-read and resubmit."
+        }
+        PolicyServiceError::Contradictory { .. } => {
+            "The submitted rules contradict the policy already in force."
+        }
+        PolicyServiceError::Invalid { .. } => "The submitted policy is not usable.",
         PolicyServiceError::Storage(_) => "The policy could not be read.",
     }
 }

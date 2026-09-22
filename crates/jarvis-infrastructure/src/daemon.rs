@@ -515,6 +515,7 @@ fn run_ports(pool: sqlx::SqlitePool) -> jarvis_application::run_service::RunPort
         deltas: repositories as Arc<dyn jarvis_application::live_events::StreamDeltaSink>,
         provider,
         clock: Arc::new(crate::time::SystemClock::new()),
+        policies: None,
     }
 }
 

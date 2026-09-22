@@ -88,7 +88,7 @@ passes one. A daemon that never called `.with_policies` passes every handler tes
 answering `service.not_ready` to every real client, which is precisely the failure mode a
 composition root needs an end-to-end test for.
 
-Five sections:
+Eleven sections:
 
 1. **The routes exist and are authenticated.** Each path is distinguished from the router's
    fallback (`resource.not_found`), because "the route is absent" and "the route answered
@@ -106,18 +106,35 @@ Five sections:
    the `RouteSelectionFailure` enum keeps them apart and why this is asserted over the wire.
 4. **Two identical probes answer byte-identically.** A per-request clock or a second store
    read inside the response would make two probes of one daemon disagree.
-5. **The daemon still reports liveness afterwards**, which catches a handler that panicked
-   in a way the router converted into a response.
+5–11. **The write path.** A `PUT` creates version 1 and reports the version *it* chose; a read
+   agrees; the reply and the read carry every rule the submission did; an unrestricted
+   allow-list stays **absent** rather than becoming an empty array; a looser submission is
+   accepted as version 2 while the stricter locality survives; a stale precondition is a
+   `409` that leaves the stored policy at version 2; a write with no `Idempotency-Key` is
+   refused before it writes; an unsupported rule value is refused and advances nothing; and
+   the daemon still reports liveness.
 
 ### What this harness found
 
 - Removing `.with_policies(...)` from `daemon.rs` turns every policy request into
   `service.not_ready` while the whole handler-test suite stays green. The harness fails on five
   checks, which is what makes it the test that covers the composition rather than the handler.
+- **A `PUT` reply that dropped `allow_fallback`.** The reply rendered the rules through the
+  six-field *statement* shape, which omits `allow_fallback`, `allowed_providers`, and
+  `allowed_models` — so the daemon's own description of what it had stored omitted a rule, and a
+  client doing read-modify-write would resubmit a body that reset it. The same omission made
+  `GET` un-round-trippable. Both responses now carry the full nine-field shape. This is why the
+  section asserts the reply and the read agree on **every** rule rather than only on `locality`:
+  a partial comparison is what let the omission through the first time.
+
+The merge direction — that a submission can only narrow what is in force — is covered in
+`jarvis_application::policy_service`'s own tests, which drive the write and the evaluation through
+one service so the stored policy is shown to reach selection. Replacing the merge with the raw
+submission fails three of them plus the HTTP test, and the failure body names the widening.
 
 The wire spellings are covered in `jarvis_infrastructure::http::policy`'s own tests, which
 enumerate **every** variant of every value family. That location is deliberate: a handler test
-can only reach the variants a fixture produces, and the defect this round fixed —
+can only reach the variants a fixture produces, and the defect found in the previous round —
 `rejected_view` rendering `RejectionReason`'s operator prose `"locality violated"` where the
 contract specifies the code `locality_violated` — survived because the one rejection code the
 handler test reached was produced by the domain, so the test agreed with the defect.

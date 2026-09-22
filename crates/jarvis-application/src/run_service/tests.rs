@@ -26,6 +26,7 @@ use super::{
 };
 use crate::model::ScriptedProvider;
 use crate::repository::conversation::ConversationRepository as _;
+use crate::repository::policy::ModelDataPolicyRepository as _;
 use crate::repository::run::RunRepository as _;
 use crate::request_context::RequestContext;
 use crate::request_context::{AuthenticationAssurance, RequestChannel};
@@ -121,6 +122,63 @@ struct Fixture {
     spawner: RecordingSpawner,
 }
 
+/// A fixture whose run service has a policy store attached.
+///
+/// Separate from [`fixture`] rather than a change to it, because most of these tests are about
+/// the *absence* of a policy store — the Foundation composition — and folding one in would make
+/// that state unreachable from a test.
+fn fixture_policied() -> Fixture {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let cancellations = Arc::new(RunCancellationRegistry::new());
+    let provider: Arc<dyn crate::model::ModelProvider> = Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "the answer")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    );
+    let service = RunService::new(
+        RunPorts {
+            runs: Arc::clone(&repositories) as Arc<dyn crate::repository::run::RunRepository>,
+            conversations: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::conversation::ConversationRepository>,
+            model_calls: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::model_call::ModelCallRepository>,
+            deltas: Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+            provider,
+            clock: Arc::new(ManualClock::new(now())),
+            policies: Some(Arc::clone(&repositories)
+                as Arc<dyn crate::repository::policy::ModelDataPolicyRepository>),
+        },
+        Arc::clone(&cancellations),
+    );
+    Fixture {
+        service,
+        repositories,
+        cancellations,
+        spawner: RecordingSpawner::new(),
+    }
+}
+
+/// Creates a run, optionally naming a policy version.
+async fn create_with_policy(
+    fixture: &Fixture,
+    text: &str,
+    key: &str,
+    policy: Option<jarvis_domain::model::policy::PolicyVersionRef>,
+) -> CreatedRun {
+    fixture
+        .service
+        .create(&context(), None, text, key, policy, &fixture.spawner)
+        .await
+        .expect("the run is created")
+}
+
 fn fixture() -> Fixture {
     fixture_with(Arc::new(
         ScriptedProvider::new(model())
@@ -149,6 +207,10 @@ fn fixture_with(provider: Arc<ScriptedProvider>) -> Fixture {
             deltas: Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
             provider,
             clock: Arc::new(ManualClock::new(now())),
+            // No policy store, so a run created in these tests records **no** policy. That is the
+            // state several of these tests are about (a Foundation composition with no policy
+            // configured), and it is asserted rather than incidental.
+            policies: None,
         },
         Arc::clone(&cancellations),
     );
@@ -163,7 +225,7 @@ fn fixture_with(provider: Arc<ScriptedProvider>) -> Fixture {
 async fn create(fixture: &Fixture, text: &str, key: &str) -> CreatedRun {
     fixture
         .service
-        .create(&context(), None, text, key, &fixture.spawner)
+        .create(&context(), None, text, key, None, &fixture.spawner)
         .await
         .expect("the run is created")
 }
@@ -284,6 +346,7 @@ async fn the_same_key_with_different_input_is_a_conflict() {
             None,
             "something else",
             "key-1",
+            None,
             &fixture.spawner,
         )
         .await
@@ -298,7 +361,7 @@ async fn a_missing_idempotency_key_is_refused_before_any_write() {
     let fixture = fixture();
     let error = fixture
         .service
-        .create(&context(), None, "hello", "", &fixture.spawner)
+        .create(&context(), None, "hello", "", None, &fixture.spawner)
         .await
         .expect_err("the key is required");
     assert_eq!(error.code(), "request.invalid");
@@ -315,7 +378,14 @@ async fn an_empty_objective_is_refused_and_an_over_long_one_too() {
     for objective in [String::new(), "x".repeat(MAX_OBJECTIVE_BYTES + 1)] {
         let error = fixture
             .service
-            .create(&context(), None, &objective, "key-1", &fixture.spawner)
+            .create(
+                &context(),
+                None,
+                &objective,
+                "key-1",
+                None,
+                &fixture.spawner,
+            )
             .await
             .expect_err("the objective is outside its bound");
         assert_eq!(error.code(), "request.semantic_invalid");
@@ -479,7 +549,14 @@ async fn a_create_into_a_foreign_conversation_is_not_found() {
     // First create it in the other scope so it genuinely exists.
     fixture
         .service
-        .create(&foreign, None, "theirs", "their-key", &fixture.spawner)
+        .create(
+            &foreign,
+            None,
+            "theirs",
+            "their-key",
+            None,
+            &fixture.spawner,
+        )
         .await
         .expect("their run is created");
     let error = fixture
@@ -489,6 +566,7 @@ async fn a_create_into_a_foreign_conversation_is_not_found() {
             Some(foreign_conversation),
             "mine",
             "my-key",
+            None,
             &fixture.spawner,
         )
         .await
@@ -511,6 +589,7 @@ async fn an_existing_conversation_is_continued_rather_than_replaced() {
             Some(first.conversation_id),
             "second question",
             "key-2",
+            None,
             &fixture.spawner,
         )
         .await
@@ -596,4 +675,148 @@ async fn a_provider_refusal_leaves_the_run_failed_rather_than_received() {
         .expect("loads");
     assert_eq!(stored.state, RunState::Failed);
     assert!(stored.is_terminal());
+}
+
+#[tokio::test]
+async fn a_named_policy_reaches_the_created_run() {
+    // The defect this closes: `CreateRunRequest.model_policy` was parsed and never read, so a
+    // client's stated policy reached the run as nothing at all. The request succeeded, which made
+    // "accepted and ignored" indistinguishable from "accepted and applied".
+    use crate::repository::policy::NewPolicyVersion;
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::{
+        ModelDataPolicyStatus, PolicyRules, PolicyVersionRef, Sensitivity,
+    };
+
+    let fixture = fixture_policied();
+    let reference = PolicyVersionRef {
+        policy_id: ModelDataPolicyId::from_uuid(id(80)),
+        version: 2,
+    };
+    fixture
+        .repositories
+        .insert_version(NewPolicyVersion {
+            policy_id: reference.policy_id,
+            version: reference.version,
+            workspace_id: workspace(),
+            name: "named".to_owned(),
+            status: ModelDataPolicyStatus::Active,
+            rules: PolicyRules::permissive(),
+            created_at: now(),
+        })
+        .await
+        .expect("the policy inserts");
+
+    let created = create_with_policy(&fixture, "hello", "key-1", Some(reference)).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+
+    assert_eq!(
+        stored.budget.policy,
+        Some(reference),
+        "the named version must be the one the run records",
+    );
+    // And its ceiling came from the *stored* rules rather than from the request, so a client
+    // cannot submit a ceiling alongside the reference. `PolicyRules::permissive()` carries the
+    // most permissive ceiling, which is what the stored policy said.
+    assert_eq!(
+        stored.budget.context_sensitivity_ceiling(),
+        Some(Sensitivity::Restricted),
+    );
+}
+
+#[tokio::test]
+async fn a_named_policy_that_does_not_exist_is_refused_rather_than_substituted() {
+    // A caller that named a version is asking to be governed by *those* rules. Falling back to
+    // the workspace's active policy would apply rules it never named and record a decision nobody
+    // made, so the run is refused instead.
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::PolicyVersionRef;
+
+    let fixture = fixture_policied();
+    let absent = PolicyVersionRef {
+        policy_id: ModelDataPolicyId::from_uuid(id(81)),
+        version: 7,
+    };
+
+    let error = fixture
+        .service
+        .create(
+            &context(),
+            None,
+            "hello",
+            "key-1",
+            Some(absent),
+            &fixture.spawner,
+        )
+        .await
+        .expect_err("an absent policy refuses the run");
+
+    assert_eq!(error.code(), "model.policy_not_found");
+    assert!(!error.retryable(), "resending the same name cannot help");
+    // And nothing was created, so no run exists whose record would have to be corrected.
+    assert_eq!(fixture.repositories.run_count().expect("reads"), 0);
+}
+
+#[tokio::test]
+async fn a_run_created_with_no_named_policy_uses_the_active_one() {
+    // The ordinary case: the client did not choose a version, so the workspace's active policy
+    // governs. This is also why the field is optional — the policy identifier is derived from the
+    // workspace, which is resolved server-side, so a client cannot name the active one without
+    // first reading it.
+    use crate::repository::policy::NewPolicyVersion;
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::{ModelDataPolicyStatus, PolicyRules};
+
+    let fixture = fixture_policied();
+    let policy_id = ModelDataPolicyId::from_uuid(id(82));
+    fixture
+        .repositories
+        .insert_version(NewPolicyVersion {
+            policy_id,
+            version: 1,
+            workspace_id: workspace(),
+            name: "active".to_owned(),
+            status: ModelDataPolicyStatus::Active,
+            rules: PolicyRules::permissive(),
+            created_at: now(),
+        })
+        .await
+        .expect("the policy inserts");
+
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+
+    assert_eq!(
+        stored.budget.policy.map(|reference| reference.version),
+        Some(1),
+        "the active version governs a run that named none",
+    );
+}
+
+#[tokio::test]
+async fn a_run_in_a_workspace_with_no_policy_records_none() {
+    // "No policy in force" is a real state, and it is kept apart from "a policy that permits
+    // everything": only the first is a configuration an operator should be told about. The run is
+    // creatable either way, so an unconfigured daemon is usable while its record stays honest.
+    let fixture = fixture_policied();
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+
+    assert!(
+        stored.budget.policy.is_none(),
+        "a run with no policy must record that fact rather than a default",
+    );
+    assert!(stored.budget.context_sensitivity_ceiling().is_none());
 }

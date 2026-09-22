@@ -216,6 +216,44 @@ const POLICY_CODES = [
   "model.exception_expired",
 ];
 
+/**
+ * A submission body, so the sections below differ only in what they vary.
+ *
+ * Every rule field is present because the write shape requires them: a client that omits one has
+ * stated no policy for it, and defaulting that to the permissive end would grant more than it
+ * asked for. `maximum_sensitivity` is the rules shape's name — the *statement* shape calls the
+ * same concept `sensitivity`, and sending that spelling here is a parse failure, which is the
+ * point of keeping the two shapes distinct.
+ */
+function policyBody(expectedVersion, locality) {
+  return {
+    name: "operator policy",
+    expected_version: expectedVersion,
+    rules: {
+      locality,
+      maximum_provider_retention: "provider_default_allowed",
+      provider_training_use: "provider_default_allowed",
+      telemetry: "local_only",
+      allowed_residency_regions: [],
+      maximum_sensitivity: "confidential",
+      allow_fallback: "denied",
+    },
+  };
+}
+
+/**
+ * An idempotency key for a write.
+ *
+ * Clock-derived rather than random: the key is only ever compared for presence, so it needs no
+ * entropy, and this harness has no random source it would be right to use for a security control
+ * it is not providing.
+ */
+let keyCounter = 0;
+function idempotencyKey(label) {
+  keyCounter += 1;
+  return `${label}-${Date.now()}-${keyCounter}`;
+}
+
 async function main() {
   const { daemon, client } = resolveBinaries();
   const profile = mkdtempSync(join(tmpdir(), "jarvis-e2e-policy-"));
@@ -349,10 +387,192 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
-    // 5. The daemon is still healthy after the policy surface ran.
+    // 5. A write creates a version, and the reply is the version the daemon chose.
+    //
+    // The request carries no version, because version identity is what keeps a past route
+    // decision explainable: a client that named the version it was creating could skip numbers
+    // or collide with one that exists. The version is therefore an output of a write, and this
+    // is where a client learns what it created.
+    // ---------------------------------------------------------------------
+    const firstWrite = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      policyBody(0, "local_only"),
+      { "Idempotency-Key": idempotencyKey("policy-1") },
+    );
+    if (firstWrite.status !== 200) {
+      fail(`the first policy write must succeed, got ${firstWrite.status}`, firstWrite.text);
+    } else if (firstWrite.json?.version !== 1) {
+      fail(
+        "the write must report the version it created as 1",
+        firstWrite.text,
+      );
+    } else {
+      pass("a write created policy version 1 and reported it");
+    }
+
+    // The read agrees, which is what proves the write persisted rather than only answering. A
+    // single-request assertion would pass against an implementation that answered correctly and
+    // stored nothing.
+    const afterWrite = await request(record, credential, "GET", "/api/v1/model-data-policy");
+    if (afterWrite.status !== 200 || afterWrite.json?.version !== 1) {
+      fail("the written policy is not readable", afterWrite.text);
+    } else if (afterWrite.json?.rules?.locality !== "local_only") {
+      fail("the read does not report the written rules", afterWrite.text);
+    } else {
+      pass("the written policy is in force and readable");
+    }
+
+    // ---------------------------------------------------------------------
+    // 6. Every rule the write submitted is present in the reply, and the read agrees.
+    //
+    // This is the defect this section was written for. The reply originally rendered the rules
+    // through the six-field *statement* shape, so `allow_fallback` was silently dropped from the
+    // daemon's own description of what it had stored — a client could not confirm its write, and
+    // a client doing read-modify-write would resubmit a body that reset the rule.
+    // ---------------------------------------------------------------------
+    const submitted = ["local_only", "confidential", "denied", "local_only"];
+    const replyText = firstWrite.text ?? "";
+    const readText = afterWrite.text ?? "";
+    const dropped = [];
+    for (const fragment of submitted) {
+      if (!replyText.includes(`"${fragment}"`)) {
+        dropped.push(`write reply is missing ${fragment}`);
+      }
+      if (!readText.includes(`"${fragment}"`)) {
+        dropped.push(`read is missing ${fragment}`);
+      }
+    }
+    if (!replyText.includes("maximum_sensitivity")) {
+      // The rules shape names the field `maximum_sensitivity`; the statement shape calls it
+      // `sensitivity`. Rendering the rules through the statement shape would rename a policy
+      // ceiling into a per-call classification.
+      dropped.push("the write reply does not carry the rules shape's field name");
+    }
+    if (firstWrite.json?.rules?.allow_fallback !== "denied") {
+      dropped.push("the write reply dropped allow_fallback");
+    }
+    if (dropped.length > 0) {
+      fail("the write reply and the read must describe the same stored rules", dropped.join("; "));
+    } else {
+      pass("the write reply and the read agree on every rule");
+    }
+
+    // An allow-list was never submitted, so it must stay absent rather than becoming an empty
+    // array. An empty set means "permit nothing" while an absent one means "no restriction at
+    // this layer", so collapsing them would turn the most permissive statement into the most
+    // restrictive-looking one — and a read-modify-write would then submit `[]` and narrow the
+    // policy to nothing.
+    if (readText.includes("allowed_providers")) {
+      fail("an unrestricted allow-list must be absent rather than empty", readText);
+    } else {
+      pass("an unrestricted allow-list is absent, not an empty set");
+    }
+
+    // ---------------------------------------------------------------------
+    // 7. A write can only narrow what is in force.
+    //
+    // The security property of the write endpoint: without an approval step, a request body must
+    // not be able to relax the workspace policy. Version 2 is accepted — the precondition holds —
+    // and the stricter locality survives.
+    // ---------------------------------------------------------------------
+    const widening = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      policyBody(1, "approved_cloud_allowed"),
+      { "Idempotency-Key": idempotencyKey("policy-2") },
+    );
+    if (widening.status !== 200 || widening.json?.version !== 2) {
+      fail(`the second write must create version 2, got ${widening.status}`, widening.text);
+    } else if (widening.json?.rules?.locality !== "local_only") {
+      fail(
+        "a submission must not widen the policy already in force",
+        widening.text,
+      );
+    } else {
+      pass("a looser submission was accepted and the stricter locality survived");
+    }
+
+    // ---------------------------------------------------------------------
+    // 8. A stale precondition is a conflict that changes nothing.
+    // ---------------------------------------------------------------------
+    const stale = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      policyBody(0, "local_only"),
+      { "Idempotency-Key": idempotencyKey("policy-3") },
+    );
+    if (stale.status !== 409) {
+      fail(`a stale precondition must be a conflict, got ${stale.status}`, stale.text);
+    } else if (stale.json?.error?.code !== "resource.version_conflict") {
+      fail("a stale precondition must use the contract's conflict code", stale.text);
+    } else {
+      pass("a stale precondition is a conflict with resource.version_conflict");
+    }
+    const stillTwo = await request(record, credential, "GET", "/api/v1/model-data-policy");
+    if (stillTwo.json?.version !== 2) {
+      fail("a refused write must leave the stored policy unchanged", stillTwo.text);
+    } else {
+      pass("the refused write left the policy at version 2");
+    }
+
+    // ---------------------------------------------------------------------
+    // 9. A write without an idempotency key is refused before it writes.
+    //
+    // The contract requires it, and the consequence of not having one is that a client retrying
+    // a timed-out write advances the version for a change already applied — so the caller can no
+    // longer tell how many distinct policies it has made.
+    // ---------------------------------------------------------------------
+    const noKey = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      policyBody(2, "local_only"),
+    );
+    if (noKey.status !== 400 || noKey.json?.error?.code !== "request.invalid") {
+      fail(`a write without a key must be refused, got ${noKey.status}`, noKey.text);
+    } else {
+      pass("a write without an idempotency key is refused with request.invalid");
+    }
+
+    // ---------------------------------------------------------------------
+    // 10. A locality this build does not support is refused rather than stored.
+    //
+    // The merge can only narrow a rule it understands, so a value this build did not parse would
+    // be a rule it wrote and never enforced — the one edit direction that widens a policy.
+    // ---------------------------------------------------------------------
+    const badValue = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      policyBody(2, "send_it_anywhere"),
+      { "Idempotency-Key": idempotencyKey("policy-4") },
+    );
+    if (badValue.status !== 400) {
+      fail(`an unsupported locality must be refused, got ${badValue.status}`, badValue.text);
+    } else {
+      pass("an unsupported rule value is refused rather than stored");
+    }
+    const unchanged = await request(record, credential, "GET", "/api/v1/model-data-policy");
+    if (unchanged.json?.version !== 2) {
+      fail("a refused write advanced the version", unchanged.text);
+    } else {
+      pass("no refused write advanced the version");
+    }
+
+    // ---------------------------------------------------------------------
+    // 11. The daemon is still healthy after the policy surface ran.
     //
     // Cheap, but it is the check that catches a handler that panics in a way the router
-    // converts into a response: the process would still be alive and the next probe would
+    // converted into a response: the process would still be alive and the next probe would
     // fail for an unrelated-looking reason.
     // ---------------------------------------------------------------------
     const live = await request(record, credential, "GET", "/health/live");

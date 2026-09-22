@@ -2197,3 +2197,168 @@ async fn seed_many_messages(fixture: &Fixture, count: u32, content: &str) {
             .expect("the message is appended");
     }
 }
+
+/// A policy that permits only public content makes the run refuse a confidential objective.
+///
+/// This is the property `BRN-010` was for: the merged policy's `maximum_sensitivity` is a
+/// *ceiling*, not a label, so content above it must never reach a provider. Before this the
+/// controller passed a permissive ceiling and said so in a comment, so the label was recorded in
+/// the manifest and acted on by nothing.
+#[tokio::test]
+async fn a_policy_ceiling_refuses_content_the_policy_forbids() {
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::{PolicyVersionRef, Sensitivity};
+
+    let fixture = fixture(answering("should never be produced"));
+    // The stored objective is labelled `internal`, and the policy permits only `public`. The
+    // assertion is on the run's terminal state rather than only on the provider, because a
+    // refusal that left the run non-terminal would be the round-21 defect again.
+    seed_with_budget(
+        &fixture,
+        RunBudget::default().with_policy(
+            PolicyVersionRef {
+                policy_id: ModelDataPolicyId::from_uuid(id(70)),
+                version: 3,
+            },
+            Sensitivity::Public,
+        ),
+    )
+    .await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("content above the ceiling must not be sent");
+
+    assert_eq!(
+        error,
+        ControllerError::ContextUnassembled {
+            code: "run.context_objective_dropped"
+        },
+        "the objective is excluded by the ceiling, so the run has no question left",
+    );
+
+    // The durable state is what proves the refusal was real rather than a returned error: a run
+    // that refused content must be terminal, and it must be terminal before a provider was
+    // contacted. A refusal that propagated with `?` and no transition would leave the run live,
+    // which is the defect class that has recurred in this controller.
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run is stored");
+    assert_eq!(stored.state, RunState::Failed);
+    assert!(
+        stored.budget.policy.is_some(),
+        "the run's own record names the policy that refused it",
+    );
+    // `agent_runs.error_code` is deliberately asserted to be `None` rather than to carry the
+    // stage. This test found that the column exists, is read back, and is never populated: the
+    // transition `UPDATE` sets `state`, `version`, `completed_at`, and the waiting columns but not
+    // `error_code`, so a failed run's own row cannot say why it failed. It is the same "column
+    // that can never be correct" class recorded for `deadline_at` and `budget_json`, and closing
+    // it needs the code to travel on the transition rather than on the event's reason string.
+    // Asserted as the current value so the gap is pinned and visible; recorded in `TODO.md` under
+    // `BRN-008`.
+    assert_eq!(
+        stored.error_code, None,
+        "the gap is real and is recorded in BRN-008",
+    );
+}
+
+/// A policy that permits the content lets the run proceed.
+///
+/// The other direction, and it is what makes the refusal above credible: a controller that
+/// refused everything would also pass the refusal test, so the ceiling must be shown to permit
+/// what it allows.
+#[tokio::test]
+async fn a_policy_ceiling_permits_content_it_allows() {
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::{PolicyVersionRef, Sensitivity};
+
+    let fixture = fixture(answering("permitted"));
+    seed_with_budget(
+        &fixture,
+        RunBudget::default().with_policy(
+            PolicyVersionRef {
+                policy_id: ModelDataPolicyId::from_uuid(id(71)),
+                version: 1,
+            },
+            // Above the fixture's `internal` label, so nothing is excluded.
+            Sensitivity::Confidential,
+        ),
+    )
+    .await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("content within the ceiling is sent");
+    assert_eq!(outcome.state, RunState::Completed);
+}
+
+/// A run created with no policy records none, and the distinction is observable.
+///
+/// "No policy in force" and "a policy that permits everything" are different facts, and only the
+/// first is a configuration an operator should be told about. The controller therefore holds
+/// nothing back when the ceiling is absent, and the budget it read carries no policy reference,
+/// so a later reader can see plainly that no policy governed the run.
+#[tokio::test]
+async fn a_run_with_no_policy_records_none_and_holds_nothing_back() {
+    let fixture = fixture(answering("unpoliced"));
+    let budget = RunBudget::default();
+    assert!(
+        budget.context_sensitivity_ceiling().is_none(),
+        "an unconfigured run must not carry an invented ceiling",
+    );
+    assert!(budget.policy.is_none(), "and no policy reference either");
+    seed_with_budget(&fixture, budget).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("an unconfigured run still completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    // The distinction is on the stored run, which is where a later reader looks.
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run is stored");
+    assert!(
+        stored.budget.policy.is_none(),
+        "a run with no policy must record that fact rather than a default",
+    );
+    assert!(stored.budget.context_sensitivity_ceiling().is_none());
+}
+
+/// The ceiling crosses a store round trip as the contract's own spelling.
+///
+/// The budget is serialized into `agent_runs.budget_json`, so the ceiling must survive that and
+/// read back as the same variant. A stored value that lost its spelling would make a run's own
+/// record unable to explain the decision it made.
+#[tokio::test]
+async fn a_policy_ceiling_survives_the_store_round_trip() {
+    use jarvis_domain::ids::ModelDataPolicyId;
+    use jarvis_domain::model::policy::{PolicyVersionRef, Sensitivity};
+
+    let fixture = fixture(answering("done"));
+    let reference = PolicyVersionRef {
+        policy_id: ModelDataPolicyId::from_uuid(id(72)),
+        version: 4,
+    };
+    seed_with_budget(
+        &fixture,
+        RunBudget::default().with_policy(reference, Sensitivity::Confidential),
+    )
+    .await;
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run is stored");
+    assert_eq!(stored.budget.policy, Some(reference));
+    assert_eq!(
+        stored.budget.context_sensitivity_ceiling(),
+        Some(Sensitivity::Confidential),
+    );
+}

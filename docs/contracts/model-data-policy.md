@@ -186,6 +186,20 @@ for the principal. Unknown fields and unsupported enum values fail. The server
 persists a new version and returns it; concurrent modification returns
 `resource.version_conflict`.
 
+`expected_version` is a **precondition, not an instruction**. The request body carries no
+`version` field: the version number is an output of a write, because it is what keeps a past
+route decision explainable. A client that named the version it was creating could skip numbers,
+reuse a version for different rules, or collide with one that already exists — and a collision
+would tell a caller its view was stale when it never held a view at all. `0` means "no policy
+exists yet", which is what makes creating the first policy expressible without a second endpoint.
+
+A submission is merged with the policy already in force, so **a request body can only narrow a
+workspace policy**. That is why a write needs no approval step, and it is the same rule stated in
+*Precedence* above: layer 4 (task/run explicit restrictions) sits beneath layer 2 (workspace
+policy). A submission that contradicts an earlier layer is refused with
+`jarvis.invalid_policy_layer` rather than stored, because an unsatisfiable policy would otherwise
+sit in force refusing every call with nothing to indicate its author had made a mistake.
+
 `effective` evaluates a bounded, schema-defined classification/capability query
 without accepting arbitrary prompt content and returns compliant candidates or
 safe rejection reason codes. It is diagnostic, not a way to force a route.
@@ -323,27 +337,75 @@ reached was produced by the domain, so the test agreed with the defect. The spel
 enumerates all nine variants and asserts each is a snake_case code that differs from the domain's
 `Display`, which makes the *class* fail rather than the instance.
 
+#### Create-run policy references, and the ceiling they produce
+
+`CreateRunRequest.model_policy` is now **read**, resolved against the store, and recorded on the
+run. Three properties are structural:
+
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| a named version is honoured exactly | `RunService::resolve_policy` loads it by reference and refuses a miss | `a_named_policy_that_does_not_exist_is_refused_rather_than_substituted` |
+| the run records the policy it resolved | the reference and the resolved ceiling are carried in `RunBudget` and stored in `agent_runs.budget_json` | `a_named_policy_reaches_the_created_run`, `a_policy_ceiling_survives_the_store_round_trip` |
+| the ceiling reaches context assembly | the controller reads it from the budget rather than re-reading the store | `a_policy_ceiling_refuses_content_the_policy_forbids`; restoring the hardcoded permissive ceiling lets the content reach the provider and the run **completes** |
+
+The field is **optional**, and that is forced by the architecture rather than chosen for
+leniency. The policy identifier is derived from the workspace and the workspace is resolved
+**server-side**, so a client cannot name its own workspace's active policy without first reading
+it. Requiring the field would make every run uncreatable on a fresh installation — and every
+existing harness submitted `{"policy_id":"scripted-test","version":1}`, an identifier that is not
+a valid `ModelDataPolicyId` and therefore named a policy no workspace could hold. It went
+unnoticed only because the daemon ignored the field; reading it turned that fiction into a 422
+across four tests, the CLI, and an E2E harness.
+
+Absent means "govern this run by the workspace's active policy", which is the only resolution a
+client could have named. Present means the caller pinned a version, and a version that does not
+exist is refused rather than silently falling back — falling back would apply rules the caller
+did not name and record a decision nobody made.
+
+**An absent ceiling is not a permissive one.** A run created in a workspace with no policy
+records **no** policy and no ceiling, and the controller then holds nothing back while the
+manifest still records every label. "A policy permitted this" and "nobody configured a policy"
+are different facts, only the first is a decision an operator made, and collapsing them would
+report an unconfigured daemon as a permissive one — which is also why `RunBudget` keeps the
+ceiling as an `Option` rather than defaulting it to the most permissive variant.
+
 **Now done:** `jarvis_application::policy_service::PolicyService` reads the **stored** policy and
 constructs the `RouteRequest` from it, so `select_route_explained` has a caller in production code.
 `GET /api/v1/model-data-policy` returns the active version; `GET /api/v1/model-data-policy/effective`
 probes the configured candidates against it. Both are described under *API* above.
 
-**Still not done.** Three things, each named rather than implied:
+**The write half is now implemented.** `PUT /api/v1/model-data-policy` creates the next
+immutable version, and four properties are structural rather than documented:
 
-- `PUT /api/v1/model-data-policy` has no handler, so a policy can only be written through the
-  repository port. The `expected_version` precondition and the `resource.version_conflict`
-  response this contract requires are implemented in the store — `insert_version` refuses a
-  version that already exists — but there is no route that reaches it.
-- `model_policy_exceptions` has a table and no code: no exception can be granted, expired,
-  revoked, or attached to a decision, so `ModelRouteDecision::exception_ref` is always absent and
-  the contract's *Exceptions* section is unimplemented. Nothing enforces a hard rule through an
-  exception, which is why no route can relax one.
-- `CreateRunRequest.model_policy` is parsed by the API and **not read**, so a create-run request's
-  stated policy ID/version does not reach `RunService::create`. A run therefore evaluates under
-  the workspace's active policy and a client's explicit reference is silently ignored — the
-  request is accepted and the field has no effect. This is recorded as a defect in `TODO.md`
-  rather than left as a silent gap, because "accepted and ignored" is indistinguishable to a
-  client from "accepted and applied".
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| a request body cannot widen the policy in force | the submission is merged with what is stored through `PolicyRules::merge_stricter`, which only narrows | `a_put_cannot_widen_the_policy_already_in_force`; replacing the merge with the raw submission fails 3 service tests and the HTTP test, and the failure body shows `approved_cloud_allowed` replacing `local_only` |
+| the version is an output, not an input | `PutPolicyRequest` has no `version` field and `[deny_unknown_fields]` refuses one | `a_put_request_carries_a_precondition_and_no_version_to_create` |
+| an unsupported rule value is refused, not stored | every value is parsed into the domain type, so the merge can never drop a rule it cannot narrow | `a_put_refuses_a_locality_this_build_does_not_support` |
+| the reply and the read describe the same row | both render through one `full_rules_view` | `a_read_after_a_write_describes_the_same_stored_row` |
+
+`expected_version` is a **precondition**: `0` means "no policy exists yet", so "create the first
+policy" needs no second endpoint, and a mismatch is `resource.version_conflict` (409) that leaves
+the stored policy untouched. It is retryable, unlike a contradictory submission: a stale view is
+fixed by re-reading, while resubmitting the same unsatisfiable rules reaches the same refusal
+forever. A contradiction is `jarvis.invalid_policy_layer` — carried as a code rather than as a
+`RepositoryError`, whose own `code()` reports its envelope and would have told the caller that
+*storage* refused a *rule* mistake.
+
+**Two defects this round found, both in the round's own work:**
+
+- **`PUT`'s reply dropped `allow_fallback`.** The reply rendered the rules through the six-field
+  *statement* shape (`DataPolicyView`), which omits `allowed_providers`, `allowed_models`, and
+  `allow_fallback`. A client could not confirm its own write, and a client doing read-modify-write
+  would resubmit a body that reset two allow-lists and the fallback rule. Both responses now carry
+  the full nine-field shape, and the round-trip test asserts it.
+- **`GET` omitted three rule fields entirely**, so the read could not be round-tripped either. The
+  same fix applies to both, which is why the two responses now share one rendering function.
+
+**Still not done.** One thing, named rather than implied: `model_policy_exceptions` has a table
+and no code, so no exception can be granted, expired, revoked, or attached to a decision. That
+makes `ModelRouteDecision::exception_ref` always absent, leaves the contract's *Exceptions*
+section unimplemented, and is why no request can relax a hard rule.
 
 `ProviderInventory` reports candidates whose `region`, `retention`, and `training_use` are all
 `None`, which is the honest state until `BRN-011` measures capabilities and an adapter attaches
