@@ -8,6 +8,7 @@
 use super::{
     BudgetError, BudgetLimit, BudgetStatus, DEFAULT_RUN_DEADLINE_MS, MAX_STEP_TIMEOUT_MS, RunBudget,
 };
+use crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS;
 use crate::model::stream::Usage;
 use crate::time::UtcTimestamp;
 
@@ -98,6 +99,53 @@ fn a_step_timeout_inside_the_range_is_recorded() {
         .with_step_timeout(30_000)
         .expect("30s is in range");
     assert_eq!(budget.step_timeout_ms, Some(30_000));
+}
+
+#[test]
+fn a_zero_context_ceiling_is_refused_rather_than_read_as_no_context() {
+    // Zero must not be readable as "send nothing": the domain's `ContextBudget` refuses
+    // a zero-token budget too, so admitting it here would let a caller set a ceiling the
+    // assembler rejects, and the failure would surface at the far boundary as though the
+    // conversation were at fault.
+    assert_eq!(
+        RunBudget::default().with_context_tokens(0),
+        Err(BudgetError::ContextTokensOutOfRange),
+    );
+}
+
+#[test]
+fn a_context_ceiling_above_the_domain_maximum_is_refused() {
+    // The two ceilings must agree. `ContextBudget::new` refuses anything above
+    // `MAX_CONTEXT_BUDGET_TOKENS`, so this type must refuse the same values or a stored
+    // budget could hold a ceiling the assembler will not accept.
+    assert_eq!(
+        RunBudget::default().with_context_tokens(MAX_CONTEXT_BUDGET_TOKENS + 1),
+        Err(BudgetError::ContextTokensOutOfRange),
+    );
+    let accepted = RunBudget::default()
+        .with_context_tokens(MAX_CONTEXT_BUDGET_TOKENS)
+        .expect("the domain maximum is the boundary the assembler accepts");
+    assert_eq!(accepted.max_context_tokens, Some(MAX_CONTEXT_BUDGET_TOKENS));
+}
+
+#[test]
+fn a_context_ceiling_inside_the_range_is_recorded() {
+    let budget = RunBudget::default()
+        .with_context_tokens(8_192)
+        .expect("8192 is in range");
+    assert_eq!(budget.max_context_tokens, Some(8_192));
+}
+
+#[test]
+fn a_stored_budget_without_a_context_ceiling_still_parses() {
+    // The field is `#[serde(default)]` for the same reason every other one is: a budget
+    // written by the build that had no context ceiling must still be readable, because
+    // runs outlive the process that created them. A parse failure here would make every
+    // pre-existing run unrecoverable, which is a migration hazard hiding behind an
+    // optional field.
+    let budget: RunBudget =
+        serde_json::from_str(r#"{"deadline":null,"step_timeout_ms":null}"#).expect("parses");
+    assert_eq!(budget.max_context_tokens, None);
 }
 
 #[test]

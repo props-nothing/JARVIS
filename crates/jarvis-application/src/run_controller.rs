@@ -48,10 +48,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_domain::clock::Clock;
+use jarvis_domain::context::manifest::ContextManifest;
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::ModelRef;
+use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::model::stream::{
-    ContentBlock, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
+    InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
     PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome, Usage,
 };
 use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget};
@@ -61,10 +63,11 @@ use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, Transitio
 use jarvis_domain::time::UtcTimestamp;
 
 use crate::cancellation::CancellationScope;
+use crate::context_assembly::{self, RetainedItem};
 use crate::live_events::StreamDeltaSink;
 use crate::model::{ModelProvider, ModelStream, ProviderError};
 use crate::repository::RepositoryError;
-use crate::repository::conversation::{ConversationRepository, NewMessage, StoredMessage};
+use crate::repository::conversation::{ConversationRepository, NewMessage};
 use crate::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelCallState, NewModelCall,
 };
@@ -79,6 +82,27 @@ use crate::request_context::RequestContext;
 /// would let one long conversation be pulled into memory, and the context budgeter
 /// exists precisely because a transcript cannot be sent whole.
 pub const MAX_TRANSCRIPT_MESSAGES: u32 = 200;
+
+/// The context ceiling applied to a run that was created without one.
+///
+/// A default rather than no ceiling, for the same reason a run gets a default deadline:
+/// an unset ceiling is not neutral, it means the prompt is bounded only by
+/// [`MAX_TRANSCRIPT_MESSAGES`], and 200 messages can exceed any model's window. This is
+/// comfortably above the window the controller reads and far below the domain's maximum,
+/// so a default run behaves identically to a capped one while a caller that needs a
+/// different bound can say so.
+pub const DEFAULT_CONTEXT_TOKENS: u64 = 8_192;
+
+/// Returns the context ceiling a run's budget implies.
+///
+/// Falls back to [`DEFAULT_CONTEXT_TOKENS`] rather than to a refusal, and the fallback is
+/// named rather than written inline so the decision has one site. A stored ceiling the
+/// domain would refuse is treated as absent instead of fatal: the value came from a budget
+/// JARVIS wrote, so failing the run would report a storage problem as a caller's mistake,
+/// while an absent ceiling is a state the default already covers.
+fn effective_context_ceiling(budget: &RunBudget) -> u64 {
+    budget.max_context_tokens.unwrap_or(DEFAULT_CONTEXT_TOKENS)
+}
 
 /// Why a run could not be driven to a terminal state.
 ///
@@ -135,6 +159,16 @@ pub enum ControllerError {
         /// Which ceiling was breached.
         limit: BudgetLimit,
     },
+    /// The model input could not be assembled from the stored conversation.
+    ///
+    /// Distinct from [`Repository`](Self::Repository) because the read succeeded — what
+    /// failed is turning stored messages into a bounded, labelled request, and the
+    /// remedies differ: a repository fault is a store problem, while this is a message
+    /// or a budget that JARVIS cannot use.
+    ContextUnassembled {
+        /// The stable, namespaced error code.
+        code: &'static str,
+    },
     /// The caller cancelled the run.
     Cancelled,
 }
@@ -161,6 +195,7 @@ impl ControllerError {
                 BudgetLimit::OutputTokens => "The run exceeded its output-token budget.",
                 BudgetLimit::Cost => "The run exceeded its cost budget.",
             },
+            Self::ContextUnassembled { .. } => "The run's context could not be assembled.",
             Self::Cancelled => "The run was cancelled.",
         }
     }
@@ -183,6 +218,7 @@ impl ControllerError {
             | Self::ClockUnavailable
             | Self::DeadlineExceeded
             | Self::BudgetExceeded { .. }
+            | Self::ContextUnassembled { .. }
             | Self::Cancelled => false,
         }
     }
@@ -201,6 +237,7 @@ impl ControllerError {
             Self::ClockUnavailable => "run.clock_unavailable",
             Self::DeadlineExceeded => "run.deadline_exceeded",
             Self::BudgetExceeded { limit } => limit.code(),
+            Self::ContextUnassembled { code } => code,
             Self::Cancelled => "run.cancelled",
         }
     }
@@ -224,7 +261,8 @@ impl ControllerError {
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
             | Self::DeadlineExceeded
-            | Self::BudgetExceeded { .. } => RunState::Failed,
+            | Self::BudgetExceeded { .. }
+            | Self::ContextUnassembled { .. } => RunState::Failed,
         }
     }
 
@@ -256,6 +294,7 @@ impl fmt::Display for ControllerError {
                 BudgetLimit::OutputTokens => "the run exceeded its output-token budget",
                 BudgetLimit::Cost => "the run exceeded its cost budget",
             },
+            Self::ContextUnassembled { .. } => "the run's context could not be assembled",
             Self::Cancelled => "the run was cancelled",
         };
         formatter.write_str(text)
@@ -342,8 +381,12 @@ enum AttemptOutcome {
 struct ModelTurn<'a> {
     context: &'a RequestContext,
     conversation_id: ConversationId,
-    objective: &'a str,
-    transcript: &'a [StoredMessage],
+    /// The items the context budget selected, in the order it selected them.
+    ///
+    /// Replaces the raw transcript this used to carry: the request is built from what fit
+    /// the budget rather than from everything that was read, so the two cannot disagree
+    /// about what the model was given.
+    items: &'a [RetainedItem],
     model: &'a ModelRef,
     cancel: &'a CancellationScope,
     /// The run's own budget. Carried into the turn because the deadline is a property of
@@ -500,22 +543,7 @@ impl RunController {
         )
         .await?;
 
-        // The budget is read from the run rather than taken from the caller, because the
-        // deadline belongs to the run that was created: a caller that re-derived it here
-        // could disagree with what was stored, and recovery reads the stored value.
-        let stored = self.load(run).await?;
-        let budget = stored.budget;
-
-        let transcript = self
-            .conversations
-            .load_messages(
-                run.workspace,
-                conversation_id,
-                None,
-                MAX_TRANSCRIPT_MESSAGES,
-            )
-            .await
-            .map_err(ControllerError::Repository)?;
+        let (budget, assembled) = self.build_context(run, conversation_id, objective).await?;
 
         // ContextBuilding -> Planning. There is no persisted plan artifact yet, which
         // the architecture permits: "Planning is a strategy, not a mandatory extra
@@ -575,8 +603,7 @@ impl RunController {
             &ModelTurn {
                 context,
                 conversation_id,
-                objective,
-                transcript: &transcript,
+                items: &assembled.items,
                 model: &model,
                 cancel,
                 budget: &budget,
@@ -585,21 +612,133 @@ impl RunController {
         .await
     }
 
+    /// Reads the run's budget, the transcript, and the budgeted prompt.
+    ///
+    /// One method rather than inline, because the stage has three failure modes with three
+    /// different honest answers — an unreadable conversation, an unusable budget, and a
+    /// context that dropped the objective — and each has to leave the run **terminal** at
+    /// `ContextBuilding`. Failing to do so was a real defect: the first version propagated
+    /// the assembly error with `?`, so the run sat in `ContextBuilding` forever with no legal
+    /// exit, the same missing-terminal-exit class this project has now found five times.
+    ///
+    /// The budget is read from the run rather than taken from the caller, because the deadline
+    /// belongs to the run that was created: a caller that re-derived it here could disagree
+    /// with what was stored, and recovery reads the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Repository`] for an unreadable conversation,
+    /// [`ControllerError::ContextUnassembled`] for an unusable budget or an unreadable message
+    /// label, and `run.context_objective_dropped` when the objective did not fit the budget.
+    async fn build_context(
+        &self,
+        run: RunRef,
+        conversation_id: ConversationId,
+        objective: &str,
+    ) -> Result<(RunBudget, context_assembly::AssembledInput), ControllerError> {
+        let budget = self.load(run).await?.budget;
+
+        // Bounded by *count*, which is why the assembly below is what bounds it by cost: a
+        // window of 200 messages can still exceed any model's window.
+        let transcript = self
+            .conversations
+            .load_messages(
+                run.workspace,
+                conversation_id,
+                None,
+                MAX_TRANSCRIPT_MESSAGES,
+            )
+            .await
+            .map_err(ControllerError::Repository)?;
+
+        // The prompt is assembled under the run's own context ceiling rather than sent as
+        // every message read. This is also where the architecture's "untrusted retrieved
+        // content is clearly delimited" rule becomes real: the transcript is content JARVIS
+        // did not author, and `RetainedItem::to_input_item` is what delimits it.
+        let assembled = match context_assembly::assemble(
+            &transcript,
+            objective,
+            effective_context_ceiling(&budget),
+            // Admits every label JARVIS writes. The merged data policy's ceiling is
+            // `BRN-010` and is not built, so asserting a stricter one here would be an
+            // invented policy that reads like a real one; the manifest records each
+            // item's label either way, so the gap is visible rather than hidden.
+            Sensitivity::Restricted,
+            self.now()?,
+        ) {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                self.fail_context_building(run, "context_unassembled")
+                    .await?;
+                return Err(ControllerError::ContextUnassembled { code: error.code() });
+            }
+        };
+
+        self.refuse_a_context_without_its_objective(run, &assembled.manifest)
+            .await?;
+        Ok((budget, assembled))
+    }
+
+    /// Moves a run from `ContextBuilding` to `Failed`.
+    ///
+    /// One helper for the three ways this stage can fail, so "a context failure leaves the run
+    /// terminal" is a single decision rather than a transition repeated at each site — which is
+    /// how one of them came to be missing.
+    async fn fail_context_building(
+        &self,
+        run: RunRef,
+        reason: &'static str,
+    ) -> Result<(), ControllerError> {
+        self.finish(
+            run,
+            Step::new(
+                RunState::ContextBuilding,
+                RunState::Failed,
+                "run.failed",
+                reason,
+            ),
+        )
+        .await
+    }
+
+    /// Refuses to continue when the context budget dropped the run's own objective.
+    ///
+    /// This is the one exclusion worth failing for. Everything else that does not fit is
+    /// recent conversation, and answering with slightly less context is a legitimate trade;
+    /// answering with **no objective** is not, because the model would be asked to answer a
+    /// question it was never given — which produces plausible text about the wrong thing, the
+    /// failure mode hardest for a caller to notice and the reason a budget is worth enforcing
+    /// rather than approximating.
+    ///
+    /// The manifest is what makes it checkable: it records the decision, so the caller is not
+    /// left to infer from an empty prompt that something was dropped. The check runs **before**
+    /// the run advances to `Planning`, so a run with no question in it fails before a provider
+    /// is contacted and therefore before anything is billed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::ContextUnassembled`] with
+    /// `run.context_objective_dropped` after moving the run to `Failed`.
+    async fn refuse_a_context_without_its_objective(
+        &self,
+        run: RunRef,
+        manifest: &ContextManifest,
+    ) -> Result<(), ControllerError> {
+        if manifest
+            .included
+            .iter()
+            .any(|item| item.reference == context_assembly::OBJECTIVE_REFERENCE)
+        {
+            return Ok(());
+        }
+        self.fail_context_building(run, "context_objective_dropped")
+            .await?;
+        Err(ControllerError::ContextUnassembled {
+            code: "run.context_objective_dropped",
+        })
+    }
+
     /// Advances a run one state, and refuses to continue if a cancellation arrived.
-    ///
-    /// Every intermediate step goes through this rather than calling [`step`](Self::step)
-    /// directly, so "a cancel that arrives during a step is honoured" is one decision
-    /// instead of a check repeated at each site — and a new step added later cannot forget
-    /// it. That is the shape the earlier per-state checks lacked: the entry check covered a
-    /// cancel before the run started, and the model-turn boundary covered one during the
-    /// provider call, but the window across `context_building` and `planning` had none. A
-    /// live-daemon journey found the consequence: a run cancelled ~20 ms after creation
-    /// still completed, because the signal was never consulted between the steps the run
-    /// walked through in those milliseconds.
-    ///
-    /// The cancellation is recorded from the state the step **reached**, so the transition
-    /// is one the machine allows and the run is left terminal rather than in a state from
-    /// which no cancellation can be expressed.
     async fn step_unless_cancelled(
         &self,
         run: RunRef,
@@ -767,13 +906,7 @@ impl RunController {
             .await
             .map_err(ControllerError::Repository)?;
 
-        let request = build_request(
-            run.run_id,
-            call_id,
-            turn.transcript,
-            turn.objective,
-            turn.budget,
-        )?;
+        let request = build_request(run.run_id, call_id, turn.items, turn.budget)?;
 
         // Bounded by the run's own budget. A provider that never answers must not hold
         // the run open: the deadline this run declares has to be an actual bound, and an
@@ -1505,38 +1638,33 @@ fn usage_of(drained: &DrainedTurn) -> Option<Usage> {
 ///
 /// Deliberately a free function: it reads no port and holds no state, so making it a
 /// method would imply a dependency on the controller that does not exist.
+///
+/// The input is the **budgeted** items, not the raw transcript. That is what makes the
+/// request bounded: everything in `items` already fit the run's context ceiling, and
+/// anything that did not is recorded in the manifest as an exclusion rather than silently
+/// dropped here. Placement decisions — including delimiting untrusted content — belong to
+/// [`RetainedItem::to_input_item`], so this function cannot place an item the budget
+/// refused.
 fn build_request(
     run_id: RunId,
     call_id: ModelCallId,
-    transcript: &[StoredMessage],
-    objective: &str,
+    items: &[RetainedItem],
     budget: &RunBudget,
 ) -> Result<ModelCallRequest, ControllerError> {
-    let mut items: Vec<InputItem> = vec![InputItem::SystemPolicyRef {
+    let mut input: Vec<InputItem> = vec![InputItem::SystemPolicyRef {
         // A reference, never inline policy text: the policy is resolved by JARVIS so a
         // request body cannot rewrite it, which is the same reason the context
-        // budgeter carries references rather than content.
+        // budgeter carries references rather than content. The run's objective is
+        // deliberately *not* placed here — that slot is JARVIS's own policy, and a
+        // caller's text occupying it is exactly the confusion the architecture forbids.
         policy_ref: "system/default".to_owned(),
     }];
-    for message in transcript {
-        items.push(InputItem::Message {
-            role: message.role,
-            blocks: vec![ContentBlock::Text {
-                text: message.content.clone(),
-            }],
-        });
-    }
-    items.push(InputItem::Message {
-        role: Role::User,
-        blocks: vec![ContentBlock::Text {
-            text: objective.to_owned(),
-        }],
-    });
+    input.extend(items.iter().map(RetainedItem::to_input_item));
     Ok(ModelCallRequest {
         call_id,
         run_id,
         route_requirements: RouteRequirements::text(),
-        input: InputItems::new(items)
+        input: InputItems::new(input)
             .map_err(|error| ControllerError::StreamRejected { code: error.code() })?,
         tools: Vec::new(),
         output_schema: None,

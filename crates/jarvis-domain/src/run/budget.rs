@@ -64,6 +64,21 @@ pub struct RunBudget {
     /// The maximum output tokens across the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// The maximum tokens the **assembled context** may occupy.
+    ///
+    /// The mirror of [`max_output_tokens`](Self::max_output_tokens) on the input side,
+    /// and it exists because a transcript cannot be sent whole: the controller reads a
+    /// bounded window of recent messages, but a window of 200 messages can still exceed
+    /// any model's window, so before this the prompt was bounded in *message count* and
+    /// unbounded in tokens. It reaches the domain's `ContextBudget`, which is what
+    /// enforces the architecture's rule that policy filtering precedes ranking — a
+    /// ceiling applied after selection could not refuse a candidate that was chosen.
+    ///
+    /// Optional for the same reason as every other field: "no context ceiling" and "a
+    /// ceiling of zero" are different facts, and zero is not expressible because
+    /// `ContextBudget` refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
     /// The maximum estimated cost across the run, in millionths of the billing unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_microunits: Option<u64>,
@@ -86,9 +101,27 @@ impl RunBudget {
             deadline: Some(deadline),
             step_timeout_ms: None,
             max_output_tokens: None,
+            max_context_tokens: None,
             max_cost_microunits: None,
             retry: RetryPolicy::none(),
         }
+    }
+
+    /// Returns this budget with a context-token ceiling applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BudgetError::ContextTokensOutOfRange`] when `tokens` is zero or above
+    /// [`crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS`]. Zero is refused rather
+    /// than read as "no context": the domain's `ContextBudget` refuses it too, and a
+    /// budget that admitted a value the assembler rejects would fail at the far
+    /// boundary instead of at the caller that set it.
+    pub const fn with_context_tokens(mut self, tokens: u64) -> Result<Self, BudgetError> {
+        if tokens == 0 || tokens > crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS {
+            return Err(BudgetError::ContextTokensOutOfRange);
+        }
+        self.max_context_tokens = Some(tokens);
+        Ok(self)
     }
 
     /// Builds a budget that expires `after_ms` milliseconds after `start`.
@@ -318,6 +351,9 @@ impl std::fmt::Display for BudgetLimit {
 pub enum BudgetError {
     /// A step timeout was zero or above [`MAX_STEP_TIMEOUT_MS`].
     StepTimeoutOutOfRange,
+    /// A context ceiling was zero or above
+    /// [`crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS`].
+    ContextTokensOutOfRange,
     /// A stored budget could not be read back.
     Malformed,
 }
@@ -328,6 +364,7 @@ impl BudgetError {
     pub const fn code(self) -> &'static str {
         match self {
             Self::StepTimeoutOutOfRange => "run.budget_step_timeout_out_of_range",
+            Self::ContextTokensOutOfRange => "run.budget_context_tokens_out_of_range",
             Self::Malformed => "run.budget_malformed",
         }
     }
@@ -342,6 +379,11 @@ impl std::fmt::Display for BudgetError {
                     "a step timeout must be 1..={MAX_STEP_TIMEOUT_MS} ms"
                 )
             }
+            Self::ContextTokensOutOfRange => write!(
+                formatter,
+                "a context ceiling must be 1..={} tokens",
+                crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS,
+            ),
             Self::Malformed => formatter.write_str("the stored run budget could not be read"),
         }
     }

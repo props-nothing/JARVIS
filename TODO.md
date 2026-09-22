@@ -794,10 +794,54 @@ Foundation TODO remains incomplete.
   Milestone 4 (`MEM-003`..`MEM-006`) and the score a caller supplies is a value
   JARVIS does not yet compute; summarization/compaction is `MEM-008`; the manifest is
   not persisted, because the `context_manifests`/`context_manifest_items` tables are
-  not created; the untrusted-content delimiting the source-priority section requires
-  is exposed by `CandidateSource::is_untrusted` but consumed by nothing, since no
-  prompt is assembled before `BRN-007`; and `ACC-035`'s cross-workspace candidate
+  not created; and `ACC-035`'s cross-workspace candidate
   case cannot be exercised end to end until retrieval exists.
+  **The pipeline now has its caller, and the last gap this entry recorded is closed.**
+  `jarvis_domain::run::budget`'s `RunBudget` gained `max_context_tokens`, and
+  `jarvis_application::context_assembly` is the bridge between the two halves that cannot
+  see each other: the domain decides *which* references fit a budget and deliberately never
+  holds content, while the content lives in stored messages that only the repository port
+  can read. The run controller now builds its prompt from what **fit the budget** rather
+  than from everything it read, so the request is bounded in the dimension that reaches the
+  provider instead of only in message count — a window of 200 messages can exceed any
+  model's window, which is exactly why this slice was written. The result is reordered so
+  the objective is placed **last**: the assembly returns items in score order, and since the
+  objective scores highest while a newer message outranks an older one, the naive order put
+  the *oldest* turn second and broke the transcript's chronology. Reordering is safe
+  precisely because every item already fit the budget — it changes presentation, not
+  selection. **The untrusted-content delimiting this entry listed as "consumed by nothing"
+  is now consumed:** `RetainedItem::to_input_item` delimits an item whose source is
+  untrusted, driven by the domain's own `SourcePriority::is_untrusted` rather than a second
+  list in the application layer. **Three defects came out of wiring it, two of them
+  introduced by the wiring.** First, the objective was sent as an **empty message**: a
+  retained item was modelled as a `kind` tag beside an `Option<StoredMessage>`, so the tag
+  could say `Objective` while no content was present — every field's type was satisfied, the
+  request was valid, and the run completed having asked the model nothing. Making the content
+  part of the **variant** (`Message(StoredMessage) | Objective(String)`) makes "an item exists
+  whose content is missing" unconstructible, and the test that caught it asserted the item's
+  *text* rather than its kind, because a test that checks which variant was produced cannot
+  detect a wrong value inside it. Second, an assembly failure left the run **stuck in
+  `ContextBuilding`** — the error was propagated with `?` and no transition, so the run had no
+  legal exit, the **sixth** instance of this project's missing-terminal-exit class and again
+  invisible until a test asserted the run's *stored state* rather than only the returned error;
+  every path out of the context stage now goes through one helper, so the rule is a single
+  decision rather than a transition repeated at each site, which is how one came to be missing.
+  Third, the candidate score was derived from the **slice index**, so the same conversation
+  assembled differently depending on the order it was read in — the exact property the domain's
+  total order exists to provide; it is now derived from the message's own durable `sequence`.
+  Falsified twice: making the effective ceiling unbounded sent **20,002** estimated tokens
+  instead of the 8,192 default and failed the bound test, and removing the terminal transition
+  left the run in `ContextBuilding` and failed the stored-state assertion. 13 assembly tests,
+  5 controller tests, and 4 budget tests. **Still not done, and stated rather than implied:**
+  the manifest is not persisted (`agent_runs.context_manifest_id` stays NULL, because the
+  `context_manifests` table and the selection ledger are `MEM-008`); the sensitivity ceiling is
+  passed as one that admits every label JARVIS writes, because the merged data policy's
+  `maximum_sensitivity` is `BRN-010` and does not exist — the manifest **records** each label,
+  so the gap is visible rather than papered over, and a defaulted ceiling here would read
+  exactly like a real policy while holding nothing back; and the token counts are documented
+  estimates from a byte division, since counting tokens is a model-specific job no adapter
+  provides yet, which is why every ceiling this milestone *enforces* is still checked against
+  the provider's reported usage instead.
 - [~] `BRN-007` Implement CLI chat plus HTTP/SSE streaming. **Partial**: the run
   resource surface and the CLI chat path are implemented and verified end to end
   against a real daemon; the **live** SSE follow is not, and is named below.
@@ -1118,6 +1162,15 @@ Foundation TODO remains incomplete.
   inside its own stream (`CancelsMidStream`), so there is no race to lose, and it asserts
   both that the run ends `Cancelled` and that the partial output was **not** stored as an
   assistant message. 2 controller tests, 1 adapter regression test, 1 E2E harness.
+  **The prompt is now bounded, which closes the last item on the native-runtime list that
+  could be closed without a tool fabric.** `RunBudget::max_context_tokens` plus
+  `jarvis_application::context_assembly` mean the controller builds its request from what fit
+  the run's context ceiling rather than from every message it read, so the budget's "token"
+  dimension covers the input side as well as the output side. An assembly failure or a context
+  that dropped the run's own objective leaves the run **terminal** at `ContextBuilding` — the
+  sixth instance of the missing-terminal-exit class, and the second found by asserting stored
+  state rather than a returned error — because the first version propagated the error with `?`
+  and left the run with no legal exit. See `BRN-006` for the three defects this found.
   **Not done:** no fallback, per-request retry policy, or resumption, as above.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,

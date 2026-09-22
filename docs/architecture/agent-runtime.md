@@ -400,6 +400,75 @@ fix existed. The test was confirmed to **fail** under `BEGIN DEFERRED` with the 
 live fault, and the journey then passed eight consecutive runs where it had previously
 failed four in eight.
 
+### Implemented evidence (`BRN-006`, context budgeting in the run path)
+
+`BRN-006` built the budgeting pipeline as pure domain types, and its own evidence recorded the
+honest gap: nothing used it. The controller sent the transcript as every message it had read, so
+the prompt was bounded in **message count** and unbounded in the dimension that reaches the
+provider — a window of 200 messages can exceed any model's window. This document's "Context
+Manifest" requirement was likewise unenforced, because no record of the decision existed anywhere.
+
+`RunBudget` gained `max_context_tokens`, and `jarvis_application::context_assembly` bridges the two
+halves that cannot see each other: the domain decides *which* references fit a budget and never
+holds content, while the content lives in stored messages that only the repository port can read.
+The controller now builds its prompt from what fit the budget rather than from what it read, and
+reorders the result so the objective is placed **last**: the assembly returns items in score order,
+and because the objective scores highest while a more recent message outranks an older one, the
+naive order would put the *oldest* turn second and break the transcript's chronology. Reordering is
+safe because every item already fit the budget — it changes presentation, not selection.
+
+Four rules are structural:
+
+- **An item's sensitivity label is recorded, and the ceiling that would act on it is not
+  invented.** `model-data-policy.md` says where `maximum_sensitivity` comes from — the merged
+  policy, with "workspace policy and data-classification ceiling" above "resource/document
+  sensitivity policy" in the precedence order — and resolving that merge is `BRN-010`, which does
+  not exist. The controller therefore passes a ceiling that admits every label JARVIS writes, and
+  the manifest records each label, so the gap is **visible rather than papered over**. A defaulted
+  ceiling would read exactly like a real policy while holding nothing back.
+- **A message whose label cannot be read fails the run.** Assuming `Internal` would send a
+  mislabelled message to a route that should never see it; assuming `Restricted` would silently
+  drop ordinary conversation and look like a retrieval bug. Refusing is the only direction of error
+  that cannot leak.
+- **An item that does not fit is excluded, never truncated**, which is the domain's rule and now
+  has a consequence: a half-truncated message reads as a complete one to the model. Exclusions are
+  counted by reason in the manifest, so "the context was small" and "most of the conversation was
+  refused" stay distinguishable.
+- **An objective the budget cannot hold fails the run.** This is the one exclusion worth failing
+  for. Every other dropped item is recent conversation, and answering with slightly less context is
+  a legitimate trade; answering with **no objective** is not, because the model would be asked a
+  question it was never given and would produce plausible text about the wrong thing. The check
+  runs before the run advances to `Planning`, so it fails before a provider is contacted and
+  therefore before anything is billed.
+
+Three defects came out of this, and two were introduced by the change itself:
+
+- **The objective was sent as an empty message.** The first version modelled a retained item as a
+  `kind` tag beside an `Option<StoredMessage>`, so the tag could say `Objective` while no content
+  was present. Every field's own type was satisfied and the request was valid — a perfectly good
+  request that asked nothing. Making the content part of the **variant**
+  (`Message(StoredMessage) | Objective(String)`) makes "an item exists whose content is missing"
+  unconstructible. The test that caught it asserted the item's *text* rather than its kind, because
+  a test that checks which variant was produced cannot detect a wrong value inside it.
+- **An assembly failure left the run stuck in `ContextBuilding`.** The error was propagated with
+  `?` and no transition, so the run had no legal exit — the **sixth** instance of this project's
+  missing-terminal-exit class, and again invisible until a test asserted the run's *stored state*
+  rather than only the returned error. Every path out of the context stage now goes through one
+  helper, so "a context failure leaves the run terminal" is a single decision rather than a
+  transition repeated at each site — which is how one came to be missing.
+- **The candidate score was derived from the slice index**, so the same conversation assembled
+  differently depending on the order it was read in — the exact property the domain's total order
+  exists to provide. It is now derived from the message's own durable `sequence`. The test that
+  caught it assembled the same two messages in both orders and compared the manifests.
+
+Falsified twice: making the effective ceiling unbounded sent **20,002** estimated tokens instead of
+the 8,192 default and failed the bound test, and removing the terminal transition left the run in
+`ContextBuilding` and failed the stored-state assertion. **Not done:** the manifest is not
+persisted — `agent_runs.context_manifest_id` remains NULL, because the `context_manifests` table and
+the context-selection ledger are `MEM-008` — and the token counts are documented estimates from a
+byte division, since counting tokens is a model-specific job no adapter provides yet. Every ceiling
+this milestone *enforces* is still checked against the provider's reported usage, not this estimate.
+
 ## Durable Run Record
 
 A run minimally tracks:

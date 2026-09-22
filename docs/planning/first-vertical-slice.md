@@ -180,6 +180,16 @@ covered in-process by the startup-recovery pass rather than by the journey. `BRN
 remains gated on its `REQUIRED` evidence note, and `agent_steps` still has a table but
 no adapter.
 
+The context budget the plan lists ("Context budgeter for identity, conversation, and
+active task") is now **enforced in the run path** rather than only implemented as a
+pipeline: the controller builds its model request from what fit the run's context
+ceiling instead of from every message it read, which is what closes the last item on
+the native-runtime list that does not need a tool fabric. That change found three
+defects, two of them its own — the objective was sent as an empty message, an assembly
+failure left the run stuck in `context_building`, and the ranking depended on the order
+the transcript happened to be read in. `BRN-006`'s evidence records all three, and both
+new behaviours were falsified by mutation.
+
 Driving that path found, among four defects, a storage-level **contention** fault:
 two transitions on one run raced, and the loser's deferred transaction could not
 upgrade its read lock to a write lock — `SQLITE_BUSY`, which SQLite raises immediately
