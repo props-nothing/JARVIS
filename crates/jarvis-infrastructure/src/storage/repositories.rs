@@ -101,11 +101,7 @@ impl jarvis_application::live_events::StreamDeltaSink for SqliteRepositories {
             // Read the next sequence and insert in one transaction, so two concurrent
             // deltas cannot both claim the same position. The unique constraint is
             // the real guarantee; the transaction is what keeps the read honest.
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| RepositoryError::Query)?;
+            let mut tx = begin_write(&self.pool).await?;
             let maximum: Option<i64> = sqlx::query_scalar(
                 "SELECT MAX(sequence) FROM run_activity_events WHERE run_id = ?",
             )
@@ -203,6 +199,33 @@ fn opt_text(
 ) -> Result<Option<String>, RepositoryError> {
     row.try_get(column)
         .map_err(|_| RepositoryError::Corrupted { column })
+}
+
+/// Begins a transaction that will **write**, taking the write lock up front.
+///
+/// `BEGIN IMMEDIATE` rather than the driver's default deferred `BEGIN`, and this is a
+/// correctness requirement rather than a performance preference. A deferred transaction
+/// takes a *read* lock and upgrades to a write lock when its first write executes. If two
+/// transactions are both in that state, SQLite fails one with `SQLITE_BUSY` **immediately
+/// and without invoking the busy handler**, because waiting would deadlock: neither can
+/// proceed until the other releases. SQLite documents this as deliberate, so `busy_timeout`
+/// — which this profile sets to five seconds and verifies — does not apply to it.
+///
+/// The symptom was a real, intermittent defect found by an end-to-end journey: two
+/// transitions on one run (a cancel arriving while the controller advanced) raced, and the
+/// loser's `UPDATE` returned `database is locked`, which the adapter mapped to a generic
+/// `Query` fault. The run was then left non-terminal — stuck in `context_building` or
+/// `responding` forever — because the terminal transition had been refused by a *lock*, not
+/// by a rule. It reproduced roughly one run in three.
+///
+/// Taking the write lock at `BEGIN` makes the conflict happen where the busy handler *does*
+/// apply, so a concurrent writer waits its bounded turn instead of failing.
+async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, RepositoryError> {
+    pool.begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|_| RepositoryError::Query)
 }
 
 /// Reads an integer column.
@@ -427,11 +450,7 @@ where
 impl RunRepository for SqliteRepositories {
     fn create(&self, run: NewRun, opening_event: NewActivityEvent) -> RepositoryFuture<'_, ()> {
         Box::pin(async move {
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| RepositoryError::Query)?;
+            let mut tx = begin_write(&self.pool).await?;
             insert_run(&mut tx, &run, &opening_event).await?;
             tx.commit().await.map_err(|_| RepositoryError::Query)
         })
@@ -497,11 +516,7 @@ impl RunRepository for SqliteRepositories {
             let run_id = event.run_id.to_string();
             let waiting = write.waiting.as_ref();
 
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| RepositoryError::Query)?;
+            let mut tx = begin_write(&self.pool).await?;
 
             // The current row is read first so the refusals can be ordered the way
             // the domain orders them: terminal, then version, then edge. Classifying
@@ -826,11 +841,7 @@ impl RunRepository for SqliteRepositories {
             // the creation are the same unit. A separate check-then-insert would leave
             // exactly the window the contract's "acknowledged mutation state and
             // idempotency records are committed atomically" rule exists to close.
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| RepositoryError::Query)?;
+            let mut tx = begin_write(&self.pool).await?;
 
             let existing = read_idempotency(
                 &mut *tx,

@@ -259,16 +259,19 @@ pub async fn cancel_run(
     };
 
     let context = context_for(&client);
-    // The status depends on whether the run had already finished *before* this command,
-    // so it is read first: the contract returns `200` with the unchanged terminal state
-    // for a finished run and `202` for one whose cleanup is in flight.
-    let was_terminal = service
-        .read(&context, run)
-        .await
-        .is_ok_and(|stored| stored.state.is_terminal());
+    // The status is derived from the state the **service** returns, not from a separate
+    // pre-read. That is the same read that decides whether to signal the run, so there is
+    // no window between the two in which the run can finish.
+    //
+    // A pre-read was the first version and it was a real defect: the run could complete
+    // between the pre-read and the service's own read, so a run the service found
+    // *terminal* was reported as `202` with cleanup in flight. The contract returns `200`
+    // with the unchanged terminal state for a run that has already finished, and two reads
+    // of one fact is what let the answer disagree with the command that produced it. This
+    // was caught by a real-daemon journey, not by a unit test.
     match service.cancel(&context, run, &reason, &key).await {
         Ok(current) => json_response(
-            if was_terminal {
+            if current.is_terminal() {
                 StatusCode::OK
             } else {
                 StatusCode::ACCEPTED

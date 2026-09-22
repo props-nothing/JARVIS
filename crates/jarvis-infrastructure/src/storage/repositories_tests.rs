@@ -44,6 +44,30 @@ async fn repository() -> (Database, SqliteRepositories) {
     (database, repositories)
 }
 
+/// A migrated **file-backed** database, which is the only shape that can falsify a
+/// concurrency bug.
+///
+/// [`repository`] uses `open_in_memory`, which the connection module deliberately pins to
+/// `max_connections(1)`. One connection means two tasks can never hold conflicting locks,
+/// so an in-memory fixture *cannot* reproduce a lock-contention defect: the pool serialises
+/// the work for it and every transaction succeeds. The `BEGIN IMMEDIATE` fix would pass
+/// against it without the fix. A file database opens `MAX_POOL_CONNECTIONS` connections, so
+/// two writers really are concurrent.
+///
+/// The path is returned so the caller can remove it; a leaked file would accumulate in the
+/// temp directory across runs.
+async fn file_repository() -> (Database, SqliteRepositories, std::path::PathBuf) {
+    let directory = std::env::temp_dir().join(format!("jarvis-repo-test-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).expect("the temp directory is creatable");
+    let path = directory.join("jarvis.sqlite3");
+    let database = Database::open(&path)
+        .await
+        .expect("the file database opens");
+    migrate::run(database.pool()).await.expect("migrates");
+    let repositories = SqliteRepositories::new(database.pool().clone());
+    (database, repositories, directory)
+}
+
 fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
 }
@@ -318,6 +342,101 @@ async fn a_transition_persists_the_state_and_its_event_together() {
             .expect("readable"),
         3,
     );
+}
+
+/// Two concurrent transitions on one run never surface a storage fault.
+///
+/// This is the regression test for a real, intermittent defect. `transition` reads the
+/// current row and then writes it, so with the driver's default deferred `BEGIN` the
+/// transaction takes a read lock and later asks to upgrade to a write lock. SQLite refuses
+/// that upgrade with `SQLITE_BUSY` **immediately, without consulting the busy handler**,
+/// because waiting would deadlock — which is exactly why `busy_timeout` did not save it.
+/// The loser's `UPDATE` failed with `database is locked`, the adapter mapped it to a
+/// generic `Query` fault, and the run was left permanently non-terminal: in the real
+/// journey that was a cancel arriving while the controller advanced, and the run sat in
+/// `context_building` or `responding` forever. It reproduced about one run in three.
+///
+/// What a correct implementation owes the caller is that a contended transition either
+/// lands or is refused by a **rule** — a typed `VersionConflict` — never by a lock. So the
+/// assertion is two-sided: every result is either success or a version conflict, and at
+/// least one write must have landed, because a test that accepted all-conflicts would
+/// pass against an implementation that refused everything.
+///
+/// Run under [`file_repository`]: the in-memory fixture has one connection and cannot
+/// produce the contention at all.
+#[tokio::test]
+async fn concurrent_transitions_on_one_run_never_fail_with_a_storage_fault() {
+    let (database, repositories, directory) = file_repository().await;
+    seed(&repositories).await;
+
+    // Four writers, each claiming the same version for a legal edge out of `Received`.
+    // Exactly one can win; the rest must be typed version conflicts. The count is four
+    // because that is `MAX_POOL_CONNECTIONS`: more writers than connections would queue
+    // on the pool and reduce the overlap this test exists to create.
+    let targets = [
+        RunState::ContextBuilding,
+        RunState::Cancelled,
+        RunState::Failed,
+        RunState::ContextBuilding,
+    ];
+    let mut handles = Vec::new();
+    for (offset, to) in targets.into_iter().enumerate() {
+        let repositories = repositories.clone();
+        handles.push(tokio::spawn(async move {
+            repositories
+                .transition(
+                    workspace(),
+                    RunWrite::new(
+                        &transition(RunState::Received, to, RunVersion::FIRST),
+                        // A distinct sequence per writer, so the event insert cannot be the
+                        // thing that conflicts — this test is about the row update's lock.
+                        event(
+                            run_id(),
+                            2 + u64::try_from(offset).expect("small"),
+                            "run.concurrent",
+                        ),
+                    ),
+                )
+                .await
+        }));
+    }
+
+    let mut succeeded = 0u32;
+    // Collected rather than panicked at the call site: a `panic!` is denied in this
+    // crate's lint policy, and `assert!(false, ..)` would trip `assertions_on_constants`.
+    // Collecting also reports *every* unexpected fault rather than only the first.
+    let mut unexpected: Vec<String> = Vec::new();
+    for handle in handles {
+        match handle.await.expect("the task does not panic") {
+            Ok(_) => succeeded += 1,
+            Err(RepositoryError::VersionConflict { .. }) => {}
+            Err(other) => unexpected.push(format!("{other:?}")),
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "a contended transition must land or report a version conflict; \
+         a lock or transport fault is not a rule, but these were reported: {}",
+        unexpected.join(", "),
+    );
+    assert!(
+        succeeded >= 1,
+        "at least one of the four writers must have applied its transition",
+    );
+
+    // The run's version advanced exactly once per applied transition.
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("the run is readable");
+    assert_eq!(
+        stored.version.get(),
+        1 + u64::from(succeeded),
+        "the version must advance exactly once per applied transition",
+    );
+
+    drop(database);
+    std::fs::remove_dir_all(&directory).ok();
 }
 
 #[tokio::test]

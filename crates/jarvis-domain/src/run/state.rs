@@ -88,8 +88,28 @@ impl RunState {
     pub const fn allowed_targets(self) -> &'static [Self] {
         match self {
             Self::Received => &[Self::ContextBuilding, Self::Cancelled, Self::Failed],
-            Self::ContextBuilding => &[Self::Planning, Self::Failed],
-            Self::Planning => &[Self::AwaitingModel, Self::Responding, Self::Failed],
+            // A cancellation is legal from every working state, because a caller can ask to
+            // stop at any moment and the contract requires the request to reach a durable
+            // terminal transition. `ContextBuilding`, `Planning`, and `Observing` were the
+            // three states missing that edge, and a real-daemon journey proved it: a run
+            // cancelled while building context sat in `context_building` **forever**, with
+            // the signal accepted and unrecordable. It is the fifth time an edge absent
+            // from the architecture diagram was the defect, and the first found by an
+            // executable acceptance test rather than by reading — the diagram has been an
+            // optimistic one, describing how a run progresses and not how it stops.
+            //
+            // `ContextBuilding` and `Waiting` share a target list: both can only advance
+            // into `Planning`, fail, or be cancelled. They are merged rather than repeated
+            // because the equality is real, not incidental.
+            Self::ContextBuilding | Self::Waiting => {
+                &[Self::Planning, Self::Failed, Self::Cancelled]
+            }
+            Self::Planning => &[
+                Self::AwaitingModel,
+                Self::Responding,
+                Self::Failed,
+                Self::Cancelled,
+            ],
             // `Responding` is reachable directly from `AwaitingModel` because the
             // architecture's native runtime says to "ask a model for either a final
             // response or typed tool intent" — the final response *is* the model
@@ -116,8 +136,7 @@ impl RunState {
                 Self::Cancelled,
             ],
             Self::ExecutingTool => &[Self::Observing, Self::Failed, Self::Cancelled],
-            Self::Observing => &[Self::Planning, Self::Waiting, Self::Failed],
-            Self::Waiting => &[Self::Planning, Self::Failed, Self::Cancelled],
+            Self::Observing => &[Self::Planning, Self::Waiting, Self::Failed, Self::Cancelled],
             // A failure or a cancellation *while producing the final answer* is a
             // real outcome, not an impossible one: the provider can fail mid-stream
             // and the caller can cancel during it. `ACC-012` requires that a
@@ -351,7 +370,7 @@ mod tests {
             ),
             (
                 RunState::ContextBuilding,
-                &[RunState::Planning, RunState::Failed],
+                &[RunState::Planning, RunState::Failed, RunState::Cancelled],
             ),
             (
                 RunState::Planning,
@@ -359,6 +378,7 @@ mod tests {
                     RunState::AwaitingModel,
                     RunState::Responding,
                     RunState::Failed,
+                    RunState::Cancelled,
                 ],
             ),
             (
@@ -386,7 +406,12 @@ mod tests {
             ),
             (
                 RunState::Observing,
-                &[RunState::Planning, RunState::Waiting, RunState::Failed],
+                &[
+                    RunState::Planning,
+                    RunState::Waiting,
+                    RunState::Failed,
+                    RunState::Cancelled,
+                ],
             ),
             (
                 RunState::Waiting,

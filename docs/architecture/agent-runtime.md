@@ -38,13 +38,16 @@ stateDiagram-v2
     Received --> Cancelled
     Received --> Failed
     ContextBuilding --> Failed
+    ContextBuilding --> Cancelled
     Planning --> Failed
+    Planning --> Cancelled
     AwaitingModel --> Failed
     ExecutingTool --> Failed
     Waiting --> Failed
     AwaitingApproval --> Cancelled
     AwaitingApproval --> Failed
     Observing --> Failed
+    Observing --> Cancelled
     AwaitingModel --> Cancelled
     ExecutingTool --> Cancelled
     Waiting --> Cancelled
@@ -53,7 +56,7 @@ stateDiagram-v2
     Completed --> [*]
 ```
 
-Six edges have been **added** to this diagram, and the reason is worth recording
+Nine edges have been **added** to this diagram, and the reason is worth recording
 because each was a defect the diagram had rather than a stylistic choice:
 
 - `AwaitingModel --> Responding`. Without it the native runtime's own instruction —
@@ -85,6 +88,15 @@ because each was a defect the diagram had rather than a stylistic choice:
   needed to record a *failure* or a *cancellation*, so it has been an optimistic
   diagram — every state could progress, and only some could admit that progress had
   stopped.
+- `ContextBuilding --> Cancelled`, `Planning --> Cancelled`, and `Observing -->
+  Cancelled`. A cancellation must be recordable from **every** working state, because
+  a caller can ask to stop at any moment. These three were the states missing it, and
+  this time there was a **live repro rather than an argument**: a real-daemon journey
+  cancelled a run whose model call was in flight, the daemon accepted the command as
+  in-flight, and the run then sat in `context_building` **forever** — the signal was
+  recorded durably and could never be expressed as a state. It is the fifth instance
+  of this class overall, and the first found by an executable acceptance test rather
+  than by reading or by driving a single path.
 
 State names are domain concepts, not UI strings. A transition records actor,
 reason, expected prior version, timestamp, and correlation metadata.
@@ -189,11 +201,11 @@ against it would prove only self-consistency.
 
 **Two questions this work surfaced:**
 
-1. Should the controller retry a retryable provider error? **Not yet.** Retry,
-   fallback, and the retry-ownership rule belong with `BRN-008`'s remaining work and
-   the model gateway, and a retry without a recorded attempt would duplicate a side
-   effect — the model-call repository already models a retry as an *attempt* of one
-   logical call, which is what that work will use.
+1. Should the controller retry a retryable provider error? **Now yes, under a policy
+   that defaults to no retry** — see the retry section below. It was deferred here
+   because a retry without a recorded attempt would duplicate a side effect, and the
+   model-call repository already models a retry as an *attempt* of one logical call,
+   which is what the implementation uses.
 2. Where does a run that suspends go? `Waiting` exists in the machine and the
    controller does not enter it, because **nothing suspends and resumes yet** —
    approvals and timers are later milestones. Entering `Waiting` with nothing to wait
@@ -304,6 +316,89 @@ the sum; there is no turn budget, because the controller still performs exactly 
 model turn; and `agent_steps.timeout_ms` has no port, so per-step timeouts exist only
 as the run-level `step_timeout_ms`. `ACC-073` therefore remains open for turn, byte,
 retry, and concurrency exhaustion.
+
+### Implemented evidence (`BRN-008`, retry)
+
+`jarvis_domain::run::retry` holds the retry policy and the pure decision that applies
+it, and the controller honours it: a transient failure **before the provider accepted
+the call** closes the attempt and leaves the run **live**, so another attempt can be
+made under the same logical call. This finally uses the retry-chain storage
+(`model_calls.logical_call_id` plus `attempt`) that the schema had carried since
+`BRN-004` and nothing had ever written — every attempt was attempt 1, and a transient
+failure ended the run.
+
+The safety boundary is enforced by construction rather than by intention. `FailureSite`
+is a **required input** to the decision, because the same error must decide differently
+on either side of acceptance, and the ambiguity rule is checked **first** so no later
+rule can reach a retry for a request whose outcome is unknown. A retry must also fit
+the deadline, a policy that does not retry is the **default** (retrying spends a budget
+the caller never offered), and no retry is attempted when a consumption ceiling was
+already breached, because the same output would breach it again. A provider error
+arriving *mid-stream* was previously propagated with **no transition at all**, leaving
+the run in `AwaitingModel` — non-terminal, and indistinguishable from a run about to
+retry, so only a daemon restart would settle it. That is the same missing-terminal-exit
+class as the diagram gaps above, and it was invisible until a test asserted the run's
+stored state rather than only the returned error.
+
+### Implemented evidence (`BRN-008`, cancellation and disconnect)
+
+Cancellation had been deferred three times because **nothing exercised it**: `jarvis
+ask` follows a run to its terminal, so a client that *disappears* is not something the
+CLI can express. `tests/e2e/disconnect-journey.mjs` is the first executable harness in
+`tests/e2e/`. It speaks the local control API directly with Node's standard library
+against a real `jarvisd` started on a fresh empty profile, so "the client was killed" is
+a real condition rather than an assertion about a process the test controls, and it
+asserts durable state read back over the API rather than only status codes. Its first
+section is the contract's explicit **prohibition** — an aborted event stream must not
+cancel the run — and it proves its own precondition by asserting the run was genuinely
+in flight when the socket died, rather than passing vacuously.
+
+Four defects came out of driving it, and one of them explains the rest:
+
+- **A cancel's status was derived from a separate pre-read** of the run. A run that
+  finished between that read and the service's own read was reported `202` as though
+  cleanup were in flight, while the service had already found it terminal — two answers
+  for one fact. The status now comes from the state the service returns, and the unit
+  test that had *accepted any terminal state* was rewritten, because a test loosened to
+  accommodate a bug encodes that bug.
+- **`ContextBuilding`, `Planning`, and `Observing` had no `Cancelled` edge**, so a run
+  cancelled in one of those states had no legal exit and sat there **forever** — the
+  signal was recorded durably and could never be expressed as a state. This is the
+  fifth instance of the missing-edge class described under the diagram, and the first
+  found by an executable acceptance test rather than by reading or by driving one path.
+- **The entry cancellation check hard-coded `Received` as the transition origin**, so a
+  cancel arriving after the run had advanced was refused as an illegal edge — and the
+  refusal was **swallowed by the detached task**, so the API accepted the cancel and the
+  run carried on. The check now loads the run and transitions from its actual state.
+  Cancellation is checked *after* each step advance and after the stream drains, and
+  `complete_run` **discards the answer** for a run cancelled during delivery rather than
+  storing output the caller asked to stop.
+- **The storage layer refused a contended transition with `database is locked`
+  (`SQLITE_BUSY`) and reported it as a generic storage fault.** This is the root cause
+  of the intermittent hang. A deferred `BEGIN` takes a *read* lock and upgrades to a
+  write lock at its first write; when two transactions both seek that upgrade SQLite
+  fails one **immediately and without consulting the busy handler**, because waiting
+  would deadlock. That is documented, deliberate behaviour, so the connection profile's
+  five-second `busy_timeout` provably did not cover the one case that mattered. The
+  loser's transition was refused by a **lock** rather than by a rule, and the run was
+  left permanently non-terminal — stuck in `context_building` or `responding`, roughly
+  one run in three. The fix is `BEGIN IMMEDIATE` (SQLx's `pool.begin_with`, which accepts
+  a `&'static str`), applied to all four write transactions, so the conflict occurs where
+  the busy handler *does* apply. The general lesson is worth keeping: **a contention
+  condition must not be reported with a transport error code**, because a caller cannot
+  tell "retry" from "your view is stale".
+
+The regression test is
+`concurrent_transitions_on_one_run_never_fail_with_a_storage_fault`, and it is
+deliberately two-sided: every contended result must be either a success or a typed
+`VersionConflict`, **and** at least one write must land, because a test that accepted
+all-conflicts would pass against an implementation that refused everything. It runs
+against a **file** database, because the in-memory fixture is pinned to a single
+connection by design and *cannot* produce contention at all — the pool serialises the
+work and every transaction succeeds, so the fix would pass against it whether or not the
+fix existed. The test was confirmed to **fail** under `BEGIN DEFERRED` with the exact
+live fault, and the journey then passed eight consecutive runs where it had previously
+failed four in eight.
 
 ## Durable Run Record
 

@@ -196,6 +196,188 @@ async fn a_plain_question_is_answered_and_the_run_completes() {
     );
 }
 
+/// A provider that cancels its own run partway through its script.
+///
+/// The point is **determinism**: a cancellation test driven from outside has to race the
+/// run, and a scripted provider finishes in microseconds, so the outcome depends on
+/// scheduling. Cancelling from *inside* the stream removes the race — the signal is
+/// delivered after the first frame is handed out and before the terminal, which is
+/// exactly the window the controller has to honour.
+struct CancelsMidStream {
+    models: Vec<ModelRef>,
+    cancel: CancellationScope,
+}
+
+impl ModelProvider for CancelsMidStream {
+    fn models(&self) -> &[ModelRef] {
+        &self.models
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        Box::pin(async move {
+            /// A stream that emits one frame, cancels the run, then emits its terminal.
+            struct Cancelling {
+                call_id: jarvis_domain::ids::ModelCallId,
+                cancel: CancellationScope,
+                step: u64,
+            }
+
+            impl ModelStream for Cancelling {
+                fn next_event(
+                    &mut self,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    Option<jarvis_domain::model::stream::ModelStreamEvent>,
+                                    ProviderError,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > {
+                    Box::pin(async move {
+                        self.step += 1;
+                        let kind = match self.step {
+                            1 => ModelStreamEventKind::CallStarted { model: None },
+                            2 => {
+                                // The cancellation is signalled *after* output has begun
+                                // and before the terminal, so the run is genuinely
+                                // mid-delivery when the caller asks it to stop.
+                                self.cancel.cancel();
+                                ModelStreamEventKind::OutputTextDelta {
+                                    item_id: "out-1".to_owned(),
+                                    delta: "partial".to_owned(),
+                                }
+                            }
+                            3 => ModelStreamEventKind::CallCompleted {
+                                finish_reason: FinishReason::Stop,
+                                usage: None,
+                                refused: false,
+                            },
+                            _ => return Ok(None),
+                        };
+                        // A fresh identifier per frame, which is JARVIS's to assign; the
+                        // sequence is the frame's position. It starts at **1**, because
+                        // `ModelStreamState` seeds `last_sequence` with `Sequence::FIRST`
+                        // (which is 0) and requires a strictly increasing sequence — so a
+                        // first frame at 0 would be refused as non-monotonic.
+                        Ok(Some(jarvis_domain::model::stream::ModelStreamEvent {
+                            call_id: self.call_id,
+                            event_id: jarvis_domain::ids::ModelStreamEventId::from_uuid(
+                                Uuid::now_v7(),
+                            ),
+                            sequence: jarvis_domain::model::stream::Sequence::new(self.step),
+                            kind,
+                            provider_metadata: None,
+                        }))
+                    })
+                }
+            }
+
+            Ok(Box::new(Cancelling {
+                call_id: request.call_id,
+                cancel: self.cancel.clone(),
+                step: 0,
+            }) as Box<dyn ModelStream + Send + 'a>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_arriving_during_delivery_ends_the_run_cancelled() {
+    // The window a live-daemon journey pointed at: the provider has produced output and has
+    // not committed it when the caller asks to stop. `ACC-016` names cancelling during
+    // streaming, and the contract requires a cancellation to reach a durable terminal
+    // transition — so completing here would record success for a request the daemon had
+    // already accepted as in-flight.
+    let cancel = CancellationScope::new();
+    let provider = Arc::new(CancelsMidStream {
+        models: vec![model()],
+        cancel: cancel.clone(),
+    });
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed(&fixture).await;
+
+    let error = fixture
+        .controller
+        .execute(&context(), run(), conversation(), "hello", &cancel)
+        .await
+        .expect_err("a cancelled run cannot complete");
+    assert_eq!(error, ControllerError::Cancelled);
+    assert_eq!(error.terminal_state(), RunState::Cancelled);
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(
+        stored.state,
+        RunState::Cancelled,
+        "a run cancelled mid-delivery must not be recorded as completed",
+    );
+
+    // The answer must **not** be stored. Writing it would put text into the transcript
+    // that the run never delivered, and a later turn's context would carry it.
+    let messages = fixture
+        .repositories
+        .load_messages(context().workspace_id, conversation(), None, 10)
+        .await
+        .expect("messages are readable");
+    assert!(
+        !messages.iter().any(|message| message.content == "partial"),
+        "a cancelled run's partial output must not become the assistant's message: {messages:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_arriving_during_delivery_publishes_exactly_one_terminal_event() {
+    // "Exactly one terminal event" must hold on the cancellation path too, or a client
+    // following the stream would see the run end twice.
+    let cancel = CancellationScope::new();
+    let provider = Arc::new(CancelsMidStream {
+        models: vec![model()],
+        cancel: cancel.clone(),
+    });
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed(&fixture).await;
+
+    let _ = fixture
+        .controller
+        .execute(&context(), run(), conversation(), "hello", &cancel)
+        .await;
+
+    let events = fixture
+        .repositories
+        .recorded_events()
+        .expect("events are readable");
+    let terminals: Vec<&str> = events
+        .iter()
+        .filter(|event| {
+            ["run.completed", "run.failed", "run.cancelled"].contains(&event.event_type.as_str())
+        })
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert_eq!(
+        terminals,
+        ["run.cancelled"],
+        "a cancelled run publishes run.cancelled and nothing else terminal: {events:?}",
+    );
+    // And the sequences are still contiguous, so the stream has no gap.
+    let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
+    assert_eq!(
+        sequences,
+        (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+        "{sequences:?}",
+    );
+}
+
 #[tokio::test]
 async fn each_state_change_published_exactly_one_event() {
     // The run's opening event, five transitions, and one output delta, so seven events

@@ -1067,6 +1067,58 @@ Foundation TODO remains incomplete.
   routes (`BRN-003`, `BRN-010`), so the contract's fallback list is not implemented; the retry
   policy is not settable per request (it is a field on the run's budget, defaulting to no
   retry, and `CreateRunRequest` has no typed override); and the disconnect case remains open.
+  **Cancellation and disconnect are now implemented and proved end to end, and the proof
+  found four defects.** The disconnect case had been deferred three times because nothing
+  exercised it: `jarvis ask` follows a run to its terminal, so a client that *disappears* is
+  not something the CLI can express. `tests/e2e/disconnect-journey.mjs` is the first
+  executable harness in `tests/e2e/`, speaks the local control API directly with Node's
+  standard library against a real `jarvisd` and a fresh `--profile`, and asserts durable
+  state read back over the API rather than only status codes. **First, the cancel status
+  was derived from a separate pre-read** of the run, so a run that finished between the
+  two reads was reported `202` as though cleanup were in flight while the service had
+  already found it terminal — two answers for one fact. The status now comes from the
+  service's own returned state, and the unit test that had *accepted any terminal state*
+  was rewritten, because a test loosened to accommodate a bug encodes it. **Second,
+  `ContextBuilding`, `Planning`, and `Observing` had no `Cancelled` edge**, so a run
+  cancelled in one of those states had **no legal exit and sat there forever** — the fifth
+  instance of the missing-diagram-edge class (the first four were `Planning -> Responding`,
+  `AwaitingApproval -> Failed`, `Observing -> Failed`, and the retry path's terminal), and
+  found by a live repro rather than by an argument. Every non-terminal state now reaches
+  `Cancelled`, and the architecture diagram gained the three edges. **Third, the entry
+  cancellation check hard-coded `Received` as the transition origin**, so a cancel arriving
+  after the run had advanced was refused as an illegal edge — and the refusal was
+  **swallowed by the detached task**, so the cancel was accepted by the API and then
+  silently did nothing. The check now loads the run and transitions from its actual state;
+  the step boundary is a helper that checks cancellation *after* each advance, and there
+  are now checks after the stream drains and before delivery completes, from which
+  `complete_run` **discards an answer** rather than storing one for a run the caller
+  cancelled. **Fourth, and the one that explains everything else: the storage layer refused
+  a contended transition with `database is locked` (`SQLITE_BUSY`) and reported it as a
+  generic `Query` fault.** A deferred `BEGIN` takes a *read* lock and upgrades to a write
+  lock at the first write; when two transactions both want that upgrade SQLite fails one
+  **immediately and without consulting the busy handler**, because waiting would deadlock —
+  documented, deliberate behaviour, so the profile's `busy_timeout` provably did not cover
+  the one case that mattered. The loser's `UPDATE` failed, the terminal transition was
+  refused by a *lock* rather than by a rule, and the run was left permanently
+  non-terminal — stuck in `context_building` or `responding`, about one run in three. The
+  fix is `BEGIN IMMEDIATE` (`pool.begin_with`, and `&'static str` implements `SqlSafeStr`),
+  applied to all four write transactions, so the conflict happens where the busy handler
+  *does* apply. This is why a contention condition must not be reported with a transport
+  error code: a caller cannot tell "try again" from "your view is stale".
+  `concurrent_transitions_on_one_run_never_fail_with_a_storage_fault` is the regression
+  test, and it is deliberately two-sided — every result must be a success or a typed
+  `VersionConflict`, and at least one write must land, because a test that accepted
+  all-conflicts would pass against an implementation that refused everything. It runs
+  against a **file** database, because the in-memory fixture is pinned to one connection
+  by design and *cannot* produce contention: the check was confirmed to **fail** under
+  `BEGIN DEFERRED` with the exact live fault (`reported Query`) and pass under
+  `BEGIN IMMEDIATE`, and the journey then passed eight consecutive runs where it had
+  previously failed four in eight. The deterministic half of the contract — that a cancel
+  arriving *during* delivery must win — is covered by a provider double that cancels from
+  inside its own stream (`CancelsMidStream`), so there is no race to lose, and it asserts
+  both that the run ends `Cancelled` and that the partial output was **not** stored as an
+  assistant message. 2 controller tests, 1 adapter regression test, 1 E2E harness.
+  **Not done:** no fallback, per-request retry policy, or resumption, as above.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider

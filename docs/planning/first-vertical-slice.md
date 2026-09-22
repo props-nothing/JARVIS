@@ -168,9 +168,27 @@ retained public events and closes, so the CLI follows a run by reconnecting with
 `Last-Event-ID` until a terminal event arrives, rather than holding one connection
 open and printing deltas as they are published. Holding a connection open needs a
 streaming response body, and the dependency set this slice reviewed has no stream
-crate; adding one is a research-gate change rather than a convenience. The E2E step's
-abrupt-restart and disconnect cases are `BRN-008`. `BRN-003` remains gated on its
-`REQUIRED` evidence note, and `agent_steps` still has a table but no adapter.
+crate; adding one is a research-gate change rather than a convenience.
+
+The disconnect and cancellation halves of the E2E step are now **done**, as
+`BRN-008`: `tests/e2e/disconnect-journey.mjs` is the first executable harness in
+`tests/e2e/`, driving the local control API directly against a real daemon on a fresh
+empty profile. It is the first harness of any kind in this repository, so the
+"real-daemon E2E" acceptance criterion is now met for the disconnect/cancel surface
+and outstanding for the rest. The abrupt-restart case remains with `BRN-008`, and is
+covered in-process by the startup-recovery pass rather than by the journey. `BRN-003`
+remains gated on its `REQUIRED` evidence note, and `agent_steps` still has a table but
+no adapter.
+
+Driving that path found, among four defects, a storage-level **contention** fault:
+two transitions on one run raced, and the loser's deferred transaction could not
+upgrade its read lock to a write lock — `SQLITE_BUSY`, which SQLite raises immediately
+and *without* consulting the busy handler, so the profile's `busy_timeout` did not
+cover it. The adapter reported it as a generic storage fault and the run was left
+permanently non-terminal. The fix is `BEGIN IMMEDIATE`, and its regression test is the
+reason the fixture for it must be a **file** database: the in-memory fixture is pinned
+to one connection and cannot produce contention, so it would have passed either way.
+The `BRN-008` evidence records the full finding.
 
 ## Acceptance
 

@@ -1627,16 +1627,27 @@ mod tests {
         )
         .await;
         // `202` while cleanup is in flight, never a claim that the run is already
-        // cancelled.
+        // cancelled. `200` is allowed only when the run had genuinely finished before the
+        // command arrived, which the body's state then shows.
         assert!(
             status == StatusCode::ACCEPTED || status == StatusCode::OK,
             "{status}: {body}",
         );
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        assert!(parsed["state"].as_str().is_some(), "{body}");
+        let reported = parsed["state"].as_str().expect("a state");
+        assert!(
+            status != StatusCode::OK || ["completed", "failed", "cancelled"].contains(&reported),
+            "a 200 must report a terminal state: {body}",
+        );
 
-        // And the run does reach a terminal state that a client can observe.
-        let mut terminal = false;
+        // And the run reaches a terminal state that a client can observe. **This
+        // assertion originally accepted any terminal state and used a permissive loop**,
+        // which accepted `completed` for a run that was cancelled — encoding the very
+        // defect the contract prohibits. A real-daemon journey is what exposed it: the
+        // scripted provider finishes in milliseconds, so a cancel that arrives after
+        // completion must not be reported as having cancelled anything, and a cancel that
+        // arrives *during* the run must end it `Cancelled` rather than `Completed`.
+        let mut observed = None;
         for _ in 0..200 {
             let (_, current) = send(
                 &app,
@@ -1647,14 +1658,23 @@ mod tests {
             )
             .await;
             let parsed: serde_json::Value = serde_json::from_str(&current).expect("valid");
-            let state = parsed["state"].as_str().unwrap_or_default();
-            if ["completed", "failed", "cancelled"].contains(&state) {
-                terminal = true;
+            let state = parsed["state"].as_str().unwrap_or_default().to_owned();
+            if ["completed", "failed", "cancelled"].contains(&state.as_str()) {
+                observed = Some(state);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(terminal, "a cancelled run must reach a terminal state");
+        let observed = observed.expect("a cancelled run must reach a terminal state");
+        // The command was accepted as `202`, so the run was live when it arrived and the
+        // only truthful terminal for it is `cancelled`. `completed` would mean the
+        // cancellation was signalled and then ignored.
+        if status == StatusCode::ACCEPTED {
+            assert_eq!(
+                observed, "cancelled",
+                "a run whose cancel was accepted as in-flight must end cancelled, not {observed}",
+            );
+        }
     }
 
     #[tokio::test]

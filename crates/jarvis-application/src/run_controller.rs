@@ -458,14 +458,18 @@ impl RunController {
         // for an answer that had already been abandoned. The contract is explicit that
         // cancellation reaches a durable terminal transition.
         if cancel.is_cancelled() {
-            // A `Received` run may already have been cancelled by an earlier attempt,
-            // in which case it is terminal and there is nothing left to record.
+            // The state is read rather than assumed to be `Received`. The first version
+            // hardcoded `Received` as the transition's origin, so a cancel arriving after
+            // the run had already advanced was **refused** as an illegal edge and the
+            // refusal was swallowed by the detached task — leaving the run in
+            // `context_building` forever with the caller's cancellation recorded but
+            // unexpressible. A live-daemon journey found it.
             let stored = self.load(run).await?;
             if !stored.state.is_terminal() {
                 self.finish(
                     run,
                     Step::new(
-                        RunState::Received,
+                        stored.state,
                         RunState::Cancelled,
                         "run.cancelled",
                         "cancelled_before_start",
@@ -478,7 +482,13 @@ impl RunController {
 
         // Received -> ContextBuilding. The transcript is read before the model call so
         // a run whose conversation is unreadable fails before it costs anything.
-        self.step(
+        //
+        // Every intermediate step goes through `step_unless_cancelled`, so a cancellation
+        // that arrives while the run is working is honoured at the next step rather than
+        // only at the model-turn boundary. That is where the earlier per-state checks were
+        // incomplete: a cancel landing between two steps was never consulted, so the run
+        // continued to completion.
+        self.step_unless_cancelled(
             run,
             Step::new(
                 RunState::Received,
@@ -486,6 +496,7 @@ impl RunController {
                 "run.context_building",
                 "context_build_requested",
             ),
+            cancel,
         )
         .await?;
 
@@ -510,7 +521,7 @@ impl RunController {
         // the architecture permits: "Planning is a strategy, not a mandatory extra
         // model call." The state names that a decision was taken; it does not claim a
         // plan document exists.
-        self.step(
+        self.step_unless_cancelled(
             run,
             Step::new(
                 RunState::ContextBuilding,
@@ -518,6 +529,7 @@ impl RunController {
                 "run.planning",
                 "context_ready",
             ),
+            cancel,
         )
         .await?;
 
@@ -544,7 +556,7 @@ impl RunController {
         };
 
         // Planning -> AwaitingModel.
-        self.step(
+        self.step_unless_cancelled(
             run,
             Step::new(
                 RunState::Planning,
@@ -552,6 +564,7 @@ impl RunController {
                 "run.model_started",
                 "model_call_requested",
             ),
+            cancel,
         )
         .await?;
 
@@ -570,6 +583,47 @@ impl RunController {
             },
         )
         .await
+    }
+
+    /// Advances a run one state, and refuses to continue if a cancellation arrived.
+    ///
+    /// Every intermediate step goes through this rather than calling [`step`](Self::step)
+    /// directly, so "a cancel that arrives during a step is honoured" is one decision
+    /// instead of a check repeated at each site — and a new step added later cannot forget
+    /// it. That is the shape the earlier per-state checks lacked: the entry check covered a
+    /// cancel before the run started, and the model-turn boundary covered one during the
+    /// provider call, but the window across `context_building` and `planning` had none. A
+    /// live-daemon journey found the consequence: a run cancelled ~20 ms after creation
+    /// still completed, because the signal was never consulted between the steps the run
+    /// walked through in those milliseconds.
+    ///
+    /// The cancellation is recorded from the state the step **reached**, so the transition
+    /// is one the machine allows and the run is left terminal rather than in a state from
+    /// which no cancellation can be expressed.
+    async fn step_unless_cancelled(
+        &self,
+        run: RunRef,
+        step: Step,
+        cancel: &CancellationScope,
+    ) -> Result<(), ControllerError> {
+        self.step(run, step).await?;
+        if !cancel.is_cancelled() {
+            return Ok(());
+        }
+        // `step.to` is where the run now is, and every working state has a `Cancelled`
+        // edge. `Waiting` is the one exception a caller could reach here, and it has one
+        // too, so this is total over the states a step can land in.
+        self.finish(
+            run,
+            Step::new(
+                step.to,
+                RunState::Cancelled,
+                "run.cancelled",
+                "cancelled_during_step",
+            ),
+        )
+        .await?;
+        Err(ControllerError::Cancelled)
     }
 
     /// Performs the model turn, retrying a pre-acceptance failure within the run's budget.
@@ -757,6 +811,41 @@ impl RunController {
             Err(error) => return Err(error),
         };
 
+        // Cancellation is re-checked **after** the stream drains and before the run is
+        // allowed to succeed. This is the last window in which a caller can cancel, and
+        // without it a cancel that arrived while the final frames were being processed
+        // was reported as `202` (cleanup in flight) and then ignored: the run completed
+        // and claimed success for a request whose cancellation the daemon had accepted.
+        //
+        // `BufferedStream` reports a cancellation only while no terminal is queued, which
+        // is correct for the *stream* — a terminal at the head means the call genuinely
+        // finished — but it means the controller cannot rely on the stream to surface a
+        // cancel that raced the terminal. Deciding here, on the run's own signal, is what
+        // makes the outcome authoritative rather than the last frame's.
+        if turn.cancel.is_cancelled() {
+            self.finish(
+                run,
+                Step::new(
+                    RunState::AwaitingModel,
+                    RunState::Cancelled,
+                    "run.cancelled",
+                    "cancelled_after_output",
+                ),
+            )
+            .await?;
+            // The attempt is closed as cancelled rather than completed: the output was
+            // produced, but recording it as a successful call would say the call's result
+            // was the run's outcome, and the run's outcome is that the caller stopped it.
+            self.record_call_outcome_with(
+                run,
+                call_id,
+                ModelCallState::Cancelled,
+                usage_of(&drained),
+            )
+            .await?;
+            return Err(ControllerError::Cancelled);
+        }
+
         self.finish_attempt(run, turn, call_id, drained).await
     }
 
@@ -813,9 +902,15 @@ impl RunController {
             .await?;
 
         // AwaitingModel -> Responding -> Completed, then the answer is stored.
-        self.complete_run(run, drained, turn.conversation_id, completed_at)
-            .await
-            .map(AttemptOutcome::Completed)
+        self.complete_run(
+            run,
+            drained,
+            turn.conversation_id,
+            completed_at,
+            turn.cancel,
+        )
+        .await
+        .map(AttemptOutcome::Completed)
     }
 
     /// Drives a successful run through `Responding` to `Completed` and stores the answer.
@@ -825,6 +920,7 @@ impl RunController {
         drained: DrainedTurn,
         conversation_id: ConversationId,
         at: UtcTimestamp,
+        cancel: &CancellationScope,
     ) -> Result<RunOutcome, ControllerError> {
         self.step(
             run,
@@ -836,6 +932,31 @@ impl RunController {
             ),
         )
         .await?;
+
+        // The last window in which a caller can cancel, and the one a live-daemon journey
+        // pointed at. The run has produced its answer but has not committed it, so a
+        // cancellation arriving here must still be truthful — the contract requires a
+        // cancellation to reach a durable terminal transition, and `ACC-016` names
+        // cancelling *during* delivery specifically. Without this check the run would move
+        // to `Completed` and record success for a request whose cancellation the daemon had
+        // already accepted as in-flight.
+        if cancel.is_cancelled() {
+            self.finish(
+                run,
+                Step::new(
+                    RunState::Responding,
+                    RunState::Cancelled,
+                    "run.cancelled",
+                    "cancelled_during_delivery",
+                ),
+            )
+            .await?;
+            // The answer is **not** stored: a cancelled run's output is not its outcome, and
+            // persisting it as the assistant's message would put text into the transcript
+            // that the run never delivered.
+            return Err(ControllerError::Cancelled);
+        }
+
         self.step(
             run,
             Step::new(
