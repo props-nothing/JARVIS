@@ -20,6 +20,7 @@
 
 pub mod conversation;
 pub mod model_call;
+pub mod policy;
 pub mod run;
 
 use std::fmt;

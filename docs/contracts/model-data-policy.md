@@ -260,6 +260,141 @@ recorded with a provider retention classification. Both read as *more* careful t
 the route is, and neither is visible without a check because the two fields are set
 independently.
 
+#### Test 7: routing rejection rather than silent relaxation
+
+`jarvis_domain::model::routing` is the **selector**: `select_route` takes a bounded
+candidate list and a `RouteRequest` and returns the first compliant candidate or
+`model.policy_unsatisfied`. Before this the contract had the vocabulary and none of the
+behaviour — `RejectionReason` was defined with nothing to produce it and
+`ModelRouteDecision` with nothing to construct it, so a "rejected candidate" could not
+exist. Three rules are structural:
+
+- **There is no path that relaxes a hard rule.** A candidate that cannot satisfy the
+  resolved policy or attest a required capability is rejected *with a reason*; nothing
+  downgrades a requirement because no candidate met it. That is the difference between a
+  filter and a preference, and it is why selection is not scored: a score could rank an
+  incompliant candidate above a compliant one.
+- **Every rejection is recorded, not only the winner.** A decision that named just its
+  selection could not answer "why not the local model", which is the question an operator
+  asks. The list is bounded (`MAX_CANDIDATES`) because it comes from a provider.
+- **Retention and training use are candidate-attested, never inferred.** Whether a
+  provider documents bounded retention is a fact about its current published terms, so
+  deriving `none_documented` from "it is a cloud endpoint" would claim a documented finding
+  from a category. A candidate with no usable note is classified `provider_default` — a new
+  `EffectiveRetention` variant meaning "the provider's own default terms were accepted",
+  which **documents nothing** — and a policy demanding a documented statement rejects it.
+  An earlier version of this module classified an undocumented cloud candidate as
+  `none_documented`, which is precisely the promotion this contract forbids: it would make
+  the least documented route read as the most careful kind. A test caught it.
+
+Two evidence predicates now exist, and using one for both would fail in one direction
+whichever was chosen. `Evidence::satisfies_hard_requirement_on` admits **only** `VERIFIED`,
+because a capability can differ between a provider's documented version and the one this
+repository pins. `Evidence::satisfies_data_policy_rule_on` admits `VERIFIED`, `DOCUMENTED`,
+and `OBSERVED`, because this contract names the labels that cannot satisfy a
+retention/training/residency rule ("expired, `STALE`, `INFERRED`, or `UNVERIFIED`") and the
+official documentation is exactly the source that establishes a retention term.
+
+`RouteCandidate::region` is an `Option`, and a missing region **fails** an allow-list rather
+than passing it: a provider that does not publish where it processes cannot be shown to be
+inside an allowed region, and refusing is recoverable while sending is not.
+
+#### The API surface: how the selector is reached
+
+`jarvis_infrastructure::http::policy` implements the two `GET`s. Each resolves the authenticated
+scope, delegates to `PolicyService`, and renders the result; the spellings live in spelling
+functions rather than the domain's `Display`, because the two vocabularies differ:
+
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| the wire vocabulary is the contract's, not the domain's | one spelling function per value family in `http::policy` | `every_rule_value_is_rendered_with_the_contracts_spelling`, which enumerates every variant |
+| a rejection reason is a **code**, not a sentence | `rejection_reason_of` rather than `RejectionReason::to_string()` | `every_rejection_reason_is_a_code_rather_than_a_sentence` |
+| `effective` is diagnostic, not a way to force a route | the handler takes no model argument, and the probe sensitivity is a constant | the route tests, plus the absence of a parameter to pass one |
+| a refusal is `200` with a body, not an error status | `PolicyServiceError::Unsatisfied` renders as `200` | `the_effective_route_endpoint_refuses_a_candidate_the_policy_excludes` |
+| nothing names a provider account or credential | the response types carry only rule values and a provider-qualified model | the response shape itself has no field for one |
+| another workspace's policy reads as absent | the scope is resolved server-side and passed to every store call | `the_policy_surface_hides_another_workspaces_policy`, which reads the row back by its own workspace to prove it exists |
+
+The rejection-reason row is a defect that was found rather than designed. `rejected_view`
+rendered `RejectionReason`'s `Display`, which is human prose for an operator log, so the wire
+carried `"locality violated"` where the contract's own response example shows
+`locality_violated`. Every other value in the module already went through a spelling function;
+this one had none, and no test asserted the string — the one rejection code a handler test
+reached was produced by the domain, so the test agreed with the defect. The spelling test now
+enumerates all nine variants and asserts each is a snake_case code that differs from the domain's
+`Display`, which makes the *class* fail rather than the instance.
+
+**Now done:** `jarvis_application::policy_service::PolicyService` reads the **stored** policy and
+constructs the `RouteRequest` from it, so `select_route_explained` has a caller in production code.
+`GET /api/v1/model-data-policy` returns the active version; `GET /api/v1/model-data-policy/effective`
+probes the configured candidates against it. Both are described under *API* above.
+
+**Still not done.** Three things, each named rather than implied:
+
+- `PUT /api/v1/model-data-policy` has no handler, so a policy can only be written through the
+  repository port. The `expected_version` precondition and the `resource.version_conflict`
+  response this contract requires are implemented in the store — `insert_version` refuses a
+  version that already exists — but there is no route that reaches it.
+- `model_policy_exceptions` has a table and no code: no exception can be granted, expired,
+  revoked, or attached to a decision, so `ModelRouteDecision::exception_ref` is always absent and
+  the contract's *Exceptions* section is unimplemented. Nothing enforces a hard rule through an
+  exception, which is why no route can relax one.
+- `CreateRunRequest.model_policy` is parsed by the API and **not read**, so a create-run request's
+  stated policy ID/version does not reach `RunService::create`. A run therefore evaluates under
+  the workspace's active policy and a client's explicit reference is silently ignored — the
+  request is accepted and the field has no effect. This is recorded as a defect in `TODO.md`
+  rather than left as a silent gap, because "accepted and ignored" is indistinguishable to a
+  client from "accepted and applied".
+
+`ProviderInventory` reports candidates whose `region`, `retention`, and `training_use` are all
+`None`, which is the honest state until `BRN-011` measures capabilities and an adapter attaches
+provider terms. The consequence is deliberate: a policy demanding **documented** retention or
+training use refuses every candidate rather than having a claim inferred for it, so an operator
+who writes a strict policy sees `model.policy_unsatisfied` with `retention_unsatisfied` reasons
+rather than a route that was permitted on an assumption.
+
+#### The persistence half: the policy store
+
+`migrations/sqlite/000004_model_data_policy.sql` creates the three tables this contract's
+`Persistence` section names — `model_data_policies`, `model_policy_exceptions`, and
+`model_route_decisions` — raising the schema to version 4 with the minimum reader left at 1,
+because every existing table and column is untouched.
+`jarvis_application::repository::policy` is the port and
+`jarvis_infrastructure::storage::repositories::policy` the SQLite adapter, with an in-memory
+double in `jarvis_application::testing` so a service test can register a policy without a
+database.
+
+The immutability rule is now structural rather than documented. `insert_version` is an
+`INSERT` behind `UNIQUE (policy_id, version)`, and a duplicate is reported as
+`storage.version_conflict` — the same typed outcome the run state machine uses, because it is
+the same fact: someone advanced the record since this caller read it. Two decisions follow
+from the contract:
+
+- **The caller states the version, and the store checks it.** Assigning the next version
+  inside the store would make a concurrent update indistinguishable from a sequential one,
+  and this contract requires `resource.version_conflict` for the former. A store that chose
+  the number could only ever report success.
+- **Rules are stored as JSON, not as twenty columns.** `PolicyRules` has seven enums and four
+  sets, so a flattened schema would be twenty places for the stored form and the domain type
+  to disagree with no single reader able to notice. A row whose rules cannot be reinterpreted
+  is reported as `Corrupted` rather than as absence, because reporting it absent would let a
+  caller create a replacement for a policy that is still there.
+
+`load_active` requires an ordering rule, since a workspace may legally hold two active
+versions (reactivating an older one without archiving the newer). It takes the highest
+version, and the in-memory double implements the same rule — a difference between the two
+would be invisible to a test that exercised either one alone. An absent active policy is
+`NotFound` rather than an empty one: a call made under no policy applies nothing, so the
+caller has to decide whether that is permitted, and it cannot decide if the store hands back
+`PolicyRules::permissive()`.
+
+**Still not done:** `select_route` remains uncalled, because nothing yet assembles a
+`RouteRequest` from a loaded policy plus a candidate inventory. The store is the input; the
+wiring and the `GET /api/v1/model-data-policy/effective` surface are the next increment. The
+API endpoints, the exception lifecycle (issue/expire/revoke/single-use), and the
+`resource.version_conflict` HTTP mapping are all absent.
+
+
+
 **Not done**: tests 2, 4 through 9 have no executable evidence yet. There is no
 persistence for `model_data_policies`, `model_policy_exceptions`, or
 `model_route_decisions` (that is `BRN-004`), so immutable version history,

@@ -14,7 +14,7 @@ use jarvis_domain::clock::ManualClock;
 use jarvis_domain::ids::{
     ConversationId, CorrelationId, PrincipalId, RequestId, RunId, WorkspaceId,
 };
-use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::{
     ContentBlock, FinishReason, InputItem, ModelCallRequest, ModelStreamEventKind, Role, Usage,
 };
@@ -218,6 +218,10 @@ struct CancelsMidStream {
 impl ModelProvider for CancelsMidStream {
     fn models(&self) -> &[ModelRef] {
         &self.models
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
     }
 
     fn open<'a>(
@@ -664,6 +668,10 @@ async fn a_provider_serving_no_model_is_refused_by_name() {
         fn models(&self) -> &[ModelRef] {
             &[]
         }
+
+        fn endpoint_class(&self) -> EndpointClass {
+            EndpointClass::Local
+        }
         fn open<'a>(
             &'a self,
             _context: &'a RequestContext,
@@ -875,6 +883,10 @@ impl ModelProvider for NeverOpens {
         &self.models
     }
 
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
+    }
+
     fn open<'a>(
         &'a self,
         _context: &'a RequestContext,
@@ -902,6 +914,10 @@ struct OpensThenStalls {
 impl ModelProvider for OpensThenStalls {
     fn models(&self) -> &[ModelRef] {
         &self.models
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
     }
 
     fn open<'a>(
@@ -1135,6 +1151,10 @@ async fn the_run_deadline_reaches_the_provider_in_the_request() {
     impl ModelProvider for Capturing {
         fn models(&self) -> &[ModelRef] {
             &self.models
+        }
+
+        fn endpoint_class(&self) -> EndpointClass {
+            EndpointClass::Local
         }
 
         fn open<'a>(
@@ -1779,6 +1799,10 @@ impl ModelProvider for FailingAfterAcceptance {
         &self.models
     }
 
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
+    }
+
     fn open<'a>(
         &'a self,
         _context: &'a RequestContext,
@@ -1869,6 +1893,10 @@ impl RecordingProvider {
 impl ModelProvider for RecordingProvider {
     fn models(&self) -> &[ModelRef] {
         self.inner.models()
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
     }
 
     fn open<'a>(

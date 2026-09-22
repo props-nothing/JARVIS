@@ -28,4 +28,5 @@
 pub mod capability;
 pub mod identity;
 pub mod policy;
+pub mod routing;
 pub mod stream;

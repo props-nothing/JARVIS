@@ -54,6 +54,26 @@ impl EvidenceLabel {
         matches!(self, Self::Verified)
     }
 
+    /// Returns whether the label can satisfy a **model data policy** rule.
+    ///
+    /// Deliberately weaker than [`satisfies_hard_requirement`](Self::satisfies_hard_requirement),
+    /// because `model-data-policy.md` sets a different bar for a different kind of claim. It
+    /// names the labels that **cannot** satisfy a "hard retention/training/residency rule" —
+    /// "expired, `STALE`, `INFERRED`, or `UNVERIFIED`" — which admits `DOCUMENTED` and
+    /// `OBSERVED` by omission. That is coherent rather than lax: whether a provider documents
+    /// bounded retention is a statement about its *current published terms*, and the official
+    /// documentation is exactly the source that establishes it, while a capability like
+    /// "supports tool calling" can differ between the documented version and the pinned one.
+    ///
+    /// Both predicates exist because using one for both would fail in one direction whichever
+    /// was chosen: the capability rule applied to retention would refuse a provider whose terms
+    /// are documented but not independently reproduced, and this rule applied to capabilities
+    /// would route to a version that does not have the feature.
+    #[must_use]
+    pub const fn satisfies_data_policy_rule(self) -> bool {
+        matches!(self, Self::Verified | Self::Documented | Self::Observed)
+    }
+
     /// Returns the uppercase spelling used in contracts and operator output.
     #[must_use]
     pub const fn as_contract_str(self) -> &'static str {
@@ -108,6 +128,16 @@ impl Evidence {
     #[must_use]
     pub fn satisfies_hard_requirement_on(&self, today: IsoDate) -> bool {
         self.label.satisfies_hard_requirement() && self.is_fresh_on(today)
+    }
+
+    /// Returns whether this evidence can satisfy a **model data policy** rule on `today`.
+    ///
+    /// The same shape as
+    /// [`satisfies_hard_requirement_on`](Self::satisfies_hard_requirement_on) over the weaker
+    /// label set `model-data-policy.md` fixes for retention, training, and residency claims.
+    #[must_use]
+    pub fn satisfies_data_policy_rule_on(&self, today: IsoDate) -> bool {
+        self.label.satisfies_data_policy_rule() && self.is_fresh_on(today)
     }
 }
 

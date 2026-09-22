@@ -251,6 +251,39 @@ idempotency records are committed atomically". A separate claim followed by a cr
 leaves exactly the window that sentence closes, and the first implementation had it: a
 replayed create reported a conflict instead of returning the original run.
 
+`migrations/sqlite/000004_model_data_policy.sql` raises the version to **4** — the
+minimum reader again stays at 1, because every existing table and column is untouched —
+and adds the three tables `docs/contracts/model-data-policy.md` fixes:
+`model_data_policies`, `model_policy_exceptions`, and `model_route_decisions`. Four
+decisions there are load-bearing:
+
+- **A policy version is immutable.** The row is insert-only with
+  `UNIQUE (policy_id, version)`, so "changing rules creates a new version" is a constraint
+  rather than a convention. An `UPDATE` would silently rewrite the rules a past route
+  decision was made under, which is the one thing the contract's "historical records retain
+  the policy version needed to explain a past decision" rule exists to prevent — and a
+  stored `version` with no matching constraint is exactly the shape that invites one.
+- **Rules are stored as JSON, not as columns.** `PolicyRules` is a typed struct with seven
+  enums and four sets, so flattening it into twenty columns would create twenty places for
+  the stored form and the domain type to disagree, with no single reader that could notice.
+  One serialized value means one representation, and a read that cannot be reinterpreted is
+  reported as `Corrupted` rather than as absence — otherwise a caller could create a
+  replacement for a policy that is still there.
+- **`route_decisions` is its own table rather than a column on `model_calls`.** One decision
+  can serve a retry's later attempts, and the contract treats the considered candidates and
+  their rejection reasons as an auditable artifact in its own right.
+- **A decision stores its own copy of the policy reference.** Reading it through a live join
+  to `model_data_policies` would make an archived version's decision unreadable, which is
+  the case the historical-record rule is about.
+
+The store reports a duplicate version as `storage.version_conflict` — the same typed
+outcome the run state machine uses, because it is the same fact: someone advanced the
+record since this caller read it. Assigning the next version inside the store would make a
+concurrent update indistinguishable from a sequential one, and the contract requires
+`resource.version_conflict` for the former. `load_active` orders by version descending, so
+a workspace that archived and re-activated across several versions gets the newest rather
+than whichever row was inserted first.
+
 Three constraints are load-bearing rather than decorative:
 
 - `agent_runs` refuses a **waiting** state whose dependency is unset and a

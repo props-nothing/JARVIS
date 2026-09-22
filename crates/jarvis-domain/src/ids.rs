@@ -185,6 +185,14 @@ identifier!(
     "Identifies one recorded context assembly."
 );
 identifier!(
+    ModelRouteDecisionId,
+    "model_route_decision",
+    "Identifies one persisted route decision. A decision is an auditable record in \
+     its own right — the contract requires its considered candidates and rejection \
+     reasons to be readable without storing prompt content — so it has its own \
+     identity rather than being derived from the call it explains."
+);
+identifier!(
     RunActivityEventId,
     "run_activity_event",
     "Identifies one durable run activity event, which is globally unique because \

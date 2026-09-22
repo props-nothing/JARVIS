@@ -256,6 +256,45 @@ pub struct PolicyLayerContribution {
     pub policy_version: Option<PolicyVersionRef>,
 }
 
+/// A stored policy version's lifecycle state.
+///
+/// Only an `Active` version is resolved for a new call. Archiving is a state rather than a
+/// delete because a past route decision names the version it ran under, and removing the row
+/// would make that decision unexplainable — the contract requires historical records to keep
+/// "the policy/evidence version needed to explain a past decision".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDataPolicyStatus {
+    /// In force: this is the version a new call resolves.
+    Active,
+    /// Retained for explanation, but not applied to a new call.
+    Archived,
+}
+
+impl ModelDataPolicyStatus {
+    /// Returns the contract-shaped name, which is also the stored value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+
+    /// Parses the stored value.
+    ///
+    /// Returns `None` for anything else, so a reader decides what an unknown status means
+    /// rather than this function inventing a third state.
+    #[must_use]
+    pub const fn from_stored(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"active" => Some(Self::Active),
+            b"archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
 /// A reference to an immutable stored policy version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyVersionRef {
@@ -426,6 +465,14 @@ pub enum EffectiveRetention {
     BoundedDocumented,
     /// No retention is documented by current evidence.
     NoneDocumented,
+    /// The provider's own default terms were accepted, which **documents nothing**.
+    ///
+    /// A distinct value rather than `none_documented`, and the distinction is the contract's:
+    /// `none_documented` means "current official evidence states no retention", while this
+    /// means "the caller accepted whatever the provider does by default". Recording the second
+    /// as the first would claim evidence that does not exist — the promotion the contract
+    /// forbids — and a route accepted on default terms would read as the most careful kind.
+    ProviderDefault,
 }
 
 /// The training-use classification of the effective route.

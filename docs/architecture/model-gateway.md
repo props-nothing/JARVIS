@@ -133,6 +133,44 @@ include:
 The route decision, considered candidates, rejected reasons, and fallback chain
 are auditable without storing prompt content.
 
+**Implemented evidence (`BRN-010`).** This list's **policy** half now has a selector:
+`jarvis_domain::model::routing::select_route` takes a bounded candidate list and a
+`RouteRequest` — the merged `PolicyRules`, the policy version, the content's sensitivity,
+and the `RouteRequirements` — and returns the **first compliant candidate** or
+`model.policy_unsatisfied`. Three properties are structural rather than documented:
+
+- **A hard rule is checked, never relaxed.** A candidate that fails the policy or cannot
+  attest a required capability is rejected *with a reason*; nothing downgrades a
+  requirement because no candidate met it. There is deliberately no score, because a score
+  could rank an incompliant candidate above a compliant one — this is a filter, not a
+  preference.
+- **Every rejection is recorded, not only the winner.** A decision naming just its
+  selection could not answer "why not the local model", which is the question an operator
+  actually asks.
+- **Placement is read from the candidate, not guessed from the name.** An
+  `EndpointClass` is required on each candidate, because this document's own point about
+  provider ids applies here: `local.ollama` *looks* local and a hosted endpoint reached over
+  a private network is not cloud, so a name-based guess would evaluate a local-only policy
+  incorrectly. A candidate whose residency region is unknown **fails** an allow-list rather
+  than passing it, and a local endpoint reports `not_applicable_local` retention rather than
+  claiming a documented retention term it cannot have.
+
+Retention and training use are **candidate-attested**, not inferred from the endpoint class,
+because "this provider documents bounded retention" is a fact about its current terms that no
+classification can derive. A candidate with no usable note is `provider_default` — the
+provider's default terms were accepted, which documents nothing — and this document's
+"Provider claims cannot be promoted into routing capabilities without current evidence" is
+enforced by two separate evidence predicates, since a capability and a retention term are
+established by different sources.
+
+**Not done:** the selector has no caller outside its tests, because nothing constructs a
+`RouteRequest` from a **stored** policy yet. That needs the versioned, workspace-scoped policy
+store and the `GET /api/v1/model-data-policy/effective` surface, which is the rest of
+`BRN-010`; it is also what would let the run controller pass a real sensitivity ceiling rather
+than the permissive one `BRN-006` recorded. Latency and cost budgets, current health/quota
+state, and task classification are likewise still absent from the inputs, so this list's
+routing inputs are only partly represented even in the selector.
+
 Data-use, retention, locality, telemetry, residency, sensitivity, evidence, and
 exception semantics are governed by the
 [model data policy contract](../contracts/model-data-policy.md). Provider claims

@@ -2,7 +2,7 @@
 
 Status: ACCEPTED
 Last updated: 2026-09-22
-Current milestone: Milestone 2 - Native Brain (started; `BRN-001`, `BRN-002`, `BRN-004`, `BRN-005`, and `BRN-006` done, `BRN-007`'s run resource surface and CLI chat path partially done with the live SSE follow outstanding, `BRN-008`'s run controller, startup recovery, time/token/cost/context budgets, pre-acceptance retry, and cancellation/disconnect partially done with fallback and turn/byte/concurrency budgets outstanding, `BRN-003` gated on evidence. Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
+Current milestone: Milestone 2 - Native Brain (started; `BRN-001`, `BRN-002`, `BRN-004`, `BRN-005`, and `BRN-006` done, `BRN-007`'s run resource surface and CLI chat path partially done with the live SSE follow outstanding, `BRN-008`'s run controller, startup recovery, time/token/cost/context budgets, pre-acceptance retry, and cancellation/disconnect partially done with fallback and turn/byte/concurrency budgets outstanding, `BRN-010`'s policy rules, route selector, versioned policy store, policy service, and the two `GET` endpoints done with `PUT`, the exception lifecycle, and the create-run policy reference outstanding, `BRN-003` gated on evidence. Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.

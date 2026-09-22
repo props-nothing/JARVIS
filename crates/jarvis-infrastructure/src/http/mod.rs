@@ -27,14 +27,18 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
+use jarvis_application::model::ModelProvider;
+use jarvis_application::policy_service::PolicyService;
 use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
 use jarvis_application::run_service::{RunService, RunSpawner};
+use jarvis_domain::time::UtcTimestamp;
 use jarvis_protocol::ErrorEnvelope;
 use serde::Serialize;
 
 use crate::auth::ClientRegistry;
 use crate::auth::credential::CredentialError;
 
+pub mod policy;
 pub mod runs;
 
 pub use runs::{RequestScope, resolve_scope, wire_state};
@@ -131,8 +135,79 @@ pub struct ApiState {
     /// than being unroutable, so a client gets a parseable envelope instead of the
     /// generic unknown-route refusal.
     pub runs: Option<Arc<RunService>>,
+    /// The model data policy service, absent when no storage is configured.
+    ///
+    /// Optional for the same reason `runs` is: the Foundation surface must build without a
+    /// database, and a policy route reached without one answers `service.not_ready` — a
+    /// parseable envelope — rather than being unroutable.
+    pub policies: Option<Arc<PolicyService>>,
+    /// The candidate inventory an effective-route probe evaluates.
+    ///
+    /// Absent when no provider is configured, because a probe with no candidates would report
+    /// `model.policy_unsatisfied` for something the policy never refused.
+    pub inventory: Option<Arc<ProviderInventory>>,
     /// How a run's execution is scheduled.
     pub spawner: Arc<dyn RunSpawner>,
+}
+
+/// The model candidates a daemon can route a call to.
+///
+/// Built once from the composed provider rather than per request, because the inventory is a
+/// property of the process — which provider is configured, and where its endpoint sits — and
+/// recomputing it per request would invite a second answer to the same question. It holds
+/// `RouteCandidate`s whose retention and capability evidence are **absent**, which is the
+/// honest state until `BRN-011` measures them: a policy demanding documented evidence refuses
+/// every candidate rather than having a claim invented on its behalf.
+#[derive(Debug)]
+pub struct ProviderInventory {
+    candidates: Vec<jarvis_domain::model::routing::RouteCandidate>,
+    now: Option<UtcTimestamp>,
+}
+
+impl ProviderInventory {
+    /// Builds the inventory from a provider and a clock.
+    ///
+    /// The clock is read here so every request through one daemon evaluates evidence freshness
+    /// against the same instant, which is what makes two probes in one run reproducible.
+    #[must_use]
+    pub fn new(provider: &dyn ModelProvider, now: Option<UtcTimestamp>) -> Self {
+        let endpoint_class = provider.endpoint_class();
+        let candidates = provider
+            .models()
+            .iter()
+            .map(|model| jarvis_domain::model::routing::RouteCandidate {
+                descriptor: jarvis_domain::model::capability::CapabilityDescriptor::new(
+                    model.clone(),
+                    endpoint_class,
+                ),
+                model: model.clone(),
+                endpoint_class,
+                // The region is unknown because no provider publishes one through this port yet.
+                // An unknown region fails an allow-list rather than passing it, which is the
+                // fail-closed direction: a provider that does not say where it processes cannot
+                // be shown to be inside an allowed region.
+                region: None,
+                // No retention or training-use evidence: `BRN-011` measures capabilities and no
+                // adapter attaches provider terms yet. `None` is the honest value and it makes a
+                // policy that demands documentation refuse rather than pass on a guess.
+                retention: None,
+                training_use: None,
+            })
+            .collect();
+        Self { candidates, now }
+    }
+
+    /// Returns the candidates.
+    #[must_use]
+    pub fn candidates(&self) -> &[jarvis_domain::model::routing::RouteCandidate] {
+        &self.candidates
+    }
+
+    /// Returns the instant the inventory was built, when a clock was available.
+    #[must_use]
+    pub const fn built_at(&self) -> Option<UtcTimestamp> {
+        self.now
+    }
 }
 
 impl std::fmt::Debug for ApiState {
@@ -164,6 +239,8 @@ impl ApiState {
             instance_id,
             bound_authority: authority_of(address),
             runs: None,
+            policies: None,
+            inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
         }
     }
@@ -172,6 +249,18 @@ impl ApiState {
     #[must_use]
     pub fn with_runs(mut self, runs: Arc<RunService>) -> Self {
         self.runs = Some(runs);
+        self
+    }
+
+    /// Attaches the model data policy service.
+    #[must_use]
+    pub fn with_policies(
+        mut self,
+        policies: Arc<PolicyService>,
+        inventory: Arc<ProviderInventory>,
+    ) -> Self {
+        self.policies = Some(policies);
+        self.inventory = Some(inventory);
         self
     }
 
@@ -262,6 +351,17 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route(
             "/api/v1/runs/{run_id}/events",
             authenticated(get(runs::run_events)),
+        )
+        // The policy routes follow the same shape as the run routes: always routable, and
+        // answering `service.not_ready` when no storage is configured, so a client receives a
+        // parseable envelope rather than the generic unknown-route refusal.
+        .route(
+            "/api/v1/model-data-policy",
+            authenticated(get(policy::read_active_policy)),
+        )
+        .route(
+            "/api/v1/model-data-policy/effective",
+            authenticated(get(policy::read_effective_route)),
         )
         .fallback(unknown_route)
         .layer(middleware::from_fn(reject_browser_origin))
@@ -627,10 +727,13 @@ pub fn credential_status(error: CredentialError) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiState, Readiness, authority_of, router};
+    use super::{ApiState, ProviderInventory, Readiness, authority_of, router};
     use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
+    use crate::storage::repositories::SqliteRepositories;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use jarvis_application::policy_service::PolicyService;
+    use jarvis_application::repository::policy::ModelDataPolicyRepository;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -1816,5 +1919,337 @@ mod tests {
         assert_eq!(super::wire_state(RunState::Completed), "completed");
         assert_eq!(super::wire_state(RunState::Failed), "failed");
         assert_eq!(super::wire_state(RunState::Cancelled), "cancelled");
+    }
+
+    /// A policy surface fixture backed by a real migrated database.
+    ///
+    /// A real store rather than a double, for the same reason the run fixture uses one: these
+    /// tests exist to falsify the boundary, and a double at the storage layer would let a scope
+    /// or serialization defect pass. The workspace is a parameter because cross-workspace
+    /// isolation is one of the properties under test, and it can only be tested by asking as
+    /// someone else.
+    async fn policy_fixture(tag: &str) -> (axum::Router, String, Arc<SqliteRepositories>) {
+        use crate::storage::repositories::SqliteRepositories;
+        use crate::storage::{Database, migrate};
+
+        let dir = temp_dir(tag);
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+        let (registered, credential) =
+            enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+        let mut clients = ClientRegistry::new();
+        clients.register(registered);
+
+        let database = Database::open_in_memory().await.expect("in-memory opens");
+        migrate::run(database.pool()).await.expect("migrates");
+        let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+
+        // A provider serving one model, reporting itself as a **cloud** endpoint. Chosen
+        // because a `LocalOnly` policy has to refuse it, which makes the refusal arm reachable;
+        // a local provider here would make the refusal test pass for the wrong reason, since a
+        // policy that was never read would also permit a local candidate.
+        let provider = jarvis_application::model::ScriptedProvider::new(model_ref())
+            .with_endpoint_class(jarvis_domain::model::identity::EndpointClass::ApprovedCloud);
+        let policies = Arc::new(PolicyService::new(
+            Arc::clone(&repositories) as Arc<dyn ModelDataPolicyRepository>
+        ));
+        let inventory = Arc::new(ProviderInventory::new(&provider, Some(policy_now())));
+
+        let state = Arc::new(
+            ApiState::new(
+                Arc::new(clients),
+                Arc::new(Readiness::new()),
+                "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+            )
+            .with_policies(policies, inventory),
+        );
+
+        (
+            router(state),
+            credential.to_presentation_text(),
+            repositories,
+        )
+    }
+
+    fn model_ref() -> jarvis_domain::model::identity::ModelRef {
+        use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+        ModelRef::new(
+            ProviderId::parse("scripted.local").expect("valid"),
+            ModelId::parse("fixture-1").expect("valid"),
+        )
+    }
+
+    /// Authenticated headers for a policy read.
+    ///
+    /// Carries the API version because every `/api/*` route requires it: a read that omitted it
+    /// would be refused as `api.version_unsupported` before reaching the handler, so a test built
+    /// on these headers would pass while asserting nothing about the policy surface.
+    fn policy_headers(token: &str) -> Vec<(&str, String)> {
+        vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+        ]
+    }
+
+    /// Reads a policy endpoint as an authenticated local client.
+    async fn policy_get(app: &axum::Router, token: &str, path: &str) -> (StatusCode, String) {
+        send(app, "GET", path, &policy_headers(token), "").await
+    }
+
+    /// The instant the fixtures evaluate against.
+    fn policy_now() -> jarvis_domain::time::UtcTimestamp {
+        jarvis_domain::time::UtcTimestamp::parse("2026-09-21T00:00:00Z").expect("valid")
+    }
+
+    fn policy_id(value: u128) -> jarvis_domain::ids::ModelDataPolicyId {
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(uuid::Uuid::from_u128(value))
+    }
+
+    /// The ruleset the policy fixtures store: a locality rule that a cloud route fails.
+    ///
+    /// The locality rule is the discriminating part. Every other field is left at
+    /// [`PolicyRules::permissive`]'s value on purpose: the inventory attaches no retention or
+    /// training-use evidence (`BRN-011` has not measured any), so a ruleset that demanded
+    /// *documented* evidence would refuse every candidate and make the compliant arm of the
+    /// route test unreachable — a test that cannot show a policy permitting anything does not
+    /// show a policy deciding.
+    fn local_only_rules() -> jarvis_domain::model::policy::PolicyRules {
+        use jarvis_domain::model::policy::{Locality, PolicyRules};
+        PolicyRules {
+            locality: Locality::LocalOnly,
+            ..PolicyRules::permissive()
+        }
+    }
+
+    /// Stores an **active** policy version in the workspace the API resolves.
+    ///
+    /// The workspace is [`runs::DEFAULT_WORKSPACE_UUID`] rather than an arbitrary identifier,
+    /// because the handler derives the scope server-side from the authenticated client. Seeding
+    /// any other workspace would make every test read "no policy in force" and pass a
+    /// `policy_not_found` assertion for the wrong reason.
+    async fn seed_policy(
+        repositories: &SqliteRepositories,
+        policy_id: jarvis_domain::ids::ModelDataPolicyId,
+        version: u32,
+    ) {
+        seed_policy_in_workspace(
+            repositories,
+            policy_id,
+            version,
+            jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::from_u128(
+                crate::http::runs::DEFAULT_WORKSPACE_UUID,
+            )),
+            "local-only",
+        )
+        .await;
+    }
+
+    /// Stores an active policy version owned by `workspace`.
+    async fn seed_policy_in_workspace(
+        repositories: &SqliteRepositories,
+        policy_id: jarvis_domain::ids::ModelDataPolicyId,
+        version: u32,
+        workspace: jarvis_domain::ids::WorkspaceId,
+        name: &str,
+    ) {
+        use jarvis_application::repository::policy::NewPolicyVersion;
+        use jarvis_domain::model::policy::ModelDataPolicyStatus;
+
+        repositories
+            .insert_version(NewPolicyVersion {
+                policy_id,
+                version,
+                workspace_id: workspace,
+                name: name.to_owned(),
+                status: ModelDataPolicyStatus::Active,
+                rules: local_only_rules(),
+                created_at: policy_now(),
+            })
+            .await
+            .expect("policy inserts");
+    }
+
+    #[tokio::test]
+    async fn the_active_policy_endpoint_reports_the_stored_rules() {
+        let (app, token, repositories) = policy_fixture("policy-active").await;
+        seed_policy(&repositories, policy_id(1), 1).await;
+
+        let (status, body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+
+        assert_eq!(status, StatusCode::OK);
+        // The contract's spellings, not the domain's `Display`: a wire value is a published
+        // identifier and a rename in the domain must not silently rename it.
+        assert!(body.contains(r#""status":"active""#), "{body}");
+        assert!(body.contains(r#""locality":"local_only""#), "{body}");
+        assert!(body.contains(r#""version":1"#), "{body}");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-active"));
+    }
+
+    #[tokio::test]
+    async fn the_active_policy_endpoint_reports_absence_rather_than_inventing_one() {
+        let (app, token, _) = policy_fixture("policy-none").await;
+
+        let (status, body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A workspace with no policy is a real state. Reporting a permissive default instead
+        // would say "everything is allowed" on behalf of an operator who never said so.
+        assert!(body.contains("model.policy_not_found"), "{body}");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-none"));
+    }
+
+    #[tokio::test]
+    async fn the_effective_route_endpoint_refuses_a_candidate_the_policy_excludes() {
+        let (app, token, repositories) = policy_fixture("policy-refused").await;
+        seed_policy(&repositories, policy_id(1), 1).await;
+
+        let (status, body) = policy_get(&app, &token, "/api/v1/model-data-policy/effective").await;
+
+        // A refusal is a successful evaluation, so it is a 200 with the refusal in the body
+        // rather than an error status. Returning 4xx would tell a client its request was
+        // malformed when the request was fine and the *policy* was the thing that said no.
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("model.policy_unsatisfied"), "{body}");
+        // The rejected candidate must be named, so a caller can see *which* model failed and
+        // not merely that something did.
+        assert!(
+            body.contains(r#""model":"scripted.local/fixture-1""#),
+            "{body}"
+        );
+        // The **code**, not the prose: this assertion is what distinguishes a rendered code from
+        // the domain's `Display`, which says "locality violated" and would satisfy a client
+        // looking for "locality" while breaking one switching on the contract's vocabulary.
+        assert!(body.contains(r#""reason":"locality_violated""#), "{body}");
+        // `compliant` is **omitted**, not `null`: the response type skips the field when it is
+        // absent, so a client's `Option` reads `None` either way and the body carries no
+        // placeholder route that could be mistaken for a selection.
+        assert!(!body.contains("compliant"), "{body}");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-refused"));
+    }
+
+    #[tokio::test]
+    async fn the_effective_route_endpoint_serves_a_local_candidate_under_a_local_only_policy() {
+        // The same policy and the same provider as the refusal test, so the only difference is
+        // the candidate's endpoint class. Without this the refusal test could pass because the
+        // route table is broken rather than because the policy excluded a cloud model.
+        //
+        // The provider is one whose endpoint class is `Local` rather than the fixture's, since
+        // that is the property under test. Nothing else about it differs.
+        use jarvis_domain::model::identity::EndpointClass;
+
+        let dir = temp_dir("policy-compliant");
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+        let (registered, credential) =
+            enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+        let mut clients = ClientRegistry::new();
+        clients.register(registered);
+
+        let database = crate::storage::Database::open_in_memory()
+            .await
+            .expect("in-memory opens");
+        crate::storage::migrate::run(database.pool())
+            .await
+            .expect("migrates");
+        let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+        seed_policy(&repositories, policy_id(1), 1).await;
+
+        // `ScriptedProvider` reports `EndpointClass::Local`, and the fixture policy is
+        // `LocalOnly`, so the one candidate must be selected. A policy that demanded documented
+        // retention would refuse it instead; this ruleset does not, which is what makes the
+        // compliant arm reachable at all.
+        let provider = jarvis_application::model::ScriptedProvider::new(model_ref());
+        assert_eq!(
+            jarvis_application::model::ModelProvider::endpoint_class(&provider),
+            EndpointClass::Local,
+            "the compliant arm depends on this provider being local"
+        );
+        let inventory = Arc::new(ProviderInventory::new(&provider, Some(policy_now())));
+        let policies = Arc::new(PolicyService::new(
+            repositories as Arc<dyn ModelDataPolicyRepository>,
+        ));
+        let state = Arc::new(
+            ApiState::new(
+                Arc::new(clients),
+                Arc::new(Readiness::new()),
+                "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+            )
+            .with_policies(policies, inventory),
+        );
+        let app = router(state);
+
+        let (status, body) = policy_get(
+            &app,
+            &credential.to_presentation_text(),
+            "/api/v1/model-data-policy/effective",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""compliant":{"#), "{body}");
+        assert!(!body.contains("error_code"), "{body}");
+        assert!(body.contains("fixture-1"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn both_policy_endpoints_report_not_ready_without_a_store() {
+        // The daemon starts serving health before it has migrations or a policy store, so the
+        // unconfigured arm is a real startup state and not a defensive branch. It must be
+        // `service.not_ready` rather than a 500: nothing failed, the daemon is not up yet.
+        let fixture = fixture("policy-unwired");
+        for path in [
+            "/api/v1/model-data-policy",
+            "/api/v1/model-data-policy/effective",
+        ] {
+            let (status, body) = policy_get(&fixture.app, &fixture.token, path).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+            assert!(body.contains("service.not_ready"), "{path}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[tokio::test]
+    async fn the_policy_surface_hides_another_workspaces_policy() {
+        // The client's workspace is resolved server-side and is always the nil workspace in
+        // these fixtures, so a policy owned by a different workspace must read as absent. This
+        // is the local-control-API rule that another scope's resource is indistinguishable from
+        // a missing one, and it is worth a test because "404 for both" is also what a broken
+        // query returns.
+        use jarvis_domain::ids::WorkspaceId;
+
+        let (app, token, repositories) = policy_fixture("policy-scope").await;
+        seed_policy_in_workspace(
+            &repositories,
+            policy_id(1),
+            1,
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xABCD)),
+            "someone-elses",
+        )
+        .await;
+
+        let (status, body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("model.policy_not_found"), "{body}");
+        // The other workspace's name must not leak into the response either.
+        assert!(!body.contains("someone-elses"), "{body}");
+
+        // The row genuinely exists and genuinely belongs to the other workspace, so the 404 is
+        // scope filtering rather than a failed insert. Reading it back by its own workspace is
+        // what makes that distinction; without it the test would pass if `insert_version` had
+        // silently stored nothing at all.
+        let stored = repositories
+            .load_version(
+                WorkspaceId::from_uuid(uuid::Uuid::from_u128(0xABCD)),
+                jarvis_domain::model::policy::PolicyVersionRef {
+                    policy_id: policy_id(1),
+                    version: 1,
+                },
+            )
+            .await
+            .expect("the other workspace's policy is stored");
+        assert_eq!(stored.name, "someone-elses");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-scope"));
     }
 }

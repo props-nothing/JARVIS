@@ -2178,3 +2178,466 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
         "a waiting run must still be offered for recovery",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The model data policy store
+// ---------------------------------------------------------------------------
+//
+// The contract requires a policy version to be **immutable** and a past route decision to
+// stay explainable. Those are storage properties rather than domain ones, so they are proved
+// here against a real migrated database: the domain can state that a version is immutable,
+// but only the `UNIQUE (policy_id, version)` constraint and the absence of an `UPDATE` make
+// it true.
+
+use jarvis_application::repository::policy::{
+    MAX_POLICY_NAME_BYTES, ModelDataPolicyRepository as _, NewPolicyVersion,
+};
+use jarvis_domain::ids::{ModelDataPolicyId, ModelRouteDecisionId};
+use jarvis_domain::model::identity::EndpointClass;
+use jarvis_domain::model::policy::{
+    EffectiveDataPolicy, EffectiveResidency, EffectiveRetention, EffectiveTrainingUse,
+    FallbackPermission, Locality, ModelDataPolicyStatus, PolicyRules, PolicyVersionRef,
+    ProviderRetention, RejectedCandidate, RejectionReason, RequestedDataPolicy, Sensitivity,
+    Telemetry, TrainingUse,
+};
+
+/// A policy id distinct from the run fixtures' ids.
+fn policy_id() -> ModelDataPolicyId {
+    ModelDataPolicyId::from_uuid(id(700))
+}
+
+/// A second policy id, for the immutability-across-policies case.
+fn other_policy_id() -> ModelDataPolicyId {
+    ModelDataPolicyId::from_uuid(id(701))
+}
+
+/// Rules that differ from the permissive identity, so a read that lost them would show.
+fn local_only_rules() -> PolicyRules {
+    PolicyRules {
+        locality: Locality::LocalOnly,
+        maximum_provider_retention: ProviderRetention::NoneDocumented,
+        provider_training_use: TrainingUse::DisallowedDocumented,
+        telemetry: Telemetry::Disabled,
+        allowed_residency_regions: ["eu".to_owned()].into_iter().collect(),
+        maximum_sensitivity: Sensitivity::Confidential,
+        allow_fallback: FallbackPermission::Denied,
+        ..PolicyRules::permissive()
+    }
+}
+
+/// A policy version creation request.
+fn new_policy(
+    policy_id: ModelDataPolicyId,
+    version: u32,
+    status: ModelDataPolicyStatus,
+    name: &str,
+) -> NewPolicyVersion {
+    NewPolicyVersion {
+        policy_id,
+        version,
+        workspace_id: workspace(),
+        name: name.to_owned(),
+        status,
+        rules: local_only_rules(),
+        created_at: now(),
+    }
+}
+
+/// A route decision naming `policy_id` at `version`.
+fn route_decision(
+    policy_id: ModelDataPolicyId,
+    version: u32,
+) -> jarvis_domain::model::policy::ModelRouteDecision {
+    jarvis_domain::model::policy::ModelRouteDecision {
+        policy: PolicyVersionRef { policy_id, version },
+        requested: RequestedDataPolicy {
+            locality: Locality::LocalOnly,
+            maximum_provider_retention: ProviderRetention::NoneDocumented,
+            provider_training_use: TrainingUse::DisallowedDocumented,
+            telemetry: Telemetry::Disabled,
+            allowed_residency_regions: ["eu".to_owned()].into_iter().collect(),
+            sensitivity: Sensitivity::Confidential,
+        },
+        effective: EffectiveDataPolicy {
+            model: model(),
+            endpoint_class: EndpointClass::Local,
+            retention: EffectiveRetention::NotApplicableLocal,
+            training_use: EffectiveTrainingUse::NotApplicableLocal,
+            telemetry: Telemetry::Disabled,
+            residency: EffectiveResidency::LocalDevice,
+        },
+        evidence_refs: Vec::new(),
+        rejected_candidates: vec![RejectedCandidate {
+            model: model(),
+            reason: RejectionReason::LocalityViolated,
+        }],
+        exception_ref: None,
+        decided_at: now(),
+    }
+}
+
+#[tokio::test]
+async fn a_policy_version_round_trips_through_real_columns() {
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Active,
+            "private client work",
+        ))
+        .await
+        .expect("the version is stored");
+
+    let stored = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            },
+        )
+        .await
+        .expect("the version reads back");
+    assert_eq!(stored.reference().version, 1);
+    // The rules are asserted field by field rather than as a whole, because a deserialization
+    // that silently took the defaults for every field would satisfy an equality against
+    // `PolicyRules::permissive()` while having lost everything the row held.
+    assert_eq!(stored.rules.locality, Locality::LocalOnly);
+    assert_eq!(
+        stored.rules.maximum_provider_retention,
+        ProviderRetention::NoneDocumented,
+    );
+    assert_eq!(stored.rules.telemetry, Telemetry::Disabled);
+    assert_eq!(stored.rules.maximum_sensitivity, Sensitivity::Confidential);
+    assert_eq!(stored.rules.allow_fallback, FallbackPermission::Denied);
+    assert_eq!(
+        stored.rules.allowed_residency_regions,
+        local_only_rules().allowed_residency_regions,
+    );
+}
+
+#[tokio::test]
+async fn two_policies_can_each_hold_the_same_version_number() {
+    // The uniqueness key is `(policy_id, version)`, not `version`. A constraint on the number
+    // alone would stop a second policy from having a first version at all, which is the shape
+    // a careless "versions are unique" reading produces — and it would look like a working
+    // store until a workspace tried to define its second policy.
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Active,
+            "private client work",
+        ))
+        .await
+        .expect("the first policy's version 1");
+    repositories
+        .insert_version(new_policy(
+            other_policy_id(),
+            1,
+            ModelDataPolicyStatus::Active,
+            "open research",
+        ))
+        .await
+        .expect("a second policy may also begin at version 1");
+
+    let other = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: other_policy_id(),
+                version: 1,
+            },
+        )
+        .await
+        .expect("the second policy reads back");
+    assert_eq!(other.name, "open research");
+}
+
+#[tokio::test]
+async fn a_second_write_at_one_version_is_a_conflict_and_changes_nothing() {
+    // The immutability rule. A store that replaced the row would satisfy "the write
+    // succeeded" while rewriting the rules a past decision was made under, which is the one
+    // thing the contract's historical-record requirement exists to prevent — so the assertion
+    // is that the *original* rules survive, not only that the second write failed.
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Active,
+            "first",
+        ))
+        .await
+        .expect("the first version is stored");
+
+    let mut replacement = new_policy(policy_id(), 1, ModelDataPolicyStatus::Archived, "second");
+    replacement.rules.maximum_sensitivity = Sensitivity::Public;
+    let error = repositories
+        .insert_version(replacement)
+        .await
+        .expect_err("a version exists once");
+    assert_eq!(
+        error.code(),
+        "storage.version_conflict",
+        "a stale version is a typed conflict, not a generic storage fault",
+    );
+
+    let stored = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            },
+        )
+        .await
+        .expect("the original reads back");
+    assert_eq!(
+        stored.name, "first",
+        "the refused write must not have replaced the row",
+    );
+    assert_eq!(stored.rules.maximum_sensitivity, Sensitivity::Confidential);
+    assert_eq!(stored.status, ModelDataPolicyStatus::Active);
+}
+
+#[tokio::test]
+async fn a_new_version_of_one_policy_coexists_with_the_old_one() {
+    // "Changing rules creates a new version" — so the old one has to survive, because a
+    // decision naming it must stay explainable after the rules changed.
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Archived,
+            "private client work",
+        ))
+        .await
+        .expect("version 1");
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            2,
+            ModelDataPolicyStatus::Active,
+            "private client work",
+        ))
+        .await
+        .expect("version 2");
+
+    let first = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            },
+        )
+        .await
+        .expect("version 1 survives");
+    assert_eq!(first.status, ModelDataPolicyStatus::Archived);
+    let active = repositories
+        .load_active(workspace())
+        .await
+        .expect("an active version exists");
+    assert_eq!(active.version, 2);
+}
+
+#[tokio::test]
+async fn the_active_read_returns_the_highest_active_version() {
+    // Two active versions are legal (a workspace may reactivate an older one without
+    // archiving the newer), so the read has to be well defined. Returning the first active row
+    // would make the answer depend on insertion order, and the in-memory double and this
+    // adapter would disagree without either looking wrong.
+    let (_database, repositories) = repository().await;
+    for version in [1, 2] {
+        repositories
+            .insert_version(new_policy(
+                policy_id(),
+                version,
+                ModelDataPolicyStatus::Active,
+                "private client work",
+            ))
+            .await
+            .expect("both versions are stored");
+    }
+    let active = repositories
+        .load_active(workspace())
+        .await
+        .expect("an active version exists");
+    assert_eq!(active.version, 2, "the newest active version wins");
+}
+
+#[tokio::test]
+async fn a_policy_from_another_workspace_is_indistinguishable_from_a_missing_one() {
+    // Scope is a query predicate rather than a post-filter, for the same reason it is in the
+    // run repository: the local control API requires another scope's resource to be
+    // indistinguishable from an absent one, and a filter applied after the fetch would admit
+    // the difference through timing or a later refactor.
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Active,
+            "private client work",
+        ))
+        .await
+        .expect("stored");
+
+    let foreign = repositories
+        .load_version(
+            other_workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            },
+        )
+        .await;
+    assert_eq!(
+        foreign.expect_err("another workspace sees nothing"),
+        RepositoryError::NotFound
+    );
+    assert_eq!(
+        repositories
+            .load_active(other_workspace())
+            .await
+            .expect_err("another workspace has no active policy"),
+        RepositoryError::NotFound,
+    );
+}
+
+#[tokio::test]
+async fn an_absent_active_policy_is_not_found_rather_than_an_empty_one() {
+    // "No policy in force" is a state the caller must act on — a call made under no policy
+    // would apply nothing — so it is an absence rather than a permissive default. Returning
+    // `PolicyRules::permissive()` here would silently grant everything.
+    let (_database, repositories) = repository().await;
+    assert_eq!(
+        repositories
+            .load_active(workspace())
+            .await
+            .expect_err("no policy is stored"),
+        RepositoryError::NotFound,
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_policy_name_is_refused_before_it_reaches_a_row() {
+    let (_database, repositories) = repository().await;
+    let mut empty = new_policy(policy_id(), 1, ModelDataPolicyStatus::Active, "");
+    empty.name = String::new();
+    let error = repositories
+        .insert_version(empty)
+        .await
+        .expect_err("an empty name is refused");
+    assert_eq!(error.code(), "storage.conflict");
+
+    let mut long = new_policy(policy_id(), 1, ModelDataPolicyStatus::Active, "x");
+    long.name = "x".repeat(MAX_POLICY_NAME_BYTES + 1);
+    assert_eq!(
+        repositories
+            .insert_version(long)
+            .await
+            .expect_err("an over-long name is refused")
+            .code(),
+        "storage.conflict",
+    );
+    // Nothing was written by either refusal, which is the half an error alone does not prove.
+    assert!(
+        repositories.load_active(workspace()).await.is_err(),
+        "a refused write must store nothing",
+    );
+}
+
+#[tokio::test]
+async fn a_route_decision_round_trips_with_its_rejections() {
+    // The contract requires the considered candidates and their rejection reason codes to be
+    // auditable without storing prompt content, so a decision that read back without them
+    // would be a record of a decision nobody could explain.
+    let (_database, repositories) = repository().await;
+    let decision_id = ModelRouteDecisionId::from_uuid(id(702));
+    repositories
+        .record_decision(workspace(), decision_id, route_decision(policy_id(), 1))
+        .await
+        .expect("the decision is recorded");
+
+    let stored = repositories
+        .load_decision(workspace(), decision_id)
+        .await
+        .expect("the decision reads back");
+    assert_eq!(stored.policy.version, 1);
+    assert_eq!(stored.effective.endpoint_class, EndpointClass::Local);
+    assert_eq!(stored.rejected_candidates.len(), 1);
+    assert_eq!(
+        stored.rejected_candidates[0].reason,
+        RejectionReason::LocalityViolated,
+    );
+    assert!(
+        stored.effective.is_self_consistent(),
+        "a decision that read back inconsistently describes a route the code could not have chosen",
+    );
+    assert!(stored.evidence_refs.is_empty());
+    assert!(!stored.relied_on_exception());
+}
+
+#[tokio::test]
+async fn a_decisions_identity_is_write_once() {
+    // A decision explains a call that already happened, so a second write at the same identity
+    // is a conflict rather than a replacement: overwriting would destroy the evidence instead
+    // of updating it, and the record of what was decided would become whatever was written
+    // last.
+    let (_database, repositories) = repository().await;
+    let decision_id = ModelRouteDecisionId::from_uuid(id(703));
+    repositories
+        .record_decision(workspace(), decision_id, route_decision(policy_id(), 1))
+        .await
+        .expect("recorded once");
+    let error = repositories
+        .record_decision(workspace(), decision_id, route_decision(policy_id(), 9))
+        .await
+        .expect_err("a decision is write-once");
+    assert_eq!(error.code(), "storage.conflict");
+
+    let stored = repositories
+        .load_decision(workspace(), decision_id)
+        .await
+        .expect("the original reads back");
+    assert_eq!(
+        stored.policy.version, 1,
+        "the refused write must not have replaced the decision",
+    );
+}
+
+#[tokio::test]
+async fn a_route_decision_survives_the_policy_version_it_named() {
+    // The contract's "historical records retain the policy version needed to explain a past
+    // decision even after current evidence expires". The decision stores its own copy of the
+    // policy reference, so archiving or replacing the policy must not make it unreadable — and
+    // this asserts the store does not reach through a join that a later archive would empty.
+    let (_database, repositories) = repository().await;
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            1,
+            ModelDataPolicyStatus::Archived,
+            "private client work",
+        ))
+        .await
+        .expect("the version is stored");
+    let decision_id = ModelRouteDecisionId::from_uuid(id(704));
+    repositories
+        .record_decision(workspace(), decision_id, route_decision(policy_id(), 1))
+        .await
+        .expect("recorded");
+
+    // Archive-then-read is the case that would break a decision read through a live join.
+    let stored = repositories
+        .load_decision(workspace(), decision_id)
+        .await
+        .expect("an archived policy still explains the decision");
+    assert_eq!(stored.policy.policy_id, policy_id());
+    assert_eq!(stored.policy.version, 1);
+}

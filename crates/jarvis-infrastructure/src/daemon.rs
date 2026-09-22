@@ -134,6 +134,14 @@ pub struct RunningDaemon {
     readiness: Arc<Readiness>,
     clients: Arc<ClientRegistry>,
     runs: Arc<RunService>,
+    /// The model data policy surface's read side.
+    ///
+    /// Built from the same pool the run service uses, so the policy a route is evaluated
+    /// against is the one the daemon stores — a second connection to a second file would let
+    /// the two disagree about which rules are in force.
+    policies: Arc<jarvis_application::policy_service::PolicyService>,
+    /// The model candidates a probe may consider.
+    inventory: Arc<crate::http::ProviderInventory>,
     recovery: RecoverySummary,
     guard: InstanceGuard,
 }
@@ -209,7 +217,8 @@ impl RunningDaemon {
                 self.instance_id.clone(),
                 address,
             )
-            .with_runs(Arc::clone(&self.runs)),
+            .with_runs(Arc::clone(&self.runs))
+            .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory)),
         ))
     }
 
@@ -403,9 +412,31 @@ pub async fn start(
     let readiness = Arc::new(Readiness::new());
     readiness.mark_ready();
 
+    // The inventory is built from the provider these ports carry, *before* the ports are moved
+    // into the run service. Re-deriving it afterwards would mean composing a second provider and
+    // probing a different one than the daemon would actually route to — the two could disagree
+    // about which models exist or where the endpoint sits, and the probe would then report on a
+    // configuration no call would use.
+    //
+    // The clock is read once here, so every probe through this daemon evaluates evidence
+    // freshness against the instant it started rather than against a per-request `now`. That is
+    // what makes two probes in one run reproducible, and a `None` keeps the surface available
+    // rather than failing startup over a clock that cannot report.
+    let inventory = Arc::new(crate::http::ProviderInventory::new(
+        ports.provider.as_ref(),
+        crate::time::SystemClock::new().now().ok(),
+    ));
+
     let runs = Arc::new(RunService::new(
         ports,
         Arc::new(RunCancellationRegistry::new()),
+    ));
+
+    // The policy surface reads the same pool the run service writes, so the rules a route is
+    // evaluated against are the ones this daemon stores.
+    let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+    let policies = Arc::new(jarvis_application::policy_service::PolicyService::new(
+        repositories as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
     ));
 
     Ok(RunningDaemon {
@@ -415,6 +446,8 @@ pub async fn start(
         readiness,
         clients: Arc::new(clients),
         runs,
+        policies,
+        inventory,
         recovery,
         guard,
     })

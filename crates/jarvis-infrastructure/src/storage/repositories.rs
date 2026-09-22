@@ -1396,6 +1396,9 @@ pub const fn is_client_visible(visibility: EventVisibility) -> bool {
 #[path = "repositories_tests.rs"]
 mod tests;
 
+#[path = "repositories/policy.rs"]
+mod policy_store;
+
 /// Rebuilds a [`ModelRef`] from its stored parts.
 ///
 /// Exposed so a caller that only needs the provider/model pair does not have to

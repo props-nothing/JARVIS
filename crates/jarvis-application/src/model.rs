@@ -56,7 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use jarvis_domain::ids::{IdGenerator, ModelCallId, ModelStreamEventId};
-use jarvis_domain::model::identity::ModelRef;
+use jarvis_domain::model::identity::{EndpointClass, ModelRef};
 use jarvis_domain::model::stream::{
     ModelCallRequest, ModelStreamEvent, ModelStreamEventKind, ProviderMetadata, Sequence,
 };
@@ -456,6 +456,20 @@ pub trait ModelProvider: Send + Sync {
     /// exists is granted nothing by it.
     fn models(&self) -> &[ModelRef];
 
+    /// Where this provider's endpoint sits relative to the user's trust boundary.
+    ///
+    /// An adapter knows this about itself and nothing above it can derive it: the
+    /// identification module states the reason plainly — `local.ollama` *looks* local and a
+    /// hosted endpoint reached over a private network is not cloud, so a provider id is not
+    /// evidence for either. Route selection needs the answer to evaluate a locality policy,
+    /// and without this method the only alternatives would be guessing from the name or
+    /// assuming the most permissive class, and the second sends confidential content to a
+    /// cloud endpoint under a local-only policy.
+    ///
+    /// It is deliberately **not** a claim about data handling. Retention and training use are
+    /// documented per provider and supplied as evidence, never inferred from this.
+    fn endpoint_class(&self) -> EndpointClass;
+
     /// Opens a normalized stream for `request`.
     ///
     /// `context` carries the server-derived request identity; `cancel` is the scope
@@ -539,6 +553,8 @@ pub struct ScriptedProvider {
     opens_seen: std::sync::atomic::AtomicU32,
     /// The error the counted failures report.
     counted_failure: ProviderError,
+    /// The class this provider reports, when a test overrides the default.
+    endpoint_class: Option<EndpointClass>,
     ids: Arc<dyn IdGenerator>,
 }
 
@@ -566,6 +582,7 @@ impl ScriptedProvider {
             fail_first_opens: 0,
             opens_seen: std::sync::atomic::AtomicU32::new(0),
             counted_failure: ProviderError::Unavailable,
+            endpoint_class: None,
             ids: Arc::new(CountingIds::new()),
         }
     }
@@ -585,6 +602,7 @@ impl ScriptedProvider {
             fail_first_opens: 0,
             opens_seen: std::sync::atomic::AtomicU32::new(0),
             counted_failure: ProviderError::Unavailable,
+            endpoint_class: None,
             ids: Arc::new(CountingIds::new()),
         }
     }
@@ -593,6 +611,18 @@ impl ScriptedProvider {
     #[must_use]
     pub fn with_ids(mut self, ids: Arc<dyn IdGenerator>) -> Self {
         self.ids = ids;
+        self
+    }
+
+    /// Overrides the endpoint class this provider reports.
+    ///
+    /// The default is `Local`, which is true of a local double. A policy test needs the
+    /// *other* answer to be reachable, though: a `LocalOnly` policy can only be shown to
+    /// refuse a cloud route if some provider reports one, and a test that cannot present a
+    /// cloud candidate proves nothing about the rule that excludes it.
+    #[must_use]
+    pub fn with_endpoint_class(mut self, class: EndpointClass) -> Self {
+        self.endpoint_class = Some(class);
         self
     }
 
@@ -674,6 +704,14 @@ impl ScriptedProvider {
 impl ModelProvider for ScriptedProvider {
     fn models(&self) -> &[ModelRef] {
         &self.models
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        // The scripted provider is a local double, so it is `Local` — which is both true and
+        // the class that a policy test most needs to be distinguishable from a cloud route.
+        // Reporting `ApprovedCloud` would make every local-only policy refuse the provider
+        // every test uses. A test that needs the cloud arm calls `with_endpoint_class`.
+        self.endpoint_class.unwrap_or(EndpointClass::Local)
     }
 
     fn open<'a>(

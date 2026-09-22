@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use jarvis_domain::ids::{CorrelationId, IdGenerator, PrincipalId, RequestId, WorkspaceId};
-use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::{
     CallLimits, FinishReason, InputItems, ModelCallRequest, ModelStreamEvent, ModelStreamEventKind,
     ModelStreamState, RouteRequirements, Sequence, StreamAdmission, StreamOutcome, ToolArguments,
@@ -707,6 +707,10 @@ fn an_adapter_can_implement_the_port_without_this_modules_internals() {
     impl ModelProvider for MinimalAdapter {
         fn models(&self) -> &[ModelRef] {
             &self.served
+        }
+
+        fn endpoint_class(&self) -> EndpointClass {
+            EndpointClass::Local
         }
 
         fn open<'a>(

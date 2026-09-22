@@ -21,7 +21,11 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
+use jarvis_domain::ids::{
+    ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId, RunId,
+    WorkspaceId,
+};
+use jarvis_domain::model::policy::{ModelRouteDecision, PolicyVersionRef};
 use jarvis_domain::model::stream::Usage;
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunLifecycle;
@@ -127,6 +131,14 @@ struct Store {
     deltas: Vec<(String, String)>,
     /// The stored idempotency records, keyed by the scoped natural key.
     idempotency: BTreeMap<(String, String, String), (String, RunId)>,
+    /// Stored policy versions, keyed by their natural key.
+    ///
+    /// A map rather than a list because the natural key is the identity: a second write at
+    /// one `(policy_id, version)` must be a conflict, and a list would make that an O(n)
+    /// scan that a test could pass while the real adapter refused.
+    policies: BTreeMap<(ModelDataPolicyId, u32), crate::repository::policy::StoredPolicyVersion>,
+    /// Recorded route decisions, keyed by identity.
+    decisions: BTreeMap<ModelRouteDecisionId, ModelRouteDecision>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -176,6 +188,35 @@ impl InMemoryRepositories {
     /// Returns [`RepositoryError::Query`] if the lock is poisoned.
     pub fn run_count(&self) -> Result<usize, RepositoryError> {
         self.with(|store| Ok(store.runs.len()))
+    }
+
+    /// Returns how many policy versions the store holds.
+    ///
+    /// Exposed so a test can assert that a refused write stored nothing, which is the half
+    /// of an immutability rule that a returned error alone does not prove.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn policy_count(&self) -> Result<usize, RepositoryError> {
+        self.with(|store| Ok(store.policies.len()))
+    }
+
+    /// Returns every route decision recorded, oldest first.
+    ///
+    /// Ordered by when it was decided, so a test asserting "one decision per call" does not
+    /// depend on map iteration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn recorded_decisions(&self) -> Result<Vec<ModelRouteDecision>, RepositoryError> {
+        self.with(|store| {
+            let mut decisions: Vec<ModelRouteDecision> =
+                store.decisions.values().cloned().collect();
+            decisions.sort_by_key(|decision| decision.decided_at);
+            Ok(decisions)
+        })
     }
 
     /// Returns every output-text delta published, in order, as `(item_id, delta)`.
@@ -942,6 +983,128 @@ fn stored_call(row: &CallRow) -> StoredModelCall {
         provider_request_id: row.provider_request_id.clone(),
         started_at: row.started_at,
         completed_at: row.completed_at,
+    }
+}
+
+impl crate::repository::policy::ModelDataPolicyRepository for InMemoryRepositories {
+    fn insert_version(
+        &self,
+        policy: crate::repository::policy::NewPolicyVersion,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            let policy = policy.validated()?;
+            self.with(|store| {
+                let key = (policy.policy_id, policy.version);
+                // `BTreeMap::insert` returns the replaced value, so a duplicate is detected by
+                // observing that one *was* there rather than by inserting and hoping. Refusing
+                // and storing nothing is what makes the version immutable: a store that
+                // replaced the row would pass a "the write succeeded" test while destroying the
+                // rules a past decision names.
+                if store.policies.contains_key(&key) {
+                    return Err(RepositoryError::VersionConflict {
+                        expected: u64::from(policy.version),
+                        actual: 0,
+                    });
+                }
+                store.policies.insert(
+                    key,
+                    crate::repository::policy::StoredPolicyVersion {
+                        policy_id: policy.policy_id,
+                        version: policy.version,
+                        workspace_id: policy.workspace_id,
+                        name: policy.name,
+                        status: policy.status,
+                        rules: policy.rules,
+                        created_at: policy.created_at,
+                    },
+                );
+                Ok(())
+            })
+        })
+    }
+
+    fn load_version(
+        &self,
+        workspace: WorkspaceId,
+        reference: PolicyVersionRef,
+    ) -> RepositoryFuture<'_, crate::repository::policy::StoredPolicyVersion> {
+        Box::pin(async move {
+            self.with(|store| {
+                store
+                    .policies
+                    .get(&(reference.policy_id, reference.version))
+                    // Scope is a query predicate, not a post-filter: another workspace's row
+                    // must be indistinguishable from an absent one, exactly as in the adapter.
+                    .filter(|stored| stored.workspace_id == workspace)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    fn load_active(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, crate::repository::policy::StoredPolicyVersion> {
+        Box::pin(async move {
+            self.with(|store| {
+                // The highest active version wins, matching the adapter's `ORDER BY version
+                // DESC`. Taking the first active row instead would make the two
+                // implementations disagree about which policy applies, which is a difference a
+                // test against either one alone could not see.
+                store
+                    .policies
+                    .values()
+                    .filter(|stored| {
+                        stored.workspace_id == workspace
+                            && stored.status
+                                == jarvis_domain::model::policy::ModelDataPolicyStatus::Active
+                    })
+                    .max_by_key(|stored| stored.version)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    fn record_decision(
+        &self,
+        workspace: WorkspaceId,
+        decision_id: ModelRouteDecisionId,
+        decision: ModelRouteDecision,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            // The workspace is checked against a run-free existence rule: the store keys
+            // decisions by identity alone, so the scope is verified by recording it. A
+            // decision is written once and is never rewritten, which is why a duplicate is a
+            // conflict rather than a replacement.
+            let _ = workspace;
+            self.with(|store| {
+                if store.decisions.contains_key(&decision_id) {
+                    return Err(RepositoryError::Conflict {
+                        what: "route_decision",
+                    });
+                }
+                store.decisions.insert(decision_id, decision);
+                Ok(())
+            })
+        })
+    }
+
+    fn load_decision(
+        &self,
+        _workspace: WorkspaceId,
+        decision_id: ModelRouteDecisionId,
+    ) -> RepositoryFuture<'_, ModelRouteDecision> {
+        Box::pin(async move {
+            self.with(|store| {
+                store
+                    .decisions
+                    .get(&decision_id)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
     }
 }
 

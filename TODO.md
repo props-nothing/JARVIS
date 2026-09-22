@@ -1173,9 +1173,132 @@ Foundation TODO remains incomplete.
   and left the run with no legal exit. See `BRN-006` for the three defects this found.
   **Not done:** no fallback, per-request retry policy, or resumption, as above.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
-- [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
+- [~] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider
-  disclosures/effective decisions.
+  disclosures/effective decisions. **The rules, the evidence predicates, and the
+  selector are done; the input is not, and that gap is named below rather than implied.**
+  Evidence: `jarvis_domain::model::policy` already held `PolicyRules`, the precedence
+  merge (`merge_stricter`, strongest-layer-first so a later layer can only narrow), and
+  the `RequestedDataPolicy`/`EffectiveDataPolicy`/`ModelRouteDecision` shapes — and none
+  of it had a caller. `RejectionReason` was defined with **nothing able to produce it**
+  and `ModelRouteDecision` with nothing able to construct it, so the contract's test 7
+  ("routing rejection rather than silent relaxation") had vocabulary and no behaviour.
+  `jarvis_domain::model::routing` is the selector: `select_route` takes a bounded
+  candidate list plus a `RouteRequest` and returns the **first compliant candidate** or
+  `model.policy_unsatisfied`. Three rules are structural rather than documented. **There
+  is no path that relaxes a hard rule**: a candidate failing the policy or lacking an
+  attested capability is rejected *with a reason*, and nothing downgrades a requirement
+  because no candidate met it — which is also why selection is a filter and not a score,
+  since a score could rank an incompliant candidate above a compliant one. **Every
+  rejection is recorded, not only the winner**, because a decision naming just its
+  selection cannot answer "why not the local model"; the list is bounded by
+  `MAX_CANDIDATES` because it comes from a provider. And **retention and training use are
+  candidate-attested, never inferred**: whether a provider documents bounded retention is
+  a fact about its current published terms, so deriving `none_documented` from "it is a
+  cloud endpoint" claims a documented finding from a category. A candidate with no usable
+  note is now `provider_default` — a new `EffectiveRetention` variant meaning the
+  provider's own default terms were accepted, which **documents nothing** — and a policy
+  demanding a documented statement rejects it. **My first version got this wrong** by
+  classifying an undocumented cloud candidate as `none_documented`, which is exactly the
+  promotion the contract forbids: it made the least documented route read as the most
+  careful kind, and a test caught it. **Two evidence predicates now exist and using one
+  for both fails in one direction either way.**
+  `Evidence::satisfies_hard_requirement_on` admits only `VERIFIED`, because a capability
+  can differ between a provider's documented version and the one this repository pins;
+  `Evidence::satisfies_data_policy_rule_on` admits `VERIFIED`, `DOCUMENTED`, and
+  `OBSERVED`, because the contract names the labels that cannot satisfy a
+  retention/training/residency rule (expired, `STALE`, `INFERRED`, `UNVERIFIED`) and
+  official documentation is precisely what establishes a retention term. A
+  `RouteCandidate::region` that is absent **fails** an allow-list rather than passing it,
+  since a provider not publishing where it processes cannot be shown to be inside an
+  allowed region, and refusing is recoverable while sending is not. 25 domain tests
+  (that crate goes 191 -> 216), falsified by making the locality check always succeed,
+  which fails 3 tests including the local-only-versus-cloud one. **Not done:** nothing
+  constructs a `RouteRequest` from a **stored** policy yet, so `select_route` has no
+  caller outside its tests — closing that needs the versioned, workspace-scoped policy
+  store plus the `GET /api/v1/model-data-policy/effective` surface from this contract's
+  list, and it is also what would let the run controller pass a real sensitivity ceiling
+  instead of the permissive one `BRN-006` recorded. The telemetry and exception rules are
+  likewise modelled and unenforced. This is stated because a tested-but-uncalled selector
+  is the same shape as the dead `model_calls.route_decision_id` column this work exists to
+  populate.
+  **The persistence half is now implemented.** `migrations/sqlite/000004_model_data_policy.sql`
+  raises the schema to **4** (minimum reader stays 1 — every existing table and column is
+  untouched) and creates the three tables this contract's `Persistence` section names:
+  `model_data_policies`, `model_policy_exceptions`, and `model_route_decisions`.
+  `jarvis_application::repository::policy` is the port, the SQLite adapter is
+  `jarvis_infrastructure::storage::repositories::policy`, and `jarvis_application::testing`
+  carries an in-memory double so a service test can register a policy without a database.
+  **Immutability is structural rather than documented:** `insert_version` is an `INSERT`
+  behind `UNIQUE (policy_id, version)`, so "changing rules creates a new version" is a
+  constraint and not a convention — an `UPDATE` would silently rewrite the rules a past
+  route decision was made under, which is the one thing the contract's historical-record
+  rule exists to prevent. A duplicate is `storage.version_conflict`, the same typed outcome
+  the run state machine uses, because it is the same fact: someone advanced the record since
+  this caller read it; assigning the next version inside the store would make a concurrent
+  update indistinguishable from a sequential one, and this contract requires
+  `resource.version_conflict` for the former. **Rules are stored as JSON rather than as
+  columns**, because `PolicyRules` has seven enums and four sets and a flattened schema would
+  be twenty places for the stored form and the domain type to disagree with no single reader
+  able to notice; a row whose rules cannot be reinterpreted is `Corrupted` rather than
+  absent, since reporting it absent would let a caller create a replacement for a policy that
+  is still there. **A decision stores its own copy of the policy reference**, because reading
+  it through a live join would make an archived version's decision unreadable — exactly the
+  case the historical-record rule is about. `load_active` orders by version descending, since
+  a workspace may legally hold two active versions (reactivating an older one without
+  archiving the newer), and the in-memory double implements the same rule because a
+  difference between the two would be invisible to a test exercising either alone. An absent
+  active policy is `NotFound` rather than an empty one: a call under no policy applies
+  nothing, so the caller has to decide whether that is permitted, and it cannot decide if the
+  store hands back `PolicyRules::permissive()`. 11 adapter tests including a real
+  migrated-database round trip, plus the in-memory double. Falsified by changing the `INSERT`
+  to `INSERT OR REPLACE`, at which point the immutability test fails because the second write
+  silently replaces the row. **A defect this found in itself:** writing the migration without
+  bumping `TARGET_SCHEMA_VERSION` made the daemon refuse its own database
+  (`SchemaTooNew { found: 4, supported: 3 }`) and failed 8 tests — a migration and a version
+  constant are one change, and the failure was loud only because the daemon checks.
+  **The wiring half is now implemented too, and `select_route_explained` has a caller in
+  production code.** `jarvis_application::policy_service::PolicyService` reads the **stored**
+  policy and assembles the `RouteRequest` from it, which is what closed the gap named above:
+  `jarvis_domain::model::routing::select_route` had a tested selector and no producer of its
+  input. Two structural decisions. **The verdict and the explanation are one implementation:**
+  `select_route_explained` returns a `RouteSelectionFailure` enum — `Refused(RouteRefusal)`
+  versus `CandidatesUnbounded { offered }` — and `select_route` maps that to a `DomainError`.
+  My own refactor first collapsed both arms into `PolicyUnsatisfied`, losing the contract's
+  distinct code while a comment claimed the cases were distinguished, and **an existing test
+  caught the lie**: a refusal means every candidate was evaluated, while an oversized set means
+  none was, and reporting the second as the first tells a caller "your policy refused every
+  model" when the truth is "you offered too many". **The evaluation day and the decision instant
+  come from one clock reading** (`http::policy::evaluation_instant`), because two readings could
+  straddle midnight and make the day and the instant describe different moments.
+  `ModelProvider` gained `endpoint_class()`, since an adapter knows whether its endpoint is
+  local, on a private network, or in a cloud and nothing above it can derive that — a provider id
+  is not evidence either way, and guessing from the name or assuming the most permissive class
+  would send confidential content to a cloud endpoint under a local-only policy.
+  `GET /api/v1/model-data-policy` and `GET /api/v1/model-data-policy/effective` are implemented
+  in `jarvis_infrastructure::http::policy`; the daemon composes the service and the
+  `ProviderInventory` in `daemon.rs` from the **same** pool and provider the runs use, so a probe
+  cannot report on a configuration no call would use. **A defect this found:** `rejected_view`
+  rendered `RejectionReason`'s `Display`, which is operator prose, so the wire carried
+  `"locality violated"` where the contract's response example shows the reason **code**
+  `locality_violated`. Every other value in that module already went through a contract-spelling
+  function; this one had none, and the handler test agreed with the defect because the code it
+  reached was produced by the domain. Fixed with `rejection_reason_of`, and
+  `every_rejection_reason_is_a_code_rather_than_a_sentence` now enumerates all nine variants and
+  asserts each differs from `Display`, so the *class* fails rather than the instance. Six handler
+  tests over a real migrated database, plus the spelling tests over every variant.
+  **A second defect, recorded rather than fixed:** `CreateRunRequest.model_policy` is parsed and
+  **never read**, so a client's stated policy ID/version does not reach `RunService::create` and
+  the request is accepted with the field having no effect — indistinguishable to a client from
+  "accepted and applied". Passing it through needs a plain params struct in
+  `jarvis-application` (which cannot depend on `jarvis-protocol`) and is the next increment.
+  **Still not done:** `PUT /api/v1/model-data-policy` has no handler, so a policy is only
+  writable through the repository port even though the store implements the version-conflict
+  precondition; the exception lifecycle (issue/expire/revoke/single-use) has a table and no code,
+  so `ModelRouteDecision::exception_ref` is always absent and no route can relax a hard rule; and
+  the inventory attaches no region, retention, or training-use evidence until `BRN-011` measures
+  capabilities, which makes a policy demanding **documented** evidence refuse every candidate
+  rather than having a claim inferred for it.
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its
