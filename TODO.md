@@ -1354,18 +1354,30 @@ Foundation TODO remains incomplete.
   round-16 `deadline_at`/`budget_json` finding; recorded as `BRN-012` below rather than fixed
   here, because closing it needs the code to travel on the transition rather than on the event's
   reason string.
-- [ ] `BRN-012` Persist the failure code on a terminal run transition, so a failed run's own
+- [x] `BRN-012` Persist the failure code on a terminal run transition, so a failed run's own
   row explains its outcome. Found while adding the policy-ceiling test above:
-  `agent_runs.error_code` exists, is selected by `run_columns!()`, is read into
-  `StoredRun::error_code`, and is **never written** — the transition `UPDATE` in
-  `jarvis_infrastructure::storage::repositories` sets `state`, `version`, `completed_at`,
-  `waiting_kind`, and `waiting_ref` only. The consequence is that `GET /api/v1/runs/{id}` reports
-  `error_code: None` for a run that failed, and the recovery pass cannot distinguish "interrupted"
-  from "failed for a reason" without reading the activity events. Closing it needs the code to
-  travel on `RunTransition`/`RunWrite` from the controller's outcome rather than being scraped
-  from the event's reason string, plus a migration-free adapter change. The test in
-  `run_controller/tests.rs` asserts the current `None` **with a comment naming the gap**, so the
-  value is pinned and visible rather than silently tolerated.
+  `agent_runs.error_code` existed, was selected by `run_columns!()`, was read into
+  `StoredRun::error_code`, and was **never written** — the transition `UPDATE` in
+  `jarvis_infrastructure::storage::repositories` set `state`, `version`, `completed_at`,
+  `waiting_kind`, and `waiting_ref` only. The consequence was that `GET /api/v1/runs/{id}`
+  reported `error_code: None` for a run that failed, which left the contract's run read unable to
+  provide the "public result/error summary" it requires; `RunView::error_code` existed to carry it
+  with nothing to carry. Evidence: the code travels on the **write**, not on the event's reason
+  string — `RunWrite::failed_with(TerminalOutcome::failed(code))` and a `Step::failed` constructor
+  that **requires** a code, so a failure cannot be written without one and a cosmetic edit to a log
+  label cannot change a client-visible identifier. `RunWrite::is_consistent` now also requires a
+  `Failed` target to carry an outcome, which is what the adapter relies on: it binds `error_code`
+  on **every** transition and `NULL` otherwise, because the column is the *current* outcome rather
+  than a history — a run that failed and recovered must stop reporting the earlier failure. The
+  code is built once from the same `ControllerError` the caller receives, so the row and the
+  response cannot disagree. Recovery uses the `error_code` `RecoveryAction` already computed for
+  its event payload, so the two cannot diverge either. Falsified by removing the adapter's
+  `error_code` bind: `a_failure_outcome_reaches_the_stored_row_and_a_retry_clears_it` fails.
+  The controller's own tests use the in-memory double, so the adapter carries this rule's coverage
+  — which is why the regression test lives in `repositories_tests.rs` beside the other
+  column round-trips. **Two rules are asserted in both directions:** a `Failed` transition writes
+  the code, and a `Completed` one writes `NULL`; an adapter that bound it unconditionally would
+  pass the first assertion and report a stale failure on the second.
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

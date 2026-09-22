@@ -72,7 +72,7 @@ use crate::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelCallState, NewModelCall,
 };
 use crate::repository::run::{
-    EventVisibility, NewActivityEvent, RunRepository, RunWrite, StoredRun,
+    EventVisibility, NewActivityEvent, RunRepository, RunWrite, StoredRun, TerminalOutcome,
 };
 use crate::request_context::RequestContext;
 
@@ -330,15 +330,22 @@ struct RunRef {
 /// The endpoints and their reason are always supplied together, so a mismatched pair
 /// — a `Received -> Planning` edge carrying `Responding`'s event type — cannot be
 /// written by accident.
+///
+/// A failure carries its typed outcome, and it is stored here rather than derived from `reason`
+/// at the write. The two are different vocabularies on purpose: `reason` is a short operator label
+/// that is safe to reword, while the outcome is a namespaced code a client switches on. Deriving
+/// one from the other would let a cosmetic edit to a log label silently change a stable identifier.
 #[derive(Debug, Clone, Copy)]
 struct Step {
     from: RunState,
     to: RunState,
     event_type: &'static str,
     reason: &'static str,
+    outcome: Option<TerminalOutcome>,
 }
 
 impl Step {
+    /// A step that leaves the run in a non-failed state.
     const fn new(
         from: RunState,
         to: RunState,
@@ -350,6 +357,30 @@ impl Step {
             to,
             event_type,
             reason,
+            outcome: None,
+        }
+    }
+
+    /// A step that fails the run, carrying the code the run settles with.
+    ///
+    /// A separate constructor rather than a flag, so a failure **cannot** be written without its
+    /// code: the compiler requires the argument at every call site that ends a run, which is the
+    /// difference between this being enforced and being remembered. Before this existed the code
+    /// was never written at all and `agent_runs.error_code` stayed `NULL` for every failed run,
+    /// so `GET /api/v1/runs/{id}` could not report the "public error summary" the contract's run
+    /// read requires.
+    const fn failed(
+        from: RunState,
+        event_type: &'static str,
+        reason: &'static str,
+        code: &'static str,
+    ) -> Self {
+        Self {
+            from,
+            to: RunState::Failed,
+            event_type,
+            reason,
+            outcome: Some(TerminalOutcome::failed(code)),
         }
     }
 }
@@ -571,11 +602,11 @@ impl RunController {
             Err(error) => {
                 self.finish(
                     run,
-                    Step::new(
+                    Step::failed(
                         RunState::Planning,
-                        RunState::Failed,
                         "run.failed",
                         "no_model_served",
+                        error.code(),
                     ),
                 )
                 .await?;
@@ -677,7 +708,7 @@ impl RunController {
         ) {
             Ok(assembled) => assembled,
             Err(error) => {
-                self.fail_context_building(run, "context_unassembled")
+                self.fail_context_building(run, "context_unassembled", error.code())
                     .await?;
                 return Err(ControllerError::ContextUnassembled { code: error.code() });
             }
@@ -697,15 +728,11 @@ impl RunController {
         &self,
         run: RunRef,
         reason: &'static str,
+        code: &'static str,
     ) -> Result<(), ControllerError> {
         self.finish(
             run,
-            Step::new(
-                RunState::ContextBuilding,
-                RunState::Failed,
-                "run.failed",
-                reason,
-            ),
+            Step::failed(RunState::ContextBuilding, "run.failed", reason, code),
         )
         .await
     }
@@ -740,8 +767,15 @@ impl RunController {
         {
             return Ok(());
         }
-        self.fail_context_building(run, "context_objective_dropped")
-            .await?;
+        self.fail_context_building(
+            run,
+            "context_objective_dropped",
+            ControllerError::ContextUnassembled {
+                code: "run.context_objective_dropped",
+            }
+            .code(),
+        )
+        .await?;
         Err(ControllerError::ContextUnassembled {
             code: "run.context_objective_dropped",
         })
@@ -800,11 +834,11 @@ impl RunController {
         if !turn.budget.permits_step_at(self.now()?) {
             self.finish(
                 run,
-                Step::new(
+                Step::failed(
                     RunState::AwaitingModel,
-                    RunState::Failed,
                     "run.failed",
                     "deadline_exceeded_before_call",
+                    ControllerError::DeadlineExceeded.code(),
                 ),
             )
             .await?;
@@ -847,21 +881,24 @@ impl RunController {
                         } else {
                             "retry_refused"
                         };
-                        self.finish(
-                            run,
-                            Step::new(
-                                RunState::AwaitingModel,
-                                RunState::Failed,
-                                "run.failed",
-                                reason,
-                            ),
-                        )
-                        .await?;
-                        return Err(if decision.refused_by_budget() {
+                        // The code is the one the caller will be *returned*, so the run's durable
+                        // row and the response cannot disagree about why it failed.
+                        let returned = if decision.refused_by_budget() {
                             ControllerError::DeadlineExceeded
                         } else {
                             ControllerError::Provider(error)
-                        });
+                        };
+                        self.finish(
+                            run,
+                            Step::failed(
+                                RunState::AwaitingModel,
+                                "run.failed",
+                                reason,
+                                returned.code(),
+                            ),
+                        )
+                        .await?;
+                        return Err(returned);
                     };
                     // The delay is bounded by the same `wait_bounded` every other wait uses,
                     // so a backoff can never outlive the run's deadline — which the decision
@@ -875,7 +912,13 @@ impl RunController {
                         .await?
                         .is_none()
                     {
-                        self.finish_expired(run, None, "deadline_exceeded").await?;
+                        self.finish_expired(
+                            run,
+                            None,
+                            "deadline_exceeded",
+                            ControllerError::DeadlineExceeded.code(),
+                        )
+                        .await?;
                         return Err(ControllerError::DeadlineExceeded);
                     }
                     attempt = next;
@@ -930,8 +973,7 @@ impl RunController {
         let mut stream = match opened {
             // The bound elapsed before the provider answered.
             None => {
-                self.finish_expired(run, Some(call_id), "deadline_exceeded")
-                    .await?;
+                self.finish_deadline_exceeded(run, Some(call_id)).await?;
                 return Err(ControllerError::DeadlineExceeded);
             }
             Some(Ok(stream)) => stream,
@@ -1006,13 +1048,17 @@ impl RunController {
         // A tool intent needs the fabric that does not exist yet. Refused with a
         // terminal, typed outcome rather than a fabricated observation.
         if let Some(tool_name) = drained.tool_intent {
+            let _ = tool_name;
             self.finish(
                 run,
-                Step::new(
+                Step::failed(
                     RunState::AwaitingModel,
-                    RunState::Failed,
                     "run.failed",
                     "tool_fabric_unavailable",
+                    ControllerError::ToolsNotImplemented {
+                        tool_name: "unavailable".to_owned(),
+                    }
+                    .code(),
                 ),
             )
             .await?;
@@ -1032,8 +1078,13 @@ impl RunController {
         if let Some(reported) = &usage
             && let Some(limit) = turn.budget.exceeded_by(reported)
         {
-            self.finish_expired(run, Some(call_id), "consumption_budget_exceeded")
-                .await?;
+            self.finish_expired(
+                run,
+                Some(call_id),
+                "consumption_budget_exceeded",
+                ControllerError::BudgetExceeded { limit }.code(),
+            )
+            .await?;
             return Err(ControllerError::BudgetExceeded { limit });
         }
 
@@ -1185,8 +1236,7 @@ impl RunController {
 
             // The bound elapsed while waiting for a frame.
             let Some(frame) = next else {
-                self.finish_expired(run, Some(call_id), "deadline_exceeded")
-                    .await?;
+                self.finish_deadline_exceeded(run, Some(call_id)).await?;
                 return Ok(Err(ControllerError::DeadlineExceeded));
             };
             let event = match frame {
@@ -1199,13 +1249,14 @@ impl RunController {
                 // Late frames are the contract's required behaviour, not a fault.
                 Ok(StreamAdmission::IgnoredAfterTerminal) => continue,
                 Err(error) => {
+                    let code = ControllerError::StreamRejected { code: error.code() }.code();
                     self.finish(
                         run,
-                        Step::new(
+                        Step::failed(
                             RunState::AwaitingModel,
-                            RunState::Failed,
                             "run.failed",
                             "stream_frame_rejected",
+                            code,
                         ),
                     )
                     .await?;
@@ -1267,11 +1318,11 @@ impl RunController {
             Ok(StreamOutcome::Interrupted { .. }) => {
                 self.finish(
                     run,
-                    Step::new(
+                    Step::failed(
                         RunState::AwaitingModel,
-                        RunState::Failed,
                         "run.failed",
                         "stream_interrupted",
+                        ControllerError::StreamInterrupted.code(),
                     ),
                 )
                 .await?;
@@ -1282,11 +1333,11 @@ impl RunController {
             Err(error) => {
                 self.finish(
                     run,
-                    Step::new(
+                    Step::failed(
                         RunState::AwaitingModel,
-                        RunState::Failed,
                         "run.failed",
                         "stream_unfinished",
+                        ControllerError::StreamRejected { code: error.code() }.code(),
                     ),
                 )
                 .await?;
@@ -1389,10 +1440,15 @@ impl RunController {
         } else {
             "provider_refused"
         };
-        let state = if cancelled {
-            RunState::Cancelled
+        // The returned error is built once, so its code is what the run's terminal row records.
+        // Building it twice would let the stored code and the returned code diverge, which is the
+        // one thing a durable error summary must not do.
+        let returned = if cancelled {
+            ControllerError::Cancelled
+        } else if timed_out {
+            ControllerError::DeadlineExceeded
         } else {
-            RunState::Failed
+            ControllerError::Provider(error)
         };
         let outcome = if cancelled {
             ModelCallState::Cancelled
@@ -1400,18 +1456,36 @@ impl RunController {
             ModelCallState::Failed
         };
 
-        self.finish(
-            run,
-            Step::new(RunState::AwaitingModel, state, "run.failed", reason),
-        )
-        .await?;
+        // A cancellation is a terminal transition too, and it is deliberately *not* a failure:
+        // `Step::failed` would record `run.failed`'s semantics on a cancelled run, so the
+        // cancellation keeps the plain constructor and its outcome stays absent. The contract maps
+        // the three terminal states one-to-one, and `run.cancelled` is not a failure code.
+        if cancelled {
+            self.finish(
+                run,
+                Step::new(
+                    RunState::AwaitingModel,
+                    RunState::Cancelled,
+                    "run.cancelled",
+                    reason,
+                ),
+            )
+            .await?;
+        } else {
+            self.finish(
+                run,
+                Step::failed(
+                    RunState::AwaitingModel,
+                    "run.failed",
+                    reason,
+                    returned.code(),
+                ),
+            )
+            .await?;
+        }
         self.record_call_outcome(run, call_id, outcome).await?;
 
-        if timed_out {
-            Err(ControllerError::DeadlineExceeded)
-        } else {
-            Err(ControllerError::Provider(error))
-        }
+        Err(returned)
     }
 
     /// Ends a run whose provider failed *after* accepting the call.
@@ -1434,11 +1508,11 @@ impl RunController {
     ) -> Result<Result<DrainedTurn, ControllerError>, ControllerError> {
         self.finish(
             run,
-            Step::new(
+            Step::failed(
                 RunState::AwaitingModel,
-                RunState::Failed,
                 "run.failed",
                 "provider_failed_after_acceptance",
+                ControllerError::Provider(error).code(),
             ),
         )
         .await?;
@@ -1455,20 +1529,40 @@ impl RunController {
     /// One method rather than a transition at each timeout site, so the state, the
     /// event, the reason, and the recorded call outcome cannot disagree about why the
     /// run stopped.
+    /// Ends a run whose own deadline expired, recording what the caller will be told.
+    ///
+    /// A wrapper over [`finish_expired`](Self::finish_expired) so the deadline's reason and code
+    /// are one decision. They were passed separately at four call sites, which is four chances for
+    /// a run to record a code that disagrees with the error its caller receives — exactly the
+    /// divergence the parameter exists to prevent.
+    async fn finish_deadline_exceeded(
+        &self,
+        run: RunRef,
+        call_id: Option<ModelCallId>,
+    ) -> Result<(), ControllerError> {
+        self.finish_expired(
+            run,
+            call_id,
+            "deadline_exceeded",
+            ControllerError::DeadlineExceeded.code(),
+        )
+        .await
+    }
+
+    /// Ends a run because its own budget expired.
+    ///
+    /// One method rather than a transition at each timeout site, so the state, the event, the
+    /// reason, and the recorded call outcome cannot disagree about why the run stopped.
     async fn finish_expired(
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
         reason: &'static str,
+        code: &'static str,
     ) -> Result<(), ControllerError> {
         self.finish(
             run,
-            Step::new(
-                RunState::AwaitingModel,
-                RunState::Failed,
-                "run.failed",
-                reason,
-            ),
+            Step::failed(RunState::AwaitingModel, "run.failed", reason, code),
         )
         .await?;
         if let Some(call_id) = call_id {
@@ -1574,8 +1668,14 @@ impl RunController {
             visibility: EventVisibility::Public,
             occurred_at: now,
         };
+        // The outcome travels on the write rather than being scraped back out of the event, so
+        // the transition, its event, and the outcome a client reads are one durable fact.
+        let write = match step.outcome {
+            Some(outcome) => RunWrite::new(&transition, event).failed_with(outcome),
+            None => RunWrite::new(&transition, event),
+        };
         self.runs
-            .transition(run.workspace, RunWrite::new(&transition, event))
+            .transition(run.workspace, write)
             .await
             .map_err(ControllerError::Repository)
     }

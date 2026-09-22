@@ -616,7 +616,14 @@ async fn a_run_that_finished_between_the_read_and_the_write_is_not_overwritten()
                     visibility: crate::repository::run::EventVisibility::Public,
                     occurred_at: now(),
                 },
-            ),
+            )
+            // A `Failed` target must carry its outcome, so this stale write declares one even
+            // though the write is refused for a different reason. Without it the consistency
+            // check fires first and the test would assert that refusal instead — which is a true
+            // fact about a *malformed* write rather than the ordering this test is about.
+            .failed_with(crate::repository::run::TerminalOutcome::failed(
+                "run.interrupted_by_restart",
+            )),
         )
         .await
         .expect_err("a stale recovery must be refused");

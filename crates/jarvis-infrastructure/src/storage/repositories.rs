@@ -507,7 +507,13 @@ impl RunRepository for SqliteRepositories {
             // the schema's `CHECK`, and a typed conflict is more useful to a caller
             // than a decoded constraint failure from deep in the driver.
             if !write.is_consistent() {
-                return Err(RepositoryError::Conflict { what: "waiting_on" });
+                // One `what` for both consistency rules — a waiting target without a dependency,
+                // and a `Failed` target without its outcome. The caller cannot act on them
+                // differently, and the second rule exists because this adapter relies on it: the
+                // `error_code` bind below is `NULL` for every non-`Failed` target.
+                return Err(RepositoryError::Conflict {
+                    what: "run_write_inconsistent",
+                });
             }
 
             let event = write.event;
@@ -554,12 +560,20 @@ impl RunRepository for SqliteRepositories {
             // The optimistic predicate stays, so a writer that slipped in between the
             // read and this statement is refused rather than overwriting it.
             let terminal = transition.to.is_terminal();
+            // `error_code` is written on every transition, so a run that failed and was then
+            // retried does not keep reporting the earlier failure once it succeeds. A `NULL` bind
+            // for every non-`Failed` target is therefore deliberate rather than an omission: the
+            // column is the *current* outcome, not a history of outcomes, and the history is the
+            // activity events. `RunWrite::is_consistent` is what guarantees the `Some` here is
+            // present exactly when the target is `Failed`.
+            let failure = write.outcome.map(|outcome| outcome.code);
             let update = sqlx::query(
                 "UPDATE agent_runs SET \
                      state = ?, version = version + 1, updated_at = ?, \
                      completed_at = CASE WHEN ? = 1 THEN ? ELSE completed_at END, \
                      waiting_kind = ?, \
-                     waiting_ref = ? \
+                     waiting_ref = ?, \
+                     error_code = ? \
                  WHERE workspace_id = ? AND id = ? AND version = ? AND state = ? \
                    AND state NOT IN ('completed', 'failed', 'cancelled')",
             )
@@ -569,6 +583,7 @@ impl RunRepository for SqliteRepositories {
             .bind(transition.occurred_at.to_string())
             .bind(waiting.map(|w| w.kind.as_str()))
             .bind(waiting.map(|w| w.reference.as_str()))
+            .bind(failure)
             .bind(workspace.to_string())
             .bind(&run_id)
             .bind(

@@ -394,7 +394,14 @@ impl RunRepository for InMemoryRepositories {
         Box::pin(async move {
             self.with(|store| {
                 if !write.is_consistent() {
-                    return Err(RepositoryError::Conflict { what: "waiting_on" });
+                    // `waiting_on` historically, but the label now covers both consistency rules:
+                    // a waiting target without a dependency, and a `Failed` target without its
+                    // outcome. Reported as one `what` because the caller's remedy is the same —
+                    // the write is internally inconsistent — and splitting it would give two
+                    // labels for one rule that a caller cannot act on differently.
+                    return Err(RepositoryError::Conflict {
+                        what: "run_write_inconsistent",
+                    });
                 }
                 let transition = write.transition;
                 let row = store
@@ -423,6 +430,12 @@ impl RunRepository for InMemoryRepositories {
                 if record.to == RunState::AwaitingModel && row.started_at.is_none() {
                     row.started_at = Some(record.occurred_at);
                 }
+                // Assigned on every transition rather than only on a failure, so this double
+                // enforces the same rule the SQLite adapter's unconditional bind does: a run that
+                // failed and was then retried must not keep reporting the earlier failure. A
+                // divergence between the two here would be invisible to a test exercising either
+                // adapter alone, which is why the double mirrors it rather than approximating.
+                row.error_code = write.outcome.map(|outcome| outcome.code.to_owned());
                 if write.waiting.is_some() {
                     row.waiting_kind = write.waiting.as_ref().map(|on| on.kind.clone());
                     row.waiting_ref = write.waiting.as_ref().map(|on| on.reference.clone());

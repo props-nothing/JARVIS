@@ -226,13 +226,36 @@ impl WaitingOn {
     }
 }
 
-/// One atomic run write: a transition, the dependency it enters or leaves, and the
-/// activity event that describes it.
+/// The typed outcome a failed run settles with.
+///
+/// The code is a `&'static str` rather than a `String` because every failure this layer produces
+/// is a compile-time constant, and a stored code is a client-visible identifier: allowing an
+/// owned string would let one be built at runtime from a provider's message, which is the way
+/// provider internals reach a stable code.
+///
+/// `code` is the same namespaced string the controller's own error reports, so the run's durable
+/// row and the returned error cannot disagree about why it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalOutcome {
+    /// The stable, namespaced error code.
+    pub code: &'static str,
+}
+
+impl TerminalOutcome {
+    /// Builds a terminal failure with `code`.
+    #[must_use]
+    pub const fn failed(code: &'static str) -> Self {
+        Self { code }
+    }
+}
+
+/// One atomic run write: a transition, the dependency it enters or leaves, the outcome
+/// it settles with, and the activity event that describes it.
 ///
 /// Bundled because `docs/architecture/storage-data.md` defines "transition run state
-/// and append its durable activity event" as **one** use case. Passing the three
-/// parts separately would let a caller move the state without its event, which is
-/// the exact window the atomicity requirement exists to close.
+/// and append its durable activity event" as **one** use case. Passing the parts
+/// separately would let a caller move the state without its event, which is the exact
+/// window the atomicity requirement exists to close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunWrite<'a> {
     /// The transition to apply. Its edge legality is checked by the repository,
@@ -241,17 +264,27 @@ pub struct RunWrite<'a> {
     /// The dependency being entered, required when the target state is a waiting
     /// state and refused when it is not.
     pub waiting: Option<WaitingOn>,
+    /// The typed outcome, required when the target state is `Failed`.
+    ///
+    /// Carried on the write rather than scraped later from the event's reason string,
+    /// because the reason is a short human label (`context_unassembled`) while the client's
+    /// `error_code` is a namespaced code — and deriving one from the other would make a
+    /// cosmetic change to a log label silently change a client-visible identifier.
+    pub outcome: Option<TerminalOutcome>,
     /// The activity event describing the transition.
     pub event: NewActivityEvent,
 }
 
 impl<'a> RunWrite<'a> {
-    /// Builds a write that leaves the run in a non-waiting state.
+    /// Builds a write that leaves the run in a non-waiting, non-failed state.
     #[must_use]
     pub fn new(transition: &'a RunTransition, event: NewActivityEvent) -> Self {
         Self {
             transition,
             waiting: None,
+            // A non-`Failed` target must not carry an outcome; this is the ordinary case, and
+            // `is_consistent` is what makes the rule enforceable rather than remembered.
+            outcome: None,
             event,
         }
     }
@@ -263,15 +296,28 @@ impl<'a> RunWrite<'a> {
         self
     }
 
+    /// Attaches the typed outcome a failed run settles with.
+    #[must_use]
+    pub fn failed_with(mut self, outcome: TerminalOutcome) -> Self {
+        self.outcome = Some(outcome);
+        self
+    }
+
     /// Returns whether this write is internally consistent.
     ///
-    /// A waiting target must name a dependency and a non-waiting target must not,
-    /// which is the same rule the schema's `CHECK` enforces. Checking it here means
-    /// the mismatch is a typed refusal rather than a constraint failure the caller
-    /// has to decode.
+    /// A waiting target must name a dependency and a non-waiting target must not, which is the
+    /// same rule the schema's `CHECK` enforces. Checking it here means the mismatch is a typed
+    /// refusal rather than a constraint failure the caller has to decode.
+    ///
+    /// A `Failed` target must name its outcome and every other target must not. The adapter
+    /// *relies* on this: it writes `error_code` when — and only when — the target is `Failed`,
+    /// because a `completed` run's stale `error_code` would describe a failure that did not
+    /// happen, and a retried run that failed once must not keep reporting that failure after it
+    /// succeeds. That reliance is why the rule is asserted here rather than left to each caller.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
         self.transition.to.is_waiting() == self.waiting.is_some()
+            && (self.transition.to == RunState::Failed) == self.outcome.is_some()
     }
 }
 

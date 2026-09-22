@@ -235,6 +235,22 @@ Initial states are `received`, `context_building`, `model_running`, and
 `responding`. Terminal states are `completed`, `failed`, and `cancelled`.
 Persist the transition before publishing an event that claims it occurred.
 
+The error summary is the `error_code` field, and it is populated from the durable column rather
+than derived at read time. Two rules make it trustworthy:
+
+- **A failure carries its code on the transition.** `RunWrite` requires a `Failed` target to name
+  its `TerminalOutcome`, and the controller builds that outcome from the same `ControllerError` it
+  returns, so the stored code and the response cannot disagree about why the run failed. The code
+  is a namespaced identifier (`run.no_model_served`) and the transition's `reason` is a separate
+  operator label, so rewording a log label cannot change a client-visible code.
+- **The column is the current outcome, not a history.** Every transition assigns it, so a run that
+  failed and then succeeded stops reporting the earlier failure. A `completed` or `cancelled` run
+  carries no `error_code` at all, and a cancellation is deliberately **not** a failure: the
+  contract maps the three terminal states one-to-one, and `run.cancelled` is not a failure code.
+
+A recovered run's code comes from the same `RecoveryAction` that builds its recovery event
+payload, so the row and the event agree.
+
 ### Cancellation
 
 `POST /api/v1/runs/{run_id}/cancel` requires an `Idempotency-Key` and accepts:

@@ -35,7 +35,7 @@ use jarvis_domain::time::UtcTimestamp;
 
 use crate::repository::RepositoryError;
 use crate::repository::run::{
-    EventVisibility, NewActivityEvent, RecoverySummary, RunRepository, RunWrite,
+    EventVisibility, NewActivityEvent, RecoverySummary, RunRepository, RunWrite, TerminalOutcome,
 };
 
 /// Why a recovery pass could not complete.
@@ -161,10 +161,15 @@ pub async fn reconcile(
             occurred_at: at,
         };
 
-        match runs
-            .transition(entry.workspace_id, RunWrite::new(&transition, event))
-            .await
-        {
+        // The outcome travels on the write so a recovered run's own row carries the code a
+        // client reads. `RecoveryAction` already computes it for the event payload, so the two
+        // cannot disagree about why the run ended.
+        let write = match action.target_state() {
+            RunState::Failed => RunWrite::new(&transition, event)
+                .failed_with(TerminalOutcome::failed(action.error_code())),
+            _ => RunWrite::new(&transition, event),
+        };
+        match runs.transition(entry.workspace_id, write).await {
             Ok(_) => {
                 if action.was_resumable() {
                     report.summary.parked = report.summary.parked.saturating_add(1);

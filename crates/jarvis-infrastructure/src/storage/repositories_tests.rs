@@ -191,6 +191,24 @@ fn transition(from: RunState, to: RunState, version: RunVersion) -> RunTransitio
     )
 }
 
+/// Wraps a write, attaching an outcome when the target is `Failed`.
+///
+/// `RunWrite::is_consistent` requires a `Failed` target to carry its outcome — the adapter writes
+/// `error_code` from it and `NULL` otherwise, so a `Failed` write without one would leave the
+/// column unset on exactly the transition that should set it. These fixture tests are about other
+/// rules, so the outcome is supplied here rather than at each of the thirty call sites; a test
+/// that is *about* the consistency rule builds its write by hand instead.
+fn write(transition: &RunTransition, event: NewActivityEvent) -> RunWrite<'_> {
+    let built = RunWrite::new(transition, event);
+    if transition.to == RunState::Failed {
+        built.failed_with(
+            jarvis_application::repository::run::TerminalOutcome::failed("run.failed_for_test"),
+        )
+    } else {
+        built
+    }
+}
+
 /// Builds a message at `sequence`'s id offset with the given content.
 fn message(id_value: u128, content: &str, role: Role) -> NewMessage {
     NewMessage {
@@ -319,7 +337,7 @@ async fn a_transition_persists_the_state_and_its_event_together() {
     let updated = repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -386,7 +404,7 @@ async fn concurrent_transitions_on_one_run_never_fail_with_a_storage_fault() {
             repositories
                 .transition(
                     workspace(),
-                    RunWrite::new(
+                    write(
                         &transition(RunState::Received, to, RunVersion::FIRST),
                         // A distinct sequence per writer, so the event insert cannot be the
                         // thing that conflicts — this test is about the row update's lock.
@@ -447,7 +465,7 @@ async fn a_stale_version_is_refused_and_nothing_changes() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -468,7 +486,7 @@ async fn a_stale_version_is_refused_and_nothing_changes() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&stale, event(run_id(), 3, "run.context_building")),
+            write(&stale, event(run_id(), 3, "run.context_building")),
         )
         .await
         .expect_err("a stale write must be refused");
@@ -505,7 +523,7 @@ async fn an_edge_the_diagram_lacks_is_refused() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&illegal, event(run_id(), 2, "run.responding")),
+            write(&illegal, event(run_id(), 2, "run.responding")),
         )
         .await
         .expect_err("an invented edge must be refused");
@@ -534,7 +552,7 @@ async fn a_version_conflict_is_reported_before_an_illegal_edge() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -551,7 +569,7 @@ async fn a_version_conflict_is_reported_before_an_illegal_edge() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&stale_and_illegal, event(run_id(), 3, "run.responding")),
+            write(&stale_and_illegal, event(run_id(), 3, "run.responding")),
         )
         .await
         .expect_err("must be refused");
@@ -583,7 +601,7 @@ async fn a_plain_question_and_answer_run_persists_through_to_completed() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
+        let write = write(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -615,7 +633,7 @@ async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
+        let write = write(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -627,7 +645,7 @@ async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(&failed, event(run_id(), 6, "run.failed")),
+            write(&failed, event(run_id(), 6, "run.failed")),
         )
         .await
         .expect("a failure while responding must be legal");
@@ -642,6 +660,94 @@ async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
         run.state,
         RunState::Completed,
         "a failed answer must never read as completed",
+    );
+}
+
+#[tokio::test]
+async fn a_failure_outcome_reaches_the_stored_row_and_a_retry_clears_it() {
+    // The contract's run read requires a "public result/error summary", and `RunView::error_code`
+    // existed to carry it with **nothing writing the column**: the transition `UPDATE` set the
+    // state, version, completion instant, and waiting columns only, so a failed run's own row
+    // could not say why it failed. This asserts the round trip and the clearing rule, because the
+    // second is what stops a run that recovered from reporting a failure that is no longer true.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let path = [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+    ];
+    let mut version = RunVersion::FIRST;
+    for (index, (from, to)) in path.iter().enumerate() {
+        let transition = transition(*from, *to, version);
+        version = repositories
+            .transition(
+                workspace(),
+                write(&transition, event(run_id(), index as u64 + 2, "run.step")),
+            )
+            .await
+            .expect("legal")
+            .version;
+    }
+
+    let failed = transition(RunState::Planning, RunState::Failed, version);
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(&failed, event(run_id(), 4, "run.failed")).failed_with(
+                jarvis_application::repository::run::TerminalOutcome::failed("run.no_model_served"),
+            ),
+        )
+        .await
+        .expect("a named failure is legal");
+
+    let run = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("loads");
+    assert_eq!(
+        run.error_code.as_deref(),
+        Some("run.no_model_served"),
+        "a failed run's row must name why it failed",
+    );
+
+    // A `completed` transition on a *new* run must leave the column `NULL`, which is the half a
+    // test asserting only the failure could not see: an adapter that bound the code on every
+    // transition would pass the assertion above and report a stale failure here.
+    let (_other_database, other) = repository().await;
+    seed(&other).await;
+    let mut version = RunVersion::FIRST;
+    for (index, (from, to)) in [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+        (RunState::Planning, RunState::AwaitingModel),
+        (RunState::AwaitingModel, RunState::Responding),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let transition = transition(*from, *to, version);
+        version = other
+            .transition(
+                workspace(),
+                write(&transition, event(run_id(), index as u64 + 2, "run.step")),
+            )
+            .await
+            .expect("legal")
+            .version;
+    }
+    let completed = transition(RunState::Responding, RunState::Completed, version);
+    other
+        .transition(
+            workspace(),
+            write(&completed, event(run_id(), 6, "run.completed")),
+        )
+        .await
+        .expect("completing is legal");
+    let done = other.load(workspace(), run_id()).await.expect("loads");
+    assert_eq!(
+        done.error_code, None,
+        "a completed run must not carry an error code",
     );
 }
 
@@ -661,7 +767,7 @@ async fn reaching_a_terminal_state_records_the_completion_instant() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
+        let write = write(&transition, event(run_id(), index as u64 + 2, "run.step"));
         let updated = repositories
             .transition(workspace(), write)
             .await
@@ -696,7 +802,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
+        let write = write(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -708,7 +814,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let cancelled = repositories
         .transition(
             workspace(),
-            RunWrite::new(&cancel, event(run_id(), 5, "run.cancelled")),
+            write(&cancel, event(run_id(), 5, "run.cancelled")),
         )
         .await
         .expect("cancellation from awaiting_model is legal");
@@ -721,7 +827,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&late, event(run_id(), 6, "run.planning")),
+            write(&late, event(run_id(), 6, "run.planning")),
         )
         .await
         .expect_err("a terminal run must absorb");
@@ -746,7 +852,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
+        let write = write(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -760,7 +866,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&into_waiting, event(run_id(), 7, "run.waiting")),
+            write(&into_waiting, event(run_id(), 7, "run.waiting")),
         )
         .await
         .expect_err("a waiting state without a dependency must be refused");
@@ -777,9 +883,9 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
 
     // With a dependency it is accepted and readable through the resume read.
     let waiting = WaitingOn::new("timer", "wake-1").expect("valid");
-    let write = RunWrite::new(&into_waiting, event(run_id(), 7, "run.waiting")).waiting_on(waiting);
+    let parked = write(&into_waiting, event(run_id(), 7, "run.waiting")).waiting_on(waiting);
     repositories
-        .transition(workspace(), write)
+        .transition(workspace(), parked)
         .await
         .expect("a waiting transition with a dependency is legal");
 
@@ -798,7 +904,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(&resumed, event(run_id(), 8, "run.planning")),
+            write(&resumed, event(run_id(), 8, "run.planning")),
         )
         .await
         .expect("resuming is legal");
@@ -828,7 +934,7 @@ async fn a_non_waiting_state_carrying_a_dependency_is_refused() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&onward, event(run_id(), 2, "run.context_building")).waiting_on(waiting),
+            write(&onward, event(run_id(), 2, "run.context_building")).waiting_on(waiting),
         )
         .await
         .expect_err("a dependency on a non-waiting state must be refused");
@@ -851,7 +957,7 @@ async fn a_duplicate_event_sequence_is_refused() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -873,7 +979,7 @@ async fn a_duplicate_event_sequence_is_refused() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(RunState::ContextBuilding, RunState::Planning, next),
                 event(run_id(), 2, "run.planning"),
             ),
@@ -1160,7 +1266,7 @@ async fn the_transition_and_event_survive_a_reopen() {
         repositories
             .transition(
                 workspace(),
-                RunWrite::new(
+                write(
                     &transition(
                         RunState::Received,
                         RunState::ContextBuilding,
@@ -1225,7 +1331,7 @@ async fn a_public_event_page_excludes_operator_events() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -1273,7 +1379,7 @@ async fn a_terminal_run_reports_its_terminal_state_to_a_late_stream() {
         repositories
             .transition(
                 workspace(),
-                RunWrite::new(
+                write(
                     &transition(from, to, version),
                     event(run_id(), version.get() + 1, "e"),
                 ),
@@ -1327,7 +1433,7 @@ async fn an_event_page_resumes_strictly_after_the_requested_sequence() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -1541,7 +1647,7 @@ async fn a_published_delta_is_durable_and_ordered_after_the_transition() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -1912,7 +2018,7 @@ async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_s
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -1938,7 +2044,7 @@ async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_s
     let settled = repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &RunTransition::new(
                     RunState::ContextBuilding,
                     RunState::Failed,
@@ -2020,7 +2126,7 @@ async fn a_terminal_run_is_never_offered_for_recovery() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(RunState::Received, RunState::Cancelled, RunVersion::FIRST),
                 event(run_id, 2, "run.cancelled"),
             ),
@@ -2060,7 +2166,7 @@ async fn a_terminal_run_is_never_offered_for_recovery() {
     repositories
         .transition(
             other_workspace(),
-            RunWrite::new(
+            write(
                 &transition(RunState::Received, RunState::Failed, RunVersion::FIRST),
                 event(other_run_id, 2, "run.failed"),
             ),
@@ -2088,7 +2194,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::Received,
                     RunState::ContextBuilding,
@@ -2102,7 +2208,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(
                     RunState::ContextBuilding,
                     RunState::Planning,
@@ -2149,7 +2255,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
         repositories
             .transition(
                 workspace(),
-                RunWrite::new(
+                write(
                     &transition(from, to, RunVersion::new(version)),
                     event(run_id(), sequence, name),
                 ),
@@ -2160,7 +2266,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(
+            write(
                 &transition(RunState::Observing, RunState::Waiting, RunVersion::new(6)),
                 event(run_id(), 7, "run.waiting"),
             )

@@ -697,6 +697,14 @@ async fn a_provider_serving_no_model_is_refused_by_name() {
         .await
         .expect("loads");
     assert_eq!(stored.state, RunState::Failed);
+    // The durable code is the one the caller was given. Asserting the state alone would pass for
+    // an adapter that stored a *different* code, or none — which is exactly what it did before:
+    // `agent_runs.error_code` was read back and never written.
+    assert_eq!(
+        stored.error_code.as_deref(),
+        Some(error.code()),
+        "the run's row and the returned error must name the same failure",
+    );
 }
 
 #[tokio::test]
@@ -2251,17 +2259,16 @@ async fn a_policy_ceiling_refuses_content_the_policy_forbids() {
         stored.budget.policy.is_some(),
         "the run's own record names the policy that refused it",
     );
-    // `agent_runs.error_code` is deliberately asserted to be `None` rather than to carry the
-    // stage. This test found that the column exists, is read back, and is never populated: the
-    // transition `UPDATE` sets `state`, `version`, `completed_at`, and the waiting columns but not
-    // `error_code`, so a failed run's own row cannot say why it failed. It is the same "column
-    // that can never be correct" class recorded for `deadline_at` and `budget_json`, and closing
-    // it needs the code to travel on the transition rather than on the event's reason string.
-    // Asserted as the current value so the gap is pinned and visible; recorded in `TODO.md` under
-    // `BRN-008`.
+    // `agent_runs.error_code` now carries the code, which is what closes the gap this test found:
+    // the column was read back, was in the schema, and was **never written** — the transition
+    // `UPDATE` set `state`, `version`, `completed_at`, and the waiting columns only. The
+    // contract's run read requires a "public result/error summary", and `RunView::error_code`
+    // existed to carry it with nothing to carry. Asserted here rather than on the HTTP surface
+    // because the durable value is the fact; the handler renders it.
     assert_eq!(
-        stored.error_code, None,
-        "the gap is real and is recorded in BRN-008",
+        stored.error_code.as_deref(),
+        Some("run.context_objective_dropped"),
+        "a failed run's own row must name why it failed",
     );
 }
 
