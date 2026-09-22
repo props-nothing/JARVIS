@@ -152,6 +152,37 @@ Do not retry invalid auth, insufficient scope, invalid schema, policy refusal,
 content refusal, or ambiguous accepted requests unless provider idempotency is
 documented and used.
 
+**Implemented evidence (`BRN-008`).** `jarvis_domain::run::retry` holds `RetryPolicy`
+and the pure decision that applies it, and the controller honours it: a transient
+failure **before the provider accepted the call** closes the attempt and leaves the run
+**live** so another attempt can be made, while every other failure leaves the run
+then terminal. The ambiguity rule is the important half and it is enforced by
+construction: `FailureSite` is a **required input** to the decision, so a policy
+cannot look only at the error — and the same error must decide differently on either
+side of acceptance. `decide` checks the ambiguity rule **first**, so no other rule can
+reach a retry for an ambiguous request.
+
+The retry chain is the one `BRN-004` built and nothing had used: each attempt is its
+own row sharing one `logical_call_id`, numbered from 1, so "this call was tried twice"
+is readable without storing prompt content. **Before this every attempt was attempt 1**
+and a transient failure ended the run, so the chain's uniqueness constraint
+(`logical_call_id` + `attempt`) was satisfiable but never exercised.
+
+Three further rules: a retry must **fit the deadline**, because a backoff that outlives
+it is a delay followed by the same failure (a budget-caused refusal is reported as
+`run.deadline_exceeded` rather than as a provider fault, since the two send an operator
+to different places); a policy that does not retry is the **default**, because retrying
+spends a budget the caller never offered; and retries are **not** attempted when the
+run's own consumption ceilings have been breached, since the same output would breach
+again.
+
+**Not done:** no fallback. This section's fallback list — a second route satisfying the
+same capabilities and data policy — needs a capability inventory and candidate routes,
+neither of which exists (`BRN-003` is the model provider, `BRN-010` the data policy).
+The retry policy is also not yet settable per request: it is a field on the run's
+budget, defaulting to no retry, and the `CreateRunRequest` schema has no typed override
+for it.
+
 ## Credentials and Data
 
 - Resolve provider secrets inside the adapter immediately before the request.

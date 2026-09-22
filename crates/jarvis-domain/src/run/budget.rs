@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::stream::{CallLimits, Usage};
+use crate::run::retry::RetryPolicy;
 use crate::time::UtcTimestamp;
 
 /// The largest accepted step timeout, in milliseconds.
@@ -66,6 +67,15 @@ pub struct RunBudget {
     /// The maximum estimated cost across the run, in millionths of the billing unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_microunits: Option<u64>,
+    /// How a failed model call may be retried.
+    ///
+    /// Carried with the budget rather than configured on the controller, because a run
+    /// should record the policy it ran under for the same reason it records its deadline:
+    /// the request that created it may be long gone when someone asks why it made three
+    /// attempts. It defaults to [`RetryPolicy::none`], so the absence of a policy is a
+    /// recorded fact rather than an unstated default.
+    #[serde(default)]
+    pub retry: RetryPolicy,
 }
 
 impl RunBudget {
@@ -77,6 +87,7 @@ impl RunBudget {
             step_timeout_ms: None,
             max_output_tokens: None,
             max_cost_microunits: None,
+            retry: RetryPolicy::none(),
         }
     }
 
@@ -101,6 +112,13 @@ impl RunBudget {
             .checked_add(jiff::Span::new().milliseconds(millis))
             .map_err(|_| BudgetError::Malformed)?;
         Ok(Self::with_deadline(UtcTimestamp::from_timestamp(deadline)))
+    }
+
+    /// Returns this budget with a retry policy applied.
+    #[must_use]
+    pub const fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Returns this budget with a single-step timeout applied.

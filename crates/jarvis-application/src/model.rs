@@ -528,6 +528,17 @@ pub struct ScriptedProvider {
     models: Vec<ModelRef>,
     script: Vec<ScriptStep>,
     open_failure: Option<ProviderError>,
+    /// How many of the first `open` calls fail before the script is served.
+    ///
+    /// A count rather than a flag, because the interesting retry cases are "the first
+    /// attempt failed and the second succeeded" (retry works), "every attempt failed"
+    /// (the policy is exhausted), and "a later attempt failed" (the failure is not
+    /// position-dependent). A single `open_failure` can only express the middle one.
+    fail_first_opens: u32,
+    /// How many opens have been attempted, so the failures run out.
+    opens_seen: std::sync::atomic::AtomicU32,
+    /// The error the counted failures report.
+    counted_failure: ProviderError,
     ids: Arc<dyn IdGenerator>,
 }
 
@@ -552,6 +563,9 @@ impl ScriptedProvider {
             models: vec![model],
             script: Vec::new(),
             open_failure: None,
+            fail_first_opens: 0,
+            opens_seen: std::sync::atomic::AtomicU32::new(0),
+            counted_failure: ProviderError::Unavailable,
             ids: Arc::new(CountingIds::new()),
         }
     }
@@ -568,6 +582,9 @@ impl ScriptedProvider {
             models: Vec::new(),
             script: Vec::new(),
             open_failure: None,
+            fail_first_opens: 0,
+            opens_seen: std::sync::atomic::AtomicU32::new(0),
+            counted_failure: ProviderError::Unavailable,
             ids: Arc::new(CountingIds::new()),
         }
     }
@@ -629,6 +646,29 @@ impl ScriptedProvider {
         self.open_failure = Some(error);
         self
     }
+
+    /// Makes the first `count` opens fail with `error`, after which the script is served.
+    ///
+    /// The shape a retry test needs: a provider that is transiently unavailable and then
+    /// succeeds. `fail_on_open` cannot express it, because it fails every call — so a test
+    /// written against it would prove only that a permanently broken provider fails, which
+    /// a retry policy that never retried would also pass.
+    #[must_use]
+    pub fn fail_first_opens(mut self, count: u32, error: ProviderError) -> Self {
+        self.fail_first_opens = count;
+        self.counted_failure = error;
+        self
+    }
+
+    /// Returns how many `open` calls this provider has been asked for.
+    ///
+    /// Exposed so a test can assert the *number of attempts* rather than only the outcome:
+    /// a controller that retried five times and a controller that retried once both reach
+    /// `Completed` against a provider that fails once, and only this distinguishes them.
+    #[must_use]
+    pub fn opens_seen(&self) -> u32 {
+        self.opens_seen.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl ModelProvider for ScriptedProvider {
@@ -650,6 +690,16 @@ impl ModelProvider for ScriptedProvider {
                 // Refused rather than answered with an empty stream: an empty
                 // stream would be read downstream as an interrupted call.
                 return Err(ProviderError::Cancelled);
+            }
+            // The counted failure is evaluated after the cancellation check, so a caller
+            // that cancelled is always told so rather than being shown a provider fault
+            // this double was configured to produce. Counting every open — including the
+            // ones that fail — is what makes `opens_seen` the number of *attempts*.
+            let seen = self
+                .opens_seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen < self.fail_first_opens {
+                return Err(self.counted_failure);
             }
 
             let mut stamper = FrameStamper::new(request.call_id, self.ids.as_ref());

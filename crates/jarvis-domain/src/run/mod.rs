@@ -26,4 +26,5 @@
 pub mod budget;
 pub mod lifecycle;
 pub mod recovery;
+pub mod retry;
 pub mod state;

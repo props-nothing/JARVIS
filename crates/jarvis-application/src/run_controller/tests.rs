@@ -19,6 +19,7 @@ use jarvis_domain::model::stream::{
     FinishReason, ModelCallRequest, ModelStreamEventKind, Role, Usage,
 };
 use jarvis_domain::run::budget::{BudgetLimit, RunBudget};
+use jarvis_domain::run::retry::RetryPolicy;
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
@@ -27,7 +28,7 @@ use super::{ControllerError, MAX_TRANSCRIPT_MESSAGES, RunController};
 use crate::cancellation::CancellationScope;
 use crate::model::{ModelProvider, ModelStream, OpenResult, ProviderError, ScriptedProvider};
 use crate::repository::conversation::{ConversationRepository, NewConversation, NewMessage};
-use crate::repository::model_call::ModelCallRepository;
+use crate::repository::model_call::{ModelCallRepository, ModelCallState};
 use crate::repository::run::{NewRun, RunRepository};
 use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
 use crate::testing::InMemoryRepositories;
@@ -874,7 +875,7 @@ async fn an_abandoned_call_is_closed_rather_than_left_pending() {
         state.is_terminal(),
         "a call abandoned by a timeout must be terminal, got {state:?}",
     );
-    assert_eq!(state, crate::repository::model_call::ModelCallState::Failed);
+    assert_eq!(state, ModelCallState::Failed);
 }
 
 #[tokio::test]
@@ -1287,4 +1288,346 @@ async fn a_breached_ceiling_is_reported_as_its_own_code_and_message() {
     );
     assert!(!error.is_unimplemented());
     assert!(!error.retryable());
+}
+
+// ---------------------------------------------------------------------------
+// Retry
+//
+// The retry-chain storage (`logical_call_id` plus `attempt`) existed since `BRN-004` and had
+// never been used: every attempt was attempt 1 and a transient failure ended the run. These
+// tests are about the two things that make retry safe rather than merely present — that a
+// *retryable* failure leaves the run **live**, and that a failure after acceptance does not
+// retry at all.
+// ---------------------------------------------------------------------------
+
+/// A budget that permits `attempts` attempts with no backoff delay, so a retry test does
+/// not sleep.
+fn retrying(attempts: u32) -> RunBudget {
+    let policy = RetryPolicy::new(attempts, 0, 0).expect("a zero backoff is in range");
+    RunBudget::default().with_retry(policy)
+}
+
+#[tokio::test]
+async fn a_transient_failure_is_retried_and_the_second_attempt_completes() {
+    // The behaviour retry exists for. The provider refuses the first open and serves the
+    // second, so a controller that never retried would fail this run.
+    let provider = Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "Hello there")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            })
+            .fail_first_opens(1, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(3)).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the second attempt succeeds");
+    assert_eq!(outcome.state, RunState::Completed);
+    assert_eq!(outcome.answer.as_deref(), Some("Hello there"));
+
+    // The attempt count is the proof that the retry happened, not the outcome: a controller
+    // that retried once and one that retried five times both reach `Completed` here.
+    assert_eq!(provider.opens_seen(), 2, "exactly one retry");
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn a_retried_call_records_two_attempts_of_one_logical_call() {
+    // The retry chain has to be auditable as one operation. Two rows sharing a
+    // `logical_call_id` with attempts 1 and 2 is what makes "this call was tried twice"
+    // readable without storing prompt content.
+    let provider = Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            })
+            .fail_first_opens(1, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(3)).await;
+
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let attempts = fixture
+        .repositories
+        .recorded_call_attempts()
+        .expect("the calls are readable");
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(attempts[0].1, 1, "the first attempt is numbered 1");
+    assert_eq!(attempts[1].1, 2, "the retry is numbered 2");
+    assert_eq!(
+        attempts[0].2, attempts[1].2,
+        "both attempts share one logical call identity",
+    );
+    assert_ne!(
+        attempts[0].0, attempts[1].0,
+        "each attempt has its own row identifier, so the first outcome is not overwritten",
+    );
+    // And the failed attempt kept its own terminal outcome rather than being retried in
+    // place.
+    assert_eq!(attempts[0].3, ModelCallState::Failed);
+    assert_eq!(attempts[1].3, ModelCallState::Completed);
+}
+
+#[tokio::test]
+async fn a_run_whose_policy_forbids_retry_fails_on_the_first_transient_failure() {
+    // The default. The provider is transiently unavailable and would succeed on a second
+    // attempt, but the run's policy is `none()` — so the run must fail, and the number of
+    // opens must be one.
+    let provider =
+        Arc::new(ScriptedProvider::new(model()).fail_first_opens(1, ProviderError::Unavailable));
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a policy of one attempt does not retry");
+    assert_eq!(error, ControllerError::Provider(ProviderError::Unavailable));
+    assert_eq!(provider.opens_seen(), 1, "no second attempt was made");
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn the_attempt_count_is_respected_when_every_attempt_fails() {
+    // The policy's bound, against a provider that never recovers: three attempts and then a
+    // failure. A policy that retried forever would hang here.
+    let provider = Arc::new(
+        ScriptedProvider::new(model()).fail_first_opens(u32::MAX, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(3)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a permanently unavailable provider exhausts the policy");
+    assert_eq!(error, ControllerError::Provider(ProviderError::Unavailable));
+    assert_eq!(provider.opens_seen(), 3, "exactly the permitted attempts");
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn a_retryable_failure_leaves_the_run_live_rather_than_failed() {
+    // The structural point: a retry needs a run it can continue. Failing the run on the
+    // first transient failure and then retrying would be a run that moved through a terminal
+    // state and back, which the state machine forbids — so the run must be left
+    // `AwaitingModel` while the policy still permits an attempt.
+    //
+    // Asserted by observing the run after a policy of two attempts against a provider that
+    // fails both: the run reached `Failed` exactly once, from `AwaitingModel`.
+    let provider = Arc::new(
+        ScriptedProvider::new(model()).fail_first_opens(u32::MAX, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(2)).await;
+
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let events = fixture
+        .repositories
+        .recorded_events()
+        .expect("the events are readable");
+    let failures = events
+        .iter()
+        .filter(|event| event.event_type == "run.failed")
+        .count();
+    assert_eq!(
+        failures, 1,
+        "the run must be failed exactly once, after the last attempt: {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_non_retryable_failure_is_not_retried_even_with_a_permissive_policy() {
+    // A refusal cannot be fixed by repeating it, so the policy does not matter. Retrying it
+    // would also be the "provider shopping" the contract forbids.
+    let provider =
+        Arc::new(ScriptedProvider::new(model()).fail_first_opens(u32::MAX, ProviderError::Refused));
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(5)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a refusal is not retryable");
+    assert_eq!(error, ControllerError::Provider(ProviderError::Refused));
+    assert_eq!(provider.opens_seen(), 1, "a refusal must not be repeated");
+}
+
+#[tokio::test]
+async fn a_failure_after_acceptance_is_not_retried_even_when_the_error_is_retryable() {
+    // The safety rule, exercised through the controller rather than only in the domain: the
+    // provider accepted the call and then the stream failed. `Unavailable` is retryable, but
+    // the request is ambiguous — output may exist and may have been billed — so repeating it
+    // is forbidden until provider idempotency is documented and used.
+    //
+    // The stream is driven to an `Err` on its first frame, which happens *after* the provider
+    // accepted. A policy of five attempts is in force, so the only reason not to retry is the
+    // ambiguity rule.
+    //
+    // **This test found a real defect.** The mid-stream error was propagated with no
+    // transition at all, so the run was left in `AwaitingModel` — non-terminal, and looking
+    // exactly like a run that was about to retry. A client would poll it forever and only a
+    // daemon restart would settle it. That is the same class as the missing terminal exit
+    // that `BRN-007` recorded, and it was invisible until the assertion below existed.
+    let provider = Arc::new(FailingAfterAcceptance {
+        models: vec![model()],
+        opens: std::sync::atomic::AtomicU32::new(0),
+    });
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, retrying(5)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("an ambiguous failure cannot be retried");
+    assert_eq!(error, ControllerError::Provider(ProviderError::Unavailable));
+    assert_eq!(
+        provider.opens_seen(),
+        1,
+        "an ambiguous request must not be repeated",
+    );
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn a_retry_with_no_budget_delay_still_completes_and_costs_nothing() {
+    // A zero backoff is the shape a test wants, and it must be a legitimate policy rather
+    // than one the setter refuses: a zero delay means "retry at once".
+    let policy = RetryPolicy::new(2, 0, 0).expect("a zero backoff is in range");
+    assert_eq!(policy.backoff_ms(2), 0);
+
+    let provider = Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            })
+            .fail_first_opens(1, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, RunBudget::default().with_retry(policy)).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the retry succeeds");
+    assert_eq!(outcome.state, RunState::Completed);
+    assert_eq!(provider.opens_seen(), 2);
+}
+
+#[tokio::test]
+async fn a_retry_is_not_attempted_when_the_run_has_no_time_left() {
+    // The budget outranks the policy: a retry whose backoff would outlive the deadline is a
+    // delay followed by the same failure. Reported as the deadline it is, because "the
+    // provider kept failing" and "the run ran out of time" send an operator to different
+    // places.
+    let provider = Arc::new(
+        ScriptedProvider::new(model()).fail_first_opens(u32::MAX, ProviderError::Unavailable),
+    );
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    // The policy permits five attempts, but the deadline is in the past by the time the
+    // first attempt fails.
+    let deadline = UtcTimestamp::parse("2026-09-22T12:00:00.001Z").expect("valid");
+    let budget = RunBudget::with_deadline(deadline)
+        .with_retry(RetryPolicy::new(5, 60_000, 60_000).expect("in range"));
+    seed_with_budget(&fixture, budget).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a run with no time left cannot retry");
+    assert_eq!(
+        error,
+        ControllerError::DeadlineExceeded,
+        "a budget-caused refusal reports the deadline, not the provider fault",
+    );
+    assert_eq!(provider.opens_seen(), 1);
+}
+
+/// A provider that accepts the call and then fails the stream on its first frame.
+///
+/// A hand-written double rather than a script, because the failure has to happen *after*
+/// `open` returns — which is what makes the request ambiguous. `ScriptedProvider`'s scripted
+/// steps are normalized frames, so it has no way to express "the stream itself errors".
+struct FailingAfterAcceptance {
+    models: Vec<ModelRef>,
+    opens: std::sync::atomic::AtomicU32,
+}
+
+impl ModelProvider for FailingAfterAcceptance {
+    fn models(&self) -> &[ModelRef] {
+        &self.models
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        _request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            /// A stream that fails its first frame, after the call was accepted.
+            struct FailsOnFirstFrame;
+
+            impl ModelStream for FailsOnFirstFrame {
+                fn next_event(
+                    &mut self,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    Option<jarvis_domain::model::stream::ModelStreamEvent>,
+                                    ProviderError,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > {
+                    // `Unavailable` is a *retryable* error, which is the point: the error
+                    // would permit a retry and only the ambiguity rule forbids it.
+                    Box::pin(async { Err(ProviderError::Unavailable) })
+                }
+            }
+
+            Ok(Box::new(FailsOnFirstFrame) as Box<dyn ModelStream + Send + 'a>)
+        })
+    }
+}
+
+impl FailingAfterAcceptance {
+    fn opens_seen(&self) -> u32 {
+        self.opens.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }

@@ -1720,6 +1720,48 @@ async fn a_call_with_no_reported_usage_stores_no_block_and_no_cost() {
 }
 
 #[tokio::test]
+async fn a_retry_policy_round_trips_through_the_stored_budget() {
+    // The retry policy is stored inside `budget_json`, so a run records the policy it ran
+    // under. That matters after the fact: the request that created the run may be long gone
+    // when someone asks why it made three attempts, and a policy reconstructed from current
+    // defaults could differ from the one that actually applied.
+    let (_database, repositories) = repository().await;
+    seed_conversation_only(&repositories).await;
+    let policy = jarvis_domain::run::retry::RetryPolicy::new(3, 250, 2_000).expect("in range");
+    let budget = RunBudget::default().with_retry(policy);
+    repositories
+        .create(
+            NewRun::with_budget(
+                run_id(),
+                workspace(),
+                conversation_id(),
+                principal(),
+                None,
+                now(),
+                budget,
+            )
+            .expect("valid"),
+            run_received_event(run_id(), now()),
+        )
+        .await
+        .expect("the run is created");
+
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.budget.retry, policy);
+    assert_eq!(stored.budget.retry.max_attempts, 3);
+    assert_eq!(stored.budget.retry.base_backoff_ms, 250);
+    // And a run created without a policy records the no-retry default rather than a null,
+    // so "this run did not retry" is a readable fact.
+    assert_eq!(
+        jarvis_domain::run::retry::RetryPolicy::none().max_attempts,
+        1,
+    );
+}
+
+#[tokio::test]
 async fn a_delta_for_a_foreign_run_is_refused_rather_than_orphaned() {
     use jarvis_application::live_events::StreamDeltaSink as _;
 

@@ -56,6 +56,7 @@ use jarvis_domain::model::stream::{
 };
 use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget};
 use jarvis_domain::run::lifecycle::RunTransition;
+use jarvis_domain::run::retry::{FailureClass, FailureSite, RetryDecision};
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
 
@@ -314,6 +315,29 @@ impl Step {
     }
 }
 
+/// What one model-call attempt produced.
+///
+/// Three outcomes rather than a `Result` with an error, because "this attempt failed and
+/// another is worth making" is not a failure of the *run*: the run is still live and
+/// non-terminal when this is returned, and a caller that treated it as an error would fail
+/// a run that is about to succeed.
+#[derive(Debug)]
+enum AttemptOutcome {
+    /// The attempt produced a completed run.
+    Completed(RunOutcome),
+    /// The provider refused before accepting the call, and a repeat may help.
+    Retryable {
+        /// How the caller classified the failure.
+        class: FailureClass,
+        /// The provider error this attempt ended with.
+        ///
+        /// Carried so a refused retry reports the *underlying* failure rather than an
+        /// invented one: an operator needs to know the provider was unavailable, not merely
+        /// that the run gave up.
+        error: ProviderError,
+    },
+}
+
 /// Everything one model turn needs besides the run it belongs to.
 struct ModelTurn<'a> {
     context: &'a RequestContext,
@@ -548,18 +572,30 @@ impl RunController {
         .await
     }
 
-    /// Performs the model turn and finishes the run.
+    /// Performs the model turn, retrying a pre-acceptance failure within the run's budget.
+    ///
+    /// The split between a *retryable* failure and a *fatal* one is where the contract's
+    /// retry-ownership rule is enforced:
+    ///
+    /// - a provider that refused **before accepting** the call left nothing behind, so the
+    ///   run is not transitioned and another attempt can be made;
+    /// - a failure **after acceptance** is ambiguous — output may exist, may have been
+    ///   billed, and may have been recorded provider-side — so the run is failed and no
+    ///   retry is attempted. `model-gateway.md` permits repeating an ambiguous request only
+    ///   once provider idempotency is documented and used, which it is not.
+    ///
+    /// Before this, every attempt was attempt 1 and a transient failure ended the run. The
+    /// retry-chain storage (`logical_call_id` plus `attempt`) existed since `BRN-004` and
+    /// had never been used.
     async fn ask_model(
         &self,
         run: RunRef,
         turn: &ModelTurn<'_>,
     ) -> Result<RunOutcome, ControllerError> {
-        // A run whose deadline had already passed when its turn began is refused before
-        // a provider is contacted at all. Recording a model call for a request that was
-        // never going to be made would leave an open attempt and spend nothing on
-        // purpose.
-        let now = self.now()?;
-        if !turn.budget.permits_step_at(now) {
+        // A run whose deadline had already passed when its turn began is refused before a
+        // provider is contacted at all. Recording a model call for a request that was never
+        // going to be made would leave an open attempt and spend nothing on purpose.
+        if !turn.budget.permits_step_at(self.now()?) {
             self.finish(
                 run,
                 Step::new(
@@ -573,15 +609,103 @@ impl RunController {
             return Err(ControllerError::DeadlineExceeded);
         }
 
+        // One logical call spans every attempt, so the chain is auditable as one operation
+        // rather than as unrelated calls that happen to be adjacent.
+        let logical_call_id = ModelCallId::from_uuid(uuid::Uuid::now_v7());
+        let mut attempt = 1_u32;
+
+        loop {
+            match self
+                .attempt_call(run, turn, logical_call_id, attempt)
+                .await?
+            {
+                AttemptOutcome::Completed(outcome) => return Ok(outcome),
+                AttemptOutcome::Retryable { class, error } => {
+                    // The run is deliberately still non-terminal here: a retry needs a run
+                    // it can continue, and failing it first would make the retry impossible.
+                    let decision = RetryDecision::decide(
+                        &turn.budget.retry,
+                        class,
+                        FailureSite::BeforeAcceptance,
+                        attempt,
+                        turn.budget,
+                        self.now()?,
+                    );
+                    let RetryDecision::Retry {
+                        attempt: next,
+                        delay_ms,
+                    } = decision
+                    else {
+                        // The policy or the budget refused the retry, so the run is failed
+                        // now. A budget-caused refusal is reported as the deadline it is,
+                        // because "the provider kept failing" and "the run ran out of time"
+                        // send an operator to different places.
+                        let reason = if decision.refused_by_budget() {
+                            "retry_refused_by_budget"
+                        } else {
+                            "retry_refused"
+                        };
+                        self.finish(
+                            run,
+                            Step::new(
+                                RunState::AwaitingModel,
+                                RunState::Failed,
+                                "run.failed",
+                                reason,
+                            ),
+                        )
+                        .await?;
+                        return Err(if decision.refused_by_budget() {
+                            ControllerError::DeadlineExceeded
+                        } else {
+                            ControllerError::Provider(error)
+                        });
+                    };
+                    // The delay is bounded by the same `wait_bounded` every other wait uses,
+                    // so a backoff can never outlive the run's deadline — which the decision
+                    // already checked, and which this makes true of the actual wait rather
+                    // than only of the arithmetic.
+                    if self
+                        .wait_bounded(
+                            turn.budget,
+                            tokio::time::sleep(Duration::from_millis(delay_ms)),
+                        )
+                        .await?
+                        .is_none()
+                    {
+                        self.finish_expired(run, None, "deadline_exceeded").await?;
+                        return Err(ControllerError::DeadlineExceeded);
+                    }
+                    attempt = next;
+                }
+            }
+        }
+    }
+
+    /// Makes one model-call attempt.
+    ///
+    /// Returns [`AttemptOutcome::Retryable`] only for a failure the provider reported
+    /// *before* accepting the call, and only for a failure the caller classified as
+    /// transient. Every other path leaves the run terminal and returns `Err`.
+    async fn attempt_call(
+        &self,
+        run: RunRef,
+        turn: &ModelTurn<'_>,
+        logical_call_id: ModelCallId,
+        attempt: u32,
+    ) -> Result<AttemptOutcome, ControllerError> {
+        // A fresh row per attempt, sharing the logical identity. A retry that reused the
+        // row id would overwrite the first attempt's recorded outcome, which the
+        // repository's uniqueness constraint exists to refuse.
         let call_id = ModelCallId::from_uuid(uuid::Uuid::now_v7());
-        let started_at = now;
+        let started_at = self.now()?;
         self.model_calls
             .record_attempt(NewModelCall {
                 id: call_id,
                 workspace_id: run.workspace,
                 run_id: run.run_id,
-                logical_call_id: call_id,
-                attempt: 1,
+                logical_call_id,
+                attempt,
                 model: turn.model.clone(),
                 request_fingerprint: None,
                 started_at,
@@ -615,7 +739,11 @@ impl RunController {
                 return Err(ControllerError::DeadlineExceeded);
             }
             Some(Ok(stream)) => stream,
-            Some(Err(error)) => return Err(self.fail_open(run, call_id, error).await),
+            // The provider refused to open, so nothing can have been produced, billed, or
+            // recorded — this is the only failure the run may retry.
+            Some(Err(error)) => {
+                return self.fail_open(run, call_id, error, logical_call_id).await;
+            }
         };
 
         // The stream is drained first and the run advanced afterwards, so a failure to
@@ -629,6 +757,17 @@ impl RunController {
             Err(error) => return Err(error),
         };
 
+        self.finish_attempt(run, turn, call_id, drained).await
+    }
+
+    /// Judges a drained stream: a tool intent, a breached ceiling, or a completion.
+    async fn finish_attempt(
+        &self,
+        run: RunRef,
+        turn: &ModelTurn<'_>,
+        call_id: ModelCallId,
+        drained: DrainedTurn,
+    ) -> Result<AttemptOutcome, ControllerError> {
         // Captured before anything is moved out of `drained`, because three paths below
         // need it and a later borrow would be a borrow of a partially moved value.
         let usage = usage_of(&drained);
@@ -676,6 +815,7 @@ impl RunController {
         // AwaitingModel -> Responding -> Completed, then the answer is stored.
         self.complete_run(run, drained, turn.conversation_id, completed_at)
             .await
+            .map(AttemptOutcome::Completed)
     }
 
     /// Drives a successful run through `Responding` to `Completed` and stores the answer.
@@ -779,16 +919,17 @@ impl RunController {
             // that has already consumed most of its time has little left, and bounding it
             // by the original allowance would let it exceed the run's own limit.
             let next = self.wait_bounded(budget, stream.next_event()).await?;
-            let Some(event) = (match next {
-                // The budget ran out while waiting for a frame.
-                None => {
-                    self.finish_expired(run, Some(call_id), "deadline_exceeded")
-                        .await?;
-                    return Ok(Err(ControllerError::DeadlineExceeded));
-                }
-                Some(frame) => frame.map_err(ControllerError::Provider)?,
-            }) else {
-                break;
+
+            // The bound elapsed while waiting for a frame.
+            let Some(frame) = next else {
+                self.finish_expired(run, Some(call_id), "deadline_exceeded")
+                    .await?;
+                return Ok(Err(ControllerError::DeadlineExceeded));
+            };
+            let event = match frame {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => return self.fail_after_acceptance(run, call_id, error).await,
             };
             match state.accept(&event) {
                 Ok(StreamAdmission::Accepted) => {}
@@ -944,26 +1085,42 @@ impl RunController {
 
     /// Ends a run whose provider refused to open a stream.
     ///
-    /// Three outcomes arrive here and they are not the same fact:
+    /// Four outcomes arrive here and they are not the same fact:
     ///
     /// - a **cancellation** is the caller's own action, so the run ends `Cancelled` and
     ///   the caller's request is never recorded as a fault;
     /// - a **timeout** means the *budget* was exhausted, so the run ends `Failed` but is
     ///   reported as `DeadlineExceeded` — an operator reading a provider fault would look
     ///   at the provider's status page when the answer is in the run's budget;
+    /// - a **transient** failure means the provider never accepted the call, so the attempt
+    ///   is closed but the **run is left `AwaitingModel`** and `Retryable` is returned. The
+    ///   run must stay live for a retry to be possible, and failing it here would make the
+    ///   retry this path exists to allow impossible;
     /// - anything else is a genuine provider fault and keeps its own code.
     ///
-    /// The recorded attempt is closed on every path, including this one: an attempt left
-    /// `Pending` would make a later reconciliation pass unable to tell whether a call was
-    /// still outstanding.
+    /// The recorded attempt is closed on every path, including the retryable one: an
+    /// attempt left `Pending` would make a later reconciliation pass unable to tell whether
+    /// a call was still outstanding.
     async fn fail_open(
         &self,
         run: RunRef,
         call_id: ModelCallId,
         error: ProviderError,
-    ) -> ControllerError {
+        _logical_call_id: ModelCallId,
+    ) -> Result<AttemptOutcome, ControllerError> {
         let cancelled = error == ProviderError::Cancelled;
         let timed_out = error == ProviderError::Timeout;
+        let class = classify(error);
+
+        // A transient failure leaves the run live. Nothing was accepted, so the run has not
+        // failed — it merely has not succeeded yet, and the loop in `ask_model` decides
+        // whether another attempt fits the policy and the budget.
+        if !cancelled && !timed_out && class == FailureClass::Transient {
+            self.record_call_outcome(run, call_id, ModelCallState::Failed)
+                .await?;
+            return Ok(AttemptOutcome::Retryable { class, error });
+        }
+
         let reason = if timed_out {
             "deadline_exceeded"
         } else {
@@ -980,31 +1137,54 @@ impl RunController {
             ModelCallState::Failed
         };
 
-        // A failure to record any of this is reported as the storage failure it is; the
-        // provider error would otherwise be returned as though the run had been settled.
-        if self
-            .finish(
-                run,
-                Step::new(RunState::AwaitingModel, state, "run.failed", reason),
-            )
-            .await
-            .is_err()
-        {
-            return ControllerError::Repository(RepositoryError::Query);
-        }
-        if self
-            .record_call_outcome(run, call_id, outcome)
-            .await
-            .is_err()
-        {
-            return ControllerError::Repository(RepositoryError::Query);
-        }
+        self.finish(
+            run,
+            Step::new(RunState::AwaitingModel, state, "run.failed", reason),
+        )
+        .await?;
+        self.record_call_outcome(run, call_id, outcome).await?;
 
         if timed_out {
-            ControllerError::DeadlineExceeded
+            Err(ControllerError::DeadlineExceeded)
         } else {
-            ControllerError::Provider(error)
+            Err(ControllerError::Provider(error))
         }
+    }
+
+    /// Ends a run whose provider failed *after* accepting the call.
+    ///
+    /// A distinct method from [`fail_open`](Self::fail_open) because the **safety** verdict
+    /// differs: a failure after acceptance is an ambiguous request, so it is never retried
+    /// whatever the error says about retryability, while a failure before acceptance may be.
+    /// Keeping them apart is what stops a future edit from routing this case into the
+    /// retryable branch, which is the one change the contract forbids here.
+    ///
+    /// This was a real defect: the mid-stream error was propagated with no transition at all,
+    /// so the run was left in `AwaitingModel` — non-terminal, and indistinguishable from a run
+    /// about to retry. A client would poll it forever and only a daemon restart would settle
+    /// it, which is the same class as the missing terminal exit `BRN-007` recorded.
+    async fn fail_after_acceptance(
+        &self,
+        run: RunRef,
+        call_id: ModelCallId,
+        error: ProviderError,
+    ) -> Result<Result<DrainedTurn, ControllerError>, ControllerError> {
+        self.finish(
+            run,
+            Step::new(
+                RunState::AwaitingModel,
+                RunState::Failed,
+                "run.failed",
+                "provider_failed_after_acceptance",
+            ),
+        )
+        .await?;
+        self.record_call_outcome(run, call_id, ModelCallState::Failed)
+            .await?;
+        // The inner `Err` is the *stream's* failure, which is what the caller reports; the
+        // outer `Ok` says draining itself worked. Collapsing them would make "the store
+        // broke" and "the provider failed mid-stream" the same value.
+        Ok(Err(ControllerError::Provider(error)))
     }
 
     /// Ends a run because its own budget expired.
@@ -1170,6 +1350,24 @@ pub fn selected_model(provider: &dyn ModelProvider) -> Result<ModelRef, Controll
         .first()
         .cloned()
         .ok_or(ControllerError::NoModelServed)
+}
+
+/// Classifies a provider failure for the retry policy.
+///
+/// This is the *only* place a provider error's retryability is turned into a policy input,
+/// and it delegates to [`ProviderError::retryable`] rather than restating the rule: a
+/// second copy of "which errors can be repeated" is exactly how the adapter and the
+/// controller would come to disagree.
+///
+/// The classification stops at transient-versus-permanent. Whether a retry is *permitted*
+/// also needs to know whether the provider had accepted the call, and that is a separate
+/// input to the decision rather than something this function could infer from the error.
+fn classify(error: ProviderError) -> FailureClass {
+    if error.retryable() {
+        FailureClass::Transient
+    } else {
+        FailureClass::Permanent
+    }
 }
 
 /// Returns the usage a drained turn reported, if any.

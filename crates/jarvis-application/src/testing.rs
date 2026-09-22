@@ -228,6 +228,29 @@ impl InMemoryRepositories {
                 .collect())
         })
     }
+
+    /// Returns every recorded attempt as `(id, attempt, logical_call_id, state)`, in
+    /// insertion order.
+    ///
+    /// Exposed so a retry test can assert the *chain*: that two attempts share one logical
+    /// call identity, that they are numbered 1 and 2, and that they have distinct row
+    /// identifiers — which is what proves a retry added an attempt rather than overwriting
+    /// the first attempt's recorded outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn recorded_call_attempts(
+        &self,
+    ) -> Result<Vec<(ModelCallId, u32, ModelCallId, ModelCallState)>, RepositoryError> {
+        self.with(|store| {
+            Ok(store
+                .calls
+                .values()
+                .map(|call| (call.id, call.attempt, call.logical_call_id, call.state))
+                .collect())
+        })
+    }
 }
 
 /// What one recorded call consumed, as a test reads it.

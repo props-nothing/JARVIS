@@ -1018,6 +1018,31 @@ Foundation TODO remains incomplete.
   calls (there is one call today, so the ceilings are per-call in effect), there is no turn
   budget, no byte or concurrency budget, no retry budget, and the disconnect case remains
   open — so `ACC-073` is closer but not closed.
+  **Retry is now implemented, and it found a defect.** `jarvis_domain::run::retry` holds
+  `RetryPolicy` and the pure decision that applies it; the controller honours it, so a
+  transient failure **before the provider accepted the call** closes the attempt and leaves
+  the run **live** so another attempt can be made. The retry-chain storage (`logical_call_id`
+  plus `attempt`) was built by `BRN-004` and had **never been used** — every attempt was
+  attempt 1, and a transient failure ended the run. The contract's safety boundary is
+  enforced by construction rather than by intention: `FailureSite` is a **required input** to
+  the decision, because the same error must decide differently on either side of acceptance,
+  and the ambiguity rule is checked **first** so no other rule can reach a retry for an
+  ambiguous request. Three further rules: a retry must fit the deadline (a backoff that
+  outlives it is a delay followed by the same failure, and a budget-caused refusal is
+  reported as the deadline rather than a provider fault); a policy that does not retry is the
+  **default**, because retrying spends a budget the caller never offered; and no retry is
+  attempted when consumption ceilings were breached, since the same output would breach
+  again. **The defect:** a provider error arriving *mid-stream* was propagated with **no
+  transition at all**, so the run was left in `AwaitingModel` — non-terminal, and looking
+  exactly like a run about to retry. A client would poll it forever and only a daemon restart
+  would settle it. It is the same class as the missing terminal exit `BRN-007` recorded, and
+  it was invisible until a test asserted the run's stored state rather than only the returned
+  error. Both new behaviours were falsified: disabling the retryable branch fails 5 tests, and
+  disabling the ambiguity rule fails 2. 18 domain tests, 9 controller tests, and 1 adapter
+  round-trip. **Not done:** **no fallback** — this needs a capability inventory and candidate
+  routes (`BRN-003`, `BRN-010`), so the contract's fallback list is not implemented; the retry
+  policy is not settable per request (it is a field on the run's budget, defaulting to no
+  retry, and `CreateRunRequest` has no typed override); and the disconnect case remains open.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider
