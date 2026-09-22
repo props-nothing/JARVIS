@@ -875,10 +875,34 @@ Foundation TODO remains incomplete.
   hand-writing a `Stream` would be an unreviewed async state machine on the
   security-relevant path. Also not done: the CLI has no streaming renderer that prints
   deltas as they arrive from one connection, `Idempotency-Key` is scoped per client
-  rather than per principal-and-credential as the contract words it, no golden JSON/SSE
-  fixture or generated OpenAPI document exists (contract test 12), the run list and
+  rather than per principal-and-credential as the contract words it, the run list and
   the `jarvis ask` conversation-continuation option are absent, and the E2E step's
   abrupt-restart and disconnect cases belong to `BRN-008`.
+  **The golden-fixture half of contract test 12 is now done, and it found two defects.**
+  `jarvis-protocol`'s `run_contract_tests` and `jarvis-domain`'s
+  `model/stream_contract_tests` **read each contract document's own JSON examples** and
+  assert the types accept them, rather than checking in copies of them. A copy can drift
+  from the document it claims to represent while the test passes, which is worse than no
+  test because it produces false confidence; reading the document makes the two
+  inseparable. The extraction is what finds a gap — a hand-written fixture list
+  reproduces the very mistake round 7 recorded, where `BRN-001`'s evidence listed the
+  *tests it wrote* rather than the *contract fields it covered*. **It caught two real
+  drifts on its first run:** (1) `ModelStreamEventKind` serialized its `type` tag as
+  `snake_case` (`output_text_delta`) while the contract **and the same type's own
+  `type_name()`** used the dotted `output.text.delta` — two spellings of one event type,
+  which would only have appeared at the far boundary; (2) the enum was `#[serde(flatten)]`ed
+  onto the envelope, so an event's `item_id` and `delta` landed at the top level, while
+  `model-stream.md`, `event-envelope.md`, and `local-control-api.md` all nest a variant's
+  fields under `payload`. Both are fixed, and a test now asserts the **serialized** shape
+  as well as the parse, since only both together make the type and the document
+  interchangeable. The contract's `route_requirements` example was also stale: it showed
+  `tools`/`structured_output`/`local_only` booleans where the accepted design uses the
+  **same `Capability` vocabulary the inventory attests** and the `Locality` the data policy
+  resolves — a parallel set of flags would let a requirement exist that no capability key
+  could satisfy, and both sides would still compile, so the example was corrected to the
+  design `BRN-001` had already justified. **Still not done:** the generated `OpenAPI`
+  document, and the SSE fixtures beyond framing (a full frame's `data` is asserted by the
+  existing envelope test, not by a golden file).
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior. This TODO owns the run controller and the repositories' test
   doubles: `jarvis_application::run_controller` drives one durable run from

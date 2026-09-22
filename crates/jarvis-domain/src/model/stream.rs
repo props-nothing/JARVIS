@@ -736,21 +736,36 @@ impl ProviderMetadata {
 }
 
 /// The payload of one stream event.
+///
+/// The tag and its body are **adjacently** placed — `"type"` beside `"payload"` rather than
+/// folded together — because that is the shape `model-stream.md` documents and the shape the
+/// normalized envelope in `event-envelope.md` uses for every event type. Flattening the body
+/// into the envelope instead put `item_id` and `delta` at the top level, which a golden-fixture
+/// test caught: the contract and the type disagreed about where a payload lives, and an adapter
+/// written from the contract would have produced frames no JARVIS client could read.
+///
+/// The tag's values are the contract's **dotted** names, spelled out per variant rather than
+/// derived from the Rust names. Deriving them as `snake_case` produced `output_text_delta`
+/// while this same type's `type_name()` returned `output.text.delta` — **two spellings of one
+/// event type**, which the same fixture test caught.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "payload")]
 pub enum ModelStreamEventKind {
     /// The call opened.
+    #[serde(rename = "call.started")]
     CallStarted {
         /// The provider/model actually selected, once known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelRef>,
     },
     /// An output item was allocated.
+    #[serde(rename = "output.item.added")]
     OutputItemAdded {
         /// The output item identifier.
         item_id: String,
     },
     /// A text delta for an output item.
+    #[serde(rename = "output.text.delta")]
     OutputTextDelta {
         /// The output item identifier.
         item_id: String,
@@ -758,11 +773,13 @@ pub enum ModelStreamEventKind {
         delta: String,
     },
     /// An output item completed.
+    #[serde(rename = "output.item.completed")]
     OutputItemCompleted {
         /// The output item identifier.
         item_id: String,
     },
     /// A tool call was proposed.
+    #[serde(rename = "tool.call.added")]
     ToolCallAdded {
         /// The stable canonical call identifier.
         call_id: String,
@@ -770,6 +787,7 @@ pub enum ModelStreamEventKind {
         tool_name: String,
     },
     /// A tool-argument delta. Never executable on its own.
+    #[serde(rename = "tool.call.arguments.delta")]
     ToolCallArgumentsDelta {
         /// The stable canonical call identifier.
         call_id: String,
@@ -777,6 +795,7 @@ pub enum ModelStreamEventKind {
         delta: String,
     },
     /// A tool call completed and its arguments are final.
+    #[serde(rename = "tool.call.completed")]
     ToolCallCompleted {
         /// The stable canonical call identifier.
         call_id: String,
@@ -784,21 +803,25 @@ pub enum ModelStreamEventKind {
         arguments: String,
     },
     /// A user-visible reasoning summary delta.
+    #[serde(rename = "reasoning.summary.delta")]
     ReasoningSummaryDelta {
         /// The summary delta.
         delta: String,
     },
     /// A usage update. May arrive before, with, or after output completion.
+    #[serde(rename = "usage.updated")]
     UsageUpdated {
         /// The usage block.
         usage: Usage,
     },
     /// A provider warning.
+    #[serde(rename = "provider.warning")]
     ProviderWarning {
         /// A bounded, user-safe warning code.
         code: String,
     },
     /// Terminal: the call completed.
+    #[serde(rename = "call.completed")]
     CallCompleted {
         /// Why it finished.
         finish_reason: FinishReason,
@@ -809,6 +832,7 @@ pub enum ModelStreamEventKind {
         refused: bool,
     },
     /// Terminal: the call failed.
+    #[serde(rename = "call.failed")]
     CallFailed {
         /// A stable, namespaced error code.
         code: String,
@@ -816,6 +840,7 @@ pub enum ModelStreamEventKind {
         retryable: bool,
     },
     /// Terminal: the call was cancelled.
+    #[serde(rename = "call.cancelled")]
     CallCancelled {
         /// Whether a provider frame arrived after the local cancellation.
         late_frames_ignored: u64,
@@ -1095,6 +1120,10 @@ impl fmt::Display for StreamOutcome {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "stream_contract_tests.rs"]
+mod contract_tests;
 
 #[cfg(test)]
 mod tests {

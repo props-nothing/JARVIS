@@ -287,6 +287,10 @@ pub fn run_links(run_id: &str) -> RunLinks {
 }
 
 #[cfg(test)]
+#[path = "run_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         CancelRunRequest, CreateRunRequest, MAX_RUN_INPUT_BYTES, NATIVE_RUNTIME, RunInput,

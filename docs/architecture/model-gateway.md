@@ -101,6 +101,22 @@ Adapters must produce exactly one terminal event and preserve provider request
 IDs, finish reasons, usage, safety/refusal metadata, and retry hints in typed
 metadata.
 
+**Implemented evidence (`BRN-007`).** `jarvis_domain::model::stream::ModelStreamEvent`
+is the envelope and `ModelStreamEventKind` the payload, and the list above is the
+`type_name()` of every variant. Two shape defects were found by reading the contract
+documents' own examples as fixtures:
+
+- the `type` tag serialized as `snake_case` (`output_text_delta`) while the contract
+  **and the type's own `type_name()`** used the dotted `output.text.delta` — two
+  spellings of one event type, which would only have surfaced at the far boundary;
+- the payload was `#[serde(flatten)]`ed onto the envelope, so a variant's fields sat
+  beside `sequence` instead of under `payload`, where this document's normalized
+  envelope and `local-control-api.md` both put them.
+
+Both are fixed, and a test asserts the **serialized** shape as well as a parse of the
+documented example, because only both together make the type and the document
+interchangeable.
+
 ## Routing
 
 Routing is deterministic application policy over a capability inventory. Inputs

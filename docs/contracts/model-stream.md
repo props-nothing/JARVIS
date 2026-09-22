@@ -12,9 +12,8 @@ Lifecycle: DRAFT
   "run_id": "019...",
   "route_requirements": {
     "modalities": ["text"],
-    "tools": true,
-    "structured_output": false,
-    "local_only": false
+    "required_capabilities": ["tool_calling"],
+    "locality": "approved_cloud_allowed"
   },
   "input": [],
   "tools": [],
@@ -27,6 +26,14 @@ Lifecycle: DRAFT
   }
 }
 ```
+
+`route_requirements` names **the same vocabulary the capability inventory attests**:
+`required_capabilities` holds `Capability` values and `locality` holds the `Locality` the
+data policy resolves. It deliberately has no `tools`, `structured_output`, or `local_only`
+booleans — a parallel set of flags would let a requirement exist that no capability key
+could satisfy, and both sides would still compile. Structured output is requested through
+`output_schema` and tool calling through `required_capabilities`, so there is exactly one
+way to ask for each.
 
 Principal/workspace/security context is trusted application context and not an
 arbitrary request body field.
