@@ -69,11 +69,17 @@ controller sent `limits.deadline: null` unconditionally, so an adapter honouring
 `limits.deadline` had nothing to honour and a provider was free to wait
 indefinitely. The controller now also bounds the provider `open` and each frame
 wait by the tighter of the remaining deadline and the step timeout, so a budget is
-an actual bound rather than a value carried in a request. The token and cost
-ceilings are carried and sent but nothing sums usage against them yet, so a run
-cannot refuse a step for exceeding them — that accounting, and the routing
-consequences this section lists ("latency and cost budgets" as a routing input),
-remain open.
+an actual bound rather than a value carried in a request. The **token and cost
+ceilings are enforced** as well: usage is captured from either arrival path (a
+`usage.updated` frame or the terminal's block, whichever comes last) and checked
+against the ceilings before a run may complete, so a breach fails the run and
+discards its output. A ceiling with no reported usage cannot breach — refusing on
+an absent value would fail every run against a provider that omits usage, so the
+gap is reported through `budget_is_verifiable` rather than hidden. **Not done:**
+usage is not summed across a run's calls, there is no turn/token/byte/concurrency/
+retry budget, and the routing consequences this section lists ("latency and cost
+budgets" as a routing input) remain open — routing still does not consider a
+budget when selecting a route.
 
 ## Normalized Events
 

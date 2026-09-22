@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::stream::CallLimits;
+use crate::model::stream::{CallLimits, Usage};
 use crate::time::UtcTimestamp;
 
 /// The largest accepted step timeout, in milliseconds.
@@ -119,6 +119,65 @@ impl RunBudget {
         Ok(self)
     }
 
+    /// Returns which ceiling `usage` breached, if any.
+    ///
+    /// This is what makes a token or cost ceiling a bound rather than a number carried in
+    /// a request. Until this existed, `max_output_tokens` reached the provider and nothing
+    /// compared what came back against it.
+    ///
+    /// The comparison is strictly **greater than**, so a call that used exactly its
+    /// ceiling is inside the budget. That is the opposite boundary convention from
+    /// [`status_at`](Self::status_at), where the deadline instant itself is expired, and
+    /// the two are consistent for the same reason: the boundary belongs to the side that
+    /// cannot do more work. A ceiling of 2048 permits producing token 2048, while a
+    /// deadline of `T` does not permit work at `T` because that work would finish after
+    /// `T`.
+    ///
+    /// An unreported counter cannot breach a ceiling. That is not permissiveness for its
+    /// own sake: refusing on an absent value would fail every run against a provider that
+    /// does not report usage, which is a false failure rather than a safety property.
+    /// [`budget_is_verifiable`](Self::budget_is_verifiable) states the gap instead of
+    /// hiding it.
+    #[must_use]
+    pub fn exceeded_by(&self, usage: &Usage) -> Option<BudgetLimit> {
+        // Checked in a fixed order so two simultaneous breaches always report the same
+        // one, and the output ceiling first because it is the one a run controls
+        // directly.
+        if let (Some(cap), Some(actual)) = (self.max_output_tokens, usage.output_tokens)
+            && actual > cap
+        {
+            return Some(BudgetLimit::OutputTokens);
+        }
+        if let (Some(cap), Some(actual)) =
+            (self.max_cost_microunits, usage.estimated_cost_microunits)
+            && actual > cap
+        {
+            return Some(BudgetLimit::Cost);
+        }
+        None
+    }
+
+    /// Returns whether a token or cost ceiling is set **and** the usage to judge it by was
+    /// reported.
+    ///
+    /// Exposed so a caller can record that a ceiling went unverified rather than reporting
+    /// a silently unchecked budget as an enforced one. A ceiling with no measurement is the
+    /// state most likely to be mistaken for enforcement, because nothing observable
+    /// distinguishes it from a ceiling that was met.
+    #[must_use]
+    pub fn budget_is_verifiable(&self, usage: &Usage) -> bool {
+        let tokens_verifiable = self.max_output_tokens.is_none() || usage.output_tokens.is_some();
+        let cost_verifiable =
+            self.max_cost_microunits.is_none() || usage.estimated_cost_microunits.is_some();
+        tokens_verifiable && cost_verifiable
+    }
+
+    /// Returns whether any token or cost ceiling is set.
+    #[must_use]
+    pub const fn has_consumption_ceiling(&self) -> bool {
+        self.max_output_tokens.is_some() || self.max_cost_microunits.is_some()
+    }
+
     /// Returns the time left before the deadline, or `None` when no deadline is set.
     ///
     /// A deadline that has already passed yields [`BudgetStatus::Expired`], and one that
@@ -200,6 +259,39 @@ impl BudgetStatus {
     #[must_use]
     pub const fn is_permitted(&self) -> bool {
         !matches!(self, Self::Expired { .. })
+    }
+}
+
+/// A consumption ceiling a run breached.
+///
+/// Named rather than reported as a boolean, because the two ceilings have different
+/// remedies: an output-token breach means the model was asked for too much, while a cost
+/// breach means the route was too expensive for the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetLimit {
+    /// Output tokens exceeded [`RunBudget::max_output_tokens`].
+    OutputTokens,
+    /// Estimated cost exceeded [`RunBudget::max_cost_microunits`].
+    Cost,
+}
+
+impl BudgetLimit {
+    /// Returns the stable, namespaced error code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OutputTokens => "run.budget_output_tokens_exceeded",
+            Self::Cost => "run.budget_cost_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for BudgetLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputTokens => formatter.write_str("the run exceeded its output-token budget"),
+            Self::Cost => formatter.write_str("the run exceeded its cost budget"),
+        }
     }
 }
 

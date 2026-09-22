@@ -52,9 +52,9 @@ use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, Workspac
 use jarvis_domain::model::identity::ModelRef;
 use jarvis_domain::model::stream::{
     ContentBlock, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
-    PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome,
+    PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome, Usage,
 };
-use jarvis_domain::run::budget::{BudgetStatus, RunBudget};
+use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget};
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
@@ -124,6 +124,16 @@ pub enum ControllerError {
     /// `run.deadline_exceeded` knows to look at the configured budget; reading a
     /// provider fault would send them to the provider's status page instead.
     DeadlineExceeded,
+    /// The run exceeded a token or cost ceiling it was created under.
+    ///
+    /// Distinct from [`DeadlineExceeded`](Self::DeadlineExceeded) because the two have
+    /// different remedies: a deadline breach means the run was too slow, while a
+    /// consumption breach means it asked for too much output or took too expensive a
+    /// route.
+    BudgetExceeded {
+        /// Which ceiling was breached.
+        limit: BudgetLimit,
+    },
     /// The caller cancelled the run.
     Cancelled,
 }
@@ -146,6 +156,10 @@ impl ControllerError {
             Self::OutputNotPersisted => "Produced output could not be recorded.",
             Self::ClockUnavailable => "The clock could not provide an instant.",
             Self::DeadlineExceeded => "The run exceeded its time budget.",
+            Self::BudgetExceeded { limit } => match limit {
+                BudgetLimit::OutputTokens => "The run exceeded its output-token budget.",
+                BudgetLimit::Cost => "The run exceeded its cost budget.",
+            },
             Self::Cancelled => "The run was cancelled.",
         }
     }
@@ -167,6 +181,7 @@ impl ControllerError {
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
             | Self::DeadlineExceeded
+            | Self::BudgetExceeded { .. }
             | Self::Cancelled => false,
         }
     }
@@ -184,6 +199,7 @@ impl ControllerError {
             Self::OutputNotPersisted => "run.output_not_persisted",
             Self::ClockUnavailable => "run.clock_unavailable",
             Self::DeadlineExceeded => "run.deadline_exceeded",
+            Self::BudgetExceeded { limit } => limit.code(),
             Self::Cancelled => "run.cancelled",
         }
     }
@@ -206,7 +222,8 @@ impl ControllerError {
             | Self::StreamRejected { .. }
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
-            | Self::DeadlineExceeded => RunState::Failed,
+            | Self::DeadlineExceeded
+            | Self::BudgetExceeded { .. } => RunState::Failed,
         }
     }
 
@@ -234,6 +251,10 @@ impl fmt::Display for ControllerError {
             Self::OutputNotPersisted => "produced output could not be recorded",
             Self::ClockUnavailable => "the clock reported no usable instant",
             Self::DeadlineExceeded => "the run exceeded its time budget",
+            Self::BudgetExceeded { limit } => match limit {
+                BudgetLimit::OutputTokens => "the run exceeded its output-token budget",
+                BudgetLimit::Cost => "the run exceeded its cost budget",
+            },
             Self::Cancelled => "the run was cancelled",
         };
         formatter.write_str(text)
@@ -316,6 +337,18 @@ struct ModelTurn<'a> {
 struct DrainedTurn {
     answer: String,
     tool_intent: Option<String>,
+    /// The usage the provider reported, from a `usage.updated` frame or the terminal.
+    ///
+    /// Captured so the run can be judged against its token and cost ceilings. Before
+    /// this, the ceilings reached the provider and nothing compared the result against
+    /// them, so they bounded nothing.
+    usage: Option<Usage>,
+    /// Whether the provider reported any usage at all.
+    ///
+    /// Kept apart from `usage` being `None`, because "the provider said it used nothing"
+    /// and "the provider said nothing" are different facts: the first is a measurement
+    /// against which a ceiling can be checked, the second cannot check anything.
+    usage_reported: bool,
 }
 
 /// Drives one durable run to a terminal state.
@@ -596,6 +629,10 @@ impl RunController {
             Err(error) => return Err(error),
         };
 
+        // Captured before anything is moved out of `drained`, because three paths below
+        // need it and a later borrow would be a borrow of a partially moved value.
+        let usage = usage_of(&drained);
+
         // A tool intent needs the fabric that does not exist yet. Refused with a
         // terminal, typed outcome rather than a fabricated observation.
         if let Some(tool_name) = drained.tool_intent {
@@ -609,15 +646,31 @@ impl RunController {
                 ),
             )
             .await?;
-            self.record_call_outcome(run, call_id, ModelCallState::Failed)
+            self.record_call_outcome_with(run, call_id, ModelCallState::Failed, usage)
                 .await?;
             return Err(ControllerError::ToolsNotImplemented { tool_name });
+        }
+
+        // The run's ceilings are checked against what was actually used. This is what makes
+        // `max_output_tokens` and `max_cost_microunits` bounds rather than numbers carried
+        // in a request: before this, both reached the provider and nothing compared the
+        // result against them.
+        //
+        // The run is failed and the answer discarded. A run that breached a ceiling and
+        // still returned its output would make the ceiling advisory, and a caller who set
+        // one could not tell an enforced limit from a cosmetic one.
+        if let Some(reported) = &usage
+            && let Some(limit) = turn.budget.exceeded_by(reported)
+        {
+            self.finish_expired(run, Some(call_id), "consumption_budget_exceeded")
+                .await?;
+            return Err(ControllerError::BudgetExceeded { limit });
         }
 
         // The call's outcome is recorded before the run moves on, so a completed run
         // never leaves a model call open.
         let completed_at = self.now()?;
-        self.record_call_outcome(run, call_id, ModelCallState::Completed)
+        self.record_call_outcome_with(run, call_id, ModelCallState::Completed, usage)
             .await?;
 
         // AwaitingModel -> Responding -> Completed, then the answer is stored.
@@ -783,6 +836,21 @@ impl RunController {
                     // stream's terminal is still observed: abandoning a stream early
                     // would leave the provider's view and JARVIS's disagreeing.
                     drained.tool_intent.get_or_insert_with(|| tool_name.clone());
+                }
+                // Usage arrives on its own frame or with the terminal, and a provider may
+                // send both. The last one wins rather than the first, because a later frame
+                // is a revision and the terminal's block is the final one — taking the
+                // first would under-count a provider that updates as it goes.
+                //
+                // Both arms assign the same thing, and they are merged rather than
+                // duplicated: a divergence between two copies of "capture the usage" is
+                // exactly how one arrival path would stop being captured.
+                ModelStreamEventKind::UsageUpdated { usage }
+                | ModelStreamEventKind::CallCompleted {
+                    usage: Some(usage), ..
+                } => {
+                    drained.usage = Some(usage.clone());
+                    drained.usage_reported = true;
                 }
                 _ => {}
             }
@@ -977,7 +1045,31 @@ impl RunController {
         call_id: ModelCallId,
         state: ModelCallState,
     ) -> Result<(), ControllerError> {
+        self.record_call_outcome_with(run, call_id, state, None)
+            .await
+    }
+
+    /// Records a model call's terminal outcome along with the usage it reported.
+    ///
+    /// The usage is written here rather than in a separate call so a completed attempt and
+    /// its consumption are one write: an attempt recorded as completed with no usage, then
+    /// updated with usage, leaves a window in which a reconciliation pass reads a finished
+    /// call as having consumed nothing — which is exactly the state a cost ceiling cannot
+    /// check.
+    async fn record_call_outcome_with(
+        &self,
+        run: RunRef,
+        call_id: ModelCallId,
+        state: ModelCallState,
+        usage: Option<Usage>,
+    ) -> Result<(), ControllerError> {
         let completed_at = self.now()?;
+        // The cost is lifted out of the usage block into its own column, because that is
+        // where a cost query reads it. Both are written from one source, so they cannot
+        // disagree.
+        let estimated_cost_microunits = usage
+            .as_ref()
+            .and_then(|reported| reported.estimated_cost_microunits);
         self.model_calls
             .record_outcome(
                 run.workspace,
@@ -986,8 +1078,8 @@ impl RunController {
                     state,
                     provider_request_id: None,
                     continuation_ref: None,
-                    usage: None,
-                    estimated_cost_microunits: None,
+                    usage,
+                    estimated_cost_microunits,
                     finish_reason: None,
                     error_code: None,
                     first_output_at: None,
@@ -1078,6 +1170,16 @@ pub fn selected_model(provider: &dyn ModelProvider) -> Result<ModelRef, Controll
         .first()
         .cloned()
         .ok_or(ControllerError::NoModelServed)
+}
+
+/// Returns the usage a drained turn reported, if any.
+///
+/// A free function because it reads no port and holds no state, and because the same
+/// expression is needed on three paths (the tool refusal, the ceiling check, and the
+/// completion) where a divergence between copies would record a different usage for the
+/// same call.
+fn usage_of(drained: &DrainedTurn) -> Option<Usage> {
+    drained.usage.clone()
 }
 
 /// Builds the normalized model request for one call.

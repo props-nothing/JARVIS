@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
+use jarvis_domain::model::stream::Usage;
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunLifecycle;
 use jarvis_domain::run::state::RunState;
@@ -107,6 +108,8 @@ struct CallRow {
     provider_request_id: Option<String>,
     started_at: UtcTimestamp,
     completed_at: Option<UtcTimestamp>,
+    usage: Option<Usage>,
+    estimated_cost_microunits: Option<u64>,
 }
 
 /// The whole in-memory store.
@@ -202,6 +205,41 @@ impl InMemoryRepositories {
                 .collect())
         })
     }
+
+    /// Returns every call's recorded usage and lifted cost, in insertion order.
+    ///
+    /// Separate from [`recorded_calls`](Self::recorded_calls) because the two answer
+    /// different questions: that one is "did the attempt reach a terminal state", this one is
+    /// "what did it consume". A test for a consumption ceiling needs the second, and a test
+    /// for an abandoned call needs the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn recorded_call_usage(&self) -> Result<Vec<RecordedUsage>, RepositoryError> {
+        self.with(|store| {
+            Ok(store
+                .calls
+                .values()
+                .map(|call| RecordedUsage {
+                    usage: call.usage.clone(),
+                    estimated_cost_microunits: call.estimated_cost_microunits,
+                })
+                .collect())
+        })
+    }
+}
+
+/// What one recorded call consumed, as a test reads it.
+///
+/// A named struct rather than a tuple of two `Option`s: both fields are optional numbers,
+/// and a tuple is where a reader transposes which one is the token count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedUsage {
+    /// The provider-reported or estimated usage block.
+    pub usage: Option<Usage>,
+    /// The cost lifted from that block into its own column.
+    pub estimated_cost_microunits: Option<u64>,
 }
 
 impl RunRepository for InMemoryRepositories {
@@ -735,6 +773,8 @@ impl ModelCallRepository for InMemoryRepositories {
                         provider_request_id: None,
                         started_at: call.started_at,
                         completed_at: None,
+                        usage: None,
+                        estimated_cost_microunits: None,
                     },
                 );
                 Ok(())
@@ -783,6 +823,11 @@ impl ModelCallRepository for InMemoryRepositories {
                 row.provider_request_id
                     .clone_from(&outcome.provider_request_id);
                 row.completed_at = outcome.completed_at;
+                // The usage and its lifted cost are stored together, from one source, so a
+                // ceiling check and the cost query cannot read different amounts for the
+                // same call.
+                row.usage.clone_from(&outcome.usage);
+                row.estimated_cost_microunits = outcome.estimated_cost_microunits;
                 Ok(())
             })
         })

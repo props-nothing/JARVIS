@@ -5,7 +5,10 @@
 //! overflowing millisecond count are the cases that would silently let a run exceed its
 //! budget or fail for the wrong reason.
 
-use super::{BudgetError, BudgetStatus, DEFAULT_RUN_DEADLINE_MS, MAX_STEP_TIMEOUT_MS, RunBudget};
+use super::{
+    BudgetError, BudgetLimit, BudgetStatus, DEFAULT_RUN_DEADLINE_MS, MAX_STEP_TIMEOUT_MS, RunBudget,
+};
+use crate::model::stream::Usage;
 use crate::time::UtcTimestamp;
 
 /// A budget whose deadline is 60 seconds after `at`.
@@ -217,4 +220,139 @@ fn an_unknown_budget_field_is_refused() {
     let error = serde_json::from_str::<RunBudget>(r#"{"max_output_token":10}"#)
         .expect_err("a misspelled limit must not parse");
     assert!(error.to_string().contains("max_output_token"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Consumption ceilings
+//
+// These are what make `max_output_tokens` and `max_cost_microunits` bounds rather than
+// numbers carried in a request. The boundary and the "no measurement" cases matter most:
+// a boundary on the wrong side either refuses a call that fit or admits one that did not,
+// and an absent measurement is the state most easily mistaken for enforcement.
+// ---------------------------------------------------------------------------
+
+/// A budget with only an output-token ceiling.
+fn token_capped(cap: u64) -> RunBudget {
+    RunBudget {
+        max_output_tokens: Some(cap),
+        ..RunBudget::default()
+    }
+}
+
+/// Usage reporting `output_tokens`.
+fn tokens(count: u64) -> Usage {
+    Usage {
+        output_tokens: Some(count),
+        ..Usage::default()
+    }
+}
+
+#[test]
+fn usage_below_or_equal_to_the_ceiling_is_not_a_breach() {
+    // The boundary belongs to the side that can still work: a ceiling of 2048 permits
+    // producing token 2048. This is the opposite convention from the deadline (where the
+    // boundary instant IS expired) and it is consistent — a deadline at `T` does not permit
+    // work at `T`, because that work would finish after `T`.
+    let budget = token_capped(2048);
+    assert_eq!(budget.exceeded_by(&tokens(0)), None);
+    assert_eq!(budget.exceeded_by(&tokens(2047)), None);
+    assert_eq!(
+        budget.exceeded_by(&tokens(2048)),
+        None,
+        "exactly the ceiling is inside the budget",
+    );
+}
+
+#[test]
+fn usage_above_the_ceiling_is_a_breach_naming_the_limit() {
+    let budget = token_capped(2048);
+    assert_eq!(
+        budget.exceeded_by(&tokens(2049)),
+        Some(BudgetLimit::OutputTokens),
+    );
+    assert_eq!(
+        BudgetLimit::OutputTokens.code(),
+        "run.budget_output_tokens_exceeded",
+    );
+}
+
+#[test]
+fn a_cost_breach_is_named_separately_from_a_token_breach() {
+    // The two have different remedies — one says the model was asked for too much, the
+    // other that the route was too expensive — so reporting either as "a budget breach"
+    // would hide which.
+    let budget = RunBudget {
+        max_cost_microunits: Some(50_000),
+        ..RunBudget::default()
+    };
+    let usage = Usage {
+        estimated_cost_microunits: Some(50_001),
+        ..Usage::default()
+    };
+    assert_eq!(budget.exceeded_by(&usage), Some(BudgetLimit::Cost));
+    assert_eq!(BudgetLimit::Cost.code(), "run.budget_cost_exceeded");
+    assert_eq!(budget.exceeded_by(&tokens(1_000_000)), None);
+}
+
+#[test]
+fn a_breached_ceiling_is_reported_stably_when_both_are_breached() {
+    // Both at once must always report the same one, or the same run would be reported
+    // differently on two attempts. The order is fixed: the output ceiling first, because it
+    // is the one the run controls directly.
+    let budget = RunBudget {
+        max_output_tokens: Some(10),
+        max_cost_microunits: Some(10),
+        ..RunBudget::default()
+    };
+    let usage = Usage {
+        output_tokens: Some(11),
+        estimated_cost_microunits: Some(11),
+        ..Usage::default()
+    };
+    assert_eq!(budget.exceeded_by(&usage), Some(BudgetLimit::OutputTokens));
+}
+
+#[test]
+fn an_unreported_counter_cannot_breach_a_ceiling() {
+    // Refusing on an absent value would fail every run against a provider that does not
+    // report usage — a false failure, not a safety property. The honest answer is that the
+    // ceiling went unchecked, which `budget_is_verifiable` states.
+    let budget = RunBudget {
+        max_output_tokens: Some(10),
+        max_cost_microunits: Some(10),
+        ..RunBudget::default()
+    };
+    assert_eq!(budget.exceeded_by(&Usage::default()), None);
+    assert!(
+        !budget.budget_is_verifiable(&Usage::default()),
+        "a ceiling with no measurement must not be reported as verified",
+    );
+}
+
+#[test]
+fn a_ceiling_with_a_measurement_is_verifiable() {
+    let budget = token_capped(10);
+    assert!(budget.budget_is_verifiable(&tokens(5)));
+    assert!(budget.has_consumption_ceiling());
+}
+
+#[test]
+fn a_budget_with_no_consumption_ceiling_is_verifiable_and_does_not_breach() {
+    // No ceiling is trivially satisfied, and it must not be reported as unverifiable — that
+    // would make an unbounded run look like one with an unchecked limit.
+    let budget =
+        RunBudget::with_deadline(UtcTimestamp::parse("2026-09-22T13:00:00Z").expect("valid"));
+    assert!(!budget.has_consumption_ceiling());
+    assert!(budget.budget_is_verifiable(&Usage::default()));
+    assert_eq!(budget.exceeded_by(&tokens(u64::MAX)), None);
+}
+
+#[test]
+fn a_reported_zero_is_a_measurement_and_does_not_exceed_a_positive_ceiling() {
+    // The distinction the `Usage` type exists for: a provider reporting zero is a
+    // measurement, so the ceiling IS verifiable and the run is well inside it.
+    let budget = token_capped(10);
+    let reported_zero = tokens(0);
+    assert!(budget.budget_is_verifiable(&reported_zero));
+    assert_eq!(budget.exceeded_by(&reported_zero), None);
 }

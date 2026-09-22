@@ -996,10 +996,28 @@ Foundation TODO remains incomplete.
   neutral: it means no deadline at all. The bounds were proven to be what makes the tests
   pass by removing them, at which point the three hang tests **hang for 60+ seconds** rather
   than fail. 16 domain tests, 8 controller tests, 2 service tests, and 4 adapter
-  round-trip tests. **Not done:** no token or cost accounting — the ceilings are carried and
-  sent but nothing sums usage against them, so `ACC-073` remains open for token, cost, byte,
-  retry, and concurrency budgets, as do turn budgets (there is still exactly one model turn)
-  and the disconnect case.
+  round-trip tests. **Token and cost ceilings are now enforced too.** The provider's
+  reported usage is captured from **either** arrival path — its own `usage.updated` frame
+  or the terminal's block, since the contract says a usage frame may arrive before, with,
+  or after completion — and the last one wins, because a later frame is a revision and
+  taking the first would under-count a run that then slips past a ceiling it breached. The
+  run's ceilings are checked against that usage before the run is allowed to complete, and
+  a breach **fails the run and discards the answer**: a run that breached a ceiling and
+  still returned its output would make the ceiling advisory, and a caller could not tell an
+  enforced limit from a cosmetic one. The comparison is strictly greater-than, so a call
+  that used exactly its ceiling is inside the budget — the opposite boundary convention
+  from the deadline, and consistent with it, because a deadline at `T` does not permit work
+  at `T` (that work finishes after `T`) while a token ceiling of 2048 permits producing
+  token 2048. A ceiling with **no reported usage cannot breach**, because failing every run
+  against a provider that omits usage is a false failure rather than a safety property;
+  `budget_is_verifiable` states the gap instead of hiding it, since an unchecked ceiling is
+  the state most easily mistaken for an enforced one. The usage and the cost lifted from it
+  are written in one call, so a ceiling check and a cost query cannot read different amounts
+  for the same call. Falsified by making the comparison never breach, at which point all
+  three enforcement tests fail. **Not done:** usage is not yet summed **across** a run's
+  calls (there is one call today, so the ceilings are per-call in effect), there is no turn
+  budget, no byte or concurrency budget, no retry budget, and the disconnect case remains
+  open — so `ACC-073` is closer but not closed.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider

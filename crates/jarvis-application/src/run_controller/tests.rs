@@ -15,8 +15,10 @@ use jarvis_domain::ids::{
     ConversationId, CorrelationId, PrincipalId, RequestId, RunId, WorkspaceId,
 };
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
-use jarvis_domain::model::stream::{FinishReason, ModelCallRequest, ModelStreamEventKind, Role};
-use jarvis_domain::run::budget::RunBudget;
+use jarvis_domain::model::stream::{
+    FinishReason, ModelCallRequest, ModelStreamEventKind, Role, Usage,
+};
+use jarvis_domain::run::budget::{BudgetLimit, RunBudget};
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
@@ -1017,4 +1019,272 @@ async fn a_deadline_exceeded_outcome_names_its_own_code_and_message() {
         error.message()
     );
     assert!(!error.is_unimplemented());
+}
+
+// ---------------------------------------------------------------------------
+// Consumption ceilings
+//
+// Until these existed, `max_output_tokens` reached the provider and nothing compared what
+// came back against it, so the ceiling bounded nothing. Each test below asserts the run was
+// left *failed* and its output discarded, which is what separates an enforced limit from an
+// advisory one — a run that breached a ceiling and still returned its answer would make the
+// ceiling cosmetic.
+// ---------------------------------------------------------------------------
+
+/// Usage reporting `output_tokens` and `estimated_cost_microunits`.
+fn reported_usage(output_tokens: u64, cost: u64) -> Usage {
+    Usage {
+        output_tokens: Some(output_tokens),
+        estimated_cost_microunits: Some(cost),
+        provider_reported: true,
+        ..Usage::default()
+    }
+}
+
+/// A provider that answers with `text` and reports `usage` with its terminal.
+fn answering_with_usage(text: &str, usage: Usage) -> Arc<dyn ModelProvider> {
+    Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", text)
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: Some(usage),
+                refused: false,
+            }),
+    )
+}
+
+/// A budget with only an output-token ceiling.
+fn token_capped(cap: u64) -> RunBudget {
+    RunBudget {
+        max_output_tokens: Some(cap),
+        ..RunBudget::default()
+    }
+}
+
+#[tokio::test]
+async fn a_run_that_exceeds_its_output_token_ceiling_is_failed_and_its_answer_discarded() {
+    // The headline case for consumption budgets. The output is discarded deliberately: a
+    // run that breached a ceiling and still returned its answer would make the ceiling
+    // advisory, and a caller could not tell an enforced limit from a cosmetic one.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        reported_usage(2049, 100),
+    ));
+    seed_with_budget(&fixture, token_capped(2048)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a run over its token ceiling cannot complete");
+    assert_eq!(
+        error,
+        ControllerError::BudgetExceeded {
+            limit: BudgetLimit::OutputTokens
+        },
+    );
+    assert_eq!(error.code(), "run.budget_output_tokens_exceeded");
+    assert_eq!(error.terminal_state(), RunState::Failed);
+    assert!(!error.retryable(), "the same output would breach again");
+
+    // The durable state, not the returned value, is the proof.
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+
+    // And the answer was not stored as the assistant's message.
+    let messages = fixture
+        .repositories
+        .load_messages(context().workspace_id, conversation(), None, 10)
+        .await
+        .expect("messages are readable");
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content.contains("Hello there")),
+        "a discarded answer must not be persisted: {messages:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_run_at_exactly_its_token_ceiling_still_completes() {
+    // The boundary, in the direction that matters: a ceiling of 2048 permits producing
+    // token 2048. An off-by-one here would refuse runs that fit inside their budget.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        reported_usage(2048, 100),
+    ));
+    seed_with_budget(&fixture, token_capped(2048)).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("a run inside its ceiling completes");
+    assert_eq!(outcome.state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn a_run_that_exceeds_its_cost_ceiling_is_failed() {
+    // The other ceiling, and it is a separate fact: the token count was fine and the route
+    // was too expensive, which is a routing problem rather than a prompt one.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        reported_usage(10, 50_001),
+    ));
+    let budget = RunBudget {
+        max_cost_microunits: Some(50_000),
+        ..RunBudget::default()
+    };
+    seed_with_budget(&fixture, budget).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a run over its cost ceiling cannot complete");
+    assert_eq!(
+        error,
+        ControllerError::BudgetExceeded {
+            limit: BudgetLimit::Cost
+        },
+    );
+    assert_eq!(error.code(), "run.budget_cost_exceeded");
+}
+
+#[tokio::test]
+async fn a_ceiling_with_no_reported_usage_does_not_fail_the_run() {
+    // A provider that reports no usage cannot be judged against a ceiling. Failing the run
+    // would be a false failure for every provider that omits usage; the honest behaviour is
+    // to complete and leave the ceiling unverified.
+    let fixture = fixture(answering("Hello there"));
+    seed_with_budget(&fixture, token_capped(1)).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("an unmeasured call is not refused");
+    assert_eq!(outcome.state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn the_usage_the_provider_reported_is_recorded_on_the_call() {
+    // The usage has to reach storage, or the ceiling check is a decision nothing can audit
+    // afterwards. Both the block and the lifted cost column come from one source.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        reported_usage(1234, 5678),
+    ));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    let stored = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the calls are readable");
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let recorded = &stored[0];
+    let usage = recorded
+        .usage
+        .as_ref()
+        .expect("the reported usage is stored");
+    assert_eq!(usage.output_tokens, Some(1234));
+    assert!(usage.provider_reported);
+    assert_eq!(
+        recorded.estimated_cost_microunits,
+        Some(5678),
+        "the cost is lifted into its own column from the same source",
+    );
+}
+
+#[tokio::test]
+async fn usage_from_a_separate_update_frame_is_recorded_too() {
+    // The contract says a `usage.updated` frame may arrive before, with, or *after* output
+    // completion, so a controller that only read the terminal's block would miss a
+    // provider that reports usage on its own frame.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "Hello there")
+            .emit(ModelStreamEventKind::UsageUpdated {
+                usage: reported_usage(777, 888),
+            })
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let stored = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the calls are readable");
+    let recorded = stored.first().expect("the call was recorded");
+    assert_eq!(
+        recorded
+            .usage
+            .as_ref()
+            .and_then(|reported| reported.output_tokens),
+        Some(777),
+        "a usage frame the provider sent on its own must be captured",
+    );
+}
+
+#[tokio::test]
+async fn a_later_usage_frame_revises_an_earlier_one() {
+    // A provider that updates as it goes sends several. The last wins, because a later
+    // frame is a revision and the terminal's block is final; taking the first would
+    // under-count and let a run slip past a ceiling it actually breached.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "Hello there")
+            .emit(ModelStreamEventKind::UsageUpdated {
+                usage: reported_usage(10, 10),
+            })
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: Some(reported_usage(3000, 3000)),
+                refused: false,
+            }),
+    ));
+    seed_with_budget(&fixture, token_capped(2048)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("the revised, larger usage must breach the ceiling");
+    assert_eq!(
+        error,
+        ControllerError::BudgetExceeded {
+            limit: BudgetLimit::OutputTokens
+        },
+    );
+}
+
+#[tokio::test]
+async fn a_breached_ceiling_is_reported_as_its_own_code_and_message() {
+    let error = ControllerError::BudgetExceeded {
+        limit: BudgetLimit::Cost,
+    };
+    assert_eq!(error.code(), "run.budget_cost_exceeded");
+    assert_eq!(error.terminal_state(), RunState::Failed);
+    assert!(
+        error.message().contains("cost budget"),
+        "{}",
+        error.message()
+    );
+    assert!(!error.is_unimplemented());
+    assert!(!error.retryable());
 }

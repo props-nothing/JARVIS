@@ -241,7 +241,7 @@ being replaced by a failure, and it is asserted directly.
 
 This document's native-runtime step 5 says "repeat within turn, token, cost, time,
 and tool budgets", and its "durable run record" list includes "model/tool usage and
-budget state". The **time** half of that is implemented.
+budget state". The **time**, **token**, and **cost** halves of that are implemented.
 
 `jarvis_domain::run::budget` holds the budget and the pure arithmetic that decides
 whether it is spent. The arithmetic is in the domain because the answer must not
@@ -279,12 +279,31 @@ the provider's status page, while the answer here is in the configured budget. I
 also deliberately **not** retryable — an expired deadline leaves no budget to retry
 inside, and the retry decision belongs to whichever layer owns the budget.
 
+**Consumption ceilings are checked, not merely sent.** The provider's reported usage
+is captured from either arrival path — its own `usage.updated` frame or the terminal's
+block, whichever comes last — and compared against the ceilings before a run may
+complete. A breach fails the run and **discards its answer**: a run that breached a
+ceiling and still returned its output would make the ceiling advisory, and a caller who
+set one could not tell an enforced limit from a cosmetic one. The comparison is
+strictly greater-than, so exactly-ceiling usage is inside the budget; that is the
+opposite boundary convention from the deadline and consistent with it, because a
+deadline at `T` does not permit work at `T` while a token ceiling of 2048 permits
+producing token 2048.
+
+A ceiling with **no reported usage cannot breach**. Refusing on an absent value would
+fail every run against a provider that omits usage, which is a false failure rather
+than a safety property, so `budget_is_verifiable` reports the gap instead of hiding
+it — an unchecked ceiling is the state most easily mistaken for an enforced one. The
+usage block and the cost lifted from it are written in a single call, so a ceiling
+check and a cost query cannot read different amounts for the same call.
+
 **What is not implemented, and is not claimed:** the token and cost ceilings are
-carried into the request but nothing sums usage against them, so a run cannot yet
-*refuse* a step for exceeding a token budget; there is no turn budget, because the
-controller still performs exactly one model turn; and `agent_steps.timeout_ms` has no
-port, so per-step timeouts exist only as the run-level `step_timeout_ms`. `ACC-073`
-therefore remains open for token, cost, byte, retry, and concurrency exhaustion.
+enforced per call, but usage is **not summed across a run's calls** — there is one
+call today, so the ceilings are per-call in effect and a multi-turn run would need
+the sum; there is no turn budget, because the controller still performs exactly one
+model turn; and `agent_steps.timeout_ms` has no port, so per-step timeouts exist only
+as the run-level `step_timeout_ms`. `ACC-073` therefore remains open for turn, byte,
+retry, and concurrency exhaustion.
 
 ## Durable Run Record
 

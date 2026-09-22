@@ -1587,6 +1587,139 @@ async fn the_recovery_read_carries_the_deadline_and_budget_too() {
 }
 
 #[tokio::test]
+async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
+    // The ceiling check reads usage back through this adapter, so the write and the read
+    // must agree — and the cost must land in its own column *from the same source* as the
+    // block, because a cost query reads the column while the ceiling reads the block.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let call_id = model_call_id();
+    repositories
+        .record_attempt(NewModelCall {
+            id: call_id,
+            workspace_id: workspace(),
+            run_id: run_id(),
+            logical_call_id: call_id,
+            attempt: 1,
+            model: model(),
+            request_fingerprint: None,
+            started_at: now(),
+        })
+        .await
+        .expect("the attempt is recorded");
+
+    let usage = jarvis_domain::model::stream::Usage {
+        input_tokens: Some(100),
+        output_tokens: Some(2049),
+        cached_input_tokens: Some(10),
+        reasoning_tokens: Some(5),
+        provider_reported: true,
+        estimated_cost_microunits: Some(5678),
+        currency: Some("usd".to_owned()),
+    };
+    repositories
+        .record_outcome(
+            workspace(),
+            call_id,
+            ModelCallOutcome {
+                state: ModelCallState::Completed,
+                provider_request_id: Some("req-1".to_owned()),
+                continuation_ref: None,
+                usage: Some(usage.clone()),
+                estimated_cost_microunits: usage.estimated_cost_microunits,
+                finish_reason: Some(jarvis_domain::model::stream::FinishReason::Stop),
+                error_code: None,
+                first_output_at: None,
+                completed_at: Some(now()),
+            },
+        )
+        .await
+        .expect("the outcome is recorded");
+
+    let stored = repositories
+        .load_attempt(workspace(), call_id)
+        .await
+        .expect("the attempt loads");
+    assert_eq!(stored.state, ModelCallState::Completed);
+
+    // Read the two columns directly, because `StoredModelCall` deliberately exposes only
+    // what a caller needs and usage is not part of it. The adapter's own write is what is
+    // under test here.
+    let row =
+        sqlx::query("SELECT usage_json, estimated_cost_microunits FROM model_calls WHERE id = ?")
+            .bind(call_id.to_string())
+            .fetch_one(repositories.pool())
+            .await
+            .expect("the row is readable");
+    let encoded: Option<String> = sqlx::Row::try_get(&row, "usage_json").expect("usage_json");
+    let encoded = encoded.expect("the usage block is stored");
+    let decoded: jarvis_domain::model::stream::Usage =
+        serde_json::from_str(&encoded).expect("the stored usage is readable");
+    assert_eq!(decoded, usage, "the whole block must round-trip");
+    assert_eq!(decoded.output_tokens, Some(2049));
+
+    let cost: Option<i64> =
+        sqlx::Row::try_get(&row, "estimated_cost_microunits").expect("the cost column");
+    assert_eq!(
+        cost,
+        Some(5678),
+        "the cost is written to its own column from the same source",
+    );
+}
+
+#[tokio::test]
+async fn a_call_with_no_reported_usage_stores_no_block_and_no_cost() {
+    // The negative direction, and the one a ceiling must not misread: an unreported usage is
+    // absent, never a measured zero, so a ceiling cannot be checked against it.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let call_id = model_call_id();
+    repositories
+        .record_attempt(NewModelCall {
+            id: call_id,
+            workspace_id: workspace(),
+            run_id: run_id(),
+            logical_call_id: call_id,
+            attempt: 1,
+            model: model(),
+            request_fingerprint: None,
+            started_at: now(),
+        })
+        .await
+        .expect("the attempt is recorded");
+    repositories
+        .record_outcome(
+            workspace(),
+            call_id,
+            ModelCallOutcome {
+                state: ModelCallState::Completed,
+                provider_request_id: None,
+                continuation_ref: None,
+                usage: None,
+                estimated_cost_microunits: None,
+                finish_reason: None,
+                error_code: None,
+                first_output_at: None,
+                completed_at: Some(now()),
+            },
+        )
+        .await
+        .expect("the outcome is recorded");
+
+    let row =
+        sqlx::query("SELECT usage_json, estimated_cost_microunits FROM model_calls WHERE id = ?")
+            .bind(call_id.to_string())
+            .fetch_one(repositories.pool())
+            .await
+            .expect("the row is readable");
+    let encoded: Option<String> = sqlx::Row::try_get(&row, "usage_json").expect("usage_json");
+    assert_eq!(encoded, None, "an unreported usage stores no block");
+    let cost: Option<i64> =
+        sqlx::Row::try_get(&row, "estimated_cost_microunits").expect("the cost column");
+    assert_eq!(cost, None, "and no cost, rather than a measured zero");
+}
+
+#[tokio::test]
 async fn a_delta_for_a_foreign_run_is_refused_rather_than_orphaned() {
     use jarvis_application::live_events::StreamDeltaSink as _;
 
