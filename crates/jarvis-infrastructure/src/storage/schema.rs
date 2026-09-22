@@ -11,11 +11,12 @@ use super::error::StorageError;
 
 /// The schema version this binary targets and writes.
 ///
-/// Bumped to `2` by `000002_conversations_runs.sql`, which adds the conversation,
-/// run, step, activity, and model-call tables. The minimum reader stays at `1`
-/// because that migration is purely additive: a binary that only understands the
-/// initial schema can still read a database that has the added tables.
-pub const TARGET_SCHEMA_VERSION: i64 = 2;
+/// Bumped to `3` by `000003_idempotency.sql`, which adds the idempotency records
+/// the local control API's `Idempotency-Key` requirement needs. The minimum reader
+/// stays at `1`: both later migrations are purely additive, so a binary that
+/// understands only the initial schema can still read a database that has the
+/// added tables.
+pub const TARGET_SCHEMA_VERSION: i64 = 3;
 
 /// The lowest schema version this binary can still read.
 ///

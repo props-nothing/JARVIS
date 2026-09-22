@@ -542,6 +542,22 @@ impl ScriptedProvider {
         }
     }
 
+    /// Creates a provider that serves **no** model.
+    ///
+    /// A real state, not a stub: it models a daemon whose provider is unconfigured, so
+    /// a run against it reaches `run.no_model_served` rather than being served by a
+    /// fabricated fallback. Composed rather than constructed at each site so the
+    /// "serves nothing" shape has one definition.
+    #[must_use]
+    pub fn serving_no_model() -> Self {
+        Self {
+            models: Vec::new(),
+            script: Vec::new(),
+            open_failure: None,
+            ids: Arc::new(CountingIds::new()),
+        }
+    }
+
     /// Injects the identifier generator used to stamp frames.
     #[must_use]
     pub fn with_ids(mut self, ids: Arc<dyn IdGenerator>) -> Self {

@@ -10,10 +10,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use jarvis_infrastructure::auth::ClientCredentialPath;
-use jarvis_infrastructure::client::{ClientError, discover, get_authenticated, read_credential};
+use jarvis_infrastructure::client::{
+    ClientError, Discovered, discover, get_authenticated, get_with_status, post_authenticated,
+    read_credential,
+};
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
 use jarvis_infrastructure::diagnostics::{
     ClientReachability, DaemonDescriptor, DiagnosticsEnvironment, EnvironmentSummary, Redactor,
@@ -62,6 +66,16 @@ struct Cli {
 enum Command {
     /// Report daemon and profile status.
     Status,
+    /// Ask a question and print the run's answer.
+    Ask {
+        /// The text to send.
+        text: String,
+    },
+    /// Inspect durable runs.
+    Runs {
+        #[command(subcommand)]
+        action: RunsAction,
+    },
     /// Inspect the resolved configuration without printing secret values.
     Config,
     /// List local log files.
@@ -213,6 +227,8 @@ async fn run(cli: Cli) -> ExitCode {
 
     match cli.command {
         Command::Status => status(paths).await,
+        Command::Ask { text } => ask(paths, &text).await,
+        Command::Runs { action } => runs(paths, action).await,
         Command::Config => config(paths),
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
@@ -226,6 +242,344 @@ async fn run(cli: Cli) -> ExitCode {
         } => verify_release(&manifest, signature, artifacts),
         Command::Install { action, root } => install(paths, action, root),
     }
+}
+
+/// Run inspection a caller can request.
+///
+/// `show` and `events` are read-only; `cancel` changes durable state and is therefore its
+/// own explicit action, so a bare `jarvis runs` can never stop anything.
+#[derive(Debug, Subcommand)]
+enum RunsAction {
+    /// Print one run's state.
+    Show {
+        /// The run identifier.
+        run_id: String,
+    },
+    /// Print a run's events as a stream.
+    Events {
+        /// The run identifier.
+        run_id: String,
+        /// Resume after this event identifier.
+        #[arg(long = "last-event-id", value_name = "ID")]
+        last_event_id: Option<String>,
+    },
+    /// Request cancellation of a run.
+    Cancel {
+        /// The run identifier.
+        run_id: String,
+    },
+}
+
+/// The daemon connection a command needs.
+struct ClientState {
+    discovered: Discovered,
+    credential: String,
+}
+
+/// Resolves the daemon and credential a command needs.
+///
+/// Shared by every command that talks to the daemon, so the credential read, the
+/// discovery read, and the failure reporting cannot differ between them.
+fn daemon_client(paths: &ProfilePaths) -> Result<ClientState, ClientError> {
+    let discovered = discover(&discovery_path_for(paths))?;
+    let credential_path = paths.config_dir().join("client-credential");
+    let credential = read_credential(&credential_path)?;
+    Ok(ClientState {
+        discovered,
+        credential,
+    })
+}
+
+/// Sends one question and prints the answer.
+///
+/// The command returns as soon as the run is created and then follows it, because a run
+/// can outlive the request that created it: printing the create response and exiting
+/// would leave the operator without the answer they asked for.
+async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
+    if text.trim().is_empty() {
+        eprintln!("error: the question is empty");
+        return ExitCode::from(EXIT_ATTENTION);
+    }
+    let state = match daemon_client(paths) {
+        Ok(state) => Arc::new(state),
+        Err(error) => return report_client_error(&error),
+    };
+    let body = format!(
+        concat!(
+            r#"{{"conversation_id":null,"input":{{"type":"text","text":{}}},"#,
+            r#""runtime":"jarvis-native","model_policy":{{"policy_id":"default","version":1}}}}"#
+        ),
+        json_string(text),
+    );
+    let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
+    let (status, response) = match post_authenticated(
+        &state.discovered,
+        &state.credential,
+        "/api/v1/runs",
+        API_MAJOR,
+        &headers,
+        &body,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return report_client_error(&error),
+    };
+    if !(200..300).contains(&status) {
+        eprintln!("error: {response}");
+        return ExitCode::from(EXIT_ATTENTION);
+    }
+    let Some(run_id) = serde_json::from_str::<serde_json::Value>(&response)
+        .ok()
+        .and_then(|value| value["run_id"].as_str().map(str::to_owned))
+    else {
+        eprintln!("error: the daemon response has no run id");
+        return ExitCode::from(EXIT_ATTENTION);
+    };
+
+    follow_run(&state, &run_id).await
+}
+
+/// Follows a run's events until it reaches a terminal state, printing its answer.
+async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
+    // The stream is polled rather than held open, because this build serves the events
+    // endpoint as a bounded replay rather than a live follow. The loop is what a client
+    // does against that shape: reconnect with `Last-Event-ID` until a terminal event
+    // arrives. It is bounded so a run that never finishes cannot hang the command.
+    let mut last_event_id: Option<String> = None;
+    let mut streamed = false;
+    for _ in 0..600 {
+        let extra = last_event_id
+            .as_ref()
+            .map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+        let (status, body) = match get_with_status(
+            &state.discovered,
+            &state.credential,
+            &format!("/api/v1/runs/{run_id}/events"),
+            API_MAJOR,
+            &extra,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return report_client_error(&error),
+        };
+        if !(200..300).contains(&status) {
+            eprintln!("error: {body}");
+            return ExitCode::from(EXIT_ATTENTION);
+        }
+
+        let mut terminal: Option<String> = None;
+        for frame in parse_sse(&body) {
+            if let Some(id) = frame.id.clone() {
+                last_event_id = Some(id);
+            }
+            if frame.event == "run.output_text.delta"
+                && let Some(delta) = frame.payload("delta")
+            {
+                print!("{delta}");
+                streamed = true;
+            }
+            if frame.event == "run.completed"
+                || frame.event == "run.failed"
+                || frame.event == "run.cancelled"
+            {
+                terminal = Some(frame.event);
+            }
+        }
+        if let Some(event) = terminal {
+            if streamed {
+                println!();
+            }
+            if event == "run.completed" {
+                return ExitCode::SUCCESS;
+            }
+            // A failed or cancelled run is reported by its own event, so an operator
+            // sees what happened rather than only that the command did not succeed.
+            eprintln!("error: {}", event.replace("run.", "run "));
+            return ExitCode::from(EXIT_ATTENTION);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    eprintln!("error: the run did not reach a terminal state in time");
+    ExitCode::from(EXIT_ATTENTION)
+}
+
+/// Inspects a run.
+async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
+    let state = match daemon_client(paths) {
+        Ok(state) => state,
+        Err(error) => return report_client_error(&error),
+    };
+    match action {
+        RunsAction::Show { run_id } => {
+            let (status, body) = match get_with_status(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/runs/{run_id}"),
+                API_MAJOR,
+                "",
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return report_client_error(&error),
+            };
+            if !(200..300).contains(&status) {
+                eprintln!("error: {body}");
+                return ExitCode::from(EXIT_ATTENTION);
+            }
+            // The daemon's own response is printed rather than a re-derived summary, so
+            // the client cannot disagree with the daemon about a run's state.
+            println!("{body}");
+            ExitCode::SUCCESS
+        }
+        RunsAction::Events {
+            run_id,
+            last_event_id,
+        } => {
+            let extra =
+                last_event_id.map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+            let (status, body) = match get_with_status(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/runs/{run_id}/events"),
+                API_MAJOR,
+                &extra,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return report_client_error(&error),
+            };
+            if !(200..300).contains(&status) {
+                eprintln!("error: {body}");
+                return ExitCode::from(EXIT_ATTENTION);
+            }
+            print!("{body}");
+            ExitCode::SUCCESS
+        }
+        RunsAction::Cancel { run_id } => {
+            let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
+            let (status, body) = match post_authenticated(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/runs/{run_id}/cancel"),
+                API_MAJOR,
+                &headers,
+                r#"{"reason":"user_requested"}"#,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return report_client_error(&error),
+            };
+            if !(200..300).contains(&status) {
+                eprintln!("error: {body}");
+                return ExitCode::from(EXIT_ATTENTION);
+            }
+            println!("{body}");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// One parsed server-sent event.
+struct SseFrame {
+    id: Option<String>,
+    event: String,
+    data: String,
+}
+
+impl SseFrame {
+    /// Reads one field out of the event's JSON payload.
+    fn payload(&self, field: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.data)
+            .ok()?
+            .get("payload")?
+            .get(field)?
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+/// Parses SSE frames out of a response body.
+///
+/// A comment line is skipped, which is what the contract requires of a keepalive: it
+/// carries no `id` and must not be mistaken for an event or consume a sequence.
+fn parse_sse(body: &str) -> Vec<SseFrame> {
+    let mut frames = Vec::new();
+    let mut id = None;
+    let mut event = None;
+    let mut data = String::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            if let Some(event_type) = event.take() {
+                frames.push(SseFrame {
+                    id: id.take(),
+                    event: event_type,
+                    data: std::mem::take(&mut data),
+                });
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("id: ") {
+            id = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("event: ") {
+            event = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("data: ") {
+            value.clone_into(&mut data);
+        }
+        // A line beginning with `:` is a comment and is deliberately ignored, so a
+        // keepalive cannot be mistaken for an event.
+    }
+    frames
+}
+
+/// Encodes a string as a JSON string literal.
+///
+/// Hand-written rather than taking a JSON dependency in the CLI for one value, and it
+/// escapes everything a JSON string may not contain, so a question with a quote or a
+/// newline cannot corrupt the request body.
+fn json_string(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if control < '\u{20}' => {
+                // `write!` rather than `push_str(&format!(..))`, which would allocate a
+                // temporary string per control character.
+                let _ = write!(out, "\\u{:04x}", control as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Generates an idempotency key for one command.
+///
+/// A fresh key per invocation is deliberate: the contract makes a *repeat with the same
+/// key* idempotent, and an operator typing `jarvis ask` twice is issuing two commands
+/// rather than retrying one.
+///
+/// The value is derived from the clock and the process rather than from a random source,
+/// because this is the only place the CLI needs one and a key is only ever compared for
+/// equality — it is never a secret and never a security token. A cryptographic source
+/// would be a dependency the research gate requires evidence for, and using one here
+/// would imply the value is a credential, which it is not.
+fn idempotency_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("cli-{}-{nanos}", std::process::id())
 }
 
 /// Reports daemon and profile status from the authenticated endpoint.
@@ -1035,7 +1389,13 @@ async fn repair(paths: &ProfilePaths, confirm: bool) -> ExitCode {
 
 /// Prints a client error with its code and actionable advice.
 fn report_client_error(error: &ClientError) -> ExitCode {
-    eprintln!("error: {}", error.code());
+    // A daemon rejection is reported with the daemon's **own** code, because
+    // `jarvis.daemon_rejected` only says a rejection occurred — an operator reading it
+    // cannot tell an unknown run from a reused idempotency key or a rejected credential.
+    match error.daemon_code() {
+        Some(code) => eprintln!("error: {code}"),
+        None => eprintln!("error: {}", error.code()),
+    }
     eprintln!("advice: {}", error.advice());
     ExitCode::from(EXIT_ATTENTION)
 }
@@ -1048,7 +1408,10 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, InstallAction, StatusBody, parse_status};
+    use super::{
+        Cli, Command, InstallAction, StatusBody, idempotency_key, json_string, parse_sse,
+        parse_status,
+    };
     use clap::Parser as _;
 
     #[test]
@@ -1066,6 +1429,8 @@ mod tests {
                 "verify-release",
             ),
             (vec!["jarvis", "install"], "install"),
+            (vec!["jarvis", "ask", "hello"], "ask"),
+            (vec!["jarvis", "runs", "show", "abc"], "runs"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -1078,6 +1443,8 @@ mod tests {
                 Command::Repair { .. } => "repair",
                 Command::VerifyRelease { .. } => "verify-release",
                 Command::Install { .. } => "install",
+                Command::Ask { .. } => "ask",
+                Command::Runs { .. } => "runs",
             };
             assert_eq!(actual, expected);
         }
@@ -1337,7 +1704,9 @@ mod tests {
                     | Command::SupportBundle { .. }
                     | Command::Repair { .. }
                     | Command::VerifyRelease { .. }
-                    | Command::Install { .. } => String::from("unexpected"),
+                    | Command::Install { .. }
+                    | Command::Ask { .. }
+                    | Command::Runs { .. } => String::from("unexpected"),
                 }
             })
             .collect();
@@ -1408,5 +1777,85 @@ mod tests {
     fn help_and_version_are_reported_through_clap_errors() {
         assert!(Cli::try_parse_from(["jarvis", "--help"]).is_err());
         assert!(Cli::try_parse_from(["jarvis", "--version"]).is_err());
+    }
+
+    #[test]
+    fn a_run_event_stream_is_parsed_into_ordered_frames() {
+        // The parser is the client's half of the SSE contract, so it is asserted against
+        // the exact framing the daemon renders: an `id`, an `event`, a `data` document,
+        // and a blank-line terminator.
+        let body = concat!(
+            "id: 0195f4f1-0475-7613-a92c-edf01183e909\n",
+            "event: run.output_text.delta\n",
+            "data: {\"payload\":{\"item_id\":\"out-1\",\"delta\":\"Hello\"}}\n",
+            "\n",
+            ": keepalive\n",
+            "\n",
+            "id: 0195f4f1-0475-7613-a92c-edf01183e90a\n",
+            "event: run.completed\n",
+            "data: {\"payload\":null}\n",
+            "\n",
+        );
+        let frames = parse_sse(body);
+        assert_eq!(frames.len(), 2, "a keepalive is not an event");
+        assert_eq!(frames[0].event, "run.output_text.delta");
+        assert_eq!(frames[0].payload("delta").as_deref(), Some("Hello"));
+        assert_eq!(
+            frames[0].id.as_deref(),
+            Some("0195f4f1-0475-7613-a92c-edf01183e909"),
+        );
+        assert_eq!(frames[1].event, "run.completed");
+        // The terminal event's payload is not an object, so a field read yields nothing
+        // rather than a fabricated value.
+        assert_eq!(frames[1].payload("delta"), None);
+    }
+
+    #[test]
+    fn a_question_is_encoded_so_it_cannot_corrupt_the_request_body() {
+        // The encoder exists so a quote or a newline in a question cannot produce a body
+        // the daemon refuses — which would look like a client bug rather than a quoting
+        // one.
+        assert_eq!(json_string("hello"), "\"hello\"");
+        assert_eq!(json_string("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(json_string("a\nb"), "\"a\\nb\"");
+        assert_eq!(json_string("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(json_string("tab\there"), "\"tab\\there\"");
+        // A control character that has no short escape is unicode-escaped, so it cannot
+        // appear raw in a JSON string.
+        assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
+        // A multi-byte character is passed through unchanged rather than mangled.
+        assert_eq!(json_string("héllo — ok"), "\"héllo — ok\"");
+    }
+
+    #[test]
+    fn an_idempotency_key_is_fresh_per_command_and_is_not_a_secret() {
+        // The key only has to differ between two invocations, because the contract's
+        // idempotency is about a *repeat with the same key*. It is deliberately not
+        // random: it is not a credential and never grants anything.
+        let first = idempotency_key();
+        let second = idempotency_key();
+        assert_ne!(first, second, "two commands must not share a key");
+        assert!(first.starts_with("cli-"), "{first}");
+        assert!(!first.contains('\0'), "{first}");
+    }
+
+    #[test]
+    fn a_bare_runs_command_cannot_cancel_a_run() {
+        // `cancel` is a named subcommand, so the shortest invocation is read-only. This
+        // is the same safety property `service` and `install` have.
+        assert!(Cli::try_parse_from(["jarvis", "runs"]).is_err());
+        for word in ["show", "events", "cancel"] {
+            let cli = Cli::try_parse_from(["jarvis", "runs", word, "abc"]).expect("parses");
+            assert!(
+                matches!(cli.command, Command::Runs { .. }),
+                "runs {word} must parse",
+            );
+        }
+        // A resume position is an option, not a positional, so it cannot be mistaken for
+        // a run identifier.
+        assert!(
+            Cli::try_parse_from(["jarvis", "runs", "events", "abc", "--last-event-id", "id"])
+                .is_ok()
+        );
     }
 }

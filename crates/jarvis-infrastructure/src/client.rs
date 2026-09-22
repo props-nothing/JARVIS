@@ -39,6 +39,8 @@ pub enum ClientError {
     Timeout,
     /// The daemon answered with an error.
     Rejected {
+        /// The HTTP status the daemon returned.
+        status: u16,
         /// The machine code the daemon returned.
         code: String,
     },
@@ -63,6 +65,19 @@ impl ClientError {
         }
     }
 
+    /// Returns the machine code the daemon reported, when it reported one.
+    ///
+    /// A caller prints this rather than the transport-level code, because the daemon's
+    /// code names the actual reason while `jarvis.daemon_rejected` only says a rejection
+    /// occurred.
+    #[must_use]
+    pub fn daemon_code(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
     /// Returns an actionable, non-secret message for the operator.
     #[must_use]
     pub fn advice(&self) -> &'static str {
@@ -75,12 +90,32 @@ impl ClientError {
                 "This profile has no enrolled client. Run `jarvisd` once to enroll the owner."
             }
             Self::Timeout => "The daemon did not answer in time. Check `jarvis doctor`.",
-            Self::Rejected { .. } => {
-                "The daemon refused the request. Check the client credential and API version."
-            }
+            // The advice follows the status, because blaming credentials for a `404`
+            // sends an operator to inspect the wrong thing entirely.
+            Self::Rejected { status, .. } => rejection_advice(*status),
             Self::MalformedResponse => "The daemon response could not be read.",
             Self::Transport => "The daemon is not reachable on its published address.",
         }
+    }
+}
+
+/// Returns the operator's next step for a refusal, by status.
+///
+/// The status is the only part of a refusal the client can act on generically; the
+/// daemon's code says which refusal it was, and this says what to do about the class.
+fn rejection_advice(status: u16) -> &'static str {
+    match status {
+        400 => "The request was not valid. Check the command's arguments.",
+        401 | 403 => "Check the client credential for this profile.",
+        404 => "That resource does not exist in this profile.",
+        409 => "The request conflicted with existing state; retry with a fresh key.",
+        413 => "The request was too large.",
+        415 => "The request's content type is not supported.",
+        422 => "The request was understood but not accepted.",
+        426 => "This client is too old for the daemon. Update it.",
+        429 => "The daemon is rate limiting; retry shortly.",
+        503 => "The daemon is not ready yet; retry shortly.",
+        _ => "The daemon refused the request. Run `jarvis doctor` for detail.",
     }
 }
 
@@ -213,6 +248,60 @@ pub async fn get_authenticated(
     get_with_headers(discovered, path, &request).await
 }
 
+/// Sends an authenticated `POST` with a JSON body and returns the status and body.
+///
+/// The status is returned alongside the body because a run command's meaning depends on
+/// it: a create answers `202`, a cancel of a finished run answers `200`, and a conflict
+/// answers `409`. A helper that collapsed the three to one success would make the CLI
+/// unable to report which happened.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Transport`] on a connection failure or a non-loopback
+/// authority, [`ClientError::Timeout`] when the bound elapses, and
+/// [`ClientError::MalformedResponse`] when the status line cannot be read.
+pub async fn post_authenticated(
+    discovered: &Discovered,
+    credential: &str,
+    path: &str,
+    api_major: u32,
+    extra_headers: &str,
+    body: &str,
+) -> Result<(u16, String), ClientError> {
+    request(
+        discovered,
+        "POST",
+        path,
+        &format!(
+            "{}{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\n",
+            authenticated_headers(credential, api_major),
+            body.len()
+        ),
+        Some(body),
+    )
+    .await
+}
+
+/// Sends an authenticated `GET` and returns the status and body.
+///
+/// # Errors
+///
+/// As [`get_authenticated`].
+pub async fn get_with_status(
+    discovered: &Discovered,
+    credential: &str,
+    path: &str,
+    api_major: u32,
+    extra_headers: &str,
+) -> Result<(u16, String), ClientError> {
+    let request_headers = format!(
+        "{}{}",
+        authenticated_headers(credential, api_major),
+        extra_headers
+    );
+    request(discovered, "GET", path, &request_headers, None).await
+}
+
 /// Builds the headers for an authenticated request.
 ///
 /// Kept as a named function so the test can assert the credential is present here
@@ -263,6 +352,23 @@ async fn get_with_headers(
     path: &str,
     extra_headers: &str,
 ) -> Result<String, ClientError> {
+    request(discovered, "GET", path, extra_headers, None)
+        .await
+        .map(|(_, body)| body)
+}
+
+/// Sends one bounded request over a loopback connection and returns its status and body.
+///
+/// The single implementation every helper goes through, so the loopback-only check, the
+/// timeout, the response bound, and the status parsing exist once. A second copy would
+/// be a place those checks could be forgotten.
+async fn request(
+    discovered: &Discovered,
+    method: &str,
+    path: &str,
+    extra_headers: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), ClientError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     // Only a numeric loopback authority is ever dialed; the discovery file was
@@ -284,10 +390,11 @@ async fn get_with_headers(
             .map_err(|_| ClientError::Transport)?;
 
         let request = format!(
-            "GET {path} HTTP/1.1\r\n\
+            "{method} {path} HTTP/1.1\r\n\
              Host: {host}:{port}\r\n\
              {extra_headers}\
-             Connection: close\r\n\r\n",
+             Connection: close\r\n\r\n{}",
+            body.unwrap_or_default(),
         );
         stream
             .write_all(request.as_bytes())
@@ -327,15 +434,28 @@ async fn get_with_headers(
         .ok_or(ClientError::MalformedResponse)?;
 
     if (200..300).contains(&status) {
-        return Ok(body.to_owned());
+        return Ok((status, body.to_owned()));
     }
 
-    // An error body carries the daemon's machine code, which is safe to surface.
-    let code = serde_json::from_str::<jarvis_protocol::ErrorEnvelope>(body).map_or_else(
+    // A non-success carries the daemon's machine code, which is safe to surface, and the
+    // status, because a caller's meaning depends on which refusal it was: a `409` for a
+    // reused idempotency key is a different instruction to a caller than a `404`.
+    Err(ClientError::Rejected {
+        status,
+        code: rejection_code(body),
+    })
+}
+
+/// Reads the machine code out of an error body.
+///
+/// A body that is not the envelope yields a stable fallback rather than a parse failure
+/// of its own, because the status is already the caller's answer and losing it to a
+/// second error would report less.
+fn rejection_code(body: &str) -> String {
+    serde_json::from_str::<jarvis_protocol::ErrorEnvelope>(body).map_or_else(
         |_| "jarvis.daemon_rejected".to_owned(),
         |envelope| envelope.code().to_owned(),
-    );
-    Err(ClientError::Rejected { code })
+    )
 }
 
 #[cfg(test)]
@@ -502,6 +622,7 @@ mod tests {
             ClientError::NoCredential,
             ClientError::Timeout,
             ClientError::Rejected {
+                status: 401,
                 code: "auth.credential_rejected".to_owned(),
             },
             ClientError::MalformedResponse,

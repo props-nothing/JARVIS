@@ -232,6 +232,26 @@ migration is purely additive. `jarvis_application::repository` defines the ports
 (`RunRepository`, `ConversationRepository`, `ModelCallRepository`) and
 `jarvis_infrastructure::storage::repositories` implements them over SQLite.
 
+`migrations/sqlite/000003_idempotency.sql` raises the version to **3** — again with
+the minimum reader at 1, because it is purely additive — and adds
+`idempotency_records`, which the local control API's required `Idempotency-Key`
+header needs. Two decisions there are load-bearing:
+
+- The stored value is a **digest of the canonical request**, not the request body.
+  Comparing digests is what answers "same key, different input?", and storing the body
+  would retain caller text in a durable row for no benefit the comparison needs.
+- The uniqueness key includes the **workspace**, the **operation**, and the **API
+  major**, because the contract scopes idempotency to the authenticated principal,
+  the resolved workspace, the client credential, the operation, and the API major.
+  Without them one client's key could replay another client's run.
+
+The record commits **with** the run it describes. `RunRepository::create_run_idempotent`
+writes the run, its opening `run.received` event, and the key record in one
+transaction, because the contract requires "acknowledged mutation state and
+idempotency records are committed atomically". A separate claim followed by a create
+leaves exactly the window that sentence closes, and the first implementation had it: a
+replayed create reported a conflict instead of returning the original run.
+
 Three constraints are load-bearing rather than decorative:
 
 - `agent_runs` refuses a **waiting** state whose dependency is unset and a

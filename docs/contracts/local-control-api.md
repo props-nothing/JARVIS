@@ -413,3 +413,66 @@ echoing either would reflect untrusted input back to the caller.
 Test 5 (body and input limits) is implemented as well, and it found a defect in the
 process: the `413` was correct but its body was the limiter's own plain text rather
 than the envelope, so the status was right and the contract was still broken.
+
+### Implemented evidence (Milestone 2, run resources)
+
+The run resource surface exists: `POST /api/v1/runs`, `GET /api/v1/runs/{run_id}`,
+`POST /api/v1/runs/{run_id}/cancel`, and `GET /api/v1/runs/{run_id}/events` are
+served by `jarvis_infrastructure::http::runs` over
+`jarvis_application::run_service`, and `jarvis-protocol::run` carries the wire types
+so the daemon and the client share one serialization definition. `jarvis ask` and
+`jarvis runs show|events|cancel` are the client half, and the path was exercised
+against a real daemon on a clean profile: a question produced an answer and exit `0`.
+
+Four rules this contract states are now enforced by construction rather than by
+intention:
+
+- **The client-visible state set is the contract's, not the controller's.**
+  `wire_state` is a total, deliberately coarser projection of the twelve domain
+  states onto the seven this contract exposes, and it lives at the API boundary
+  because `agent-runtime.md` forbids domain state names doubling as wire strings. The
+  three terminal states map one-to-one, so a client never sees a finished run
+  described by a non-terminal state.
+- **Authentication is a property of the handler.** `AuthenticatedClient` is a
+  `FromRequestParts` extractor, so a route that lacks a credential cannot run and
+  cannot be reached by forgetting a middleware call. All four run routes are asserted
+  to refuse an unauthenticated caller.
+- **Scope is resolved server-side** from the authenticated client. A caller cannot
+  address another workspace's run by naming it, and a foreign run is
+  indistinguishable from a missing one — including a malformed identifier, which
+  answers `404 resource.not_found` rather than something that would reveal which
+  identifiers exist.
+- **Idempotency commits with the mutation.** `create_run_idempotent` writes the run,
+  its opening `run.received` event, and the key record in **one** transaction, because
+  this contract requires "acknowledged mutation state and idempotency records are
+  committed atomically". A separate claim-then-create leaves exactly the window that
+  sentence closes, and the first implementation had it: a replayed create reported a
+  conflict instead of returning the original run. A reused key with different input is
+  now `409 idempotency.conflict`, and a repeated key with identical input returns the
+  original run.
+
+Three further facts are worth recording because each was a defect first:
+
+- **`Received -> Cancelled` is a legal edge.** A run cancelled before its first step
+  previously had no terminal exit, so a client polling it waited forever for an answer
+  that had been abandoned. This contract's cancellation section requires a durable
+  terminal transition, and the state diagram was missing the edge that allows it.
+- **A run's opening event is created with the run.** A client that connects before the
+  run does any work must still be able to replay `run.received` at sequence 1, so the
+  event is written in the same transaction as the row rather than appended afterwards.
+- **An unavailable replay position is `409`, never a silent restart.** `Last-Event-ID`
+  is resolved against the retained events, so a position this daemon does not have
+  produces `stream.replay_unavailable` instead of delivering a gap as if it were
+  complete.
+
+**Not implemented, and deliberately not claimed:** the event stream delivers the
+retained public events and closes rather than following the run live. A client
+therefore reconnects with `Last-Event-ID` until it receives a terminal event, which is
+what `jarvis ask` does. Holding the connection open needs a streaming response body,
+and this crate has neither a stream crate nor `axum`'s `sse` feature in its reviewed
+dependency set; adding either is a dependency change the research gate requires
+evidence for, and hand-writing a `Stream` would be an unreviewed async state machine
+on the security-relevant path. Also outstanding: contract test 12's golden JSON/SSE
+fixtures and generated OpenAPI drift, `Idempotency-Key` scoping per principal and
+credential rather than per client, and the E2E disconnect and abrupt-restart cases,
+which are `BRN-008`.

@@ -87,7 +87,7 @@ impl RunState {
     #[must_use]
     pub const fn allowed_targets(self) -> &'static [Self] {
         match self {
-            Self::Received => &[Self::ContextBuilding, Self::Failed],
+            Self::Received => &[Self::ContextBuilding, Self::Cancelled, Self::Failed],
             Self::ContextBuilding => &[Self::Planning, Self::Failed],
             Self::Planning => &[Self::AwaitingModel, Self::Responding, Self::Failed],
             // `Responding` is reachable directly from `AwaitingModel` because the
@@ -323,7 +323,11 @@ mod tests {
         let expected: [(RunState, &[RunState]); 9] = [
             (
                 RunState::Received,
-                &[RunState::ContextBuilding, RunState::Failed],
+                &[
+                    RunState::ContextBuilding,
+                    RunState::Cancelled,
+                    RunState::Failed,
+                ],
             ),
             (
                 RunState::ContextBuilding,

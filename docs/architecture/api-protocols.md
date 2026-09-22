@@ -134,6 +134,33 @@ is insufficient, such as low-latency desktop/voice activity. Define a versioned
 envelope, handshake, auth expiry/rekey, ping/pong, subscriptions, backpressure,
 and reconnect behavior. Do not send ad hoc JSON shapes per feature.
 
+### Implemented evidence (Milestone 2, run resources)
+
+The first four run endpoints are served, and `jarvis-protocol::run` is the single
+serialization definition the daemon and the CLI both use rather than each maintaining
+its own. Three points from the rules above are now enforced by construction:
+
+- **One terminal event, and the server closes.** A stream is rendered from the stored
+  activity events, which the repository already guarantees contains exactly one
+  terminal event per run, so the framing rule holds because the source does rather
+  than because a writer remembers.
+- **Reconnect uses a last event ID only where replay is supported.** A `Last-Event-ID`
+  is resolved against the retained events, and a position this daemon does not have
+  returns `409 stream.replay_unavailable` instead of starting over — because a silent
+  restart would deliver a gap as if the stream were complete.
+- **Client disconnect does not cancel a run.** The run is driven by a background task
+  owned by `jarvis_application::run_service`, so its lifetime is not tied to the
+  connection; cancellation is the explicit command endpoint.
+
+**Not implemented:** the connection is not held open. The events endpoint delivers the
+retained events and closes, so a client follows a run by reconnecting until it receives
+a terminal event. Holding one connection open needs a streaming response body, and
+`axum`'s `sse` feature is not in this repository's reviewed dependency set; adding it is
+a research-gate change rather than a convenience. Keepalives, slow-consumer
+disconnection, and bounded per-client buffers are therefore not implemented either,
+because they are properties of a long-lived connection. Generated OpenAPI and golden
+fixtures are also outstanding.
+
 ## Generated Contracts
 
 - Generate OpenAPI from the owning Rust schema or one canonical source.

@@ -14,7 +14,7 @@ use jarvis_domain::ids::{
 };
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, ModelCallRequest, ModelStreamEventKind, Role};
-use jarvis_domain::run::state::{RunState, RunVersion};
+use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
 
@@ -76,7 +76,14 @@ fn fixture(provider: Arc<dyn ModelProvider>) -> Fixture {
     let conversations: Arc<dyn ConversationRepository> = repositories.clone();
     let model_calls: Arc<dyn ModelCallRepository> = repositories.clone();
     let clock = Arc::new(ManualClock::new(now()));
-    let controller = RunController::new(runs, conversations, model_calls, provider, clock);
+    let controller = RunController::new(
+        runs,
+        conversations,
+        model_calls,
+        Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+        provider,
+        clock,
+    );
     Fixture {
         controller,
         repositories,
@@ -112,6 +119,7 @@ async fn seed(fixture: &Fixture) {
                 now(),
             )
             .expect("valid"),
+            crate::repository::run::run_received_event(run(), now()),
         )
         .await
         .expect("the run is created");
@@ -184,9 +192,12 @@ async fn a_plain_question_is_answered_and_the_run_completes() {
 
 #[tokio::test]
 async fn each_state_change_published_exactly_one_event() {
-    // The storage architecture requires a state change and its event to commit
-    // together. The plain answer path has five transitions, so five events exist and
-    // the next sequence is six.
+    // The run's opening event, five transitions, and one output delta, so seven events
+    // exist in strict sequence order and the next position is eight. The delta is
+    // interleaved at the point it was produced — before `responding` — because the
+    // contract requires each chunk to be a durable public event at its own position,
+    // so a client that reconnects replays the output it missed rather than only the
+    // final answer.
     let fixture = fixture(answering("answer"));
     seed(&fixture).await;
     execute(&fixture, &CancellationScope::new())
@@ -197,7 +208,6 @@ async fn each_state_change_published_exactly_one_event() {
         .repositories
         .recorded_events()
         .expect("events are readable");
-    assert_eq!(events.len(), 5, "one event per transition: {events:?}");
     let types: Vec<&str> = events
         .iter()
         .map(|event| event.event_type.as_str())
@@ -205,21 +215,95 @@ async fn each_state_change_published_exactly_one_event() {
     assert_eq!(
         types,
         [
+            "run.received",
             "run.context_building",
             "run.planning",
             "run.model_started",
+            "run.output_text.delta",
             "run.responding",
             "run.completed",
         ],
+        "{events:?}",
     );
+    // Sequences are 1..=n with no gap, which the contract states as "starts at 1 per
+    // run and increases by exactly one for each persisted public event".
+    let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
+    assert_eq!(sequences, [1, 2, 3, 4, 5, 6, 7]);
+    // Exactly one terminal event, which the contract requires.
+    let terminals = types
+        .iter()
+        .filter(|kind| {
+            kind.starts_with("run.completed")
+                || kind.starts_with("run.failed")
+                || kind.starts_with("run.cancelled")
+        })
+        .count();
+    assert_eq!(terminals, 1);
     assert_eq!(
         fixture
             .repositories
             .next_event_sequence(context().workspace_id, run())
             .await
             .expect("readable"),
-        6,
+        8,
     );
+}
+
+#[tokio::test]
+async fn every_output_chunk_is_published_before_the_run_completes() {
+    // The contract requires the server to persist an event before making it visible,
+    // so the stored stream must contain each chunk in order and must contain it
+    // *before* the terminal event. A controller that published only the whole answer
+    // at the end would pass a final-state assertion and still break a streaming
+    // client.
+    let provider: Arc<dyn ModelProvider> = Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "Hel")
+            .emit_text("out-1", "lo")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    );
+    let fixture = fixture(provider);
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("completes");
+
+    let deltas = fixture
+        .repositories
+        .recorded_deltas()
+        .expect("deltas are readable");
+    // Two chunks were published as two deltas, not coalesced into one.
+    assert_eq!(
+        deltas,
+        [
+            ("out-1".to_owned(), "Hel".to_owned()),
+            ("out-1".to_owned(), "lo".to_owned())
+        ]
+    );
+
+    let events = fixture
+        .repositories
+        .recorded_events()
+        .expect("events are readable");
+    let terminal_index = events
+        .iter()
+        .position(|event| event.event_type == "run.completed")
+        .expect("a terminal event exists");
+    for (index, event) in events.iter().enumerate() {
+        if event.event_type == "run.output_text_delta" {
+            assert!(
+                index < terminal_index,
+                "a delta must be persisted before the terminal event",
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -335,9 +419,16 @@ async fn a_cancelled_call_ends_cancelled_rather_than_failed() {
 }
 
 #[tokio::test]
-async fn a_cancellation_registered_before_any_work_leaves_the_run_untouched() {
-    // Recording work that never happened is its own kind of falsehood, so a request
-    // cancelled before it started must not move the run to `Cancelled`.
+async fn a_cancellation_registered_before_any_work_still_reaches_a_terminal_state() {
+    // The run must be left `Cancelled`, not `Received`.
+    //
+    // An earlier version of the controller returned without touching the run, on the
+    // reasoning that recording work that never happened is a falsehood. Driving the
+    // service end to end showed why that was wrong: moving to `Cancelled` does not
+    // assert that work happened, it records that the request was cancelled — which is
+    // exactly what occurred. Leaving the run in `Received` made it permanently
+    // non-terminal, so a client polling it waited forever for an answer that had
+    // already been abandoned.
     let fixture = fixture(answering("hi"));
     seed(&fixture).await;
     let cancel = CancellationScope::new();
@@ -345,28 +436,27 @@ async fn a_cancellation_registered_before_any_work_leaves_the_run_untouched() {
 
     let error = execute(&fixture, &cancel)
         .await
-        .expect_err("a cancelled request does not execute");
+        .expect_err("a cancelled request does not run");
     assert_eq!(error, ControllerError::Cancelled);
+    assert_eq!(error.terminal_state(), RunState::Cancelled);
 
     let stored = fixture
         .repositories
         .load(context().workspace_id, run())
         .await
         .expect("loads");
-    assert_eq!(
-        stored.state,
-        RunState::Received,
-        "a request that never started must leave the run untouched",
-    );
-    assert_eq!(stored.version, RunVersion::FIRST);
-    assert!(
-        fixture
-            .repositories
-            .recorded_events()
-            .expect("readable")
-            .is_empty(),
-        "no event may be published for work that did not happen",
-    );
+    assert_eq!(stored.state, RunState::Cancelled);
+    assert!(stored.is_terminal(), "a cancelled run must be terminal");
+    assert_eq!(stored.completed_at, Some(now()));
+
+    // One event records the cancellation, after the opening event: no model work
+    // happened, so no `awaiting_model` or delta event may exist.
+    let events = fixture.repositories.recorded_events().expect("readable");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert_eq!(types, ["run.received", "run.cancelled"], "{events:?}");
 }
 
 #[tokio::test]

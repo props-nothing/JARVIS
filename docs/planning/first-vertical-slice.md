@@ -150,13 +150,27 @@ model turn and **refuses a tool intent** with a typed, terminal
 `run.tools_not_implemented` rather than fabricating an observation, because the tool
 fabric is Milestone 3; there is no turn/token/cost/time budget, no retry or fallback,
 no `Waiting` entry because nothing suspends and resumes yet, and no timeout or
-daemon-restart behavior. No endpoint or CLI path calls the controller, no event is
-published to a client, no controller state is mapped onto the client-visible set,
-and nothing retrieves the context candidates `BRN-006` budgets — so the pieces that
-exist are joined to one another by the controller but not yet to a caller. Step 16 is
-only partly done — `agent_steps` has a table but no adapter. Step 17 (`BRN-007`,
-HTTP/SSE and CLI surfaces) and the E2E step are not started, and `BRN-003` remains
-gated on its `REQUIRED` evidence note.
+daemon-restart behavior.
+
+Step 16's run resource surface and step 17's CLI half are now in place
+(`BRN-007`, partial): `POST /api/v1/runs` and the read, cancel, and events routes are
+served by `jarvis_infrastructure::http::runs` over
+`jarvis_application::run_service`, the wire types live in `jarvis-protocol::run`, and
+`jarvis ask` follows a run to its answer. This slice's own acceptance criterion — a
+prompt sent through the public client to a deterministic scripted provider, with the
+run persisted — **was exercised against a real daemon on a clean profile**: a question
+produced an answer and exit `0`. The daemon composes the scripted provider, which is
+what this plan names as the slice's model source, and it is the one place a real
+provider adapter (`BRN-003`) replaces rather than adds to.
+
+The streaming criterion is only **partly** met: the events endpoint delivers the
+retained public events and closes, so the CLI follows a run by reconnecting with
+`Last-Event-ID` until a terminal event arrives, rather than holding one connection
+open and printing deltas as they are published. Holding a connection open needs a
+streaming response body, and the dependency set this slice reviewed has no stream
+crate; adding one is a research-gate change rather than a convenience. The E2E step's
+abrupt-restart and disconnect cases are `BRN-008`. `BRN-003` remains gated on its
+`REQUIRED` evidence note, and `agent_steps` still has a table but no adapter.
 
 ## Acceptance
 

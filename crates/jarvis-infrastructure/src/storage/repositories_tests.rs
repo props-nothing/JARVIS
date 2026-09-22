@@ -21,7 +21,8 @@ use jarvis_application::repository::model_call::{
     ModelCallOutcome, ModelCallRepository as _, ModelCallState, NewModelCall,
 };
 use jarvis_application::repository::run::{
-    EventVisibility, NewActivityEvent, NewRun, RunRepository as _, RunWrite, WaitingOn,
+    EventVisibility, IdempotencyClaim, NewActivityEvent, NewIdempotencyRecord, NewRun,
+    RunRepository as _, RunWrite, WaitingOn, run_received_event,
 };
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, PrincipalId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
@@ -57,6 +58,11 @@ fn other_workspace() -> WorkspaceId {
 
 fn conversation_id() -> ConversationId {
     ConversationId::from_uuid(id(3))
+}
+
+/// A second conversation, for the second workspace's run.
+fn other_conversation_id() -> ConversationId {
+    ConversationId::from_uuid(id(30))
 }
 
 fn principal() -> PrincipalId {
@@ -121,6 +127,7 @@ async fn seed(repositories: &SqliteRepositories) {
                 now(),
             )
             .expect("valid"),
+            run_received_event(run_id(), now()),
         )
         .await
         .expect("the run is created");
@@ -252,7 +259,7 @@ async fn a_duplicate_run_is_refused_rather_than_silently_created_twice() {
     )
     .expect("valid");
     let error = repositories
-        .create(duplicate)
+        .create(duplicate, run_received_event(run_id(), now()))
         .await
         .expect_err("a duplicate run must be refused");
     assert_eq!(error.code(), "storage.conflict");
@@ -270,7 +277,10 @@ async fn a_transition_persists_the_state_and_its_event_together() {
         .next_event_sequence(workspace(), run_id())
         .await
         .expect("the sequence is readable");
-    assert_eq!(sequence, 1, "a fresh run's first event is sequence 1");
+    assert_eq!(
+        sequence, 2,
+        "creation owns sequence 1, so the first transition is 2",
+    );
 
     let updated = repositories
         .transition(
@@ -296,7 +306,7 @@ async fn a_transition_persists_the_state_and_its_event_together() {
             .next_event_sequence(workspace(), run_id())
             .await
             .expect("readable"),
-        2,
+        3,
     );
 }
 
@@ -314,7 +324,7 @@ async fn a_stale_version_is_refused_and_nothing_changes() {
                     RunState::ContextBuilding,
                     RunVersion::FIRST,
                 ),
-                event(run_id(), 1, "run.context_building"),
+                event(run_id(), 2, "run.context_building"),
             ),
         )
         .await
@@ -329,7 +339,7 @@ async fn a_stale_version_is_refused_and_nothing_changes() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&stale, event(run_id(), 2, "run.context_building")),
+            RunWrite::new(&stale, event(run_id(), 3, "run.context_building")),
         )
         .await
         .expect_err("a stale write must be refused");
@@ -347,7 +357,7 @@ async fn a_stale_version_is_refused_and_nothing_changes() {
             .next_event_sequence(workspace(), run_id())
             .await
             .expect("readable"),
-        2,
+        3,
         "the refused transition must not have appended an event",
     );
 }
@@ -366,7 +376,7 @@ async fn an_edge_the_diagram_lacks_is_refused() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&illegal, event(run_id(), 1, "run.responding")),
+            RunWrite::new(&illegal, event(run_id(), 2, "run.responding")),
         )
         .await
         .expect_err("an invented edge must be refused");
@@ -401,7 +411,7 @@ async fn a_version_conflict_is_reported_before_an_illegal_edge() {
                     RunState::ContextBuilding,
                     RunVersion::FIRST,
                 ),
-                event(run_id(), 1, "run.context_building"),
+                event(run_id(), 2, "run.context_building"),
             ),
         )
         .await
@@ -412,7 +422,7 @@ async fn a_version_conflict_is_reported_before_an_illegal_edge() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&stale_and_illegal, event(run_id(), 2, "run.responding")),
+            RunWrite::new(&stale_and_illegal, event(run_id(), 3, "run.responding")),
         )
         .await
         .expect_err("must be refused");
@@ -444,7 +454,7 @@ async fn a_plain_question_and_answer_run_persists_through_to_completed() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -476,7 +486,7 @@ async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -488,7 +498,7 @@ async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(&failed, event(run_id(), 5, "run.failed")),
+            RunWrite::new(&failed, event(run_id(), 6, "run.failed")),
         )
         .await
         .expect("a failure while responding must be legal");
@@ -522,7 +532,7 @@ async fn reaching_a_terminal_state_records_the_completion_instant() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
         let updated = repositories
             .transition(workspace(), write)
             .await
@@ -557,7 +567,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -569,7 +579,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let cancelled = repositories
         .transition(
             workspace(),
-            RunWrite::new(&cancel, event(run_id(), 4, "run.cancelled")),
+            RunWrite::new(&cancel, event(run_id(), 5, "run.cancelled")),
         )
         .await
         .expect("cancellation from awaiting_model is legal");
@@ -582,7 +592,7 @@ async fn a_terminal_run_refuses_every_later_transition() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&late, event(run_id(), 5, "run.planning")),
+            RunWrite::new(&late, event(run_id(), 6, "run.planning")),
         )
         .await
         .expect_err("a terminal run must absorb");
@@ -607,7 +617,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     let mut version = RunVersion::FIRST;
     for (index, (from, to)) in path.iter().enumerate() {
         let transition = transition(*from, *to, version);
-        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 2, "run.step"));
         version = repositories
             .transition(workspace(), write)
             .await
@@ -621,7 +631,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&into_waiting, event(run_id(), 6, "run.waiting")),
+            RunWrite::new(&into_waiting, event(run_id(), 7, "run.waiting")),
         )
         .await
         .expect_err("a waiting state without a dependency must be refused");
@@ -638,7 +648,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
 
     // With a dependency it is accepted and readable through the resume read.
     let waiting = WaitingOn::new("timer", "wake-1").expect("valid");
-    let write = RunWrite::new(&into_waiting, event(run_id(), 6, "run.waiting")).waiting_on(waiting);
+    let write = RunWrite::new(&into_waiting, event(run_id(), 7, "run.waiting")).waiting_on(waiting);
     repositories
         .transition(workspace(), write)
         .await
@@ -659,7 +669,7 @@ async fn a_waiting_state_records_its_dependency_and_clears_it_on_advance() {
     repositories
         .transition(
             workspace(),
-            RunWrite::new(&resumed, event(run_id(), 7, "run.planning")),
+            RunWrite::new(&resumed, event(run_id(), 8, "run.planning")),
         )
         .await
         .expect("resuming is legal");
@@ -689,7 +699,7 @@ async fn a_non_waiting_state_carrying_a_dependency_is_refused() {
     let error = repositories
         .transition(
             workspace(),
-            RunWrite::new(&onward, event(run_id(), 1, "run.context_building")).waiting_on(waiting),
+            RunWrite::new(&onward, event(run_id(), 2, "run.context_building")).waiting_on(waiting),
         )
         .await
         .expect_err("a dependency on a non-waiting state must be refused");
@@ -718,13 +728,13 @@ async fn a_duplicate_event_sequence_is_refused() {
                     RunState::ContextBuilding,
                     RunVersion::FIRST,
                 ),
-                event(run_id(), 1, "run.context_building"),
+                event(run_id(), 2, "run.context_building"),
             ),
         )
         .await
         .expect("applies");
 
-    // Append at the same position the first event occupies. The UNIQUE(run_id,
+    // Append at the same position the first *transition* occupies. The UNIQUE(run_id,
     // sequence) constraint is what keeps "sequence increases by exactly one" true.
     let next = repositories
         .load(workspace(), run_id())
@@ -736,7 +746,7 @@ async fn a_duplicate_event_sequence_is_refused() {
             workspace(),
             RunWrite::new(
                 &transition(RunState::ContextBuilding, RunState::Planning, next),
-                event(run_id(), 1, "run.planning"),
+                event(run_id(), 2, "run.planning"),
             ),
         )
         .await
@@ -966,7 +976,7 @@ async fn an_orphaned_run_is_refused_by_the_foreign_key() {
     )
     .expect("valid");
     let error = repositories
-        .create(orphan)
+        .create(orphan, run_received_event(run_id(), now()))
         .await
         .expect_err("a run without its conversation must be refused");
     assert!(!error.retryable());
@@ -1027,7 +1037,7 @@ async fn the_transition_and_event_survive_a_reopen() {
                         RunState::ContextBuilding,
                         RunVersion::FIRST,
                     ),
-                    event(run_id(), 1, "run.context_building"),
+                    event(run_id(), 2, "run.context_building"),
                 ),
             )
             .await
@@ -1048,9 +1058,422 @@ async fn the_transition_and_event_survive_a_reopen() {
             .next_event_sequence(workspace(), run_id())
             .await
             .expect("readable"),
-        2,
-        "the activity event must have survived too",
+        3,
+        "both the opening and the transition event must have survived",
     );
     database.close().await;
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn a_public_event_page_excludes_operator_events() {
+    // The visibility filter is a query predicate, not a presentation choice. If it
+    // were applied after the read, the operator row would already have been loaded on
+    // a client-facing path, which is a leak that has not happened yet rather than a
+    // non-leak.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let mut hidden = event(run_id(), 2, "run.operator_note");
+    hidden.visibility = EventVisibility::Operator;
+    // Written directly, because a transition only ever appends a public event and
+    // the point of this test is that a stored operator row stays unreadable.
+    sqlx::query(
+        "INSERT INTO run_activity_events (\
+             id, workspace_id, run_id, sequence, event_type, payload_json, visibility, occurred_at\
+         ) VALUES (?, ?, ?, ?, ?, NULL, 'operator', ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(workspace().to_string())
+    .bind(run_id().to_string())
+    .bind(2_i64)
+    .bind("run.operator_note")
+    .bind(now().to_string())
+    .execute(repositories.pool())
+    .await
+    .expect("the operator row is written");
+
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::Received,
+                    RunState::ContextBuilding,
+                    RunVersion::FIRST,
+                ),
+                event(run_id(), 3, "run.context_building"),
+            ),
+        )
+        .await
+        .expect("applies");
+
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 100)
+        .await
+        .expect("readable");
+    // The opening event and the transition are returned; the operator row is not.
+    assert_eq!(page.events.len(), 2, "{:?}", page.events);
+    assert_eq!(page.events[0].event_type, "run.received");
+    assert_eq!(page.events[1].event_type, "run.context_building");
+    assert!(
+        !page
+            .events
+            .iter()
+            .any(|event| event.event_type == "run.operator_note"),
+        "an operator-only event must never reach a client page",
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_run_reports_its_terminal_state_to_a_late_stream() {
+    // A stream that connects after the run finished must be able to deliver the
+    // terminal event from retention and close. Without the terminal state on the page
+    // it would wait for a terminal that was published before it connected.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    for (index, (from, to)) in [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+        (RunState::Planning, RunState::Failed),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let version = RunVersion::new(u64::try_from(index).expect("small") + 1);
+        repositories
+            .transition(
+                workspace(),
+                RunWrite::new(
+                    &transition(from, to, version),
+                    event(run_id(), version.get() + 1, "e"),
+                ),
+            )
+            .await
+            .expect("applies");
+    }
+
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 100)
+        .await
+        .expect("readable");
+    assert_eq!(page.terminal_state, Some(RunState::Failed));
+    // The opening event plus the three transitions.
+    assert_eq!(page.events.len(), 4);
+}
+
+#[tokio::test]
+async fn a_non_terminal_run_reports_no_terminal_state() {
+    // The negative case matters: reporting a terminal state for a live run would make
+    // a stream close on a run that is still working.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 100)
+        .await
+        .expect("readable");
+    assert_eq!(page.terminal_state, None);
+    // Only the opening event exists: creation published `run.received`.
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].event_type, "run.received");
+}
+
+#[tokio::test]
+async fn an_event_page_is_scoped_to_its_workspace() {
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    assert_eq!(
+        repositories
+            .load_events(other_workspace(), run_id(), 1, 100)
+            .await
+            .expect_err("a foreign run is not readable"),
+        RepositoryError::NotFound,
+    );
+}
+
+#[tokio::test]
+async fn an_event_page_resumes_strictly_after_the_requested_sequence() {
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::Received,
+                    RunState::ContextBuilding,
+                    RunVersion::FIRST,
+                ),
+                event(run_id(), 2, "run.context_building"),
+            ),
+        )
+        .await
+        .expect("applies");
+
+    // `>= from` with `from = 3` returns nothing: sequence 2 is delivered once.
+    let page = repositories
+        .load_events(workspace(), run_id(), 3, 100)
+        .await
+        .expect("readable");
+    assert!(page.events.is_empty(), "{:?}", page.events);
+}
+
+#[tokio::test]
+async fn a_first_claim_succeeds_and_an_identical_repeat_replays() {
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let record = || NewIdempotencyRecord {
+        key: "0195f4f0-18dc-729b-bb34-07e8c7627f21".to_owned(),
+        workspace_id: workspace(),
+        operation: "runs.create".to_owned(),
+        request_digest: "digest-a".to_owned(),
+        run_id: run_id(),
+        created_at: now(),
+    };
+    assert_eq!(
+        repositories
+            .claim_idempotency(record())
+            .await
+            .expect("claims"),
+        IdempotencyClaim::Claimed,
+    );
+    // The same key with the same digest is a replay carrying the original run, which
+    // is what makes a retried create safe.
+    assert_eq!(
+        repositories
+            .claim_idempotency(record())
+            .await
+            .expect("replays"),
+        IdempotencyClaim::Replay(run_id()),
+    );
+}
+
+#[tokio::test]
+async fn a_reused_key_with_different_input_is_a_conflict() {
+    // This is the refusal that stops one key being used for two different requests.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .claim_idempotency(NewIdempotencyRecord {
+            key: "key-1".to_owned(),
+            workspace_id: workspace(),
+            operation: "runs.create".to_owned(),
+            request_digest: "digest-a".to_owned(),
+            run_id: run_id(),
+            created_at: now(),
+        })
+        .await
+        .expect("claims");
+
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: "key-1".to_owned(),
+                workspace_id: workspace(),
+                operation: "runs.create".to_owned(),
+                request_digest: "digest-b".to_owned(),
+                run_id: other_run_id(),
+                created_at: now(),
+            })
+            .await
+            .expect("answers"),
+        IdempotencyClaim::Conflict,
+    );
+}
+
+#[tokio::test]
+async fn the_same_key_in_two_workspaces_does_not_replay_across_them() {
+    // Idempotency is scoped to the resolved workspace, so one client's key must not
+    // replay another workspace's run even when the opaque key string matches.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    // The other workspace needs its own conversation and run, because a record may
+    // only name a run that exists.
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                other_conversation_id(),
+                other_workspace(),
+                principal(),
+                None,
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the other conversation is created");
+    repositories
+        .create(
+            NewRun::new(
+                other_run_id(),
+                other_workspace(),
+                other_conversation_id(),
+                principal(),
+                None,
+                now(),
+            )
+            .expect("valid"),
+            run_received_event(other_run_id(), now()),
+        )
+        .await
+        .expect("the other run is created");
+
+    repositories
+        .claim_idempotency(NewIdempotencyRecord {
+            key: "shared-key".to_owned(),
+            workspace_id: workspace(),
+            operation: "runs.create".to_owned(),
+            request_digest: "digest-a".to_owned(),
+            run_id: run_id(),
+            created_at: now(),
+        })
+        .await
+        .expect("claims");
+
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: "shared-key".to_owned(),
+                workspace_id: other_workspace(),
+                operation: "runs.create".to_owned(),
+                request_digest: "digest-a".to_owned(),
+                run_id: other_run_id(),
+                created_at: now(),
+            })
+            .await
+            .expect("claims in the other scope"),
+        IdempotencyClaim::Claimed,
+    );
+}
+
+#[tokio::test]
+async fn a_claim_naming_an_absent_run_is_not_a_conflict() {
+    // The foreign key would refuse this row anyway, but it would report the same
+    // `Conflict` a concurrent claim produces. A caller would then be told "someone
+    // else used this key" when the truth is "there is no such run".
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: "key-for-a-ghost".to_owned(),
+                workspace_id: workspace(),
+                operation: "runs.create".to_owned(),
+                request_digest: "digest-a".to_owned(),
+                // Never created.
+                run_id: RunId::from_uuid(id(999)),
+                created_at: now(),
+            })
+            .await
+            .expect_err("a record must name a real run"),
+        RepositoryError::NotFound,
+    );
+}
+
+#[tokio::test]
+async fn an_empty_idempotency_key_is_refused() {
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: String::new(),
+                workspace_id: workspace(),
+                operation: "runs.create".to_owned(),
+                request_digest: "digest-a".to_owned(),
+                run_id: run_id(),
+                created_at: now(),
+            })
+            .await
+            .expect_err("an empty key is not a key"),
+        RepositoryError::Conflict {
+            what: "idempotency_key"
+        },
+    );
+}
+
+#[tokio::test]
+async fn a_published_delta_is_durable_and_ordered_after_the_transition() {
+    // The delta sink is what makes a run's output replayable. It must assign the next
+    // sequence itself and store the payload the contract defines, so a client that
+    // reconnects sees the text it missed at the position it belongs.
+    use jarvis_application::live_events::{OUTPUT_TEXT_DELTA_EVENT, StreamDeltaSink as _};
+    use jarvis_protocol::event_type; // the wire constant the adapter must agree with
+
+    assert_eq!(
+        OUTPUT_TEXT_DELTA_EVENT,
+        event_type::OUTPUT_TEXT_DELTA,
+        "the port's event name and the wire constant must not drift",
+    );
+
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(
+                &transition(
+                    RunState::Received,
+                    RunState::ContextBuilding,
+                    RunVersion::FIRST,
+                ),
+                event(run_id(), 2, "run.context_building"),
+            ),
+        )
+        .await
+        .expect("applies");
+
+    let sequence = repositories
+        .output_text_delta(
+            workspace(),
+            run_id(),
+            "out-1".to_owned(),
+            "Hello".to_owned(),
+            now(),
+        )
+        .await
+        .expect("publishes");
+    // Sequence 3 follows the opening event (1) and the transition (2): the sink
+    // assigns the next position rather than its own counter.
+    assert_eq!(sequence, 3);
+
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 100)
+        .await
+        .expect("readable");
+    assert_eq!(page.events.len(), 3);
+    let delta = &page.events[2];
+    assert_eq!(delta.event_type, event_type::OUTPUT_TEXT_DELTA);
+    assert_eq!(delta.sequence, 3);
+    let payload = delta
+        .payload_json
+        .as_deref()
+        .expect("a delta carries a payload");
+    assert!(payload.contains(r#""delta":"Hello""#), "{payload}");
+    assert!(payload.contains(r#""item_id":"out-1""#), "{payload}");
+    // The stored payload is a fixed shape, so prompt text or a secret cannot appear.
+    let parsed: serde_json::Value = serde_json::from_str(payload).expect("valid JSON");
+    assert_eq!(parsed.as_object().expect("object").len(), 2);
+}
+
+#[tokio::test]
+async fn a_delta_for_a_foreign_run_is_refused_rather_than_orphaned() {
+    use jarvis_application::live_events::StreamDeltaSink as _;
+
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    assert_eq!(
+        repositories
+            .output_text_delta(
+                other_workspace(),
+                run_id(),
+                "out-1".to_owned(),
+                "leak".to_owned(),
+                now(),
+            )
+            .await
+            .expect_err("a foreign run is absent"),
+        RepositoryError::NotFound,
+    );
 }

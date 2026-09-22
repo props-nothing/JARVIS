@@ -23,6 +23,8 @@ use crate::auth::ClientRegistry;
 use crate::http::{ApiState, Readiness};
 use crate::lifecycle::{DiscoveryError, InstanceError, InstanceGuard};
 use crate::storage::StorageError;
+use crate::storage::repositories::SqliteRepositories;
+use jarvis_application::run_service::{RunCancellationRegistry, RunService};
 
 /// The default bounded drain grace period.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -122,6 +124,7 @@ pub struct RunningDaemon {
     instance_id: String,
     readiness: Arc<Readiness>,
     clients: Arc<ClientRegistry>,
+    runs: Arc<RunService>,
     guard: InstanceGuard,
 }
 
@@ -177,12 +180,15 @@ impl RunningDaemon {
     /// would leave the `Host` check without an authority to compare against.
     pub fn api_state(&self) -> Result<Arc<ApiState>, StartupError> {
         let address = self.local_addr()?;
-        Ok(Arc::new(ApiState::new(
-            Arc::clone(&self.clients),
-            Arc::clone(&self.readiness),
-            self.instance_id.clone(),
-            address,
-        )))
+        Ok(Arc::new(
+            ApiState::new(
+                Arc::clone(&self.clients),
+                Arc::clone(&self.readiness),
+                self.instance_id.clone(),
+                address,
+            )
+            .with_runs(Arc::clone(&self.runs)),
+        ))
     }
 
     /// Serves until `shutdown` completes, then drains within `grace`.
@@ -358,14 +364,89 @@ pub async fn start(
     let readiness = Arc::new(Readiness::new());
     readiness.mark_ready();
 
+    // The run service shares the migrated pool. It is composed here rather than in a
+    // binary because the pool must be the one migrations ran against: a second
+    // connection to the same file would work but could not prove the schema was
+    // migrated.
+    let runs = Arc::new(RunService::new(
+        run_ports(database.pool().clone()),
+        Arc::new(RunCancellationRegistry::new()),
+    ));
+
     Ok(RunningDaemon {
         listener,
         discovery_path: config.discovery_path(),
         instance_id,
         readiness,
         clients: Arc::new(clients),
+        runs,
         guard,
     })
+}
+
+/// Builds the run service's ports over a migrated pool.
+///
+/// The provider is the **deterministic scripted** one, which is what the accepted
+/// [first vertical slice](docs/planning/first-vertical-slice.md) names as this
+/// slice's model source: it lets the whole path — create, run, stream, persist — be
+/// exercised without a paid provider or an API key. A real provider adapter is
+/// `BRN-003`, which is evidence-gated, and it replaces this composition rather than
+/// sitting beside it.
+///
+/// It is not a fake of something that exists: it is the deterministic provider the
+/// plan requires, and its model identifier says `scripted.local` so an operator can
+/// see which source served a run.
+fn run_ports(pool: sqlx::SqlitePool) -> jarvis_application::run_service::RunPorts {
+    use jarvis_application::model::{ModelProvider, ScriptedProvider};
+    use jarvis_application::run_service::RunPorts;
+    use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+    use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
+
+    let repositories = Arc::new(SqliteRepositories::new(pool));
+    // The identifiers are literals this build controls, so a failure here would be a
+    // programming error rather than a runtime condition. They are validated once and
+    // fall back rather than being unwrapped, so a future edit that mistypes one degrades
+    // to a provider that serves no model — which makes every run fail with
+    // `run.no_model_served`, a state an operator can see — instead of panicking on the
+    // startup path.
+    let provider: Arc<dyn ModelProvider> = match (
+        ProviderId::from_literal("scripted.local"),
+        ModelId::from_literal("scripted-echo"),
+    ) {
+        (Some(provider_id), Some(model_id)) => {
+            // The script echoes a bounded acknowledgement rather than the caller's text,
+            // so the deterministic path cannot be mistaken for a real model's answer and
+            // its output cannot reflect prompt content into a public event payload.
+            Arc::new(
+                ScriptedProvider::new(ModelRef::new(provider_id, model_id))
+                    .emit(ModelStreamEventKind::OutputItemAdded {
+                        item_id: "scripted-answer".to_owned(),
+                    })
+                    .emit_text(
+                        "scripted-answer",
+                        "The scripted provider received this run. Configure a model provider to receive real answers.",
+                    )
+                    .emit(ModelStreamEventKind::CallCompleted {
+                        finish_reason: FinishReason::Stop,
+                        usage: None,
+                        refused: false,
+                    }),
+            )
+        }
+        _ => Arc::new(ScriptedProvider::serving_no_model()),
+    };
+
+    RunPorts {
+        runs: Arc::clone(&repositories)
+            as Arc<dyn jarvis_application::repository::run::RunRepository>,
+        conversations: Arc::clone(&repositories)
+            as Arc<dyn jarvis_application::repository::conversation::ConversationRepository>,
+        model_calls: Arc::clone(&repositories)
+            as Arc<dyn jarvis_application::repository::model_call::ModelCallRepository>,
+        deltas: repositories as Arc<dyn jarvis_application::live_events::StreamDeltaSink>,
+        provider,
+        clock: Arc::new(crate::time::SystemClock::new()),
+    }
 }
 
 /// Formats the loopback base URL for a bound address.

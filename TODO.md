@@ -798,7 +798,87 @@ Foundation TODO remains incomplete.
   is exposed by `CandidateSource::is_untrusted` but consumed by nothing, since no
   prompt is assembled before `BRN-007`; and `ACC-035`'s cross-workspace candidate
   case cannot be exercised end to end until retrieval exists.
-- [ ] `BRN-007` Implement CLI chat plus HTTP/SSE streaming.
+- [~] `BRN-007` Implement CLI chat plus HTTP/SSE streaming. **Partial**: the run
+  resource surface and the CLI chat path are implemented and verified end to end
+  against a real daemon; the **live** SSE follow is not, and is named below.
+  Evidence: `jarvis_application::run_service` is the orchestration — it resolves the
+  conversation, claims the idempotency key, creates the run, spawns the controller, and
+  records cancellation intent — and `jarvis_infrastructure::http::runs` is the thin
+  boundary over it, so the handlers do nothing but resolve the authenticated scope,
+  parse the command, and call the service. `jarvis-protocol::run` carries the wire
+  types, so the daemon and the client share one serialization definition rather than
+  each defining its own. Six endpoints now exist: `POST /api/v1/runs`,
+  `GET /api/v1/runs/{id}`, `POST /api/v1/runs/{id}/cancel`,
+  `GET /api/v1/runs/{id}/events`, plus the existing status and health probes. The CLI
+  gained `jarvis ask <text>`, `jarvis runs show|events|cancel`, and it **was run**: a
+  clean profile, a real `jarvisd`, `jarvis ask "what is the deadline"` printed the
+  answer and exited 0, and `jarvis runs show` on an unknown run printed
+  `resource.not_found` with advice that matched the status.
+  Five properties are structural. **The state mapping is total and lives at the
+  boundary** — `wire_state` collapses twelve domain states onto the contract's seven,
+  which is what `BRN-005` deferred here because the architecture forbids domain states
+  doubling as UI strings; a test asserts it is both total and coarser, and that the three
+  terminal states stay one-to-one. **The authenticated identity is an extractor** —
+  `AuthenticatedClient` is a `FromRequestParts` implementation, so a handler that lacks a
+  credential cannot run, which makes "this route requires authentication" a property of
+  its signature rather than a middleware promise in another file, and a test asserts all
+  four run routes refuse an unauthenticated caller. **The scope is resolved
+  server-side** from the authenticated client, never from a body field, so a caller
+  cannot address another workspace's run by naming it. **Idempotency is atomic with the
+  mutation** — `create_run_idempotent` writes the run, its opening event, and the key
+  record in one transaction, because the contract requires "acknowledged mutation state
+  and idempotency records are committed atomically", and a separate claim-then-create
+  leaves exactly the window that rule closes. **A reused key with different input is a
+  conflict** rather than a second run.
+  Six defects were found, five by running rather than reading.
+  1. **A cancelled run never reached a terminal state.** A run cancelled before its
+     first step had no legal exit from `Received`, so a client polling it waited
+     forever for an abandoned answer. Fixed by adding `Received -> Cancelled` to the
+     diagram and the machine — the **third** time an edge absent from that diagram
+     turned out to be a defect in the diagram.
+  2. **A replayed create left an orphan conversation.** The first implementation
+     created the conversation *before* checking the key, so a replay reported a
+     conflict instead of replaying. The check now precedes any preparation, and a
+     concurrent replay discards the conversation it did not need.
+  3. **The port event name drifted from the contract.** The delta event was declared
+     `run.output_text_delta` while the contract's example says `run.output_text.delta`.
+     A cross-check test asserting the port constant equals the wire constant caught it
+     on its first run.
+  4. **A claim naming an absent run reported the wrong reason.** The foreign key refused
+     it, but as the same `Conflict` a concurrent claim produces, so a caller was told
+     "someone else used this key" when the truth was "there is no such run". The run is
+     now checked first, and `NotFound` is the answer.
+  5. **The CLI printed the transport code for a daemon refusal**, so an operator saw
+     `jarvis.daemon_rejected` and could not tell an unknown run from a rejected
+     credential. It now prints the daemon's own code, and the advice follows the status
+     because blaming credentials for a `404` sends an operator to inspect the wrong
+     thing.
+  6. **`ModelRef`'s owner-name types had no way to build a constant**, so composing the
+     daemon's provider needed an `expect` on the startup path — denied by the lint
+     policy and wrong regardless. `from_literal` returns `None` instead, so a mistyped
+     literal degrades to a provider that serves no model, which reports
+     `run.no_model_served` per run, rather than panicking before the daemon can serve.
+  The daemon now composes the **deterministic scripted provider**, which is what the
+  accepted [first vertical slice](docs/planning/first-vertical-slice.md) names as this
+  slice's model source; its reply is a fixed acknowledgement rather than an echo, so the
+  deterministic path cannot be mistaken for a real answer and prompt content cannot
+  reach a public event payload. `BRN-003` replaces that composition rather than sitting
+  beside it. 656 workspace tests (application 86, infrastructure 369, CLI 20). `fmt`,
+  `clippy -D warnings`, `node scripts/validate-docs.mjs`, and its fail-closed tests are
+  clean. **Not done, and this is why this TODO is `~`:**
+  the events endpoint delivers the **retained** public events and closes, so a client
+  follows a run by reconnecting with `Last-Event-ID` until a terminal event arrives — it
+  does **not** hold the connection open and push each new event as it is published. A
+  streaming response body needs a `Stream` implementation, and this crate has neither a
+  stream crate nor `axum`'s `sse` feature in its reviewed dependency set; adding either
+  is a dependency change the integration research gate requires evidence for, and
+  hand-writing a `Stream` would be an unreviewed async state machine on the
+  security-relevant path. Also not done: the CLI has no streaming renderer that prints
+  deltas as they arrive from one connection, `Idempotency-Key` is scoped per client
+  rather than per principal-and-credential as the contract words it, no golden JSON/SSE
+  fixture or generated OpenAPI document exists (contract test 12), the run list and
+  the `jarvis ask` conversation-continuation option are absent, and the E2E step's
+  abrupt-restart and disconnect cases belong to `BRN-008`.
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior. This TODO owns the run controller and the repositories' test
   doubles: `jarvis_application::run_controller` drives one durable run from

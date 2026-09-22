@@ -35,6 +35,7 @@ stateDiagram-v2
     Responding --> Completed
     Responding --> Failed
     Responding --> Cancelled
+    Received --> Cancelled
     Received --> Failed
     ContextBuilding --> Failed
     Planning --> Failed
@@ -50,7 +51,7 @@ stateDiagram-v2
     Completed --> [*]
 ```
 
-Three edges were **added** to this diagram on 2026-09-22, and the reason is worth
+Four edges were **added** to this diagram on 2026-09-22, and the reason is worth
 recording because each was a defect the diagram had rather than a stylistic
 choice:
 
@@ -66,6 +67,13 @@ choice:
   `ACC-012` requires that a disconnect "never becomes false `Completed`" while
   `ACC-016` requires cancelling during streaming. With `Completed` as the only
   successor, neither could be persisted truthfully.
+- `Received --> Cancelled`. A run can be cancelled before its first step, and the
+  local control API requires a cancellation to reach a durable terminal transition.
+  Without this edge such a run was **permanently non-terminal**: the controller had
+  no legal way to record the cancellation, so a client polling the run waited forever
+  for an answer that had already been abandoned. This one was found by driving the
+  run service end to end rather than by reading the diagram, and it is the third
+  time an edge absent from this diagram turned out to be a defect in the diagram.
 
 State names are domain concepts, not UI strings. A transition records actor,
 reason, expected prior version, timestamp, and correlation metadata.

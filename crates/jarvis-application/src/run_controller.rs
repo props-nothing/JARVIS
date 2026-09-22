@@ -57,6 +57,7 @@ use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, Transitio
 use jarvis_domain::time::UtcTimestamp;
 
 use crate::cancellation::CancellationScope;
+use crate::live_events::StreamDeltaSink;
 use crate::model::{ModelProvider, ModelStream, ProviderError};
 use crate::repository::RepositoryError;
 use crate::repository::conversation::{ConversationRepository, NewMessage, StoredMessage};
@@ -104,6 +105,13 @@ pub enum ControllerError {
         /// The stable, namespaced domain error code.
         code: &'static str,
     },
+    /// Produced output could not be published as a durable public event.
+    ///
+    /// Distinct from a generic storage failure because it says exactly what was
+    /// lost: a client that already saw part of an answer would otherwise be told the
+    /// run failed for an unrelated reason, and the events it received would not
+    /// reconcile with the run's stored state.
+    OutputNotPersisted,
     /// The injected clock reported no usable instant.
     ClockUnavailable,
     /// The caller cancelled the run.
@@ -111,6 +119,46 @@ pub enum ControllerError {
 }
 
 impl ControllerError {
+    /// Returns a message safe for the requesting principal.
+    ///
+    /// The same fixed text [`Display`](fmt::Display) produces, exposed so a caller
+    /// that reports an error to a client does not have to format it and risk a
+    /// developer-facing string reaching a user.
+    #[must_use]
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::Repository(_) => "The run could not be persisted.",
+            Self::Provider(_) => "The model provider did not answer.",
+            Self::NoModelServed => "No model is available to serve this run.",
+            Self::ToolsNotImplemented { .. } => "Tool execution is not available yet.",
+            Self::StreamInterrupted => "The model stream ended before it finished.",
+            Self::StreamRejected { .. } => "The model stream was refused.",
+            Self::OutputNotPersisted => "Produced output could not be recorded.",
+            Self::ClockUnavailable => "The clock could not provide an instant.",
+            Self::Cancelled => "The run was cancelled.",
+        }
+    }
+
+    /// Returns whether retrying the same request unchanged could succeed.
+    ///
+    /// A tool-shaped refusal is explicitly **not** retryable: the capability is
+    /// absent, so retrying it changes nothing. A provider error's own retryability is
+    /// preserved rather than guessed at here.
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        match self {
+            Self::Provider(error) => error.retryable(),
+            Self::Repository(error) => error.retryable(),
+            Self::NoModelServed
+            | Self::ToolsNotImplemented { .. }
+            | Self::StreamInterrupted
+            | Self::StreamRejected { .. }
+            | Self::OutputNotPersisted
+            | Self::ClockUnavailable
+            | Self::Cancelled => false,
+        }
+    }
+
     /// Returns the stable, namespaced error code.
     #[must_use]
     pub const fn code(&self) -> &'static str {
@@ -121,6 +169,7 @@ impl ControllerError {
             Self::ToolsNotImplemented { .. } => "run.tools_not_implemented",
             Self::StreamInterrupted => "run.stream_interrupted",
             Self::StreamRejected { .. } => "run.stream_rejected",
+            Self::OutputNotPersisted => "run.output_not_persisted",
             Self::ClockUnavailable => "run.clock_unavailable",
             Self::Cancelled => "run.cancelled",
         }
@@ -142,6 +191,7 @@ impl ControllerError {
             | Self::ToolsNotImplemented { .. }
             | Self::StreamInterrupted
             | Self::StreamRejected { .. }
+            | Self::OutputNotPersisted
             | Self::ClockUnavailable => RunState::Failed,
         }
     }
@@ -167,6 +217,7 @@ impl fmt::Display for ControllerError {
             Self::ToolsNotImplemented { .. } => "tool execution is not implemented yet",
             Self::StreamInterrupted => "the model stream ended without a terminal event",
             Self::StreamRejected { .. } => "the model stream was refused",
+            Self::OutputNotPersisted => "produced output could not be recorded",
             Self::ClockUnavailable => "the clock reported no usable instant",
             Self::Cancelled => "the run was cancelled",
         };
@@ -249,6 +300,9 @@ pub struct RunController {
     runs: Arc<dyn RunRepository>,
     conversations: Arc<dyn ConversationRepository>,
     model_calls: Arc<dyn ModelCallRepository>,
+    /// Publishes live output deltas. A no-op sink is valid for a caller that
+    /// replays the persisted events later rather than following them live.
+    deltas: Arc<dyn StreamDeltaSink>,
     provider: Arc<dyn ModelProvider>,
     clock: Arc<dyn Clock>,
 }
@@ -271,6 +325,7 @@ impl RunController {
         runs: Arc<dyn RunRepository>,
         conversations: Arc<dyn ConversationRepository>,
         model_calls: Arc<dyn ModelCallRepository>,
+        deltas: Arc<dyn StreamDeltaSink>,
         provider: Arc<dyn ModelProvider>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -278,6 +333,7 @@ impl RunController {
             runs,
             conversations,
             model_calls,
+            deltas,
             provider,
             clock,
         }
@@ -310,11 +366,33 @@ impl RunController {
             run_id,
         };
 
-        // A cancellation that arrived before any work is reported without touching
-        // the run's state: there is nothing to clean up, and moving a run to
-        // `Cancelled` for a request that never started would record work that did not
-        // happen.
+        // A cancellation that arrived before any work is recorded as a terminal
+        // transition rather than leaving the run in `Received`.
+        //
+        // An earlier version of this method returned without touching the run, on the
+        // reasoning that recording work that never happened is a falsehood. That
+        // reasoning was wrong about what the transition claims: moving to `Cancelled`
+        // does not assert that work happened, it records that the request was
+        // cancelled — which is exactly what occurred. Leaving the run in `Received`
+        // made it permanently non-terminal, so a client polling it would wait forever
+        // for an answer that had already been abandoned. The contract is explicit that
+        // cancellation reaches a durable terminal transition.
         if cancel.is_cancelled() {
+            // A `Received` run may already have been cancelled by an earlier attempt,
+            // in which case it is terminal and there is nothing left to record.
+            let stored = self.load(run).await?;
+            if !stored.state.is_terminal() {
+                self.finish(
+                    run,
+                    Step::new(
+                        RunState::Received,
+                        RunState::Cancelled,
+                        "run.cancelled",
+                        "cancelled_before_start",
+                    ),
+                )
+                .await?;
+            }
             return Err(ControllerError::Cancelled);
         }
 
@@ -627,7 +705,24 @@ impl RunController {
                 }
             }
             match &event.kind {
-                ModelStreamEventKind::OutputTextDelta { delta, .. } => {
+                ModelStreamEventKind::OutputTextDelta { item_id, delta } => {
+                    // Each chunk is published as its own durable public event, so a
+                    // client that reconnects replays the output it missed rather than
+                    // only the final answer. A failure to publish fails the run: a
+                    // stream whose output cannot be recorded is not one a client can
+                    // trust, and completing anyway would claim an answer the audit
+                    // trail does not contain.
+                    let occurred_at = self.now()?;
+                    self.deltas
+                        .output_text_delta(
+                            run.workspace,
+                            run.run_id,
+                            item_id.clone(),
+                            delta.clone(),
+                            occurred_at,
+                        )
+                        .await
+                        .map_err(|_| ControllerError::OutputNotPersisted)?;
                     drained.answer.push_str(delta);
                 }
                 ModelStreamEventKind::ToolCallAdded { tool_name, .. } => {

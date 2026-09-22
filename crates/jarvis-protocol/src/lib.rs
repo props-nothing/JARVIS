@@ -7,6 +7,12 @@
 
 pub mod discovery;
 pub mod error;
+pub mod run;
 
 pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 pub use error::{ErrorEnvelope, ErrorResponse};
+pub use run::{
+    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, ModelPolicyRef,
+    NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame, RunInput, RunLinks, RunView, SseEvent,
+    event_type,
+};

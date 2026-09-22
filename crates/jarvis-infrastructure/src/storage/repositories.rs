@@ -31,10 +31,14 @@ use jarvis_application::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, NewModelCall, StoredModelCall,
 };
 use jarvis_application::repository::run::{
-    EventVisibility, NewActivityEvent, NewRun, RunRepository, RunResumeState, RunWrite, StoredRun,
+    EventVisibility, IdempotencyClaim, MAX_EVENT_PAGE, NewActivityEvent, NewIdempotencyRecord,
+    NewRun, RunEventPage, RunRepository, RunResumeState, RunWrite, StoredActivityEvent, StoredRun,
+    validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
-use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, PrincipalId, RunId, WorkspaceId};
+use jarvis_domain::ids::{
+    ConversationId, MessageId, ModelCallId, PrincipalId, RunActivityEventId, RunId, WorkspaceId,
+};
 use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::Role;
 use jarvis_domain::run::state::{RunState, RunVersion};
@@ -61,6 +65,90 @@ impl SqliteRepositories {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+}
+
+impl jarvis_application::live_events::StreamDeltaSink for SqliteRepositories {
+    fn output_text_delta(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        item_id: String,
+        delta: String,
+        occurred_at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, u64> {
+        Box::pin(async move {
+            // The run is checked first so an absent or foreign run reports `NotFound`
+            // and no orphan event is appended under it.
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE workspace_id = ? AND id = ?")
+                    .bind(workspace.to_string())
+                    .bind(run.to_string())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|_| RepositoryError::Query)?;
+            if exists.is_none() {
+                return Err(RepositoryError::NotFound);
+            }
+
+            // The payload is assembled here rather than by the controller, so the
+            // application layer never builds JSON and cannot put prompt text or a
+            // secret into a public payload. The shape is the contract's fixed delta
+            // payload: an item id and the text.
+            let payload = jarvis_protocol::run::output_text_delta_payload(&item_id, &delta);
+
+            // Read the next sequence and insert in one transaction, so two concurrent
+            // deltas cannot both claim the same position. The unique constraint is
+            // the real guarantee; the transaction is what keeps the read honest.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| RepositoryError::Query)?;
+            let maximum: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(sequence) FROM run_activity_events WHERE run_id = ?",
+            )
+            .bind(run.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            let sequence = maximum.map_or(1, |value| value.saturating_add(1));
+            let sequence = u64::try_from(sequence)
+                .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?;
+
+            let inserted = sqlx::query(
+                "INSERT INTO run_activity_events (\
+                     id, workspace_id, run_id, sequence, event_type, payload_json, \
+                     visibility, occurred_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, 'public', ?)",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(workspace.to_string())
+            .bind(run.to_string())
+            .bind(
+                i64::try_from(sequence)
+                    .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?,
+            )
+            .bind(jarvis_protocol::event_type::OUTPUT_TEXT_DELTA)
+            .bind(payload.to_string())
+            .bind(occurred_at.to_string())
+            .execute(&mut *tx)
+            .await;
+
+            match inserted {
+                Ok(result) if result.rows_affected() == 1 => {}
+                // A duplicate sequence is the same caller-visible conflict whether the
+                // constraint appears as a zero-row result or an error.
+                Ok(_) | Err(_) => {
+                    return Err(RepositoryError::Conflict {
+                        what: "activity_sequence",
+                    });
+                }
+            }
+
+            tx.commit().await.map_err(|_| RepositoryError::Query)?;
+            Ok(sequence)
+        })
     }
 }
 
@@ -194,32 +282,115 @@ where
     row.as_ref().map(stored_run).transpose()
 }
 
-impl RunRepository for SqliteRepositories {
-    fn create(&self, run: NewRun) -> RepositoryFuture<'_, ()> {
-        Box::pin(async move {
-            let result = sqlx::query(
-                "INSERT INTO agent_runs (\
-                     id, workspace_id, conversation_id, parent_run_id, principal_id, \
-                     objective_ref, state, version, created_at, updated_at\
-                 ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?)",
-            )
-            .bind(run.id.to_string())
-            .bind(run.workspace_id.to_string())
-            .bind(run.conversation_id.to_string())
-            .bind(run.principal_id.to_string())
-            .bind(run.objective_ref.as_deref())
-            .bind(run.created_at.to_string())
-            .bind(run.created_at.to_string())
-            .execute(&self.pool)
-            .await;
+/// Inserts a run row and its opening activity event inside one transaction.
+///
+/// A free function rather than a method because both plain create and the atomic
+/// idempotent create need it, and having two copies of the insert would let the two
+/// paths diverge on the constraints they enforce.
+async fn insert_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run: &NewRun,
+    opening_event: &NewActivityEvent,
+) -> Result<(), RepositoryError> {
+    // The event must describe the run being created. Refusing a mismatch here rather
+    // than letting the foreign key catch it keeps "the opening event belongs to this
+    // run" a stated rule.
+    if opening_event.run_id != run.id {
+        return Err(RepositoryError::Conflict {
+            what: "opening_event",
+        });
+    }
+    // The first event is sequence 1 and no other, so a caller cannot create a run
+    // whose stream starts at a position a client would read as a gap.
+    if opening_event.sequence != 1 {
+        return Err(RepositoryError::Conflict {
+            what: "opening_event",
+        });
+    }
 
-            // A duplicate primary key or a missing conversation both arrive as an
-            // `Err` from the constraint, and both are caller-visible conflicts
-            // rather than transport faults.
-            match result {
-                Ok(created) if created.rows_affected() == 1 => Ok(()),
-                Ok(_) | Err(_) => Err(RepositoryError::Conflict { what: "run" }),
-            }
+    let result = sqlx::query(
+        "INSERT INTO agent_runs (\
+             id, workspace_id, conversation_id, parent_run_id, principal_id, \
+             objective_ref, state, version, created_at, updated_at\
+         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?)",
+    )
+    .bind(run.id.to_string())
+    .bind(run.workspace_id.to_string())
+    .bind(run.conversation_id.to_string())
+    .bind(run.principal_id.to_string())
+    .bind(run.objective_ref.as_deref())
+    .bind(run.created_at.to_string())
+    .bind(run.created_at.to_string())
+    .execute(&mut **tx)
+    .await;
+
+    // A duplicate primary key or a missing conversation both arrive as an `Err` from
+    // the constraint, and both are caller-visible conflicts rather than transport
+    // faults.
+    match result {
+        Ok(created) if created.rows_affected() == 1 => {}
+        Ok(_) | Err(_) => return Err(RepositoryError::Conflict { what: "run" }),
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO run_activity_events (\
+             id, workspace_id, run_id, sequence, event_type, payload_json, \
+             visibility, occurred_at\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(run.workspace_id.to_string())
+    .bind(run.id.to_string())
+    .bind(1_i64)
+    .bind(&opening_event.event_type)
+    .bind(opening_event.payload_json.as_deref())
+    .bind(opening_event.visibility.as_str())
+    .bind(opening_event.occurred_at.to_string())
+    .execute(&mut **tx)
+    .await;
+
+    match inserted {
+        Ok(event) if event.rows_affected() == 1 => Ok(()),
+        Ok(_) | Err(_) => Err(RepositoryError::Conflict {
+            what: "activity_sequence",
+        }),
+    }
+}
+
+/// Reads an existing idempotency record inside `executor`.
+async fn read_idempotency<'e, E>(
+    executor: E,
+    workspace: WorkspaceId,
+    operation: &str,
+    key: &str,
+) -> Result<Option<(String, String)>, RepositoryError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query_as(
+        "SELECT request_digest, run_id FROM idempotency_records \
+         WHERE workspace_id = ? AND operation = ? AND api_major = ? \
+           AND idempotency_key = ?",
+    )
+    .bind(workspace.to_string())
+    .bind(operation)
+    .bind(i64::from(crate::http::API_MAJOR))
+    .bind(key)
+    .fetch_optional(executor)
+    .await
+    .map_err(|_| RepositoryError::Query)
+}
+
+impl RunRepository for SqliteRepositories {
+    fn create(&self, run: NewRun, opening_event: NewActivityEvent) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| RepositoryError::Query)?;
+            insert_run(&mut tx, &run, &opening_event).await?;
+            tx.commit().await.map_err(|_| RepositoryError::Query)
         })
     }
 
@@ -436,6 +607,238 @@ impl RunRepository for SqliteRepositories {
             u64::try_from(next).map_err(|_| RepositoryError::Corrupted { column: "sequence" })
         })
     }
+
+    fn load_events(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        from_sequence: u64,
+        limit: u32,
+    ) -> RepositoryFuture<'_, RunEventPage> {
+        Box::pin(async move {
+            // The run is read first, both to scope the read and to learn the terminal
+            // state: a stream that connects after the run finished must deliver the
+            // terminal event from retention and then close, so it has to know the run
+            // is already finished rather than wait for a terminal that was published
+            // before it connected.
+            let Some(stored) = read_run(&self.pool, workspace, &run.to_string()).await? else {
+                return Err(RepositoryError::NotFound);
+            };
+
+            // Visibility is a query predicate, not a post-filter: an operator-only
+            // event must never be read into memory on a client-facing path.
+            let bounded = i64::from(limit.clamp(1, MAX_EVENT_PAGE));
+            let from = i64::try_from(from_sequence)
+                .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?;
+
+            let rows = sqlx::query(
+                "SELECT id, run_id, sequence, event_type, payload_json, visibility, occurred_at \
+                 FROM run_activity_events \
+                 WHERE workspace_id = ? AND run_id = ? AND visibility = 'public' \
+                   AND sequence >= ? \
+                 ORDER BY sequence ASC LIMIT ?",
+            )
+            .bind(workspace.to_string())
+            .bind(run.to_string())
+            .bind(from)
+            .bind(bounded)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+
+            let mut events = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let sequence = u64::try_from(int(row, "sequence")?)
+                    .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?;
+                events.push(StoredActivityEvent {
+                    id: RunActivityEventId::parse(&text(row, "id")?)
+                        .map_err(|_| RepositoryError::Corrupted { column: "event_id" })?,
+                    run_id: RunId::parse(&text(row, "run_id")?)
+                        .map_err(|_| RepositoryError::Corrupted { column: "run_id" })?,
+                    sequence,
+                    event_type: text(row, "event_type")?,
+                    payload_json: opt_text(row, "payload_json")?,
+                    visibility: EventVisibility::parse(&text(row, "visibility")?)?,
+                    occurred_at: parse_time(&text(row, "occurred_at")?, "occurred_at")?,
+                });
+            }
+
+            Ok(RunEventPage {
+                events,
+                terminal_state: stored.state.is_terminal().then_some(stored.state),
+            })
+        })
+    }
+
+    fn claim_idempotency(
+        &self,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim> {
+        Box::pin(async move {
+            validate_idempotency_key(&record.key)?;
+
+            // An existing record is read first so the common replay case answers
+            // without attempting an insert that would fail on the unique constraint.
+            let existing = read_idempotency(
+                &self.pool,
+                record.workspace_id,
+                &record.operation,
+                &record.key,
+            )
+            .await?;
+
+            if let Some((digest, run_id)) = existing {
+                if digest == record.request_digest {
+                    let run_id = RunId::parse(&run_id)
+                        .map_err(|_| RepositoryError::Corrupted { column: "run_id" })?;
+                    return Ok(IdempotencyClaim::Replay(run_id));
+                }
+                return Ok(IdempotencyClaim::Conflict);
+            }
+
+            // The run is checked before the insert so a record naming a run that does
+            // not exist in this workspace reports `NotFound` rather than a conflict.
+            // Without this, the foreign key would fire and be indistinguishable from
+            // the concurrent-claim branch below, so a caller would be told "someone
+            // else used this key" when the truth is "there is no such run".
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE workspace_id = ? AND id = ?")
+                    .bind(record.workspace_id.to_string())
+                    .bind(record.run_id.to_string())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|_| RepositoryError::Query)?;
+            if exists.is_none() {
+                return Err(RepositoryError::NotFound);
+            }
+
+            let inserted = sqlx::query(
+                "INSERT INTO idempotency_records (\
+                     id, idempotency_key, workspace_id, operation, api_major, \
+                     request_digest, run_id, created_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&record.key)
+            .bind(record.workspace_id.to_string())
+            .bind(&record.operation)
+            .bind(i64::from(crate::http::API_MAJOR))
+            .bind(&record.request_digest)
+            .bind(record.run_id.to_string())
+            .bind(record.created_at.to_string())
+            .execute(&self.pool)
+            .await;
+
+            match inserted {
+                Ok(result) if result.rows_affected() == 1 => Ok(IdempotencyClaim::Claimed),
+                // A concurrent request claimed the same key between the read and this
+                // insert. The unique constraint is what makes the claim atomic; the
+                // honest answer is to report the conflict rather than to guess which
+                // request won.
+                Ok(_) | Err(_) => Ok(IdempotencyClaim::Conflict),
+            }
+        })
+    }
+
+    fn lookup_idempotency(
+        &self,
+        workspace: WorkspaceId,
+        operation: &str,
+        key: &str,
+    ) -> RepositoryFuture<'_, Option<(String, RunId)>> {
+        // The strings are copied before the future is built: the returned future is
+        // tied to `&self`'s lifetime, so capturing shorter borrows would not compile.
+        let operation = operation.to_owned();
+        let key = key.to_owned();
+        Box::pin(async move {
+            let found = read_idempotency(&self.pool, workspace, &operation, &key).await?;
+            found
+                .map(|(digest, run_id)| {
+                    Ok((
+                        digest,
+                        RunId::parse(&run_id)
+                            .map_err(|_| RepositoryError::Corrupted { column: "run_id" })?,
+                    ))
+                })
+                .transpose()
+        })
+    }
+
+    fn create_run_idempotent(
+        &self,
+        run: NewRun,
+        opening_event: NewActivityEvent,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim> {
+        Box::pin(async move {
+            validate_idempotency_key(&record.key)?;
+            if record.run_id != run.id {
+                return Err(RepositoryError::Conflict {
+                    what: "idempotency_run",
+                });
+            }
+
+            // Everything happens inside one transaction, so the decision to create and
+            // the creation are the same unit. A separate check-then-insert would leave
+            // exactly the window the contract's "acknowledged mutation state and
+            // idempotency records are committed atomically" rule exists to close.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| RepositoryError::Query)?;
+
+            let existing = read_idempotency(
+                &mut *tx,
+                record.workspace_id,
+                &record.operation,
+                &record.key,
+            )
+            .await?;
+            if let Some((digest, run_id)) = existing {
+                // Rolled back rather than committed: nothing was changed, and the
+                // replay answer is read-only.
+                tx.rollback().await.map_err(|_| RepositoryError::Query)?;
+                if digest == record.request_digest {
+                    let run_id = RunId::parse(&run_id)
+                        .map_err(|_| RepositoryError::Corrupted { column: "run_id" })?;
+                    return Ok(IdempotencyClaim::Replay(run_id));
+                }
+                return Ok(IdempotencyClaim::Conflict);
+            }
+
+            insert_run(&mut tx, &run, &opening_event).await?;
+
+            let inserted = sqlx::query(
+                "INSERT INTO idempotency_records (\
+                     id, idempotency_key, workspace_id, operation, api_major, \
+                     request_digest, run_id, created_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&record.key)
+            .bind(record.workspace_id.to_string())
+            .bind(&record.operation)
+            .bind(i64::from(crate::http::API_MAJOR))
+            .bind(&record.request_digest)
+            .bind(record.run_id.to_string())
+            .bind(record.created_at.to_string())
+            .execute(&mut *tx)
+            .await;
+
+            match inserted {
+                Ok(result) if result.rows_affected() == 1 => {}
+                // A concurrent request claimed the same key. Reported as a conflict so
+                // the caller retries and replays rather than creating a duplicate.
+                Ok(_) | Err(_) => {
+                    return Ok(IdempotencyClaim::Conflict);
+                }
+            }
+
+            tx.commit().await.map_err(|_| RepositoryError::Query)?;
+            Ok(IdempotencyClaim::Claimed)
+        })
+    }
 }
 
 impl ConversationRepository for SqliteRepositories {
@@ -643,6 +1046,30 @@ impl ConversationRepository for SqliteRepositories {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn discard_if_empty(
+        &self,
+        workspace: WorkspaceId,
+        conversation: ConversationId,
+    ) -> RepositoryFuture<'_, bool> {
+        Box::pin(async move {
+            // The emptiness condition is part of the DELETE, so a message appended
+            // between a check and this statement cannot be destroyed: the predicate is
+            // evaluated inside the write, not before it.
+            let deleted = sqlx::query(
+                "DELETE FROM conversations \
+                 WHERE workspace_id = ? AND id = ? \
+                   AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ?)",
+            )
+            .bind(workspace.to_string())
+            .bind(conversation.to_string())
+            .bind(conversation.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            Ok(deleted.rows_affected() == 1)
         })
     }
 }

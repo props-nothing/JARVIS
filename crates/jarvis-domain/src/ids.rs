@@ -184,6 +184,12 @@ identifier!(
     "context_manifest",
     "Identifies one recorded context assembly."
 );
+identifier!(
+    RunActivityEventId,
+    "run_activity_event",
+    "Identifies one durable run activity event, which is globally unique because \
+     a client resumes an event stream by echoing this value as `Last-Event-ID`."
+);
 
 /// Generates identifiers for domain records.
 ///

@@ -222,6 +222,24 @@ pub trait ConversationRepository: Send + Sync {
         after_sequence: Option<u64>,
         limit: u32,
     ) -> RepositoryFuture<'_, Vec<StoredMessage>>;
+
+    /// Removes a conversation that has no messages, returning whether one was removed.
+    ///
+    /// Used to clean up a conversation created for a command that turned out to be a
+    /// replay, so a replayed command leaves no trace of the work it did not need.
+    ///
+    /// The emptiness check is part of the delete rather than a separate read, so a
+    /// message appended between a check and a delete cannot be destroyed. A
+    /// conversation with any message is left alone and reported as `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] for a driver failure.
+    fn discard_if_empty(
+        &self,
+        workspace: WorkspaceId,
+        conversation: ConversationId,
+    ) -> RepositoryFuture<'_, bool>;
 }
 
 #[cfg(test)]

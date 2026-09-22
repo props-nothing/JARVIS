@@ -20,17 +20,24 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
+use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
+use jarvis_application::run_service::{RunService, RunSpawner};
 use jarvis_protocol::ErrorEnvelope;
 use serde::Serialize;
 
 use crate::auth::ClientRegistry;
 use crate::auth::credential::CredentialError;
+
+pub mod runs;
+
+pub use runs::{RequestScope, resolve_scope, wire_state};
 
 /// The maximum accepted request body, in bytes.
 ///
@@ -102,7 +109,6 @@ impl Default for Readiness {
 }
 
 /// Shared state for the HTTP handlers.
-#[derive(Debug)]
 pub struct ApiState {
     /// The enrolled clients used for authentication.
     pub clients: Arc<ClientRegistry>,
@@ -118,6 +124,29 @@ pub struct ApiState {
     /// accepting any loopback host would let `localhost`, a different loopback
     /// address, or a foreign port reach the control surface.
     pub bound_authority: String,
+    /// The run orchestration service, absent when no storage is configured.
+    ///
+    /// Optional so the Foundation surface (health and status) can be built without a
+    /// database. A run route reached without one answers `service.not_ready` rather
+    /// than being unroutable, so a client gets a parseable envelope instead of the
+    /// generic unknown-route refusal.
+    pub runs: Option<Arc<RunService>>,
+    /// How a run's execution is scheduled.
+    pub spawner: Arc<dyn RunSpawner>,
+}
+
+impl std::fmt::Debug for ApiState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The client registry and the run ports are not printed: one holds credential
+        // verifiers and the other can hold a connection string.
+        formatter
+            .debug_struct("ApiState")
+            .field("instance_id", &self.instance_id)
+            .field("bound_authority", &self.bound_authority)
+            .field("ready", &self.readiness.is_ready())
+            .field("runs_configured", &self.runs.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ApiState {
@@ -134,7 +163,23 @@ impl ApiState {
             readiness,
             instance_id,
             bound_authority: authority_of(address),
+            runs: None,
+            spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
         }
+    }
+
+    /// Attaches the run orchestration service.
+    #[must_use]
+    pub fn with_runs(mut self, runs: Arc<RunService>) -> Self {
+        self.runs = Some(runs);
+        self
+    }
+
+    /// Overrides how a run's execution is scheduled.
+    #[must_use]
+    pub fn with_spawner(mut self, spawner: Arc<dyn RunSpawner>) -> Self {
+        self.spawner = spawner;
+        self
     }
 }
 
@@ -190,15 +235,33 @@ struct StorageStatus {
 /// 4. version negotiation and authentication, per route;
 /// 5. routing, with the envelope-returning fallback.
 pub fn router(state: Arc<ApiState>) -> Router {
+    // Every `/api/v1` route needs the same authentication layer, so it is applied by
+    // one helper rather than repeated. A route that forgot it would be reachable
+    // without a credential, which is why the wrapping is a function and not a
+    // copy-paste at each call site.
+    let authenticated = |route: MethodRouter<Arc<ApiState>>| {
+        route.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_authentication,
+        ))
+    };
     Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness_handler))
+        .route("/api/v1/system/status", authenticated(get(system_status)))
+        // The run routes are always *routable* and answer `service.not_ready` when no
+        // storage is configured, rather than being absent. A client then receives a
+        // parseable envelope instead of the generic unknown-route refusal, which would
+        // tell it the endpoint does not exist.
+        .route("/api/v1/runs", authenticated(post(runs::create_run)))
+        .route("/api/v1/runs/{run_id}", authenticated(get(runs::read_run)))
         .route(
-            "/api/v1/system/status",
-            get(system_status).layer(middleware::from_fn_with_state(
-                Arc::clone(&state),
-                require_authentication,
-            )),
+            "/api/v1/runs/{run_id}/cancel",
+            authenticated(post(runs::cancel_run)),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/events",
+            authenticated(get(runs::run_events)),
         )
         .fallback(unknown_route)
         .layer(middleware::from_fn(reject_browser_origin))
@@ -387,11 +450,67 @@ async fn reject_browser_origin(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// The authenticated identity of the caller, as a route extractor.
+///
+/// A route that names this parameter cannot run without a credential: the extraction
+/// fails with the same envelope [`require_authentication`] produces, and it fails
+/// *before* the handler body runs. That makes "this handler requires authentication" a
+/// property of its signature rather than a promise the middleware layer has to keep in
+/// a separate file — the two cannot drift.
+///
+/// It deliberately carries only what a handler needs to build trusted context: the
+/// client id, the assurance level, and the channel. The credential itself is not here,
+/// so a handler cannot log it or place it in a response by accident.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedClient {
+    /// The stable client identifier the credential authenticated as.
+    pub client_id: String,
+    /// How strongly the caller's identity was proven.
+    pub assurance: AuthenticationAssurance,
+    /// The channel this request arrived on.
+    pub channel: RequestChannel,
+}
+
+impl<S> FromRequestParts<S> for AuthenticatedClient
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // The extraction reads a value the middleware already recorded, so it has
+        // nothing to wait for. `FromRequestParts` requires an `async` signature, so this
+        // yields once rather than pretending to do asynchronous work — the alternative
+        // would be an `allow` for `unused_async`, which would hide a genuinely
+        // unnecessary `async` if one were introduced later.
+        std::future::ready(()).await;
+
+        // An absent identity would mean a route was wired without the authentication
+        // layer. That must fail rather than proceed unauthenticated, so it produces the
+        // same refusal the middleware does.
+        let Some(client_id) = parts.extensions.get::<AuthenticatedClientId>() else {
+            return Err(unauthenticated());
+        };
+        Ok(Self {
+            client_id: client_id.0.clone(),
+            assurance: AuthenticationAssurance::Standard,
+            // A local API client is one that reached the loopback surface with a valid
+            // credential; the channel is not caller-supplied, so it cannot claim to be
+            // something more privileged.
+            channel: RequestChannel::Api,
+        })
+    }
+}
+
+/// The client id the authentication middleware verified.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedClientId(String);
+
 /// Requires a valid local credential and a supported API version.
 async fn require_authentication(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // Version negotiation comes first: an unsupported client should learn the
@@ -414,9 +533,16 @@ async fn require_authentication(
     let Some(presented) = bearer_token(&headers) else {
         return unauthenticated();
     };
-    if state.clients.authenticate(presented).is_err() {
+    let Ok(client) = state.clients.authenticate(presented) else {
         return unauthenticated();
-    }
+    };
+
+    // The verified identity is recorded for the extractor, so a handler's signature
+    // can require it. Only the id is stored: the credential is not, so it cannot reach
+    // a log or a response through a handler.
+    request
+        .extensions_mut()
+        .insert(AuthenticatedClientId(client.client_id.clone()));
 
     let mut response = next.run(request).await;
     if let Ok(value) = header::HeaderValue::from_str(&API_MAJOR.to_string()) {
@@ -1066,5 +1192,609 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- The run resource surface ----
+
+    /// The run-surface fixture: a migrated database with the scripted provider.
+    ///
+    /// A real migrated database rather than a double, because these tests are about the
+    /// HTTP boundary and a double at both layers would let a serialization or scope
+    /// defect survive. The database is in-memory so the fixture stays fast.
+    async fn runs_fixture(tag: &str) -> (axum::Router, String) {
+        use crate::storage::repositories::SqliteRepositories;
+        use crate::storage::{Database, migrate};
+        use jarvis_application::live_events::StreamDeltaSink;
+        use jarvis_application::model::ModelProvider;
+        use jarvis_application::run_service::{
+            RunCancellationRegistry, RunPorts, RunService, TokioSpawner,
+        };
+        use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+        use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
+
+        let dir = temp_dir(tag);
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+        let (registered, credential) =
+            enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+        let mut clients = ClientRegistry::new();
+        clients.register(registered);
+
+        let database = Database::open_in_memory().await.expect("in-memory opens");
+        migrate::run(database.pool()).await.expect("migrates");
+        let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+        let model = ModelRef::new(
+            ProviderId::parse("scripted.local").expect("valid"),
+            ModelId::parse("fixture-1").expect("valid"),
+        );
+        let provider: Arc<dyn ModelProvider> = Arc::new(
+            jarvis_application::model::ScriptedProvider::new(model)
+                .emit(ModelStreamEventKind::OutputItemAdded {
+                    item_id: "out-1".to_owned(),
+                })
+                .emit_text("out-1", "hello from the scripted provider")
+                .emit(ModelStreamEventKind::CallCompleted {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    refused: false,
+                }),
+        );
+        let service = Arc::new(RunService::new(
+            RunPorts {
+                runs: Arc::clone(&repositories)
+                    as Arc<dyn jarvis_application::repository::run::RunRepository>,
+                conversations: Arc::clone(&repositories)
+                    as Arc<
+                        dyn jarvis_application::repository::conversation::ConversationRepository,
+                    >,
+                model_calls: Arc::clone(&repositories)
+                    as Arc<dyn jarvis_application::repository::model_call::ModelCallRepository>,
+                deltas: Arc::clone(&repositories) as Arc<dyn StreamDeltaSink>,
+                provider,
+                clock: Arc::new(crate::time::SystemClock::new()),
+            },
+            Arc::new(RunCancellationRegistry::new()),
+        ));
+
+        let state = Arc::new(
+            ApiState::new(
+                Arc::new(clients),
+                Arc::new(Readiness::new()),
+                "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+            )
+            .with_runs(service)
+            .with_spawner(Arc::new(TokioSpawner)),
+        );
+        (router(state), credential.to_presentation_text())
+    }
+
+    /// Authenticated headers for a run request.
+    fn run_headers(token: &str) -> Vec<(&str, String)> {
+        vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "application/json".to_owned()),
+            ("idempotency-key", format!("key-{}", uuid::Uuid::now_v7())),
+        ]
+    }
+
+    /// Sends a request that may carry a body.
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        body: &str,
+    ) -> (StatusCode, String) {
+        let overrides_host = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("host"));
+        let mut builder = Request::builder().uri(path).method(method);
+        if !overrides_host {
+            builder = builder.header("host", TEST_AUTHORITY);
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, value.clone());
+        }
+        // `Content-Length` is set explicitly because a real client sends it and the
+        // body-limit middleware reads it. `Request::builder()` does not add it, so a
+        // test that omitted it would exercise a path no client takes.
+        if !body.is_empty() {
+            builder = builder.header("content-length", body.len().to_string());
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_owned())).expect("builds"))
+            .await
+            .expect("router responds");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body readable");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn create_body(text: &str) -> String {
+        format!(
+            r#"{{"conversation_id":null,"input":{{"type":"text","text":"{text}"}},"runtime":"jarvis-native","model_policy":{{"policy_id":"scripted-test","version":1}}}}"#
+        )
+    }
+
+    /// Creates a run and returns its identifier.
+    async fn create_run(app: &axum::Router, token: &str, text: &str) -> String {
+        let (status, body) = send(
+            app,
+            "POST",
+            "/api/v1/runs",
+            &run_headers(token),
+            &create_body(text),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        parsed["run_id"].as_str().expect("a run id").to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_create_returns_the_contracts_accepted_shape() {
+        let (app, token) = runs_fixture("runs-create").await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &run_headers(&token),
+            &create_body("hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        // The contract's response shape: identity, state, instant, and links.
+        assert_eq!(parsed["state"], "received");
+        assert!(
+            parsed["conversation_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 36),
+            "{body}",
+        );
+        assert!(
+            parsed["created_at"]
+                .as_str()
+                .is_some_and(|at| at.ends_with('Z')),
+            "{body}"
+        );
+        let run_id = parsed["run_id"].as_str().expect("a run id");
+        assert_eq!(parsed["links"]["self"], format!("/api/v1/runs/{run_id}"));
+        assert_eq!(
+            parsed["links"]["events"],
+            format!("/api/v1/runs/{run_id}/events"),
+        );
+        // The response must not carry the prompt, any provider configuration, or a
+        // path.
+        assert!(!body.contains("model_policy"), "{body}");
+        assert!(!body.contains("/home"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_create_without_an_idempotency_key_is_refused_with_a_code() {
+        // The contract requires the key, and its absence must be a named refusal rather
+        // than a silently non-idempotent create.
+        let (app, token) = runs_fixture("runs-no-key").await;
+        let headers = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "application/json".to_owned()),
+        ];
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &headers,
+            &create_body("hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(r#""code":"request.invalid""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_create_with_an_unknown_field_is_refused() {
+        // The contract rejects unknown command fields, and the refusal must be the
+        // envelope rather than the extractor's plain text.
+        let (app, token) = runs_fixture("runs-unknown-field").await;
+        let body = r#"{"input":{"type":"text","text":"hi"},"runtime":"jarvis-native","model_policy":{"policy_id":"p","version":1},"api_key":"secret"}"#;
+        let (status, response) =
+            send(&app, "POST", "/api/v1/runs", &run_headers(&token), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert!(
+            response.contains(r#""code":"request.invalid""#),
+            "{response}"
+        );
+        // The rejected value is caller-supplied text and must not be echoed.
+        assert!(!response.contains("secret"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_runtime_is_refused_rather_than_defaulted() {
+        // A client that asked for an external runtime must not silently receive a
+        // native one, or it would believe a capability it does not have is in use.
+        let (app, token) = runs_fixture("runs-runtime").await;
+        let body = r#"{"input":{"type":"text","text":"hi"},"runtime":"langgraph","model_policy":{"policy_id":"p","version":1}}"#;
+        let (status, response) =
+            send(&app, "POST", "/api/v1/runs", &run_headers(&token), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            response.contains(r#""code":"request.semantic_invalid""#),
+            "{response}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_is_readable_after_creation_and_the_state_is_a_wire_state() {
+        let (app, token) = runs_fixture("runs-read").await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}"),
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["run_id"], run_id);
+        // The wire state set is coarser than the domain's, and this asserts the value
+        // is one a client can act on rather than a domain name that leaked through.
+        let state = parsed["state"].as_str().expect("a state");
+        assert!(
+            [
+                "received",
+                "context_building",
+                "model_running",
+                "responding",
+                "completed",
+                "failed",
+                "cancelled",
+            ]
+            .contains(&state),
+            "{state} is not a client-visible state",
+        );
+        assert!(parsed["version"].as_u64().is_some_and(|v| v >= 1), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_run_is_not_found_and_a_malformed_id_is_indistinguishable() {
+        // The contract requires a foreign run and a missing run to be
+        // indistinguishable, and a malformed identifier must not be a different answer
+        // either — that would tell a caller which identifiers exist.
+        let (app, token) = runs_fixture("runs-not-found").await;
+        let missing = "0195f4f0-4c13-7bf4-89fb-f067adac13ee";
+        let (unknown_status, unknown_body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{missing}"),
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        let (malformed_status, malformed_body) = send(
+            &app,
+            "GET",
+            "/api/v1/runs/not-an-identifier",
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+        assert_eq!(malformed_status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown_body, malformed_body);
+        assert!(
+            unknown_body.contains(r#""code":"resource.not_found""#),
+            "{unknown_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_create_with_one_key_replays_the_same_run() {
+        // The property the key exists for, asserted at the HTTP boundary where a client
+        // actually relies on it.
+        let (app, token) = runs_fixture("runs-idempotent").await;
+        let headers = run_headers(&token);
+        let body = create_body("hello");
+        let (first_status, first) = send(&app, "POST", "/api/v1/runs", &headers, &body).await;
+        let (second_status, second) = send(&app, "POST", "/api/v1/runs", &headers, &body).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED);
+        assert_eq!(second_status, StatusCode::ACCEPTED);
+        let first: serde_json::Value = serde_json::from_str(&first).expect("valid");
+        let second: serde_json::Value = serde_json::from_str(&second).expect("valid");
+        assert_eq!(first["run_id"], second["run_id"]);
+        assert_eq!(first["conversation_id"], second["conversation_id"]);
+    }
+
+    #[tokio::test]
+    async fn reusing_one_key_for_different_input_is_a_conflict() {
+        let (app, token) = runs_fixture("runs-conflict").await;
+        let headers = run_headers(&token);
+        send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &headers,
+            &create_body("hello"),
+        )
+        .await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &headers,
+            &create_body("something else"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains(r#""code":"idempotency.conflict""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_uses_sse_framing_and_one_terminal_event() {
+        let (app, token) = runs_fixture("runs-stream").await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        // The run is driven on a real runtime, so the stream is polled until it reports
+        // a terminal state. Polling rather than sleeping keeps the test fast and
+        // deterministic in what it asserts, without asserting a timing.
+        let mut body = String::new();
+        for _ in 0..200 {
+            let (status, current) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &run_headers(&token),
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{current}");
+            body = current;
+            if body.contains("event: run.completed")
+                || body.contains("event: run.failed")
+                || body.contains("event: run.cancelled")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Framing: an `id:`, an `event:`, a `data:` line, and a blank line terminator.
+        assert!(body.contains("\nid: "), "{body}");
+        assert!(body.contains("\nevent: "), "{body}");
+        assert!(body.contains("\ndata: {"), "{body}");
+        assert!(body.ends_with("\n\n"), "{body}");
+
+        // The first event is the run's opening event at sequence 1.
+        assert!(body.contains("event: run.received"), "{body}");
+        assert!(body.contains(r#""sequence":1"#), "{body}");
+
+        // Exactly one terminal event, and it is the completion.
+        let terminals = ["run.completed", "run.failed", "run.cancelled"]
+            .iter()
+            .map(|kind| body.matches(kind).count())
+            .sum::<usize>();
+        assert_eq!(terminals, 1, "{body}");
+        assert!(body.contains("event: run.completed"), "{body}");
+        // The delta reached the stream, which is what a streaming client is for.
+        assert!(body.contains("event: run.output_text.delta"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_resume_position_is_a_conflict_not_a_silent_restart() {
+        // The contract is explicit: a missing or no-longer-retained position returns
+        // `409` rather than silently skipping a gap.
+        let (app, token) = runs_fixture("runs-resume").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let mut headers = run_headers(&token);
+        headers.push((
+            "last-event-id",
+            "0195f4f1-0475-7613-a92c-edf01183e909".to_owned(),
+        ));
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}/events"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.contains(r#""code":"stream.replay_unavailable""#),
+            "{body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reaches_a_terminal_state_and_is_truthful_about_the_timing() {
+        let (app, token) = runs_fixture("runs-cancel").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let headers = run_headers(&token);
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            &headers,
+            r#"{"reason":"user_requested"}"#,
+        )
+        .await;
+        // `202` while cleanup is in flight, never a claim that the run is already
+        // cancelled.
+        assert!(
+            status == StatusCode::ACCEPTED || status == StatusCode::OK,
+            "{status}: {body}",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(parsed["state"].as_str().is_some(), "{body}");
+
+        // And the run does reach a terminal state that a client can observe.
+        let mut terminal = false;
+        for _ in 0..200 {
+            let (_, current) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}"),
+                &run_headers(&token),
+                "",
+            )
+            .await;
+            let parsed: serde_json::Value = serde_json::from_str(&current).expect("valid");
+            let state = parsed["state"].as_str().unwrap_or_default();
+            if ["completed", "failed", "cancelled"].contains(&state) {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(terminal, "a cancelled run must reach a terminal state");
+    }
+
+    #[tokio::test]
+    async fn the_run_surface_requires_authentication_like_every_other_api_route() {
+        // A run route must not be reachable without a credential. The extractor makes
+        // this a property of the handler signature, and this asserts it on the wire.
+        let (app, _token) = runs_fixture("runs-auth").await;
+        for (method, path) in [
+            ("POST", "/api/v1/runs"),
+            ("GET", "/api/v1/runs/0195f4f0-4c13-7bf4-89fb-f067adac13ee"),
+            (
+                "POST",
+                "/api/v1/runs/0195f4f0-4c13-7bf4-89fb-f067adac13ee/cancel",
+            ),
+            (
+                "GET",
+                "/api/v1/runs/0195f4f0-4c13-7bf4-89fb-f067adac13ee/events",
+            ),
+        ] {
+            let headers = vec![
+                ("host", TEST_AUTHORITY.to_owned()),
+                ("jarvis-api-version", "1".to_owned()),
+                ("content-type", "application/json".to_owned()),
+            ];
+            let (status, body) = send(&app, method, path, &headers, &create_body("hello")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}: {body}");
+            assert!(
+                body.contains(r#""code":"auth.credential_rejected""#),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_surface_rejects_a_browser_origin_and_a_forwarded_header() {
+        // The checks apply to the run routes as they do everywhere else; a new route is
+        // exactly where a missing layer would go unnoticed.
+        let (app, token) = runs_fixture("runs-origin").await;
+        for extra in [
+            ("origin", "https://evil.invalid".to_owned()),
+            ("x-forwarded-host", "evil.invalid".to_owned()),
+        ] {
+            let mut headers = run_headers(&token);
+            headers.push(extra);
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/v1/runs",
+                &headers,
+                &create_body("hello"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.starts_with('{'),
+                "the refusal must be the envelope: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_surface_rejects_a_body_over_the_bound_before_authentication() {
+        // The body cap is outermost, so an oversized body is reported as
+        // `request.too_large` regardless of the credentials presented.
+        let (app, _token) = runs_fixture("runs-too-large").await;
+        let headers = vec![
+            ("host", TEST_AUTHORITY.to_owned()),
+            ("jarvis-api-version", "1".to_owned()),
+        ];
+        let oversized = "x".repeat(70 * 1024);
+        let (status, body) = send(&app, "POST", "/api/v1/runs", &headers, &oversized).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            &body[..body.len().min(200)]
+        );
+        assert!(body.contains(r#""code":"request.too_large""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_run_surface_without_storage_answers_not_ready_rather_than_missing() {
+        // A client must be able to tell "this endpoint exists but the daemon cannot
+        // serve it" from "there is no such endpoint", so the refusal is a named code and
+        // not the unknown-route answer.
+        let dir = temp_dir("runs-no-storage");
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+        let (registered, credential) =
+            enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+        let mut clients = ClientRegistry::new();
+        clients.register(registered);
+        let state = Arc::new(ApiState::new(
+            Arc::new(clients),
+            Arc::new(Readiness::new()),
+            "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+        ));
+        let app = router(state);
+        let token = credential.to_presentation_text();
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &run_headers(&token),
+            &create_body("hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains(r#""code":"service.not_ready""#), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wire_state_projection_is_total_and_coarser_than_the_domain() {
+        // Every domain state must have a wire state: a missing arm would be a panic on
+        // the request path, and `total` is a claim worth checking rather than assuming.
+        use jarvis_domain::run::state::RunState;
+        let all = [
+            RunState::Received,
+            RunState::ContextBuilding,
+            RunState::Planning,
+            RunState::AwaitingModel,
+            RunState::AwaitingApproval,
+            RunState::ExecutingTool,
+            RunState::Observing,
+            RunState::Waiting,
+            RunState::Responding,
+            RunState::Completed,
+            RunState::Failed,
+            RunState::Cancelled,
+        ];
+        let wire: Vec<&str> = all.iter().copied().map(super::wire_state).collect();
+        // Coarser: twelve domain states map to at most seven wire states.
+        let unique: std::collections::BTreeSet<&str> = wire.iter().copied().collect();
+        assert!(unique.len() < all.len(), "{wire:?}");
+        assert_eq!(unique.len(), 7, "{unique:?}");
+        // The terminal states are one-to-one, so a client never sees a finished run
+        // described by a non-terminal wire state.
+        assert_eq!(super::wire_state(RunState::Completed), "completed");
+        assert_eq!(super::wire_state(RunState::Failed), "failed");
+        assert_eq!(super::wire_state(RunState::Cancelled), "cancelled");
     }
 }

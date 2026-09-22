@@ -75,6 +75,18 @@ macro_rules! owner_name {
         pub struct $name(String);
 
         impl $name {
+            /// Builds a value from a string literal already known to be valid.
+            ///
+            /// A literal is validated at first use rather than with an `expect` at the
+            /// call site, so a mistyped literal degrades to a fallback instead of
+            /// panicking on a startup path. `None` means the literal is not a legal
+            /// value, which a caller should treat as a programming error and handle by
+            /// falling back rather than by unwrapping.
+            #[must_use]
+            pub fn from_literal(value: &'static str) -> Option<Self> {
+                validate_name(value, $kind).ok().map(|()| Self(value.to_owned()))
+            }
+
             /// Parses and validates a value.
             ///
             /// # Errors

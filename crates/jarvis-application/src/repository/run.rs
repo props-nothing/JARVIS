@@ -17,7 +17,7 @@
 //!   result, because the local control API requires the two to be indistinguishable.
 
 use crate::repository::{RepositoryError, RepositoryFuture};
-use jarvis_domain::ids::{ConversationId, PrincipalId, RunId, WorkspaceId};
+use jarvis_domain::ids::{ConversationId, PrincipalId, RunActivityEventId, RunId, WorkspaceId};
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion};
 use jarvis_domain::time::UtcTimestamp;
@@ -242,6 +242,118 @@ pub struct NewActivityEvent {
     pub occurred_at: UtcTimestamp,
 }
 
+/// A loaded activity event, as a client stream needs it.
+///
+/// Carries its own [`id`](Self::id) because a client resumes by echoing that value
+/// as `Last-Event-ID`, so it must be stable and globally unique rather than derived
+/// from the run and sequence at read time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredActivityEvent {
+    /// The globally unique event identifier.
+    pub id: RunActivityEventId,
+    /// The run it belongs to.
+    pub run_id: RunId,
+    /// Its position in the run's stream.
+    pub sequence: u64,
+    /// The event type.
+    pub event_type: String,
+    /// The redacted public payload, when the event has one.
+    pub payload_json: Option<String>,
+    /// Who may see it.
+    pub visibility: EventVisibility,
+    /// When it occurred.
+    pub occurred_at: UtcTimestamp,
+}
+
+/// An idempotency record for a run-creating command.
+///
+/// The contract requires a repeated create with the same canonical request to
+/// return the original run while the same key with different input is a conflict.
+/// Storing the request digest rather than the request body is what makes the second
+/// comparison possible without retaining caller text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIdempotencyRecord {
+    /// The caller-supplied key.
+    pub key: String,
+    /// The workspace the command was made in.
+    pub workspace_id: WorkspaceId,
+    /// The operation the key was used for.
+    pub operation: String,
+    /// The digest of the canonical request.
+    pub request_digest: String,
+    /// The run the first use created.
+    pub run_id: RunId,
+    /// When the record was created.
+    pub created_at: UtcTimestamp,
+}
+
+/// The outcome of claiming an idempotency key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyClaim {
+    /// The key was unused and is now claimed.
+    Claimed,
+    /// The key was already used for an identical request; return this run.
+    Replay(RunId),
+    /// The key was already used for a different request.
+    Conflict,
+}
+
+/// A run and its events, for a client stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEventPage {
+    /// The events, in ascending sequence order.
+    pub events: Vec<StoredActivityEvent>,
+    /// The run's client-visible terminal state, when it has reached one.
+    ///
+    /// Present so a stream that replays an already-finished run knows to deliver
+    /// exactly one terminal event and close, rather than waiting for one that was
+    /// published before the client connected.
+    pub terminal_state: Option<RunState>,
+}
+
+/// The largest number of events one page read may return.
+///
+/// A bounded read rather than the whole stream, because a long run accumulates
+/// events and replaying all of them at once would let one reconnect load an
+/// unbounded amount into memory.
+pub const MAX_EVENT_PAGE: u32 = 500;
+
+/// The largest accepted idempotency key.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
+
+/// Checks an idempotency key's shape.
+///
+/// # Errors
+///
+/// Returns [`RepositoryError::Conflict`] when the key is empty, over
+/// [`MAX_IDEMPOTENCY_KEY_BYTES`], or contains a NUL byte, because the key reaches a
+/// persisted column and a `UNIQUE` constraint.
+pub fn validate_idempotency_key(key: &str) -> Result<(), RepositoryError> {
+    if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES || key.contains('\0') {
+        return Err(RepositoryError::Conflict {
+            what: "idempotency_key",
+        });
+    }
+    Ok(())
+}
+
+/// Builds a run's opening `run.received` event.
+///
+/// Provided so the first event is constructed identically everywhere: a run's stream
+/// must begin at sequence 1 with the received type, and a caller that assembled it by
+/// hand could start it at another position or with a type no client expects.
+#[must_use]
+pub fn run_received_event(run_id: RunId, occurred_at: UtcTimestamp) -> NewActivityEvent {
+    NewActivityEvent {
+        run_id,
+        sequence: 1,
+        event_type: "run.received".to_owned(),
+        payload_json: None,
+        visibility: EventVisibility::Public,
+        occurred_at,
+    }
+}
+
 /// Who may see an activity event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventVisibility {
@@ -281,13 +393,22 @@ impl EventVisibility {
 
 /// The durable run store.
 pub trait RunRepository: Send + Sync {
-    /// Inserts a new run in `Received`.
+    /// Inserts a new run in `Received`, appending its opening event atomically.
+    ///
+    /// The opening event is a parameter rather than appended by the caller because
+    /// the local control API requires exactly this: a client that connects before the
+    /// run does any work must still be able to replay `run.received`, and the
+    /// "persist the transition before publishing an event that claims it occurred"
+    /// rule applies to creation as much as to any later transition. Appending it
+    /// afterwards would leave a window in which the run exists with no first event.
     ///
     /// # Errors
     ///
-    /// Returns [`RepositoryError::Conflict`] when the run already exists and
-    /// [`RepositoryError::Query`] for a driver failure.
-    fn create(&self, run: NewRun) -> RepositoryFuture<'_, ()>;
+    /// Returns [`RepositoryError::Conflict`] when the run already exists, when the
+    /// opening event's sequence is not 1, or when the event names a different run;
+    /// and [`RepositoryError::NotFound`] when the conversation does not exist in
+    /// `workspace`.
+    fn create(&self, run: NewRun, opening_event: NewActivityEvent) -> RepositoryFuture<'_, ()>;
 
     /// Loads a run within `workspace`.
     ///
@@ -344,6 +465,82 @@ pub trait RunRepository: Send + Sync {
     ///
     /// Returns [`RepositoryError::NotFound`] for an absent or foreign run.
     fn next_event_sequence(&self, workspace: WorkspaceId, run: RunId) -> RepositoryFuture<'_, u64>;
+
+    /// Reads a page of a run's public activity events in ascending sequence order.
+    ///
+    /// The read is scoped by workspace **and by visibility**, so an operator-only
+    /// event is never returned to an ordinary client. Filtering after the read would
+    /// mean the row was already in memory and only the presentation changed, which is
+    /// the same shape as a leak that has not happened yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an absent or foreign run.
+    fn load_events(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        from_sequence: u64,
+        limit: u32,
+    ) -> RepositoryFuture<'_, RunEventPage>;
+
+    /// Claims an idempotency key for a run-creating command.
+    ///
+    /// The claim is atomic: two concurrent requests with one key must not both be
+    /// told `Claimed`. A repeated key with an identical digest returns
+    /// [`IdempotencyClaim::Replay`] carrying the original run, and a repeated key
+    /// with a different digest returns [`IdempotencyClaim::Conflict`], which is what
+    /// makes a retry safe and a different request under the same key refusable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Conflict`] when the key's shape is invalid and
+    /// [`RepositoryError::Query`] for a driver failure.
+    fn claim_idempotency(
+        &self,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim>;
+
+    /// Reads an idempotency record without writing anything, if one exists.
+    ///
+    /// Exposed for a caller that must decide whether to do preparatory work before it
+    /// can claim — a run needs a conversation, and creating a conversation for a
+    /// request that turns out to be a replay would leave an orphan. The read is
+    /// advisory only: [`create_run_idempotent`](Self::create_run_idempotent) is what
+    /// actually decides, because only it is atomic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] for a driver failure.
+    fn lookup_idempotency(
+        &self,
+        workspace: WorkspaceId,
+        operation: &str,
+        key: &str,
+    ) -> RepositoryFuture<'_, Option<(String, RunId)>>;
+
+    /// Creates a run, its opening event, and its idempotency record in one write.
+    ///
+    /// This is the operation the local control API's atomicity rule requires:
+    /// "acknowledged mutation state and idempotency records are committed
+    /// atomically". Splitting it into a claim followed by a create leaves the gap the
+    /// rule exists to close — a key claimed by a command whose run was never written,
+    /// or a run written twice because two requests both passed a separate check.
+    ///
+    /// If the key already exists, **nothing is created** and the result is
+    /// [`IdempotencyClaim::Replay`] or [`IdempotencyClaim::Conflict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Conflict`] when the run or conversation already
+    /// exists, the opening event is malformed, or the key's shape is invalid; and
+    /// [`RepositoryError::Query`] for a driver failure.
+    fn create_run_idempotent(
+        &self,
+        run: NewRun,
+        opening_event: NewActivityEvent,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim>;
 }
 
 #[cfg(test)]

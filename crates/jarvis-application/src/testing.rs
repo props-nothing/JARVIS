@@ -32,7 +32,10 @@ use crate::repository::conversation::{
 use crate::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelCallState, NewModelCall, StoredModelCall,
 };
-use crate::repository::run::{NewActivityEvent, NewRun, RunRepository, RunResumeState, StoredRun};
+use crate::repository::run::{
+    IdempotencyClaim, MAX_EVENT_PAGE, NewActivityEvent, NewIdempotencyRecord, NewRun, RunEventPage,
+    RunRepository, RunResumeState, StoredActivityEvent, StoredRun, validate_idempotency_key,
+};
 use crate::repository::{RepositoryError, RepositoryFuture};
 
 /// One stored run: its domain lifecycle plus the fields the lifecycle does not own.
@@ -109,6 +112,13 @@ struct Store {
     messages: Vec<MessageRow>,
     calls: BTreeMap<ModelCallId, CallRow>,
     events: Vec<NewActivityEvent>,
+    /// Every output-text delta published, as `(item_id, delta)`.
+    ///
+    /// Kept separately from `events` so a test can assert the published text without
+    /// this crate needing a JSON serializer to build the event payload.
+    deltas: Vec<(String, String)>,
+    /// The stored idempotency records, keyed by the scoped natural key.
+    idempotency: BTreeMap<(String, String, String), (String, RunId)>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -159,12 +169,26 @@ impl InMemoryRepositories {
     pub fn run_count(&self) -> Result<usize, RepositoryError> {
         self.with(|store| Ok(store.runs.len()))
     }
+
+    /// Returns every output-text delta published, in order, as `(item_id, delta)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn recorded_deltas(&self) -> Result<Vec<(String, String)>, RepositoryError> {
+        self.with(|store| Ok(store.deltas.clone()))
+    }
 }
 
 impl RunRepository for InMemoryRepositories {
-    fn create(&self, run: NewRun) -> RepositoryFuture<'_, ()> {
+    fn create(&self, run: NewRun, opening_event: NewActivityEvent) -> RepositoryFuture<'_, ()> {
         Box::pin(async move {
             self.with(|store| {
+                if opening_event.run_id != run.id || opening_event.sequence != 1 {
+                    return Err(RepositoryError::Conflict {
+                        what: "opening_event",
+                    });
+                }
                 if store.runs.contains_key(&run.id) {
                     return Err(RepositoryError::Conflict { what: "run" });
                 }
@@ -190,6 +214,9 @@ impl RunRepository for InMemoryRepositories {
                         waiting_ref: None,
                     },
                 );
+                // The opening event is appended in the same call as the row, exactly
+                // as the adapter commits them in one transaction.
+                store.events.push(opening_event);
                 Ok(())
             })
         })
@@ -316,6 +343,170 @@ impl RunRepository for InMemoryRepositories {
             })
         })
     }
+
+    fn load_events(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        from_sequence: u64,
+        limit: u32,
+    ) -> RepositoryFuture<'_, RunEventPage> {
+        Box::pin(async move {
+            self.with(|store| {
+                let state = store
+                    .runs
+                    .get(&run)
+                    .filter(|row| row.workspace_id == workspace)
+                    .map(|row| row.lifecycle.state())
+                    .ok_or(RepositoryError::NotFound)?;
+
+                // Visibility is a filter rather than a presentation decision, so an
+                // operator-only event is never returned on a client-facing read.
+                let mut events: Vec<StoredActivityEvent> = store
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.run_id == run
+                            && event.visibility == crate::repository::run::EventVisibility::Public
+                            && event.sequence >= from_sequence
+                    })
+                    .map(|event| StoredActivityEvent {
+                        // The double synthesizes a stable id from the run and
+                        // sequence, which is unique per event and stable across
+                        // reads, so a `Last-Event-ID` resume addresses the same row.
+                        id: jarvis_domain::ids::RunActivityEventId::from_uuid(
+                            uuid::Uuid::from_u128(
+                                (run.as_uuid().as_u128() ^ u128::from(event.sequence)).max(1),
+                            ),
+                        ),
+                        run_id: event.run_id,
+                        sequence: event.sequence,
+                        event_type: event.event_type.clone(),
+                        payload_json: event.payload_json.clone(),
+                        visibility: event.visibility,
+                        occurred_at: event.occurred_at,
+                    })
+                    .collect();
+                events.sort_by_key(|event| event.sequence);
+                events.truncate(usize::try_from(limit.clamp(1, MAX_EVENT_PAGE)).unwrap_or(500));
+
+                Ok(RunEventPage {
+                    events,
+                    terminal_state: state.is_terminal().then_some(state),
+                })
+            })
+        })
+    }
+
+    fn claim_idempotency(
+        &self,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim> {
+        Box::pin(async move {
+            self.with(|store| {
+                validate_idempotency_key(&record.key)?;
+                let key = (
+                    record.workspace_id.to_string(),
+                    record.operation.clone(),
+                    record.key.clone(),
+                );
+                if let Some((digest, run_id)) = store.idempotency.get(&key) {
+                    if *digest == record.request_digest {
+                        return Ok(IdempotencyClaim::Replay(*run_id));
+                    }
+                    return Ok(IdempotencyClaim::Conflict);
+                }
+                store
+                    .idempotency
+                    .insert(key, (record.request_digest, record.run_id));
+                Ok(IdempotencyClaim::Claimed)
+            })
+        })
+    }
+
+    fn lookup_idempotency(
+        &self,
+        workspace: WorkspaceId,
+        operation: &str,
+        key: &str,
+    ) -> RepositoryFuture<'_, Option<(String, RunId)>> {
+        // The strings are copied before the future is built: the returned future is
+        // tied to `&self`'s lifetime, so capturing shorter borrows would not compile.
+        let operation = operation.to_owned();
+        let key = key.to_owned();
+        Box::pin(async move {
+            self.with(|store| {
+                Ok(store
+                    .idempotency
+                    .get(&(workspace.to_string(), operation, key))
+                    .map(|(digest, run_id)| (digest.clone(), *run_id)))
+            })
+        })
+    }
+
+    fn create_run_idempotent(
+        &self,
+        run: NewRun,
+        opening_event: NewActivityEvent,
+        record: NewIdempotencyRecord,
+    ) -> RepositoryFuture<'_, IdempotencyClaim> {
+        Box::pin(async move {
+            self.with(|store| {
+                validate_idempotency_key(&record.key)?;
+                if record.run_id != run.id {
+                    return Err(RepositoryError::Conflict {
+                        what: "idempotency_run",
+                    });
+                }
+                // The lookup, the run insert, and the record insert happen under one
+                // lock and with nothing observable in between, which is the double's
+                // equivalent of a single transaction.
+                let key = (
+                    record.workspace_id.to_string(),
+                    record.operation.clone(),
+                    record.key.clone(),
+                );
+                if let Some((digest, run_id)) = store.idempotency.get(&key) {
+                    if *digest == record.request_digest {
+                        return Ok(IdempotencyClaim::Replay(*run_id));
+                    }
+                    return Ok(IdempotencyClaim::Conflict);
+                }
+                if opening_event.run_id != run.id || opening_event.sequence != 1 {
+                    return Err(RepositoryError::Conflict {
+                        what: "opening_event",
+                    });
+                }
+                if store.runs.contains_key(&run.id)
+                    || !store.conversations.contains_key(&run.conversation_id)
+                {
+                    return Err(RepositoryError::Conflict { what: "run" });
+                }
+                store.runs.insert(
+                    run.id,
+                    RunRow {
+                        id: run.id,
+                        lifecycle: RunLifecycle::new(),
+                        workspace_id: run.workspace_id,
+                        conversation_id: run.conversation_id,
+                        principal_id: run.principal_id,
+                        objective_ref: run.objective_ref.clone(),
+                        created_at: run.created_at,
+                        started_at: None,
+                        updated_at: run.created_at,
+                        error_code: None,
+                        waiting_kind: None,
+                        waiting_ref: None,
+                    },
+                );
+                store.events.push(opening_event);
+                store
+                    .idempotency
+                    .insert(key, (record.request_digest, record.run_id));
+                Ok(IdempotencyClaim::Claimed)
+            })
+        })
+    }
 }
 
 impl ConversationRepository for InMemoryRepositories {
@@ -439,6 +630,34 @@ impl ConversationRepository for InMemoryRepositories {
             })
         })
     }
+
+    fn discard_if_empty(
+        &self,
+        workspace: WorkspaceId,
+        conversation: ConversationId,
+    ) -> RepositoryFuture<'_, bool> {
+        Box::pin(async move {
+            self.with(|store| {
+                let visible = store
+                    .conversations
+                    .get(&conversation)
+                    .is_some_and(|row| row.workspace_id == workspace);
+                // The emptiness check happens under the same lock as the removal and
+                // with no await between them, which is the double's equivalent of
+                // putting the condition inside the DELETE.
+                if !visible
+                    || store
+                        .messages
+                        .iter()
+                        .any(|row| row.conversation_id == conversation)
+                {
+                    return Ok(false);
+                }
+                store.conversations.remove(&conversation);
+                Ok(true)
+            })
+        })
+    }
 }
 
 impl ModelCallRepository for InMemoryRepositories {
@@ -540,6 +759,57 @@ impl ModelCallRepository for InMemoryRepositories {
     }
 }
 
+/// Publishes a run's output deltas by appending them to the shared store, exactly
+/// as the SQLite adapter appends them to `run_activity_events`.
+impl crate::live_events::StreamDeltaSink for InMemoryRepositories {
+    fn output_text_delta(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        item_id: String,
+        delta: String,
+        occurred_at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, u64> {
+        Box::pin(async move {
+            self.with(|store| {
+                if store
+                    .runs
+                    .get(&run)
+                    .is_none_or(|row| row.workspace_id != workspace)
+                {
+                    // The same scope rule as the adapter: a foreign run is absent.
+                    return Err(RepositoryError::NotFound);
+                }
+                let sequence = store
+                    .events
+                    .iter()
+                    .filter(|event| event.run_id == run)
+                    .map(|event| event.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                store.events.push(NewActivityEvent {
+                    run_id: run,
+                    sequence,
+                    // The event type is the port's constant, so the double and the
+                    // adapter cannot publish a different name for the same event.
+                    event_type: crate::live_events::OUTPUT_TEXT_DELTA_EVENT.to_owned(),
+                    // The payload is left unset because this crate has no JSON
+                    // serializer: building one here would be a dependency change for
+                    // a test double. The structured delta is recorded in
+                    // `store.deltas` instead, so a test asserts on the text rather
+                    // than on a JSON string this crate cannot honestly produce.
+                    payload_json: None,
+                    visibility: crate::repository::run::EventVisibility::Public,
+                    occurred_at,
+                });
+                store.deltas.push((item_id, delta));
+                Ok(sequence)
+            })
+        })
+    }
+}
+
 /// Projects a stored call row into the port's view.
 fn stored_call(row: &CallRow) -> StoredModelCall {
     StoredModelCall {
@@ -621,6 +891,7 @@ mod tests {
                     now(),
                 )
                 .expect("valid"),
+                crate::repository::run::run_received_event(run(), now()),
             )
             .await
             .expect("created");
@@ -663,7 +934,7 @@ mod tests {
                     &illegal,
                     crate::repository::run::NewActivityEvent {
                         run_id: run(),
-                        sequence: 1,
+                        sequence: 2,
                         event_type: "run.responding".to_owned(),
                         payload_json: None,
                         visibility: crate::repository::run::EventVisibility::Public,
@@ -700,7 +971,7 @@ mod tests {
                     &transition,
                     crate::repository::run::NewActivityEvent {
                         run_id: run(),
-                        sequence: 1,
+                        sequence: 2,
                         event_type: "run.context_building".to_owned(),
                         payload_json: None,
                         visibility: crate::repository::run::EventVisibility::Public,
@@ -711,13 +982,14 @@ mod tests {
             .await
             .expect("applied");
 
-        assert_eq!(repositories.recorded_events().expect("events").len(), 1);
+        // The opening event plus the transition.
+        assert_eq!(repositories.recorded_events().expect("events").len(), 2);
         assert_eq!(
             repositories
                 .next_event_sequence(workspace(), run())
                 .await
                 .expect("readable"),
-            2,
+            3,
         );
     }
 
@@ -740,7 +1012,7 @@ mod tests {
                     &first,
                     crate::repository::run::NewActivityEvent {
                         run_id: run(),
-                        sequence: 1,
+                        sequence: 2,
                         event_type: "run.context_building".to_owned(),
                         payload_json: None,
                         visibility: crate::repository::run::EventVisibility::Public,
@@ -766,7 +1038,7 @@ mod tests {
                     &second,
                     crate::repository::run::NewActivityEvent {
                         run_id: run(),
-                        sequence: 1,
+                        sequence: 2,
                         event_type: "run.planning".to_owned(),
                         payload_json: None,
                         visibility: crate::repository::run::EventVisibility::Public,
