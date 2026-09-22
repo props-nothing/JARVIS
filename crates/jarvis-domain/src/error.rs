@@ -77,6 +77,13 @@ pub enum DomainError {
     /// `streaming` flag cannot tell them apart.
     #[error("the model delivers its output as a single burst")]
     DeliveryNotIncremental,
+    /// A portable sampling or reasoning control was outside its accepted range.
+    ///
+    /// Distinct from an unknown field: an unknown provider key is a parse
+    /// rejection, while a known control with an impossible value is a semantic
+    /// refusal, and the two need different operator responses.
+    #[error("a portable model setting is outside its accepted range")]
+    ModelSettingsInvalid,
     /// A model data policy was not found.
     #[error("the model data policy was not found")]
     PolicyNotFound,
@@ -98,6 +105,55 @@ pub enum DomainError {
     /// A route relied on a policy exception that has expired.
     #[error("the model data policy exception has expired")]
     ExceptionExpired,
+    /// A run transition named a target the architecture diagram does not contain.
+    ///
+    /// Distinct from a version conflict: this is a caller asking for an edge that
+    /// does not exist, not a caller working from a stale view, and the two need
+    /// different operator responses.
+    #[error("the run state transition is not an allowed edge")]
+    RunTransitionNotAllowed {
+        /// The state the run is actually in.
+        from: crate::run::state::RunState,
+        /// The requested target state.
+        to: crate::run::state::RunState,
+    },
+    /// A run transition lost an optimistic-concurrency race.
+    #[error("the run version conflicts with a concurrent transition")]
+    RunVersionConflict {
+        /// The version the caller expected.
+        expected: crate::run::state::RunVersion,
+        /// The version that is actually current.
+        actual: crate::run::state::RunVersion,
+    },
+    /// A transition was attempted on a run that has already reached a terminal state.
+    ///
+    /// Carries the terminal state because, when a write is refused for this reason,
+    /// the operator's next question is *which* terminal state the run settled in —
+    /// "already terminal" alone does not distinguish a completed run from a
+    /// cancelled one.
+    #[error("the run has already reached a terminal state")]
+    RunAlreadyTerminal {
+        /// The terminal state the run is in.
+        state: crate::run::state::RunState,
+    },
+    /// The run version counter could not advance.
+    #[error("the run version is exhausted")]
+    RunVersionExhausted,
+    /// A transition reason was empty or exceeded its bound.
+    #[error("the transition reason is empty or exceeds its bounded length")]
+    InvalidTransitionReason,
+    /// A context token budget was zero or exceeded its bound.
+    #[error("the context token budget is outside its accepted range")]
+    ContextBudgetInvalid,
+    /// More context candidates were offered than the bound allows.
+    #[error("too many context candidates were offered")]
+    ContextCandidatesUnbounded,
+    /// A context candidate was malformed.
+    ///
+    /// Distinct from an unbounded set: one is a single unusable item, the other is a
+    /// list too large to process, and the two need different caller responses.
+    #[error("the context candidate is empty, unbounded, or not a usable value")]
+    ContextCandidateInvalid,
 }
 
 impl DomainError {
@@ -124,6 +180,7 @@ impl DomainError {
             Self::DuplicateToolCallId => "jarvis.duplicate_tool_call_id",
             Self::InvalidPolicyLayer => "jarvis.invalid_policy_layer",
             Self::DeliveryNotIncremental => "jarvis.delivery_not_incremental",
+            Self::ModelSettingsInvalid => "model.settings_invalid",
             Self::PolicyNotFound => "model.policy_not_found",
             Self::PolicyVersionConflict => "model.policy_version_conflict",
             Self::PolicyUnsatisfied => "model.policy_unsatisfied",
@@ -131,40 +188,33 @@ impl DomainError {
             Self::EvidenceStale => "model.evidence_stale",
             Self::ExceptionRequired => "model.exception_required",
             Self::ExceptionExpired => "model.exception_expired",
+            Self::RunTransitionNotAllowed { .. } => "jarvis.run_transition_not_allowed",
+            Self::RunVersionConflict { .. } => "jarvis.run_version_conflict",
+            Self::RunAlreadyTerminal { .. } => "jarvis.run_already_terminal",
+            Self::RunVersionExhausted => "jarvis.run_version_exhausted",
+            Self::InvalidTransitionReason => "jarvis.invalid_transition_reason",
+            Self::ContextBudgetInvalid => "jarvis.context_budget_invalid",
+            Self::ContextCandidatesUnbounded => "jarvis.context_candidates_unbounded",
+            Self::ContextCandidateInvalid => "jarvis.context_candidate_invalid",
         }
     }
 
     /// Returns whether the failed operation is safe to retry unchanged.
     ///
-    /// Every current variant fails deterministically for the same input, so a
-    /// blind retry cannot succeed and is reported as non-retryable.
+    /// This is decided per variant rather than per error class, because the same
+    /// "conflict" idea has different answers here. A **version conflict** is
+    /// retryable: the caller re-reads the run, recomputes the transition against
+    /// the current state, and can succeed — that is the whole point of stating an
+    /// expected version. Everything else is not: an absent edge stays absent, a
+    /// terminal run stays terminal, and a reason that failed validation fails again
+    /// for the same input.
+    ///
+    /// The context errors are all non-retryable for the same reason: an invalid
+    /// budget, an over-large candidate list, and a malformed candidate all fail
+    /// again unchanged.
     #[must_use]
     pub const fn retryable(&self) -> bool {
-        match self {
-            Self::InvalidIdentifier { .. }
-            | Self::InvalidTimestamp
-            | Self::SystemClockUnavailable
-            | Self::UnboundedProviderValue
-            | Self::StreamSequenceExhausted
-            | Self::StreamCallMismatch
-            | Self::StreamSequenceNotMonotonic
-            | Self::StreamAlreadyStarted
-            | Self::UnknownToolCall
-            | Self::ToolArgumentsMismatch
-            | Self::UnfinishedToolCall
-            | Self::ToolArgumentsNotExecutable
-            | Self::OrphanedToolResult
-            | Self::DuplicateToolCallId
-            | Self::InvalidPolicyLayer
-            | Self::DeliveryNotIncremental
-            | Self::PolicyNotFound
-            | Self::PolicyVersionConflict
-            | Self::PolicyUnsatisfied
-            | Self::EvidenceMissing
-            | Self::EvidenceStale
-            | Self::ExceptionRequired
-            | Self::ExceptionExpired => false,
-        }
+        matches!(self, Self::RunVersionConflict { .. })
     }
 }
 
@@ -289,6 +339,7 @@ mod tests {
             DomainError::DuplicateToolCallId,
             DomainError::InvalidPolicyLayer,
             DomainError::DeliveryNotIncremental,
+            DomainError::ModelSettingsInvalid,
             DomainError::PolicyNotFound,
             DomainError::PolicyVersionConflict,
             DomainError::PolicyUnsatisfied,
@@ -296,6 +347,22 @@ mod tests {
             DomainError::EvidenceStale,
             DomainError::ExceptionRequired,
             DomainError::ExceptionExpired,
+            DomainError::RunTransitionNotAllowed {
+                from: crate::run::state::RunState::Received,
+                to: crate::run::state::RunState::Planning,
+            },
+            DomainError::RunVersionConflict {
+                expected: crate::run::state::RunVersion::FIRST,
+                actual: crate::run::state::RunVersion::new(2),
+            },
+            DomainError::RunAlreadyTerminal {
+                state: crate::run::state::RunState::Completed,
+            },
+            DomainError::RunVersionExhausted,
+            DomainError::InvalidTransitionReason,
+            DomainError::ContextBudgetInvalid,
+            DomainError::ContextCandidatesUnbounded,
+            DomainError::ContextCandidateInvalid,
         ];
         let mut codes: Vec<&str> = errors.iter().map(DomainError::code).collect();
         codes.sort_unstable();
@@ -327,6 +394,37 @@ mod tests {
             DomainError::InvalidIdentifier { kind: "principal" },
             DomainError::InvalidTimestamp,
             DomainError::SystemClockUnavailable,
+        ] {
+            assert!(!error.retryable(), "{} must not be retryable", error.code());
+        }
+    }
+
+    #[test]
+    fn a_stale_run_version_is_retryable_but_the_other_run_errors_are_not() {
+        // A version conflict is the one domain error a caller can resolve by
+        // re-reading and recomputing, which is what stating an expected version is
+        // for. An absent edge, a terminal run, and an invalid reason all fail again
+        // for the same input, so retrying them blindly cannot succeed.
+        assert!(
+            DomainError::RunVersionConflict {
+                expected: crate::run::state::RunVersion::FIRST,
+                actual: crate::run::state::RunVersion::new(2),
+            }
+            .retryable(),
+        );
+        for error in [
+            DomainError::RunTransitionNotAllowed {
+                from: crate::run::state::RunState::Received,
+                to: crate::run::state::RunState::Planning,
+            },
+            DomainError::RunAlreadyTerminal {
+                state: crate::run::state::RunState::Completed,
+            },
+            DomainError::RunVersionExhausted,
+            DomainError::InvalidTransitionReason,
+            DomainError::ContextBudgetInvalid,
+            DomainError::ContextCandidatesUnbounded,
+            DomainError::ContextCandidateInvalid,
         ] {
             assert!(!error.retryable(), "{} must not be retryable", error.code());
         }

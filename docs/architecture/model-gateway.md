@@ -161,4 +161,10 @@ documented and used.
 - explicit skips when credentials or account features are absent.
 
 The first provider implementation must include the fake provider. A paid live
-call cannot be the only test of JARVIS orchestration.
+call cannot be the only test of JARVIS orchestration. That provider exists:
+`jarvis_application::model::ScriptedProvider` replays a prepared script through
+the `ModelProvider` port, so the "Deterministic" list above is assertable today —
+including the negative cases (a replayed sequence, a frame for another call, an
+unfinished tool call) that a well-behaved provider can never produce. See the
+[model stream contract](../contracts/model-stream.md) for the rule-to-test table
+and the two defects its negative cases found.

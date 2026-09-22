@@ -155,9 +155,14 @@ identifier!(
 );
 identifier!(RunId, "run", "Identifies one durable agent run.");
 identifier!(
-    SessionId,
-    "session",
-    "Identifies a durable conversation session."
+    ConversationId,
+    "conversation",
+    "Identifies a durable conversation in the conversation/run context."
+);
+identifier!(
+    MessageId,
+    "message",
+    "Identifies one durable message in a conversation."
 );
 identifier!(
     ModelCallId,
@@ -173,6 +178,11 @@ identifier!(
     ModelDataPolicyId,
     "model_data_policy",
     "Identifies one immutable version of a model data policy."
+);
+identifier!(
+    ContextManifestId,
+    "context_manifest",
+    "Identifies one recorded context assembly."
 );
 
 /// Generates identifiers for domain records.

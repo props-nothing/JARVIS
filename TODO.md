@@ -593,13 +593,194 @@ Foundation TODO remains incomplete.
   `BRN-003` and is blocked on its `REQUIRED` evidence note, the scripted provider
   is `BRN-002`, repositories are `BRN-004`, and the measured-per-model capability
   inventory that `NFR-VOI-002` and `BRN-011` need is not collected.
-- [ ] `BRN-002` Implement deterministic scripted model provider for tests.
+- [x] `BRN-002` Implement deterministic scripted model provider for tests.
+  Evidence: `jarvis_application::model` adds the `ModelProvider` port and the
+  deterministic `ScriptedProvider`, one unit of work because the scripted provider
+  is what makes the port's contract assertable without a network, a credential, or
+  a paid call, and because the architecture requires the first provider
+  implementation to include the fake one. The port is narrower than a provider SDK
+  — an adapter maps its own protocol into normalized `ModelStreamEvent` values at
+  its boundary — so nothing provider-specific reaches the application layer, which
+  is what lets `ACC-015` replace an adapter without changing the run or
+  conversation schema. Four properties are structural rather than documented: the
+  provider **numbers frames itself, starting at 1** (0 is the stream state's
+  "nothing seen yet" cursor, so a provider numbering from 0 would be refused before
+  any payload was seen); frame identifiers come from the **injected `IdGenerator`**,
+  never a raw UUID call, so a stream is reproducible frame-for-frame under test
+  while production keeps `UUIDv7` ordering; the provider **never sleeps**, because
+  a wall-clock "slow provider" makes tests slow and non-deterministic and a passing
+  test would only mean the machine was fast enough — delivery timing is *measured*
+  under `BRN-011` instead; and **cancellation is an input** that ends the stream
+  with the normalized `call.cancelled` terminal rather than a bare stop, which
+  would be recorded as an interrupted fault instead of a cancellation.
+  `ProviderError` keeps a provider **refusal** apart from an **invalid request**
+  (one is a decision repeating cannot change, the other a defect in JARVIS) and
+  `retryable` is the single place that decides retryability, because the
+  architecture gives exactly one layer ownership of each retry.
+  `ScriptStep::Raw` exists so the contract's *negative* cases are scriptable at
+  all, and **two of those tests found defects the positive cases could not**:
+  a raw frame's call was being rewritten to the stream's own call, making "a frame
+  for another call is refused" unproducible while the code appeared to support it;
+  and the stream disabled its cancellation path as soon as the script merely
+  *contained* a terminal, so a caller cancelling while the first frame was still
+  queued received the script's `call.completed` instead of `call.cancelled` — a
+  cancellation recorded as success. **A third defect was a design one that no test
+  used so far could catch:** the port originally returned a concrete same-crate
+  stream struct with a private frame buffer, so `ModelProvider` read as a general
+  trait while no adapter in another crate could implement it — `BRN-003` would have
+  had to add its own constructor inside this crate. The port now returns the
+  `ModelStream` **trait**, with `AdapterStream` as the shared implementation an
+  adapter uses (it observes cancellation *while waiting* for a frame, because an
+  adapter that checked only between frames would hang a cancelled call whose
+  provider had gone quiet, and it produces exactly one terminal, so a channel that
+  closes with none ends the stream as *interrupted* rather than fabricating a
+  completion). `an_adapter_can_implement_the_port_without_this_modules_internals`
+  is the test that would have caught it: a port is only as general as the crates
+  that can implement it, and a single in-crate implementor hides the difference.
+  The contract's `settings` block, which the domain did not model, is added as
+  `PortableSettings`: **thousandths rather than floats**, because a float cannot
+  derive the `Eq` the module relies on and a decimal bound such as `2.0` is not
+  exactly representable, so an out-of-range value is refused with
+  `model.settings_invalid` rather than clamped (a clamped call runs with settings
+  the caller did not choose, and the caller cannot tell the difference). The block
+  is `deny_unknown_fields`, so a provider-only key inside it is a parse failure —
+  the same rule as the absent extension map stated from the other direction.
+  27 new application tests plus 3 domain tests (480 workspace-wide; `jarvis-domain`
+  80 -> 82, `jarvis-application` 5 -> 31); `fmt` and `clippy -D warnings` are clean.
+  **Not done**: the scripted provider is a test double, not a product path — no
+  adapter, routing engine, capability inventory, repository, or run state machine
+  exists yet, so nothing calls `ModelProvider` outside tests. `BRN-003` is blocked
+  on its `REQUIRED` evidence note, `BRN-004` and `BRN-005` follow, and the measured
+  per-model capability inventory that `BRN-011` and `NFR-VOI-002` need is not
+  collected.
 - [ ] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
-- [ ] `BRN-004` Implement durable session/message/run/model-call repositories.
-- [ ] `BRN-005` Implement native agent state machine with explicit terminal and
+- [x] `BRN-005` Implement native agent state machine with explicit terminal and
   waiting states.
-- [ ] `BRN-006` Implement context budgeting for identity, active task, and recent
+  Evidence: `jarvis_domain::run` (`state.rs`, `lifecycle.rs`) implements the state
+  machine in `docs/architecture/agent-runtime.md`, the document that owns the run
+  controller. The state set and every legal edge are the diagram **transcribed**
+  rather than derived, and `RunState::allowed_targets` is asserted table-for-table
+  by `every_edge_in_the_architecture_diagram_is_present`, so the code and the
+  diagram cannot drift silently. `RunLifecycle` keeps the state **private**, so
+  every change goes through `apply` and an edge the diagram lacks cannot be reached
+  by assigning to a field. Four rules are structural: terminal states **absorb**
+  (so a late worker cannot resurrect a finished run, and the local control API's
+  "exactly one terminal event" rule is unreachable from below); a transition
+  carries **provenance** (actor from a closed set, a bounded reason, the expected
+  prior version, the instant, an optional correlation ID) and
+  `RunTransitionRecord` records what was *applied* — both versions included —
+  because "the state changed" is not auditable on its own; refusals are ordered
+  **terminal → version → edge** so a caller gets the most specific true answer (an
+  illegal edge computed from a stale view may be legal from the current state), and
+  `RunVersionConflict` is the one **retryable** domain error, because re-reading and
+  recomputing is exactly what stating an expected version is for; and waiting is
+  **explicit and distinct from failure** (`AwaitingApproval`/`Waiting` are named
+  states, so a run parked on a dependency does not look like a run that is merely
+  not progressing). A mismatched `expected_from` at the right version is refused as
+  well, which is the two-workers-from-one-version case a version check alone would
+  let through. 27 new domain tests (that crate goes 82 -> 109; 507 workspace-wide),
+  including reachability proofs that every non-terminal state can reach a terminal
+  state and none has a self-edge. **Two questions the transcription surfaced are
+  recorded in the architecture rather than resolved by assumption:** the diagram
+  gives `Responding` exactly one successor, so a provider failure *while producing
+  the final answer* is not expressible — either the diagram gains that edge or the
+  controller must surface the failure before entering `Responding`, and the
+  architecture owner decides; and the client-visible state set in the local control
+  API is **coarser** than the controller's, with no projection function here on
+  purpose because the architecture forbids domain states doubling as UI strings, so
+  that total mapping is `BRN-007`'s at the API boundary. **Not done**: this is the
+  transition layer only — no repository persists a run, no controller drives it, no
+  event is published, and nothing yet maps a controller state onto the wire, so no
+  product path exercises `RunLifecycle`. Persistence is `BRN-004`, context budgeting
+  is `BRN-006`, and the CLI/HTTP surfaces are `BRN-007`.
+- [x] `BRN-004` Implement durable session/message/run/model-call repositories.
+  Evidence: `migrations/sqlite/000002_conversations_runs.sql` creates
+  `conversations`, `messages`, `agent_runs`, `agent_steps`, `run_activity_events`,
+  and `model_calls`, and raises the schema to version 2 with the minimum reader left
+  at 1 because the migration is purely additive.
+  `jarvis_application::repository` holds the ports and
+  `jarvis_infrastructure::storage::repositories` implements them over SQLite, so the
+  domain still depends on traits rather than on `SQLx` types. Three constraints do
+  the work rather than decorating the schema: `agent_runs` **refuses a waiting state
+  whose dependency is unset and a terminal state whose completion instant is unset**
+  (mirrored in `RunWrite::is_consistent`, with a test for each direction of the
+  mismatch, because a row that reads as waiting with nothing to wait for or as
+  finished with no instant would look plausible); `UNIQUE(run_id, sequence)` on
+  `run_activity_events` keeps "sequence increases by exactly one" true; and
+  `UNIQUE(logical_call_id, attempt)` on `model_calls` makes a retry an *attempt* of
+  one logical call rather than a new call, which is what the retry-ownership rule
+  depends on. `RunRepository::transition` commits the state change and its activity
+  event in **one transaction** — the first required atomic use case in the storage
+  architecture — so a reader never sees an event for a transition that is not
+  durable, or a transition with no event. Scope is a query predicate, so a run in
+  another workspace is `NotFound` rather than a forbidden result, as the local
+  control API requires; and a stored state the domain does not recognize is
+  `Corrupted`, never "absent", because treating it as absent converts a migration
+  problem into apparent data loss. **Two defect classes were found by the tests, and
+  the first is why an edge check must not live in a SQL predicate:** the first
+  implementation inferred a transition's legality from its `... AND state = ?`
+  predicate, which proves only that the run *was* in the expected state — it
+  **accepted `Received -> Responding`**, an edge the architecture diagram does not
+  contain, and passed every test until one asserted the refusal. The adapter now
+  reads the row inside the transaction, orders its refusals exactly as the domain
+  does (terminal, then version, then edge) and asks `RunState::can_transition_to`
+  rather than duplicating the table. Second, constraint failures were mapped to
+  `storage.query_failed`, reporting a **caller-visible conflict as a transport
+  fault** a blind retry might "fix"; they now map to `storage.conflict` across runs,
+  conversations, messages, activity, and model calls. A separate domain fix in the
+  same change: `SessionId`, documented as identifying a "durable conversation
+  session", conflated the conversation aggregate with the identity architecture's
+  **authenticated session** (the `sessions` table), so it is now `ConversationId`
+  with `MessageId` added. 23 adapter tests against a **real migrated database** plus
+  12 port tests and 3 domain tests (546 workspace-wide; application 31 -> 46,
+  infrastructure 315 -> 339, domain 109). `fmt` and `clippy -D warnings` are clean.
+  **Not done**: `agent_steps` has a table but no port or adapter, so no step is
+  persisted; `model_route_decisions`/`model_data_policies`/`model_policy_exceptions`
+  are not created (routing and policy are `BRN-010`); the schema-version bump has
+  not been exercised as an upgrade from a **populated** version-1 database, which
+  `docs/data/migrations.md` requires (`PRD-009`); no PostgreSQL implementation
+  exists (`PRD-001`); and no controller, endpoint, or CLI path calls these
+  repositories yet.
+- [x] `BRN-006` Implement context budgeting for identity, active task, and recent
   conversation.
+  Evidence: `jarvis_domain::context` implements the second half of the
+  `docs/architecture/memory-context.md` retrieval pipeline as types, so
+  `FR-CTX-001` ("context selection is budgeted, provenance-aware, and recorded") is
+  enforced rather than restated. `ContextBudget::assemble` is the pipeline and the
+  step order is the rule: **policy and scope filtering precede ranking**, because the
+  architecture states that post-filtering a ranked result "leaks both recall and
+  potential side channels" — a candidate over the sensitivity ceiling or past its
+  validity is refused *before* it is scored, and every refusal is **counted by
+  reason** rather than silently dropped; deduplication follows ranking, so the
+  highest-ranked occurrence of a reference is kept rather than whichever came first
+  in the caller's list; ranking is a **total order** (priority band, score, recency,
+  reference) so the same set assembles identically regardless of input order; and an
+  item that does not fit is **excluded, never truncated**, because a half-truncated
+  message reads as a complete one to the model. `ContextManifest` records each
+  inclusion's reference, source, sensitivity, token estimate, reason, and score plus
+  an exclusion summary by reason, which is the architecture's "Context Manifest"
+  requirement met without storing duplicate prompt text — and references content
+  rather than containing it, because a manifest that embedded the text would outlive
+  the retention decision that allowed it. Three properties are structural: a
+  **zero-cost candidate is refused**, since it is the one way content could enter
+  without consuming budget; a **non-finite score is refused**, because `NaN` makes
+  the ranking comparator's order undefined; and **hidden reasoning is inexpressible
+  rather than filtered**, because `CandidateSource` has no variant for model-internal
+  reasoning — `FR-RUN-005` holds by construction, and a serialized-shape test asserts
+  the manifest has no field that could carry it. `ContextManifest::is_consistent`
+  checks its own arithmetic (included plus excluded equals offered, used tokens equal
+  the included sum, used never exceeds the budget), because a manifest failing that
+  describes a decision the code could not have made. 22 new domain tests (that crate
+  goes 109 -> 131; 568 workspace-wide). `fmt` and `clippy -D warnings` are clean.
+  **Not done**: this is candidate selection and budgeting only — nothing *retrieves*
+  candidates, so lexical, semantic, and hybrid retrieval and entity resolution remain
+  Milestone 4 (`MEM-003`..`MEM-006`) and the score a caller supplies is a value
+  JARVIS does not yet compute; summarization/compaction is `MEM-008`; the manifest is
+  not persisted, because the `context_manifests`/`context_manifest_items` tables are
+  not created; the untrusted-content delimiting the source-priority section requires
+  is exposed by `CandidateSource::is_untrusted` but consumed by nothing, since no
+  prompt is assembled before `BRN-007`; and `ACC-035`'s cross-workspace candidate
+  case cannot be exercised end to end until retrieval exists.
 - [ ] `BRN-007` Implement CLI chat plus HTTP/SSE streaming.
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior.

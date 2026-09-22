@@ -135,6 +135,54 @@ Every model/runtime context build records a manifest containing:
 The manifest enables diagnosis without storing duplicate prompt text. Access to
 the referenced content still follows current authorization and retention rules.
 
+### Implemented evidence: context budgeting and the manifest (`BRN-006`)
+
+`jarvis_domain::context` implements the retrieval pipeline's second half as types.
+`ContextBudget::assemble` is the pipeline, and the step order is the rule it
+enforces:
+
+1. **Policy and scope filtering precede ranking.** A candidate whose sensitivity
+   exceeds the call's ceiling, or whose validity has passed, is refused *before* it
+   is scored — the architecture requires this because "post-filtering a global
+   nearest-neighbor result leaks both recall and potential side channels". A refused
+   candidate is **counted by reason**, never silently dropped.
+2. **Deduplication follows ranking**, so the highest-ranked occurrence of a
+   reference is the one kept rather than whichever came first in the caller's list.
+3. **Ranking is a total order** — priority band, then score, then recency, then
+   reference — so the same candidate set assembles identically regardless of input
+   order.
+4. **An item that does not fit is excluded, never truncated**, because a
+   half-truncated message reads as a complete one to the model.
+5. **The manifest is built from what happened**, carrying each inclusion's
+   reference, source, sensitivity, token estimate, reason, and score, plus an
+   exclusion summary counted by reason.
+
+Three properties are structural:
+
+- **A zero-cost candidate is refused** (`ContextCandidate::validated`), because it is
+  the one way content could enter the context without consuming budget.
+- **A non-finite score is refused**, because a `NaN` makes the ranking comparator's
+  order undefined, so the same set could assemble differently on two runs.
+- **Hidden reasoning is inexpressible, not filtered.** `CandidateSource` has no
+  variant for model-internal reasoning, so `FR-RUN-005` holds by construction, and a
+  serialized-shape test asserts the manifest has no field that could carry it.
+
+`ContextManifest::is_consistent` checks its own arithmetic — included plus excluded
+equals offered, the used tokens equal the included items' sum, and the used total
+never exceeds the budget — because a manifest failing any of those describes a
+decision the code could not have made, which is a corruption signal rather than a
+display problem.
+
+**Not done**: this is candidate selection and budgeting only. Nothing retrieves
+candidates yet — lexical and semantic retrieval, the hybrid score's components, and
+entity resolution are Milestone 4 (`MEM-003`, `MEM-004`, `MEM-005`, `MEM-006`), so
+the `score` a caller supplies is a value JARVIS does not yet compute. Summarization
+and compaction are `MEM-008`; the manifest is not persisted, because the
+`context_manifests` and `context_manifest_items` tables are not created; and the
+delimiting of untrusted content that the source-priority section requires is exposed
+by `CandidateSource::is_untrusted` but consumed by nothing yet, since no prompt is
+assembled before `BRN-007`.
+
 ## Context Source Priority
 
 Typical order:

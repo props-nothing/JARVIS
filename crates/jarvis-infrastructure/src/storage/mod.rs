@@ -10,6 +10,7 @@ pub mod connection;
 pub mod error;
 pub mod lock;
 pub mod migrate;
+pub mod repositories;
 pub mod schema;
 
 pub use backup::{Backup, create as create_backup, restore as restore_backup};

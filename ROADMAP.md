@@ -2,7 +2,7 @@
 
 Status: ACCEPTED
 Last updated: 2026-09-22
-Current milestone: Milestone 2 - Native Brain (started; `BRN-001` done, `BRN-002`+ next. Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
+Current milestone: Milestone 2 - Native Brain (started; `BRN-001`, `BRN-002`, `BRN-004`, `BRN-005`, and `BRN-006` done, `BRN-003` gated on evidence, `BRN-007`+ next. Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.

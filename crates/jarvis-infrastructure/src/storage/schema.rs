@@ -10,9 +10,18 @@ use sqlx::{Row as _, SqlitePool};
 use super::error::StorageError;
 
 /// The schema version this binary targets and writes.
-pub const TARGET_SCHEMA_VERSION: i64 = 1;
+///
+/// Bumped to `2` by `000002_conversations_runs.sql`, which adds the conversation,
+/// run, step, activity, and model-call tables. The minimum reader stays at `1`
+/// because that migration is purely additive: a binary that only understands the
+/// initial schema can still read a database that has the added tables.
+pub const TARGET_SCHEMA_VERSION: i64 = 2;
 
 /// The lowest schema version this binary can still read.
+///
+/// `1` rather than `2`: migration from a supported prior version is required (see
+/// `docs/data/migrations.md`), so a version-1 database must be readable and
+/// migratable rather than refused.
 pub const MIN_SUPPORTED_SCHEMA_VERSION: i64 = 1;
 
 /// The compatibility state discovered in a database.
@@ -86,7 +95,7 @@ pub async fn read_compatibility(pool: &SqlitePool) -> Result<Compatibility, Stor
 
 #[cfg(test)]
 mod tests {
-    use super::{Compatibility, TARGET_SCHEMA_VERSION};
+    use super::{Compatibility, MIN_SUPPORTED_SCHEMA_VERSION, TARGET_SCHEMA_VERSION};
 
     fn compatibility(schema_version: i64) -> Compatibility {
         Compatibility {
@@ -106,9 +115,24 @@ mod tests {
 
     #[test]
     fn an_older_but_supported_version_is_readable_and_needs_migration() {
-        let older = compatibility(1);
+        // Migration from a supported prior version is required, so version 1 must
+        // be readable *and* reported as needing migration — not refused.
+        let older = compatibility(MIN_SUPPORTED_SCHEMA_VERSION);
         assert!(older.is_readable());
-        assert!(!older.needs_migration(), "version 1 is the target");
+        assert!(older.needs_migration());
+    }
+
+    #[test]
+    fn the_supported_version_range_is_ordered() {
+        // A minimum reader above the target would describe a database this binary
+        // writes but refuses to read. Compared as values rather than asserted as
+        // constants, so the check is a real comparison rather than a lint target.
+        let minimum = MIN_SUPPORTED_SCHEMA_VERSION;
+        let target = TARGET_SCHEMA_VERSION;
+        assert!(
+            minimum <= target,
+            "the minimum reader must not exceed the target"
+        );
     }
 
     #[test]

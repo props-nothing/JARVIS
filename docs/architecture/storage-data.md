@@ -63,6 +63,30 @@ trait RunRepository {
 Transition methods enforce expected version/state and return conflict rather
 than silently overwriting concurrent work.
 
+### Implemented evidence (`BRN-004`)
+
+`jarvis_application::repository` holds the ports and
+`jarvis_infrastructure::storage::repositories` implements them over SQLite. Two
+decisions are worth stating because they are load-bearing:
+
+- **The edge check asks the domain, not the SQL predicate.** An optimistic
+  `UPDATE ... WHERE version = ? AND state = ?` proves the run *was* in the expected
+  state; it does not prove the edge exists. The first implementation inferred
+  legality from that predicate and **accepted `Received -> Responding`**, an edge
+  the [agent-runtime](agent-runtime.md) diagram does not contain. The adapter now
+  reads the row inside the transaction, orders its refusals as the domain does
+  (terminal, version, edge) and delegates the edge question to
+  `RunState::can_transition_to`. A duplicated transition table in the adapter would
+  be the same defect waiting to reappear.
+- **"Transition run state and append its durable activity event" is one method.**
+  `RunRepository::transition` takes a `RunWrite` that carries both, so a caller
+  cannot move the state without its event. This is the first required atomic use
+  case above, and passing the parts separately is what would leave the window open.
+
+`RepositoryError` is deliberately not the domain's error type: a missing row and an
+illegal transition are different facts, so a domain refusal is carried through as
+`TransitionRefused { code }` rather than flattened into a generic storage failure.
+
 ## Transactions
 
 Atomic use cases use an application unit-of-work port. Required examples:

@@ -131,6 +131,15 @@ id, workspace_id, owner_user_id, title, status, channel_origin,
 created_at, updated_at, archived_at
 ```
 
+Named `conversations`, not `sessions`. The
+[identity architecture](../architecture/identity-workspaces.md) reserves
+**session** for a bounded authenticated interaction context (the `sessions` table
+above and its channel/assurance columns), while a conversation is the durable
+transcript container. The local control API addresses this aggregate as
+`conversation_id`. `jarvis-domain` previously carried a `SessionId` documented as
+identifying a "durable conversation session", which conflated the two; it is now
+`ConversationId`, and `MessageId` was added alongside it.
+
 ### `messages`
 
 ```text
@@ -213,6 +222,70 @@ consumed_at nullable
 
 Exceptions cannot alter their scope after issue and are evaluated/revoked
 server-side.
+
+### Implemented evidence: conversations, runs, activity, and model calls (`BRN-004`)
+
+`migrations/sqlite/000002_conversations_runs.sql` creates `conversations`,
+`messages`, `agent_runs`, `agent_steps`, `run_activity_events`, and `model_calls`,
+and raises the schema version to 2 with the minimum reader left at 1 because the
+migration is purely additive. `jarvis_application::repository` defines the ports
+(`RunRepository`, `ConversationRepository`, `ModelCallRepository`) and
+`jarvis_infrastructure::storage::repositories` implements them over SQLite.
+
+Three constraints are load-bearing rather than decorative:
+
+- `agent_runs` refuses a **waiting** state whose dependency is unset and a
+  **terminal** state whose completion instant is unset. Without them a row could
+  read as waiting with nothing to wait for, or as finished with no instant, and
+  both would look plausible to a reader. The port mirrors the rule through
+  `RunWrite::is_consistent`, and there is a test for each direction of the
+  mismatch.
+- `UNIQUE(run_id, sequence)` on `run_activity_events` keeps "sequence increases by
+  exactly one" true, so a retried append cannot place two events at one position.
+- `UNIQUE(logical_call_id, attempt)` on `model_calls` makes a retry an *attempt* of
+  one logical call rather than a new call, which is the distinction the
+  retry-ownership rule depends on.
+
+`RunRepository::transition` commits the state change and its activity event in
+**one transaction** — the first required atomic use case in the storage
+architecture — so a reader never sees an event describing a transition that is not
+durable, or a transition with no event.
+
+**A defect this slice found, and the reason the edge check does not live in the
+SQL predicate.** The first implementation inferred the legality of a transition
+from its `... AND state = ?` predicate, which only proves the run *was* in the
+expected state — it does not prove the edge exists. That version **accepted
+`Received -> Responding`**, an edge the architecture diagram does not contain, and
+it passed every test until one asserted the refusal. The adapter now reads the
+current row inside the transaction, orders its refusals exactly as the domain
+does (**terminal, then version, then edge**) and asks
+`RunState::can_transition_to` — the domain's own table — rather than duplicating
+or approximating it. `an_edge_the_diagram_lacks_is_refused` is the test.
+
+A second class of defect was found the same way, in the opposite direction:
+constraint failures were mapped to `storage.query_failed`, reporting a
+**caller-visible conflict** as a transport fault a blind retry might "fix". A
+unique-constraint violation now maps to `storage.conflict` across runs,
+conversations, messages, activity events, and model calls.
+
+Storage-level outcomes are deliberately separate from domain errors: a missing row
+and an illegal transition are different facts, so `RepositoryError` carries the
+domain's refusal code through in `TransitionRefused { code }` instead of
+flattening it. A run in another workspace is `NotFound`, never a forbidden result,
+because the local control API requires the two to be indistinguishable. A stored
+state or role the domain does not recognize is `Corrupted`, never "absent",
+because treating it as absent would convert a migration problem into apparent data
+loss.
+
+**Not done**: `agent_steps` has a migration and a schema, but no port or adapter
+yet, so no step is persisted (that is `BRN-005`'s controller work). `sessions`,
+`users`, `workspaces`, and `client_credentials` remain schema-only — local
+single-owner enrollment still uses the Foundation credential file. The
+`model_route_decisions`, `model_data_policies`, and `model_policy_exceptions`
+tables are not created, because routing and the data policy are `BRN-010`. No
+PostgreSQL implementation exists (that is `PRD-001`), and the schema-version bump
+has not been exercised as an upgrade from a populated version-1 database, which
+`docs/data/migrations.md` requires and belongs to `PRD-009`.
 
 ## Tools, Policy, and Approvals
 

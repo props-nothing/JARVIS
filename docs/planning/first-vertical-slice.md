@@ -121,6 +121,28 @@ jarvis runs show <id>
   diagnostics, support, and repair work completes Milestone 1.
 - No hidden chain-of-thought or fake planning UI.
 
+## Progress
+
+Steps 1 through 13 (Milestone 1) are complete apart from the owner-gated
+`OWN-001` through `OWN-005`; see `TODO.md`. In this slice: step 14 (the port and
+scripted provider, `BRN-002`) is done, step 15's **state machine** (`BRN-005`) is
+done as the transition layer, step 16's **repositories** (`BRN-004`) are done
+against SQLite, and `BRN-006`'s **context budgeter** is done as candidate selection
+and the manifest.
+
+`BRN-005` was taken before `BRN-004` because the state machine is pure domain logic
+with no dependency on a repository, while `BRN-004` needs one; the IDs are stable
+and were not renumbered.
+
+What this is **not** yet: a working run. No controller drives the states, no
+endpoint or CLI path calls the repositories, no event is published to a client, no
+controller state is mapped onto the client-visible set, and nothing retrieves the
+context candidates `BRN-006` budgets — so the pieces that exist are each tested but
+none is joined to another by a product path. Step 16 is only partly done —
+`agent_steps` has a table but no adapter. Step 17 (`BRN-007`, HTTP/SSE and CLI
+surfaces) and the E2E step are not started, and `BRN-003` remains gated on its
+`REQUIRED` evidence note.
+
 ## Acceptance
 
 The slice is complete when:

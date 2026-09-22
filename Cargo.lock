@@ -970,6 +970,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -1005,6 +1006,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom",
  "http-body-util",
+ "jarvis-application",
  "jarvis-domain",
  "jarvis-observability",
  "jarvis-protocol",

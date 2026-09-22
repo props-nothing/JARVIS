@@ -50,6 +50,49 @@ stateDiagram-v2
 State names are domain concepts, not UI strings. A transition records actor,
 reason, expected prior version, timestamp, and correlation metadata.
 
+### Implemented evidence (`BRN-005`)
+
+`jarvis_domain::run` implements this state machine, so the edges above are
+enforced rather than restated. `RunState::allowed_targets` is the diagram
+transcribed, and `RunLifecycle::apply` is the single place a change is decided:
+the state is **private**, so an edge the diagram does not contain cannot be
+reached by assigning to a field.
+
+Four rules are structural rather than documented:
+
+- **Terminal states absorb.** `Completed`, `Failed`, and `Cancelled` have no
+  successors, so a late worker cannot resurrect a finished run — and a second
+  terminal event, which the local control API forbids, is unreachable.
+- **A transition carries provenance.** `RunTransition` supplies the actor, the
+  bounded reason, the expected prior version, the instant, and an optional
+  correlation ID; `RunTransitionRecord` describes what was *applied*, including
+  both the prior and the resulting version, because "the state changed" is not
+  auditable on its own.
+- **Optimistic concurrency, and a stated check order.** The refusals are ordered
+  terminal → version → edge so a caller receives the most specific true answer: an
+  illegal edge computed from a stale view may be legal from the current state, so a
+  stale caller is told its view is stale first. `RunVersionConflict` is the one
+  domain error that is **retryable**, because re-reading and recomputing is exactly
+  what stating an expected version is for.
+- **Waiting is explicit and distinct from failure.** `AwaitingApproval` and
+  `Waiting` are named states, so a run parked on a dependency does not look like a
+  run that is merely not progressing.
+
+**Two questions this transcription surfaced, recorded rather than resolved:**
+
+1. The diagram gives `Responding` exactly one successor (`Completed`), so a
+   provider failure *while producing the final answer* is not expressible: the
+   refusal is pinned by
+   `an_edge_absent_from_the_diagram_is_refused`. Either failure during responding
+   must be reachable (a diagram change) or it must be defined to surface before
+   `Responding` is entered (a controller rule) — the architecture owner decides.
+2. The client-visible states in the
+   [local control API](../contracts/local-control-api.md) are a **coarser** set
+   than the controller's, and this module holds no projection function on purpose
+   (the sentence above forbids domain states doubling as UI strings). The mapping
+   is therefore `BRN-007`'s to implement at the API boundary, where the wire
+   contract is owned, and it must be total over the non-terminal states.
+
 ## Durable Run Record
 
 A run minimally tracks:

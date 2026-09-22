@@ -234,6 +234,129 @@ pub struct CallLimits {
     pub max_cost_microunits: Option<u64>,
 }
 
+/// The largest accepted sampling temperature, in thousandths (`2.0`).
+pub const MAX_TEMPERATURE_MILLIS: u16 = 2_000;
+
+/// The largest accepted nucleus mass, in thousandths (`1.0`).
+pub const MAX_TOP_P_MILLIS: u16 = 1_000;
+
+/// A portable reasoning-effort hint.
+///
+/// The set is closed and named, because a free-form effort string would let a
+/// caller express a level no provider adapter could map, and the mismatch would
+/// only appear at the far boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    /// Prefer the fewest reasoning tokens the model supports.
+    Minimal,
+    /// A low effort level.
+    Low,
+    /// A balanced effort level.
+    Medium,
+    /// A high effort level.
+    High,
+}
+
+/// Portable sampling and reasoning controls for one call.
+///
+/// Only controls whose meaning is the same across providers live here. A knob
+/// that is specific to one provider belongs to that adapter's namespaced
+/// extension, and the struct is `deny_unknown_fields` so a provider-only key
+/// inside the portable block is a **parse failure** rather than an ignored field
+/// — which is what stops a provider value from being read as a portable one, and
+/// the portable one from being read as provider-owned.
+///
+/// Sampling values are **thousandths rather than floats**. A float cannot derive
+/// the `Eq` the rest of this module relies on, and a decimal bound such as `2.0`
+/// is not exactly representable, so a range check on it would be a comparison
+/// whose result an operator cannot predict. `0.7` is `700` here, and the accepted
+/// ranges are exact integers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PortableSettings {
+    /// Sampling temperature in thousandths (`0..=2_000`, i.e. `0.0..=2.0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_millis: Option<u16>,
+    /// Nucleus sampling mass in thousandths (`1..=1_000`).
+    ///
+    /// Zero is refused rather than clamped: a nucleus of zero mass selects
+    /// nothing, so it is a request the caller cannot have meant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p_millis: Option<u16>,
+    /// The reasoning-effort hint, when the caller set one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl PortableSettings {
+    /// Validates and builds settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ModelSettingsInvalid`] when a temperature exceeds
+    /// [`MAX_TEMPERATURE_MILLIS`] or a nucleus mass is zero or exceeds
+    /// [`MAX_TOP_P_MILLIS`]. Out-of-range values are refused rather than clamped,
+    /// because clamping would silently run a call with settings the caller did
+    /// not choose — and a caller cannot tell a clamped value from an honored one.
+    pub fn new(
+        temperature_millis: Option<u16>,
+        top_p_millis: Option<u16>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, DomainError> {
+        if temperature_millis.is_some_and(|value| value > MAX_TEMPERATURE_MILLIS) {
+            return Err(DomainError::ModelSettingsInvalid);
+        }
+        if top_p_millis.is_some_and(|value| value == 0 || value > MAX_TOP_P_MILLIS) {
+            return Err(DomainError::ModelSettingsInvalid);
+        }
+        Ok(Self {
+            temperature_millis,
+            top_p_millis,
+            reasoning_effort,
+        })
+    }
+
+    /// Returns whether no control was set.
+    ///
+    /// Used so an absent settings block and an empty one are the same fact on the
+    /// wire instead of two spellings of one.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.temperature_millis.is_none()
+            && self.top_p_millis.is_none()
+            && self.reasoning_effort.is_none()
+    }
+}
+
+/// The wire form of [`PortableSettings`], before range validation.
+///
+/// It exists so unknown-field rejection and range validation both apply to a
+/// value that arrived over the wire: a derived `Deserialize` would build the
+/// struct directly and skip the range check, so the invariant would hold only for
+/// in-crate callers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPortableSettings {
+    #[serde(default)]
+    temperature_millis: Option<u16>,
+    #[serde(default)]
+    top_p_millis: Option<u16>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl<'de> Deserialize<'de> for PortableSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawPortableSettings::deserialize(deserializer)?;
+        Self::new(
+            raw.temperature_millis,
+            raw.top_p_millis,
+            raw.reasoning_effort,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A block of message content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -480,6 +603,12 @@ pub struct ModelCallRequest {
     /// The requested output schema document, when structured output is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<JsonText>,
+    /// Portable sampling and reasoning controls.
+    ///
+    /// Absent, or present and empty, both omit the block on the wire, so there is
+    /// one representation of "no controls set".
+    #[serde(default, skip_serializing_if = "PortableSettings::is_empty")]
+    pub settings: PortableSettings,
     /// Budgets for this call.
     pub limits: CallLimits,
 }
@@ -971,8 +1100,9 @@ impl fmt::Display for StreamOutcome {
 mod tests {
     use super::{
         CallLimits, FinishReason, InputItem, InputItems, JsonText, MAX_JSON_TEXT_BYTES,
-        MAX_PROVIDER_STRING_BYTES, Modality, ModelCallRequest, ModelStreamEvent,
-        ModelStreamEventKind, ModelStreamState, Role, RouteRequirements, Sequence, StreamAdmission,
+        MAX_PROVIDER_STRING_BYTES, MAX_TEMPERATURE_MILLIS, MAX_TOP_P_MILLIS, Modality,
+        ModelCallRequest, ModelStreamEvent, ModelStreamEventKind, ModelStreamState,
+        PortableSettings, ReasoningEffort, Role, RouteRequirements, Sequence, StreamAdmission,
         StreamOutcome, ToolArguments, Usage,
     };
     use crate::ids::{ModelCallId, ModelStreamEventId, RunId};
@@ -1546,6 +1676,7 @@ mod tests {
             input: InputItems::new(Vec::new()).expect("an empty list is valid"),
             tools: Vec::new(),
             output_schema: None,
+            settings: PortableSettings::default(),
             limits: CallLimits {
                 deadline: None,
                 max_output_tokens: Some(2048),
@@ -1557,11 +1688,68 @@ mod tests {
             !json.contains("extension") && !json.contains("provider_"),
             "the portable request must have no provider-owned field: {json}",
         );
+        assert!(
+            !json.contains("settings"),
+            "an empty settings block must be omitted, not written as an empty object: {json}",
+        );
         assert_eq!(
             request.route_requirements.modalities,
             [Modality::Text].into_iter().collect(),
         );
         assert!(request.limits.max_cost_microunits.is_none());
+    }
+
+    #[test]
+    fn a_portable_setting_out_of_range_is_refused_rather_than_clamped() {
+        // Clamping would run the call with settings the caller did not choose, and
+        // a caller cannot distinguish a clamped value from an honored one.
+        assert!(
+            PortableSettings::new(Some(MAX_TEMPERATURE_MILLIS), None, None).is_ok(),
+            "the inclusive bound is inside the range",
+        );
+        let error = PortableSettings::new(Some(MAX_TEMPERATURE_MILLIS + 1), None, None)
+            .expect_err("above the bound must be refused");
+        assert_eq!(error.code(), "model.settings_invalid");
+
+        assert!(
+            PortableSettings::new(None, Some(1), None).is_ok(),
+            "the smallest usable nucleus mass is accepted",
+        );
+        for mass in [0, MAX_TOP_P_MILLIS + 1] {
+            let error = PortableSettings::new(None, Some(mass), None)
+                .expect_err("a zero or over-full nucleus must be refused");
+            assert_eq!(error.code(), "model.settings_invalid");
+        }
+    }
+
+    #[test]
+    fn a_deserialized_settings_block_is_range_checked_and_rejects_unknown_keys() {
+        // A derived `Deserialize` would build the struct directly and skip the
+        // range check, so the refusal would hold only for in-crate callers.
+        serde_json::from_value::<PortableSettings>(
+            serde_json::json!({"temperature_millis": 5_000}),
+        )
+        .expect_err("an out-of-range value must not deserialize");
+        // The boundary is asserted from both sides: the in-range value directly
+        // below the maximum must still parse, or the refusal above would be
+        // attributable to a broken fixture rather than to the range check.
+        let accepted: PortableSettings = serde_json::from_value(
+            serde_json::json!({"temperature_millis": MAX_TEMPERATURE_MILLIS}),
+        )
+        .expect("the inclusive maximum deserializes");
+
+        // A provider-only knob inside the portable block is a parse failure rather
+        // than an ignored field, which is what keeps a provider value from being
+        // read as a portable one.
+        let provider_only = serde_json::json!({"top_k": 40});
+        serde_json::from_value::<PortableSettings>(provider_only)
+            .expect_err("an unknown key must not be silently ignored");
+
+        let with_effort: PortableSettings =
+            serde_json::from_value(serde_json::json!({"reasoning_effort": "high"}))
+                .expect("a known value deserializes");
+        assert_eq!(accepted.temperature_millis, Some(MAX_TEMPERATURE_MILLIS));
+        assert_eq!(with_effort.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
