@@ -79,3 +79,45 @@ The deterministic half of the cancellation contract — that a cancel arriving *
 delivery must win — is covered in-process by `run_controller`'s
 `a_cancel_arriving_during_delivery_ends_the_run_cancelled`, which cancels from inside the
 provider's own stream so there is no race to lose.
+## `policy-surface.mjs`
+
+Proves that the model data policy selector is reachable from a **real** `jarvisd`. The
+handler tests build their own `ApiState` with `.with_policies(...)`, so they prove the
+handlers work *when the state carries a service* — and cannot prove the daemon composition
+passes one. A daemon that never called `.with_policies` passes every handler test while
+answering `service.not_ready` to every real client, which is precisely the failure mode a
+composition root needs an end-to-end test for.
+
+Five sections:
+
+1. **The routes exist and are authenticated.** Each path is distinguished from the router's
+   fallback (`resource.not_found`), because "the route is absent" and "the route answered
+   something else" both produce a non-200. A bad credential must be refused with `401`:
+   binding to loopback is not authorization, since another local user can reach the port.
+2. **A store with no policy row is `model.policy_not_found`, not `service.not_ready`.** The
+   contract keeps "no store" (a readiness fact a client retries) and "no policy in force"
+   (a decision a client acts on) distinct. This is the assertion that proves the composition,
+   because the handler short-circuits to `not_ready` *before* reading anything — and it also
+   asserts the body is not the not-ready envelope, so a client reading only the body cannot
+   see one state rendered as the other.
+3. **The route probe with no policy reports the missing policy, not a refusal.** It must not
+   be `model.policy_unsatisfied`: nothing was offered, so "your policy refused every model"
+   would name a decision that was never made. The two codes are one word apart, which is why
+   the `RouteSelectionFailure` enum keeps them apart and why this is asserted over the wire.
+4. **Two identical probes answer byte-identically.** A per-request clock or a second store
+   read inside the response would make two probes of one daemon disagree.
+5. **The daemon still reports liveness afterwards**, which catches a handler that panicked
+   in a way the router converted into a response.
+
+### What this harness found
+
+- Removing `.with_policies(...)` from `daemon.rs` turns every policy request into
+  `service.not_ready` while the whole handler-test suite stays green. The harness fails on five
+  checks, which is what makes it the test that covers the composition rather than the handler.
+
+The wire spellings are covered in `jarvis_infrastructure::http::policy`'s own tests, which
+enumerate **every** variant of every value family. That location is deliberate: a handler test
+can only reach the variants a fixture produces, and the defect this round fixed —
+`rejected_view` rendering `RejectionReason`'s operator prose `"locality violated"` where the
+contract specifies the code `locality_violated` — survived because the one rejection code the
+handler test reached was produced by the domain, so the test agreed with the defect.
