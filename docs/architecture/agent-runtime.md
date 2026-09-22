@@ -22,6 +22,7 @@ stateDiagram-v2
     Received --> ContextBuilding
     ContextBuilding --> Planning
     Planning --> AwaitingModel
+    AwaitingModel --> Responding: final response
     AwaitingModel --> ExecutingTool: allowed tool intent
     AwaitingModel --> AwaitingApproval: approval required
     AwaitingApproval --> ExecutingTool: approved
@@ -32,6 +33,8 @@ stateDiagram-v2
     Waiting --> Planning: resumed
     Planning --> Responding: answer ready
     Responding --> Completed
+    Responding --> Failed
+    Responding --> Cancelled
     Received --> Failed
     ContextBuilding --> Failed
     Planning --> Failed
@@ -46,6 +49,23 @@ stateDiagram-v2
     Cancelled --> [*]
     Completed --> [*]
 ```
+
+Three edges were **added** to this diagram on 2026-09-22, and the reason is worth
+recording because each was a defect the diagram had rather than a stylistic
+choice:
+
+- `AwaitingModel --> Responding`. Without it the native runtime's own instruction —
+  "ask a model for either a final response or typed tool intent" — had no legal
+  completion path: a plain question-and-answer run could reach neither `Responding`
+  nor `Completed` and would sit in `AwaitingModel` forever. The
+  [first vertical slice](../planning/first-vertical-slice.md) already named the
+  minimal machine as "received, context, model, responding, completed", so the edge
+  was missing from this diagram, not from the design.
+- `Responding --> Failed` and `Responding --> Cancelled`. Producing the answer is
+  where a provider failure and a caller's cancellation actually arrive, and
+  `ACC-012` requires that a disconnect "never becomes false `Completed`" while
+  `ACC-016` requires cancelling during streaming. With `Completed` as the only
+  successor, neither could be persisted truthfully.
 
 State names are domain concepts, not UI strings. A transition records actor,
 reason, expected prior version, timestamp, and correlation metadata.
@@ -78,20 +98,88 @@ Four rules are structural rather than documented:
   `Waiting` are named states, so a run parked on a dependency does not look like a
   run that is merely not progressing.
 
-**Two questions this transcription surfaced, recorded rather than resolved:**
+**Two questions this transcription surfaced, both now resolved:**
 
-1. The diagram gives `Responding` exactly one successor (`Completed`), so a
-   provider failure *while producing the final answer* is not expressible: the
-   refusal is pinned by
-   `an_edge_absent_from_the_diagram_is_refused`. Either failure during responding
-   must be reachable (a diagram change) or it must be defined to surface before
-   `Responding` is entered (a controller rule) — the architecture owner decides.
+1. The diagram gave `Responding` exactly one successor (`Completed`), so neither a
+   provider failure nor a cancellation *while producing the final answer* was
+   expressible. **Resolved by adding `Responding --> Failed` and
+   `Responding --> Cancelled`** to the diagram above, because producing the answer
+   is where both actually arrive and `ACC-012`/`ACC-016` require them to be
+   persistable. A third, related gap was found at the same time and is described
+   under the diagram: `AwaitingModel --> Responding` was missing, which left a plain
+   question-and-answer run with no legal path to `Completed` at all. The tests are
+   `a_failure_or_cancellation_during_the_answer_is_expressible` and
+   `a_plain_question_and_answer_path_reaches_completed`, plus the repository-level
+   `a_plain_question_and_answer_run_persists_through_to_completed`.
 2. The client-visible states in the
    [local control API](../contracts/local-control-api.md) are a **coarser** set
    than the controller's, and this module holds no projection function on purpose
    (the sentence above forbids domain states doubling as UI strings). The mapping
    is therefore `BRN-007`'s to implement at the API boundary, where the wire
    contract is owned, and it must be total over the non-terminal states.
+
+**A lesson worth keeping:** the original `BRN-005` "happy path" test drove
+`Planning -> Responding` and so never visited `AwaitingModel`; every edge it used
+was legal, so it passed while the product's primary ask-and-answer path was
+unreachable. A happy-path test that avoids a state proves nothing about that state,
+which is why the repository suite now drives the real path rather than a legal
+convenience path.
+
+### Implemented evidence (`BRN-008`, run control)
+
+`jarvis_application::run_controller` is the loop that drives the machine above, and
+is what the "run controller" in this document's opening means in code. Its shape is
+the **native runtime** list of steps 1, 2, and 6: receive the objective and bounded
+context, ask a model for a final response or a typed tool intent, and produce a final
+response or an explicit terminal state. `RunController::execute` advances the state
+machine through the run repository, reads the transcript, performs the model turn
+through `ModelProvider`, and persists **every** transition with its public event in
+the same write — a state that moved without an event would be a silent gap in the
+audit trail, so the fused repository call is the only way the controller changes a
+state.
+
+Four rules are structural:
+
+- **Frames are admitted by the domain, not by the controller.** `ModelStreamState`
+  decides ordering, duplicates, and terminal absorption, so the controller holds no
+  second copy of the contract's rules and cannot disagree with them. A stream that
+  ends without a terminal is the domain's `StreamOutcome::Interrupted`, which maps to
+  `Failed` — never to `Completed`.
+- **A cancelled call ends `Cancelled`, not `Failed`.** `ControllerError`'s
+  `terminal_state` is the one place that decides, so the caller's own action is
+  never recorded as a fault.
+- **A tool intent is refused, not faked.** The tool fabric is Milestone 3, so a
+  model that proposes a tool call ends the run with a typed
+  `run.tools_not_implemented`; `is_unimplemented` distinguishes that known gap from a
+  fault. The controller performs exactly **one** model turn, because a loop that
+  cannot iterate a second time would be a claim with no behaviour behind it.
+- **A misconfiguration fails before the run waits.** The model roster is checked
+  from `Planning`, so a provider serving no model reaches `Failed` rather than
+  `AwaitingModel` — checking it later left a run waiting for a call that could never
+  be made, in a state with no legal way out.
+
+The repository **test doubles** (`jarvis_application::testing`) are shipped rather
+than test-only for the same reason the scripted provider is: a controller test needs
+a store, and a paid database cannot be the only way to exercise orchestration. The
+doubles deliberately do not reimplement the transition table — they delegate edge
+legality, version ordering, and terminal absorption to `RunLifecycle`, exactly as the
+SQLite adapter does, and add only the storage semantics (transaction-and-event
+fusion, uniqueness, scope as a query predicate). A double that copied the rules would
+be a second implementation that could disagree with the first, and a test passing
+against it would prove only self-consistency.
+
+**Two questions this work surfaced:**
+
+1. Should the controller retry a retryable provider error? **Not yet.** Retry,
+   fallback, and the retry-ownership rule belong with `BRN-008`'s remaining work and
+   the model gateway, and a retry without a recorded attempt would duplicate a side
+   effect — the model-call repository already models a retry as an *attempt* of one
+   logical call, which is what that work will use.
+2. Where does a run that suspends go? `Waiting` exists in the machine and the
+   controller does not enter it, because **nothing suspends and resumes yet** —
+   approvals and timers are later milestones. Entering `Waiting` with nothing to wait
+   on would be the same kind of false record the state machine's consistency rules
+   exist to prevent.
 
 ## Durable Run Record
 

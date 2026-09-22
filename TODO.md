@@ -680,19 +680,36 @@ Foundation TODO remains incomplete.
   well, which is the two-workers-from-one-version case a version check alone would
   let through. 27 new domain tests (that crate goes 82 -> 109; 507 workspace-wide),
   including reachability proofs that every non-terminal state can reach a terminal
-  state and none has a self-edge. **Two questions the transcription surfaced are
-  recorded in the architecture rather than resolved by assumption:** the diagram
-  gives `Responding` exactly one successor, so a provider failure *while producing
-  the final answer* is not expressible — either the diagram gains that edge or the
-  controller must surface the failure before entering `Responding`, and the
-  architecture owner decides; and the client-visible state set in the local control
-  API is **coarser** than the controller's, with no projection function here on
-  purpose because the architecture forbids domain states doubling as UI strings, so
-  that total mapping is `BRN-007`'s at the API boundary. **Not done**: this is the
-  transition layer only — no repository persists a run, no controller drives it, no
-  event is published, and nothing yet maps a controller state onto the wire, so no
-  product path exercises `RunLifecycle`. Persistence is `BRN-004`, context budgeting
-  is `BRN-006`, and the CLI/HTTP surfaces are `BRN-007`.
+  state and none has a self-edge. **Both questions this transcription surfaced are
+  now resolved, and resolving them found a third, blocking defect.** The diagram gave
+  `Responding` exactly one successor (`Completed`), so a provider failure or a
+  cancellation *while producing the final answer* was not expressible;
+  `Responding -> Failed` and `Responding -> Cancelled` are now edges, because
+  producing the answer is where both actually arrive and `ACC-012`/`ACC-016` require
+  them to be persistable. Reviewing that same area found the larger defect:
+  **`AwaitingModel` had no edge to `Responding`**, so the native runtime's own
+  instruction ("ask a model for either a final response or typed tool intent") had no
+  legal completion path — a plain question-and-answer run could reach neither
+  `Responding` nor `Completed` and would sit in `AwaitingModel` forever, blocking
+  `BRN-007`. The edge was missing from the diagram, not the design: the
+  [first vertical slice](docs/planning/first-vertical-slice.md) already names the
+  minimal machine as "received, context, model, responding, completed". The original
+  happy-path test did not catch it because it drove `Planning -> Responding` and so
+  never visited `AwaitingModel` — **a happy-path test that avoids a state proves
+  nothing about that state**, so the repository suite now drives the real path
+  (`a_plain_question_and_answer_run_persists_through_to_completed`) and a failure
+  while responding is asserted to persist as `failed`, never as `completed`. The
+  client-visible state set in the local control API remains **coarser** than the
+  controller's, with no projection function here on purpose because the architecture
+  forbids domain states doubling as UI strings, so that total mapping is `BRN-007`'s
+  at the API boundary. **Not done**: this is the transition layer only — the state
+  machine itself owns no I/O and names no UI string. Since this entry was written the
+  layer is exercised: `BRN-004` persists a run and its events and `BRN-008`'s run
+  controller drives the machine to a terminal state, so `RunLifecycle` now has a
+  caller. What remains outside this TODO is the client-visible projection: no
+  controller state is mapped onto the wire yet, because that mapping is `BRN-007`'s at
+  the API boundary. Context budgeting is `BRN-006`, and the CLI/HTTP surfaces are
+  `BRN-007`.
 - [x] `BRN-004` Implement durable session/message/run/model-call repositories.
   Evidence: `migrations/sqlite/000002_conversations_runs.sql` creates
   `conversations`, `messages`, `agent_runs`, `agent_steps`, `run_activity_events`,
@@ -783,7 +800,67 @@ Foundation TODO remains incomplete.
   case cannot be exercised end to end until retrieval exists.
 - [ ] `BRN-007` Implement CLI chat plus HTTP/SSE streaming.
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
-  restart behavior.
+  restart behavior. This TODO owns the run controller and the repositories' test
+  doubles: `jarvis_application::run_controller` drives one durable run from
+  `Received` to a terminal state, and `jarvis_application::testing` supplies the
+  in-memory repository port implementations that let a controller test assert what
+  was **persisted** rather than which mock was called.
+  Evidence: `RunController::execute` joins the four pieces the earlier slices built —
+  it advances the state machine through `RepositoryTransition`, performs one model
+  turn through `ModelProvider`, reads the transcript through `ConversationRepository`,
+  and records the attempt through `ModelCallRepository`. That a plain question now
+  reaches `Completed` is the direct product consequence of the `BRN-005` edge fix: the
+  path is `Received -> ContextBuilding -> Planning -> AwaitingModel -> Responding ->
+  Completed`, and the test asserts five activity events were published, one per
+  transition, with the next sequence at six — because the storage architecture's rule
+  is that a state change and its event commit together, so a state that moved without
+  an event would be a silent gap in the audit trail. **Three defects were found only
+  by driving the real path.** First, the model roster was checked *after*
+  `AwaitingModel` was entered, so a provider serving no model left the run **waiting
+  for a call that could never be made, in a state with no legal way out** — the check
+  now runs from `Planning` and the run ends `Failed` with `run.no_model_served`;
+  `selected_model` returning a fabricated fallback would have hidden a
+  misconfiguration and then failed at the provider with a confusing error, which is
+  why an empty roster is refused by name. Second, a provider that refused to open a
+  stream left its `model_calls` row `Pending`, so a later reconciliation pass could not
+  tell whether a call was outstanding, and a frame refused mid-stream left it open the
+  same way — every path that ends a model call now records its terminal outcome.
+  Third, `build_request` took `&self` while reading no port and holding no state, so
+  it is now a free function; the controller's helpers group their arguments
+  (`RunRef`, `Step`, `ModelTurn`) rather than passing seven or eight scalars, which is
+  also what removes the possibility of a workspace/run-id transposition at a call
+  site. Four properties are structural rather than asserted. **A cancelled call ends
+  `Cancelled`, not `Failed`** — `ControllerError::terminal_state` maps a cancellation
+  to `Cancelled` and every other outcome to `Failed`, so one decision covers every
+  path. **A cancellation that arrived before any work leaves the run untouched** in
+  `Received` with no event, because moving a run to `Cancelled` for a request that
+  never started records work that did not happen. **A stream with no terminal event
+  fails the run**, using the domain's `StreamOutcome::Interrupted` rather than a
+  boolean completion, because the contract is explicit that a stream ending without a
+  terminal is not success. And **a tool intent is refused with a typed, terminal
+  `run.tools_not_implemented`** rather than answered with a fabricated observation:
+  the fabric is Milestone 3, `ControllerError::is_unimplemented` distinguishes the
+  known gap from a fault so a caller reports "not built yet" differently from
+  "something went wrong", and the controller performs exactly **one** model turn
+  because a loop that cannot iterate a second time would be a claim with no behaviour
+  behind it. The in-memory double deliberately **does not reimplement the transition
+  table**: it delegates edge legality, version ordering, and terminal absorption to
+  `RunLifecycle`, exactly as the SQLite adapter does, and adds only the storage
+  semantics (transaction-and-event fusion, the uniqueness constraints, scope as a
+  query predicate), because a double that copied the rules would be a second
+  implementation that could disagree with the first and a test passing against it
+  would prove only self-consistency. 67 application tests (46 -> 67; 593
+  workspace-wide). `fmt`, `clippy -D warnings`, and `node scripts/validate-docs.mjs`
+  are clean. **Not done**: this is one model turn with no tool execution and no repeat
+  — steps 3, 4, and 5 of the architecture's native runtime list are the tool fabric
+  (`TLS-001` through `TLS-012`); there is no turn/token/cost/time budget enforcement,
+  no retry or fallback on a retryable provider error, no `Waiting` state entry because
+  nothing suspends and resumes yet, the `agent_steps` table still has no port or
+  adapter, no timeout or daemon-restart behavior is implemented, no endpoint or CLI
+  path reaches the controller, and the run's state is not yet mapped onto the
+  client-visible set — that projection remains `BRN-007`'s, since the architecture
+  forbids domain states doubling as UI strings. `BRN-009`'s deterministic
+  orchestration tests and the gated provider smoke test are still outstanding.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider

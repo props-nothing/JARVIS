@@ -424,15 +424,99 @@ async fn a_version_conflict_is_reported_before_an_illegal_edge() {
 }
 
 #[tokio::test]
+async fn a_plain_question_and_answer_run_persists_through_to_completed() {
+    // The product's core loop, end to end through the repository: a text question is
+    // asked, a model answers, and the run completes. This is the case the earlier
+    // happy-path test missed — it drove `Planning -> Responding` and so never
+    // exercised `AwaitingModel` at all, which is why a missing `AwaitingModel ->
+    // Responding` edge went unnoticed until the state machine was read against the
+    // architecture's "ask a model for either a final response or typed tool intent".
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let path = [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+        (RunState::Planning, RunState::AwaitingModel),
+        (RunState::AwaitingModel, RunState::Responding),
+        (RunState::Responding, RunState::Completed),
+    ];
+    let mut version = RunVersion::FIRST;
+    for (index, (from, to)) in path.iter().enumerate() {
+        let transition = transition(*from, *to, version);
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        version = repositories
+            .transition(workspace(), write)
+            .await
+            .expect("every step of the plain answer path is legal")
+            .version;
+    }
+
+    let run = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("loads");
+    assert_eq!(run.state, RunState::Completed);
+    assert_eq!(run.completed_at, Some(now()));
+}
+
+#[tokio::test]
+async fn a_failure_while_responding_is_persisted_as_failed_not_completed() {
+    // `ACC-012`: a disconnect mid-run "never becomes false `Completed`". With the
+    // corrected edges this is expressible, and the persisted state proves it.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let path = [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+        (RunState::Planning, RunState::AwaitingModel),
+        (RunState::AwaitingModel, RunState::Responding),
+    ];
+    let mut version = RunVersion::FIRST;
+    for (index, (from, to)) in path.iter().enumerate() {
+        let transition = transition(*from, *to, version);
+        let write = RunWrite::new(&transition, event(run_id(), index as u64 + 1, "run.step"));
+        version = repositories
+            .transition(workspace(), write)
+            .await
+            .expect("legal")
+            .version;
+    }
+
+    let failed = transition(RunState::Responding, RunState::Failed, version);
+    repositories
+        .transition(
+            workspace(),
+            RunWrite::new(&failed, event(run_id(), 5, "run.failed")),
+        )
+        .await
+        .expect("a failure while responding must be legal");
+
+    let run = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("loads");
+    assert_eq!(run.state, RunState::Failed);
+    assert!(run.is_terminal());
+    assert_ne!(
+        run.state,
+        RunState::Completed,
+        "a failed answer must never read as completed",
+    );
+}
+
+#[tokio::test]
 async fn reaching_a_terminal_state_records_the_completion_instant() {
     let (_database, repositories) = repository().await;
     seed(&repositories).await;
 
-    // Walk to a terminal state through legal edges.
+    // The plain answer path, which is the one a client actually drives.
     let path = [
         (RunState::Received, RunState::ContextBuilding),
         (RunState::ContextBuilding, RunState::Planning),
-        (RunState::Planning, RunState::Responding),
+        (RunState::Planning, RunState::AwaitingModel),
+        (RunState::AwaitingModel, RunState::Responding),
         (RunState::Responding, RunState::Completed),
     ];
     let mut version = RunVersion::FIRST;

@@ -90,7 +90,13 @@ impl RunState {
             Self::Received => &[Self::ContextBuilding, Self::Failed],
             Self::ContextBuilding => &[Self::Planning, Self::Failed],
             Self::Planning => &[Self::AwaitingModel, Self::Responding, Self::Failed],
+            // `Responding` is reachable directly from `AwaitingModel` because the
+            // architecture's native runtime says to "ask a model for either a final
+            // response or typed tool intent" — the final response *is* the model
+            // call's outcome, so refusing this edge would make a plain
+            // question-and-answer run unable to reach `Completed` at all.
             Self::AwaitingModel => &[
+                Self::Responding,
                 Self::ExecutingTool,
                 Self::AwaitingApproval,
                 Self::Failed,
@@ -100,7 +106,12 @@ impl RunState {
             Self::ExecutingTool => &[Self::Observing, Self::Failed, Self::Cancelled],
             Self::Observing => &[Self::Planning, Self::Waiting],
             Self::Waiting => &[Self::Planning, Self::Failed, Self::Cancelled],
-            Self::Responding => &[Self::Completed],
+            // A failure or a cancellation *while producing the final answer* is a
+            // real outcome, not an impossible one: the provider can fail mid-stream
+            // and the caller can cancel during it. `ACC-012` requires that a
+            // disconnect "never becomes false `Completed`" and `ACC-016` requires
+            // cancelling "during ... streaming", so both must be expressible.
+            Self::Responding => &[Self::Completed, Self::Failed, Self::Cancelled],
             // Terminal states are absorbing, so the list is empty rather than
             // "everything", which would let a late worker restart a finished run.
             Self::Completed | Self::Failed | Self::Cancelled => &[],
@@ -329,6 +340,7 @@ mod tests {
             (
                 RunState::AwaitingModel,
                 &[
+                    RunState::Responding,
                     RunState::ExecutingTool,
                     RunState::AwaitingApproval,
                     RunState::Failed,
@@ -355,7 +367,10 @@ mod tests {
                 RunState::Waiting,
                 &[RunState::Planning, RunState::Failed, RunState::Cancelled],
             ),
-            (RunState::Responding, &[RunState::Completed]),
+            (
+                RunState::Responding,
+                &[RunState::Completed, RunState::Failed, RunState::Cancelled],
+            ),
         ];
         for (from, targets) in expected {
             assert_eq!(
@@ -367,15 +382,56 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_absent_from_the_diagram_is_refused() {
-        // `Responding` has a single successor in the diagram. The omission of
-        // `Responding -> Failed/Cancelled` is recorded as a question for the
-        // architecture owner rather than filled in by assumption, and this test
-        // pins the current, documented answer.
-        assert!(!RunState::Responding.can_transition_to(RunState::Failed));
-        assert!(!RunState::Responding.can_transition_to(RunState::Cancelled));
-        assert!(RunState::Responding.can_transition_to(RunState::Completed));
+    fn a_plain_question_and_answer_path_reaches_completed() {
+        // The product's core loop. Before this edge existed the machine could not
+        // express it: `AwaitingModel` reached only tool and failure states, so a
+        // plain text answer was stuck and `BRN-007`'s CLI chat had no legal path to
+        // `Completed`. The earlier happy-path test did not catch it because it drove
+        // a *tool* path through `ExecutingTool`, which is legal but is not the
+        // question-and-answer case.
+        let path = [
+            RunState::ContextBuilding,
+            RunState::Planning,
+            RunState::AwaitingModel,
+            RunState::Responding,
+            RunState::Completed,
+        ];
+        let mut reachable = vec![RunState::Received];
+        for pair in path.windows(2) {
+            assert!(
+                pair[0].can_transition_to(pair[1]),
+                "{} must transition to {}",
+                pair[0],
+                pair[1],
+            );
+            reachable.push(pair[1]);
+        }
+        assert!(reachable.last().copied().is_some_and(RunState::is_terminal));
+    }
 
+    #[test]
+    fn a_failure_or_cancellation_during_the_answer_is_expressible() {
+        // `ACC-012` requires a disconnect never to become a false `Completed`, and
+        // `ACC-016` requires cancelling during streaming. Both need an edge out of
+        // `Responding` that is not `Completed`.
+        assert!(RunState::Responding.can_transition_to(RunState::Failed));
+        assert!(RunState::Responding.can_transition_to(RunState::Cancelled));
+        assert!(RunState::Responding.can_transition_to(RunState::Completed));
+    }
+
+    #[test]
+    fn an_edge_absent_from_the_diagram_is_refused() {
+        // Edges the diagram does not contain stay absent rather than being invented
+        // at a call site. `AwaitingModel` has no return to `Planning` (it goes
+        // straight to `Responding` or to a tool), and no state skips from
+        // `ContextBuilding` to a model call.
+        // The edges that remain absent, each of which a caller might reasonably
+        // assume: `AwaitingModel` does not return to `Planning` (it goes straight to
+        // `Responding` or to a tool), and nothing skips from `ContextBuilding` or
+        // `Received` straight to a model call.
+        assert!(!RunState::AwaitingModel.can_transition_to(RunState::Planning));
+        assert!(!RunState::Received.can_transition_to(RunState::AwaitingModel));
+        assert!(!RunState::ContextBuilding.can_transition_to(RunState::AwaitingModel));
         // A run cannot skip from planning straight to a tool.
         assert!(!RunState::Planning.can_transition_to(RunState::ExecutingTool));
         // And nothing leaves a terminal state.

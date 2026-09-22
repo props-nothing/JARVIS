@@ -127,21 +127,36 @@ Steps 1 through 13 (Milestone 1) are complete apart from the owner-gated
 `OWN-001` through `OWN-005`; see `TODO.md`. In this slice: step 14 (the port and
 scripted provider, `BRN-002`) is done, step 15's **state machine** (`BRN-005`) is
 done as the transition layer, step 16's **repositories** (`BRN-004`) are done
-against SQLite, and `BRN-006`'s **context budgeter** is done as candidate selection
-and the manifest.
+against SQLite, `BRN-006`'s **context budgeter** is done as candidate selection
+and the manifest, and step 15's **run controller** plus the repositories' in-memory
+test doubles (`BRN-008`, the pieces of that TODO which exist) now drive the states.
 
 `BRN-005` was taken before `BRN-004` because the state machine is pure domain logic
 with no dependency on a repository, while `BRN-004` needs one; the IDs are stable
 and were not renumbered.
 
-What this is **not** yet: a working run. No controller drives the states, no
-endpoint or CLI path calls the repositories, no event is published to a client, no
-controller state is mapped onto the client-visible set, and nothing retrieves the
-context candidates `BRN-006` budgets — so the pieces that exist are each tested but
-none is joined to another by a product path. Step 16 is only partly done —
-`agent_steps` has a table but no adapter. Step 17 (`BRN-007`, HTTP/SSE and CLI
-surfaces) and the E2E step are not started, and `BRN-003` remains gated on its
-`REQUIRED` evidence note.
+`jarvis_application::run_controller` joins the four pieces: `execute` advances the
+state machine, reads the transcript, performs one model turn through
+`ModelProvider`, records the attempt, and persists every transition with its public
+event in the same write. A plain question now reaches `Completed` with five activity
+events, so the run loop the earlier slices described exists as code rather than as
+disconnected parts. Driving the real path is what found three defects that no unit
+test had — a provider serving no model left the run stuck in `AwaitingModel`, a
+refused stream left its model-call row open, and the request builder was a method
+that read no port — and the `BRN-008` evidence records them.
+
+What this is **not** yet: a working product. The controller performs exactly one
+model turn and **refuses a tool intent** with a typed, terminal
+`run.tools_not_implemented` rather than fabricating an observation, because the tool
+fabric is Milestone 3; there is no turn/token/cost/time budget, no retry or fallback,
+no `Waiting` entry because nothing suspends and resumes yet, and no timeout or
+daemon-restart behavior. No endpoint or CLI path calls the controller, no event is
+published to a client, no controller state is mapped onto the client-visible set,
+and nothing retrieves the context candidates `BRN-006` budgets — so the pieces that
+exist are joined to one another by the controller but not yet to a caller. Step 16 is
+only partly done — `agent_steps` has a table but no adapter. Step 17 (`BRN-007`,
+HTTP/SSE and CLI surfaces) and the E2E step are not started, and `BRN-003` remains
+gated on its `REQUIRED` evidence note.
 
 ## Acceptance
 
