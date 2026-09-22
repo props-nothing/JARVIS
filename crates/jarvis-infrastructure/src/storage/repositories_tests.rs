@@ -27,6 +27,7 @@ use jarvis_application::repository::run::{
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, PrincipalId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::Role;
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
@@ -102,20 +103,7 @@ fn model() -> ModelRef {
 
 /// Creates the conversation and run the run tests need.
 async fn seed(repositories: &SqliteRepositories) {
-    repositories
-        .create_conversation(
-            NewConversation::new(
-                conversation_id(),
-                workspace(),
-                principal(),
-                Some("first".to_owned()),
-                "cli".to_owned(),
-                now(),
-            )
-            .expect("valid"),
-        )
-        .await
-        .expect("the conversation is created");
+    seed_conversation_only(repositories).await;
     repositories
         .create(
             NewRun::new(
@@ -131,6 +119,28 @@ async fn seed(repositories: &SqliteRepositories) {
         )
         .await
         .expect("the run is created");
+}
+
+/// Creates only the conversation, for a test that wants to create the run itself.
+///
+/// Separate from [`seed`] because a test about a run's *creation* needs to control what
+/// the run is created with, and one that has already inserted a run cannot insert a
+/// second with the same identity.
+async fn seed_conversation_only(repositories: &SqliteRepositories) {
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                conversation_id(),
+                workspace(),
+                principal(),
+                Some("first".to_owned()),
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the conversation is created");
 }
 
 /// Builds an event at `sequence` for `run`.
@@ -1455,6 +1465,125 @@ async fn a_published_delta_is_durable_and_ordered_after_the_transition() {
     // The stored payload is a fixed shape, so prompt text or a secret cannot appear.
     let parsed: serde_json::Value = serde_json::from_str(payload).expect("valid JSON");
     assert_eq!(parsed.as_object().expect("object").len(), 2);
+}
+
+#[tokio::test]
+async fn a_run_budget_and_deadline_round_trip_through_real_columns() {
+    // `deadline_at` and `budget_json` are schema columns that had no port to populate
+    // them, so they were always NULL. This proves the write and the read agree, and that
+    // the column and the serialized budget name the same instant — two representations of
+    // one fact are exactly where a silent disagreement can live.
+    let (_database, repositories) = repository().await;
+    seed_conversation_only(&repositories).await;
+
+    let deadline = UtcTimestamp::parse("2026-09-22T13:00:00Z").expect("valid");
+    let budget = RunBudget::with_deadline(deadline)
+        .with_step_timeout(30_000)
+        .expect("in range");
+    repositories
+        .create(
+            NewRun::with_budget(
+                run_id(),
+                workspace(),
+                conversation_id(),
+                principal(),
+                Some("objective-1".to_owned()),
+                now(),
+                budget,
+            )
+            .expect("valid"),
+            run_received_event(run_id(), now()),
+        )
+        .await
+        .expect("the run is created");
+
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("the run loads");
+    assert_eq!(
+        stored.deadline_at,
+        Some(deadline),
+        "the column must hold it"
+    );
+    assert_eq!(
+        stored.budget, budget,
+        "the serialized budget must round-trip"
+    );
+    assert_eq!(stored.budget.deadline, stored.deadline_at);
+    assert_eq!(stored.budget.step_timeout_ms, Some(30_000));
+}
+
+#[tokio::test]
+async fn a_run_created_without_a_budget_reads_back_without_one() {
+    // The negative direction. An unset budget must read back as unset rather than as a
+    // budget of zero, which would make every step expire immediately.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.deadline_at, None);
+    assert_eq!(stored.budget, RunBudget::default());
+    assert_eq!(stored.budget.deadline, None);
+    assert_eq!(stored.budget.max_output_tokens, None);
+}
+
+#[tokio::test]
+async fn an_unreadable_stored_budget_is_reported_rather_than_read_as_unbounded() {
+    // A budget that cannot be interpreted must not become "no budget". Reading it as
+    // unbounded would re-fund a run whose deadline had passed — the failure mode the
+    // column exists to prevent — so corruption is reported by name.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    sqlx::query("UPDATE agent_runs SET budget_json = ? WHERE id = ?")
+        .bind("{not json")
+        .bind(run_id().to_string())
+        .execute(repositories.pool())
+        .await
+        .expect("the corruption is written");
+
+    assert_eq!(
+        repositories
+            .load(workspace(), run_id())
+            .await
+            .expect_err("an unreadable budget is not a valid read"),
+        RepositoryError::Corrupted {
+            column: "budget_json"
+        },
+    );
+}
+
+#[tokio::test]
+async fn the_recovery_read_carries_the_deadline_and_budget_too() {
+    // The startup pass reads runs through a different query, so it needs the same columns
+    // or an interrupted run would be settled without its budget being consulted.
+    let (_database, repositories) = repository().await;
+    seed_conversation_only(&repositories).await;
+    let deadline = UtcTimestamp::parse("2026-09-22T13:00:00Z").expect("valid");
+    repositories
+        .create(
+            NewRun::with_budget(
+                run_id(),
+                workspace(),
+                conversation_id(),
+                principal(),
+                None,
+                now(),
+                RunBudget::with_deadline(deadline),
+            )
+            .expect("valid"),
+            run_received_event(run_id(), now()),
+        )
+        .await
+        .expect("the run is created");
+
+    let incomplete = repositories.incomplete_runs().await.expect("readable");
+    let entry = incomplete.first().expect("the run is interrupted");
+    assert_eq!(entry.run.deadline_at, Some(deadline), "{entry:?}");
+    assert_eq!(entry.run.budget.deadline, Some(deadline), "{entry:?}");
 }
 
 #[tokio::test]

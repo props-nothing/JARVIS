@@ -94,6 +94,14 @@ pub enum ProviderError {
     Malformed,
     /// No model this provider serves can satisfy the request.
     NoRoute,
+    /// The call exceeded a deadline JARVIS set.
+    ///
+    /// Kept apart from [`Unavailable`](Self::Unavailable) because the two facts differ
+    /// in a way an operator acts on: an unreachable provider is the provider's problem,
+    /// while an exceeded deadline is JARVIS's own budget doing its job. Retrying is
+    /// also different — an unreachable provider may answer a retry within the same
+    /// budget, whereas a deadline that has passed has no budget left to retry inside.
+    Timeout,
     /// The call was already cancelled when the provider was asked to open.
     ///
     /// An error rather than an empty stream, because an empty stream would be
@@ -114,6 +122,7 @@ impl ProviderError {
             Self::Refused => "model.provider_refused",
             Self::Malformed => "model.provider_malformed",
             Self::NoRoute => "model.provider_no_route",
+            Self::Timeout => "model.provider_timeout",
             Self::Cancelled => "model.provider_cancelled",
         }
     }
@@ -125,6 +134,11 @@ impl ProviderError {
     /// retry of a refusal, a malformed request, or a rejected credential cannot
     /// succeed, and retrying a cancellation would do the opposite of what the
     /// caller asked.
+    ///
+    /// A timeout is **not** retryable here. The deadline that expired belongs to the
+    /// run, so a retry would begin with no budget left — the retry decision belongs to
+    /// whichever layer owns the budget, and that is the run controller rather than the
+    /// provider.
     #[must_use]
     pub const fn retryable(self) -> bool {
         matches!(self, Self::RateLimited { .. } | Self::Unavailable)

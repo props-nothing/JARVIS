@@ -976,6 +976,30 @@ Foundation TODO remains incomplete.
   feature rather than describing it. 11 application tests plus 4 adapter tests against a
   real migrated SQLite database. **Not claimed:** no run is resumed or re-driven, and no
   dependency a parked run was waiting on is re-evaluated.
+  **Time budgets are now enforced.** `jarvis_domain::run::budget` holds `RunBudget` — a
+  deadline, a step timeout, and token/cost ceilings — and the pure arithmetic that decides
+  whether one is spent, so "this run is out of time" has exactly one definition rather than
+  a comparison repeated at each call site. Two facts were wrong before this: a run had **no
+  deadline at all** (`agent_runs.deadline_at` and `budget_json` were schema columns with no
+  port able to populate them, so they were always NULL), and the controller sent
+  `limits.deadline: null` to every provider, so a provider honouring the contract's own
+  `limits.deadline` had nothing to honour and one that hung held the run open indefinitely.
+  The controller now bounds **both** awaits — the provider `open` and each frame wait — with
+  the tighter of the remaining deadline and the step timeout, re-derived per frame so a
+  stream that consumed most of its time cannot exceed the run's own limit. A run whose
+  deadline had already passed is failed before a provider is contacted, so no model call is
+  recorded and nothing is billed. `ProviderError::Timeout` is a new variant because a
+  deadline JARVIS set is a different fact from an unreachable provider — the operator looks
+  at the budget rather than the provider's status page — and it is deliberately **not**
+  retryable, because an expired deadline leaves no budget to retry inside. Every run created
+  through the service now carries a bounded default budget, since an unset budget is not
+  neutral: it means no deadline at all. The bounds were proven to be what makes the tests
+  pass by removing them, at which point the three hang tests **hang for 60+ seconds** rather
+  than fail. 16 domain tests, 8 controller tests, 2 service tests, and 4 adapter
+  round-trip tests. **Not done:** no token or cost accounting — the ceilings are carried and
+  sent but nothing sums usage against them, so `ACC-073` remains open for token, cost, byte,
+  retry, and concurrency budgets, as do turn budgets (there is still exactly one model turn)
+  and the disconnect case.
 - [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
 - [ ] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider

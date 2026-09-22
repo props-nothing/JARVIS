@@ -61,6 +61,20 @@ A model call contains:
 Provider-specific extensions are explicit and namespaced. They never leak into
 the base domain request as arbitrary fields.
 
+**Implemented evidence (`BRN-008`).** `jarvis_domain::run::budget::RunBudget` is
+the typed form of the deadline, step-timeout, token, and cost budget, and
+`RunBudget::call_limits()` is the single mapping from a run's budget onto the
+per-call `limits` block this section requires. That mapping was missing: the
+controller sent `limits.deadline: null` unconditionally, so an adapter honouring
+`limits.deadline` had nothing to honour and a provider was free to wait
+indefinitely. The controller now also bounds the provider `open` and each frame
+wait by the tighter of the remaining deadline and the step timeout, so a budget is
+an actual bound rather than a value carried in a request. The token and cost
+ceilings are carried and sent but nothing sums usage against them yet, so a run
+cannot refuse a step for exceeding them — that accounting, and the routing
+consequences this section lists ("latency and cost budgets" as a routing input),
+remain open.
+
 ## Normalized Events
 
 ```text

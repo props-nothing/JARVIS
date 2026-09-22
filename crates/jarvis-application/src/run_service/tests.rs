@@ -200,6 +200,61 @@ async fn a_create_command_returns_a_run_that_is_already_durable_and_streamable()
 }
 
 #[tokio::test]
+async fn a_created_run_carries_a_bounded_deadline_so_it_cannot_hang_forever() {
+    // A run with no deadline is a run no bound applies to: a provider that never answers
+    // would hold it open until a daemon restart recovered it. Every run therefore gets a
+    // budget at creation, and this asserts the *stored* value rather than the constant —
+    // a budget that is computed and then dropped would satisfy a test of the constant.
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+
+    let deadline = stored.deadline_at.expect("every run must carry a deadline");
+    assert_eq!(
+        stored.budget.deadline,
+        Some(deadline),
+        "the column and the serialized budget must name the same instant",
+    );
+    // The deadline is in the future relative to creation, and it is the configured
+    // offset rather than some other value.
+    let expected = jarvis_domain::run::budget::RunBudget::expiring_after(
+        stored.created_at,
+        super::DEFAULT_RUN_BUDGET_MS,
+    )
+    .expect("the default is in range");
+    assert_eq!(stored.budget, expected);
+    assert!(
+        deadline > stored.created_at,
+        "{deadline} {0}",
+        stored.created_at
+    );
+}
+
+#[tokio::test]
+async fn an_expired_deadline_is_refused_by_the_budget_the_run_stored() {
+    // The stored budget is what the controller reads, so it must be a budget that
+    // actually permits the run to start. A deadline in the past here would fail every run
+    // at its first step, which is worse than no budget at all.
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-2").await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+    assert!(
+        stored.budget.permits_step_at(stored.created_at),
+        "a freshly created run must have time to work: {:?}",
+        stored.budget,
+    );
+}
+
+#[tokio::test]
 async fn a_repeated_create_with_the_same_key_replays_and_starts_no_second_run() {
     // This is the property the idempotency key exists for: a client that retries a
     // create because it did not see the response must not get two runs.

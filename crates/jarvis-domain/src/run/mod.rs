@@ -23,6 +23,7 @@
 //! here remain internal, which is why [`state::WireRunState`] exists as an explicit
 //! mapping rather than as a `serde` rename on [`state::RunState`].
 
+pub mod budget;
 pub mod lifecycle;
 pub mod recovery;
 pub mod state;

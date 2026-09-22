@@ -43,15 +43,18 @@
 //!   caller's own action as a fault.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use jarvis_domain::clock::Clock;
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::ModelRef;
 use jarvis_domain::model::stream::{
-    CallLimits, ContentBlock, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind,
-    ModelStreamState, PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome,
+    ContentBlock, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
+    PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome,
 };
+use jarvis_domain::run::budget::{BudgetStatus, RunBudget};
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
@@ -114,6 +117,13 @@ pub enum ControllerError {
     OutputNotPersisted,
     /// The injected clock reported no usable instant.
     ClockUnavailable,
+    /// The run exceeded its own deadline.
+    ///
+    /// Distinct from [`Provider`](Self::Provider) because the deadline is JARVIS's
+    /// budget and the run is responsible for it, not the provider. An operator reading
+    /// `run.deadline_exceeded` knows to look at the configured budget; reading a
+    /// provider fault would send them to the provider's status page instead.
+    DeadlineExceeded,
     /// The caller cancelled the run.
     Cancelled,
 }
@@ -135,6 +145,7 @@ impl ControllerError {
             Self::StreamRejected { .. } => "The model stream was refused.",
             Self::OutputNotPersisted => "Produced output could not be recorded.",
             Self::ClockUnavailable => "The clock could not provide an instant.",
+            Self::DeadlineExceeded => "The run exceeded its time budget.",
             Self::Cancelled => "The run was cancelled.",
         }
     }
@@ -155,6 +166,7 @@ impl ControllerError {
             | Self::StreamRejected { .. }
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
+            | Self::DeadlineExceeded
             | Self::Cancelled => false,
         }
     }
@@ -171,6 +183,7 @@ impl ControllerError {
             Self::StreamRejected { .. } => "run.stream_rejected",
             Self::OutputNotPersisted => "run.output_not_persisted",
             Self::ClockUnavailable => "run.clock_unavailable",
+            Self::DeadlineExceeded => "run.deadline_exceeded",
             Self::Cancelled => "run.cancelled",
         }
     }
@@ -192,7 +205,8 @@ impl ControllerError {
             | Self::StreamInterrupted
             | Self::StreamRejected { .. }
             | Self::OutputNotPersisted
-            | Self::ClockUnavailable => RunState::Failed,
+            | Self::ClockUnavailable
+            | Self::DeadlineExceeded => RunState::Failed,
         }
     }
 
@@ -219,6 +233,7 @@ impl fmt::Display for ControllerError {
             Self::StreamRejected { .. } => "the model stream was refused",
             Self::OutputNotPersisted => "produced output could not be recorded",
             Self::ClockUnavailable => "the clock reported no usable instant",
+            Self::DeadlineExceeded => "the run exceeded its time budget",
             Self::Cancelled => "the run was cancelled",
         };
         formatter.write_str(text)
@@ -286,6 +301,14 @@ struct ModelTurn<'a> {
     transcript: &'a [StoredMessage],
     model: &'a ModelRef,
     cancel: &'a CancellationScope,
+    /// The run's own budget. Carried into the turn because the deadline is a property of
+    /// the *run*, not of this call: the same budget must bound every step, and deriving
+    /// a fresh deadline per step would let a run outlive its own limit.
+    ///
+    /// The deadline is read from here rather than passed beside it. `NewRun::with_budget`
+    /// derives the stored `deadline_at` column from this value, so carrying both into the
+    /// turn would give one fact two sources that could disagree.
+    budget: &'a RunBudget,
 }
 
 /// What draining a stream produced once it reached its terminal.
@@ -409,6 +432,12 @@ impl RunController {
         )
         .await?;
 
+        // The budget is read from the run rather than taken from the caller, because the
+        // deadline belongs to the run that was created: a caller that re-derived it here
+        // could disagree with what was stored, and recovery reads the stored value.
+        let stored = self.load(run).await?;
+        let budget = stored.budget;
+
         let transcript = self
             .conversations
             .load_messages(
@@ -480,6 +509,7 @@ impl RunController {
                 transcript: &transcript,
                 model: &model,
                 cancel,
+                budget: &budget,
             },
         )
         .await
@@ -491,8 +521,27 @@ impl RunController {
         run: RunRef,
         turn: &ModelTurn<'_>,
     ) -> Result<RunOutcome, ControllerError> {
+        // A run whose deadline had already passed when its turn began is refused before
+        // a provider is contacted at all. Recording a model call for a request that was
+        // never going to be made would leave an open attempt and spend nothing on
+        // purpose.
+        let now = self.now()?;
+        if !turn.budget.permits_step_at(now) {
+            self.finish(
+                run,
+                Step::new(
+                    RunState::AwaitingModel,
+                    RunState::Failed,
+                    "run.failed",
+                    "deadline_exceeded_before_call",
+                ),
+            )
+            .await?;
+            return Err(ControllerError::DeadlineExceeded);
+        }
+
         let call_id = ModelCallId::from_uuid(uuid::Uuid::now_v7());
-        let started_at = self.now()?;
+        let started_at = now;
         self.model_calls
             .record_attempt(NewModelCall {
                 id: call_id,
@@ -507,51 +556,41 @@ impl RunController {
             .await
             .map_err(ControllerError::Repository)?;
 
-        let request = build_request(run.run_id, call_id, turn.transcript, turn.objective)?;
+        let request = build_request(
+            run.run_id,
+            call_id,
+            turn.transcript,
+            turn.objective,
+            turn.budget,
+        )?;
 
-        let mut stream = match self
-            .provider
-            .open(turn.context, &request, turn.cancel)
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                // A cancellation is the caller's own action, so the run ends
-                // `Cancelled` and the error keeps its identity rather than becoming a
-                // generic failure.
-                let cancelled = error == ProviderError::Cancelled;
-                let finish = if cancelled {
-                    Step::new(
-                        RunState::AwaitingModel,
-                        RunState::Cancelled,
-                        "run.failed",
-                        "provider_refused",
-                    )
-                } else {
-                    Step::new(
-                        RunState::AwaitingModel,
-                        RunState::Failed,
-                        "run.failed",
-                        "provider_refused",
-                    )
-                };
-                self.finish(run, finish).await?;
-                // The recorded attempt is closed even though the provider never
-                // accepted it: an attempt left `Pending` would make a later
-                // reconciliation pass unable to tell whether a call was outstanding.
-                let outcome = if cancelled {
-                    ModelCallState::Cancelled
-                } else {
-                    ModelCallState::Failed
-                };
-                self.record_call_outcome(run, call_id, outcome).await?;
-                return Err(ControllerError::Provider(error));
+        // Bounded by the run's own budget. A provider that never answers must not hold
+        // the run open: the deadline this run declares has to be an actual bound, and an
+        // unbounded `await` here is exactly how a deadline stops meaning anything.
+        let opened = self
+            .wait_bounded(
+                turn.budget,
+                self.provider.open(turn.context, &request, turn.cancel),
+            )
+            .await?;
+
+        let mut stream = match opened {
+            // The bound elapsed before the provider answered.
+            None => {
+                self.finish_expired(run, Some(call_id), "deadline_exceeded")
+                    .await?;
+                return Err(ControllerError::DeadlineExceeded);
             }
+            Some(Ok(stream)) => stream,
+            Some(Err(error)) => return Err(self.fail_open(run, call_id, error).await),
         };
 
         // The stream is drained first and the run advanced afterwards, so a failure to
         // persist a transition cannot be confused with a failure to read the stream.
-        let drained = match self.drain_stream(run, call_id, stream.as_mut()).await? {
+        let drained = match self
+            .drain_stream(run, call_id, stream.as_mut(), turn.budget)
+            .await?
+        {
             Ok(drained) => drained,
             // The stream was refused or a frame rejected; the run is already terminal.
             Err(error) => return Err(error),
@@ -676,14 +715,28 @@ impl RunController {
         run: RunRef,
         call_id: ModelCallId,
         stream: &mut dyn ModelStream,
+        budget: &RunBudget,
     ) -> Result<Result<DrainedTurn, ControllerError>, ControllerError> {
         let mut state = ModelStreamState::new(call_id);
         let mut drained = DrainedTurn::default();
-        while let Some(event) = stream
-            .next_event()
-            .await
-            .map_err(ControllerError::Provider)?
-        {
+        loop {
+            // Each frame wait is bounded by what is left of the budget, so a provider
+            // that stalls mid-stream cannot hold the run open past its deadline. The
+            // bound is re-derived per frame rather than fixed at the first one: a stream
+            // that has already consumed most of its time has little left, and bounding it
+            // by the original allowance would let it exceed the run's own limit.
+            let next = self.wait_bounded(budget, stream.next_event()).await?;
+            let Some(event) = (match next {
+                // The budget ran out while waiting for a frame.
+                None => {
+                    self.finish_expired(run, Some(call_id), "deadline_exceeded")
+                        .await?;
+                    return Ok(Err(ControllerError::DeadlineExceeded));
+                }
+                Some(frame) => frame.map_err(ControllerError::Provider)?,
+            }) else {
+                break;
+            };
             match state.accept(&event) {
                 Ok(StreamAdmission::Accepted) => {}
                 // Late frames are the contract's required behaviour, not a fault.
@@ -770,6 +823,151 @@ impl RunController {
                 Ok(Err(ControllerError::StreamRejected { code: error.code() }))
             }
         }
+    }
+
+    /// Returns the longest a single wait may take, or `None` when unbounded.
+    ///
+    /// The bound is the **minimum** of the remaining deadline and the step timeout,
+    /// because both are limits the run declared and only the tighter one satisfies
+    /// both. Computed fresh at each wait rather than once, so a stream that has already
+    /// consumed half its time is bounded by what is left rather than by the original
+    /// allowance.
+    fn wait_bound(&self, budget: &RunBudget) -> Result<Option<Duration>, ControllerError> {
+        let now = self.now()?;
+        let deadline_bound = match budget.status_at(now) {
+            // An expired deadline yields a zero bound, so the wait fails immediately
+            // rather than being treated as "no limit" — the direction that would let a
+            // run past its own deadline keep going.
+            BudgetStatus::Expired { .. } => Some(Duration::ZERO),
+            BudgetStatus::Remaining { millis, .. } => Some(Duration::from_millis(millis)),
+            BudgetStatus::Unbounded => None,
+        };
+        let step_bound = budget.step_timeout_ms.map(Duration::from_millis);
+        Ok(match (deadline_bound, step_bound) {
+            (Some(deadline), Some(step)) => Some(deadline.min(step)),
+            (Some(bound), None) | (None, Some(bound)) => Some(bound),
+            (None, None) => None,
+        })
+    }
+
+    /// Awaits `future`, bounded by the run's budget.
+    ///
+    /// Returns `None` when the bound elapsed. This is the method that makes a deadline
+    /// an actual bound rather than a value carried in a request: without it a provider
+    /// that never sends a frame would hold the run open forever, and the run's own
+    /// `deadline_at` would describe a limit nothing enforced.
+    ///
+    /// With no bound configured the future is awaited as-is. That is a real state a
+    /// directly-created run can be in, and reporting "timed out" for it would invent a
+    /// limit the run never had.
+    async fn wait_bounded<F, T>(
+        &self,
+        budget: &RunBudget,
+        future: F,
+    ) -> Result<Option<T>, ControllerError>
+    where
+        F: Future<Output = T>,
+    {
+        match self.wait_bound(budget)? {
+            Some(bound) => Ok(tokio::time::timeout(bound, future).await.ok()),
+            None => Ok(Some(future.await)),
+        }
+    }
+
+    /// Ends a run whose provider refused to open a stream.
+    ///
+    /// Three outcomes arrive here and they are not the same fact:
+    ///
+    /// - a **cancellation** is the caller's own action, so the run ends `Cancelled` and
+    ///   the caller's request is never recorded as a fault;
+    /// - a **timeout** means the *budget* was exhausted, so the run ends `Failed` but is
+    ///   reported as `DeadlineExceeded` — an operator reading a provider fault would look
+    ///   at the provider's status page when the answer is in the run's budget;
+    /// - anything else is a genuine provider fault and keeps its own code.
+    ///
+    /// The recorded attempt is closed on every path, including this one: an attempt left
+    /// `Pending` would make a later reconciliation pass unable to tell whether a call was
+    /// still outstanding.
+    async fn fail_open(
+        &self,
+        run: RunRef,
+        call_id: ModelCallId,
+        error: ProviderError,
+    ) -> ControllerError {
+        let cancelled = error == ProviderError::Cancelled;
+        let timed_out = error == ProviderError::Timeout;
+        let reason = if timed_out {
+            "deadline_exceeded"
+        } else {
+            "provider_refused"
+        };
+        let state = if cancelled {
+            RunState::Cancelled
+        } else {
+            RunState::Failed
+        };
+        let outcome = if cancelled {
+            ModelCallState::Cancelled
+        } else {
+            ModelCallState::Failed
+        };
+
+        // A failure to record any of this is reported as the storage failure it is; the
+        // provider error would otherwise be returned as though the run had been settled.
+        if self
+            .finish(
+                run,
+                Step::new(RunState::AwaitingModel, state, "run.failed", reason),
+            )
+            .await
+            .is_err()
+        {
+            return ControllerError::Repository(RepositoryError::Query);
+        }
+        if self
+            .record_call_outcome(run, call_id, outcome)
+            .await
+            .is_err()
+        {
+            return ControllerError::Repository(RepositoryError::Query);
+        }
+
+        if timed_out {
+            ControllerError::DeadlineExceeded
+        } else {
+            ControllerError::Provider(error)
+        }
+    }
+
+    /// Ends a run because its own budget expired.
+    ///
+    /// One method rather than a transition at each timeout site, so the state, the
+    /// event, the reason, and the recorded call outcome cannot disagree about why the
+    /// run stopped.
+    async fn finish_expired(
+        &self,
+        run: RunRef,
+        call_id: Option<ModelCallId>,
+        reason: &'static str,
+    ) -> Result<(), ControllerError> {
+        self.finish(
+            run,
+            Step::new(
+                RunState::AwaitingModel,
+                RunState::Failed,
+                "run.failed",
+                reason,
+            ),
+        )
+        .await?;
+        if let Some(call_id) = call_id {
+            // The attempt is closed as failed rather than left pending: a call that was
+            // abandoned mid-stream is finished, and a pending row would make a later
+            // reconciliation pass read it as still outstanding.
+            self.record_call_outcome(run, call_id, ModelCallState::Failed)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Records a model call's terminal outcome.
@@ -891,6 +1089,7 @@ fn build_request(
     call_id: ModelCallId,
     transcript: &[StoredMessage],
     objective: &str,
+    budget: &RunBudget,
 ) -> Result<ModelCallRequest, ControllerError> {
     let mut items: Vec<InputItem> = vec![InputItem::SystemPolicyRef {
         // A reference, never inline policy text: the policy is resolved by JARVIS so a
@@ -921,10 +1120,10 @@ fn build_request(
         tools: Vec::new(),
         output_schema: None,
         settings: PortableSettings::default(),
-        limits: CallLimits {
-            deadline: None,
-            max_output_tokens: None,
-            max_cost_microunits: None,
-        },
+        // The run's budget, not an empty set of limits. Sending `None` here was the
+        // defect: a run could carry a deadline that never reached the provider, so an
+        // adapter honouring the contract's `limits.deadline` had nothing to honour and
+        // a provider was free to wait indefinitely.
+        limits: budget.call_limits(),
     })
 }

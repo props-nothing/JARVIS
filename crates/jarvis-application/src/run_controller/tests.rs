@@ -6,6 +6,8 @@
 //! purpose is to turn a provider's frames into durable state, and a store that
 //! recorded nothing would agree with whatever the controller assumed.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use jarvis_domain::clock::ManualClock;
@@ -14,13 +16,14 @@ use jarvis_domain::ids::{
 };
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, ModelCallRequest, ModelStreamEventKind, Role};
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
 
 use super::{ControllerError, MAX_TRANSCRIPT_MESSAGES, RunController};
 use crate::cancellation::CancellationScope;
-use crate::model::{ModelProvider, OpenResult, ProviderError, ScriptedProvider};
+use crate::model::{ModelProvider, ModelStream, OpenResult, ProviderError, ScriptedProvider};
 use crate::repository::conversation::{ConversationRepository, NewConversation, NewMessage};
 use crate::repository::model_call::ModelCallRepository;
 use crate::repository::run::{NewRun, RunRepository};
@@ -654,4 +657,364 @@ fn a_quiet_controller_object_does_not_print_its_ports() {
         "a diagnostic rendering must not print stream payloads: {rendered}",
     );
     assert!(rendered.contains("served_models"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// Budget enforcement
+//
+// The tests below are the reason the budget exists. Carrying a deadline into a request
+// is not enforcement: a provider that never sends a frame would hold the run open
+// forever, and the run's own `deadline_at` would describe a limit nothing bounded. Every
+// test here asserts a *bound elapsed*, so each one would hang — and be caught by the
+// harness — if the controller awaited without a limit.
+// ---------------------------------------------------------------------------
+
+/// A provider whose `open` never returns.
+///
+/// The point of this double is that it does not cooperate: it does not check the
+/// cancellation token and it does not consult the deadline it was handed. A provider that
+/// behaved would prove nothing about whether the controller bounds it.
+struct NeverOpens {
+    models: Vec<ModelRef>,
+}
+
+impl ModelProvider for NeverOpens {
+    fn models(&self) -> &[ModelRef] {
+        &self.models
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        _request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        Box::pin(async move {
+            std::future::pending::<()>().await;
+            unreachable!("a pending future never resolves")
+        })
+    }
+}
+
+/// A provider that opens and then never emits a frame.
+///
+/// Distinct from [`NeverOpens`] because the two failures happen at different points: a
+/// hang *before* the stream exists, and a hang *after* the provider accepted the call. The
+/// second is the more dangerous one — a model-call row is already recorded, so a run
+/// abandoned there leaves an attempt behind that a reconciliation pass would read as
+/// outstanding work.
+struct OpensThenStalls {
+    models: Vec<ModelRef>,
+}
+
+impl ModelProvider for OpensThenStalls {
+    fn models(&self) -> &[ModelRef] {
+        &self.models
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        _request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        Box::pin(async move {
+            /// A stream that never yields a frame and never terminates.
+            struct Stalled;
+
+            impl ModelStream for Stalled {
+                fn next_event(
+                    &mut self,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    Option<jarvis_domain::model::stream::ModelStreamEvent>,
+                                    ProviderError,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > {
+                    Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!("a pending future never resolves")
+                    })
+                }
+            }
+
+            Ok(Box::new(Stalled) as Box<dyn ModelStream + Send + 'a>)
+        })
+    }
+}
+
+/// Seeds a run that carries `budget`.
+async fn seed_with_budget(fixture: &Fixture, budget: RunBudget) {
+    fixture
+        .repositories
+        .create_conversation(
+            NewConversation::new(
+                conversation(),
+                context().workspace_id,
+                PrincipalId::from_uuid(id(3)),
+                Some("first".to_owned()),
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the conversation is created");
+    fixture
+        .repositories
+        .create(
+            NewRun::with_budget(
+                run(),
+                context().workspace_id,
+                conversation(),
+                PrincipalId::from_uuid(id(3)),
+                Some("objective-1".to_owned()),
+                now(),
+                budget,
+            )
+            .expect("valid"),
+            crate::repository::run::run_received_event(run(), now()),
+        )
+        .await
+        .expect("the run is created");
+}
+
+/// A budget that expires one millisecond after now, with a step timeout to match.
+///
+/// Both are set so the run is bounded by the tighter of the two, which is what the
+/// controller must compute. One millisecond is far below the scripted provider's response
+/// time, so the bound is what ends the wait rather than the provider answering first.
+fn almost_immediate() -> RunBudget {
+    let deadline = UtcTimestamp::parse("2026-09-22T12:00:00.001Z").expect("valid");
+    RunBudget::with_deadline(deadline)
+        .with_step_timeout(1)
+        .expect("1ms is in range")
+}
+
+#[tokio::test]
+async fn a_provider_that_never_opens_is_bounded_by_the_runs_deadline() {
+    // The headline case. Without the bound this test never returns: it would hang the
+    // suite rather than fail, which is why the assertion is about the state the run was
+    // left in rather than only about the returned error.
+    let fixture = fixture(Arc::new(NeverOpens {
+        models: vec![model()],
+    }));
+    seed_with_budget(&fixture, almost_immediate()).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a provider that never answers cannot complete a run");
+    assert_eq!(error, ControllerError::DeadlineExceeded);
+    assert_eq!(
+        error.terminal_state(),
+        RunState::Failed,
+        "an expired budget is a failure, not a cancellation",
+    );
+
+    // The durable state is what matters: a run left non-terminal would leave a client
+    // polling forever, which is the same defect the recovery pass exists to fix.
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+    assert!(stored.is_terminal());
+}
+
+#[tokio::test]
+async fn a_provider_that_stalls_mid_stream_is_bounded_per_frame() {
+    // The hang after the call was accepted. A bound applied only to `open` would let this
+    // one run forever, so the frame wait is bounded too — and it is bounded by what is
+    // *left*, not by the original allowance.
+    let fixture = fixture(Arc::new(OpensThenStalls {
+        models: vec![model()],
+    }));
+    seed_with_budget(&fixture, almost_immediate()).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a stalled stream cannot complete a run");
+    assert_eq!(error, ControllerError::DeadlineExceeded);
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn an_abandoned_call_is_closed_rather_than_left_pending() {
+    // A call the provider accepted and then abandoned must not stay `Pending`: a later
+    // reconciliation pass reads a pending attempt as outstanding work, so the run would
+    // look live when it is finished.
+    let fixture = fixture(Arc::new(OpensThenStalls {
+        models: vec![model()],
+    }));
+    seed_with_budget(&fixture, almost_immediate()).await;
+
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let state = calls[0].1;
+    assert!(
+        state.is_terminal(),
+        "a call abandoned by a timeout must be terminal, got {state:?}",
+    );
+    assert_eq!(state, crate::repository::model_call::ModelCallState::Failed);
+}
+
+#[tokio::test]
+async fn a_run_whose_deadline_already_passed_is_failed_without_calling_a_provider() {
+    // A deadline in the past is refused before any provider is contacted, so no model
+    // call is recorded and no provider is billed. The alternative — opening the call and
+    // relying on the bound — would spend an attempt on a request known to be pointless.
+    let fixture = fixture(answering("never reached"));
+    let deadline = UtcTimestamp::parse("2026-09-22T11:59:59Z").expect("valid");
+    seed_with_budget(&fixture, RunBudget::with_deadline(deadline)).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("an expired run cannot proceed");
+    assert_eq!(error, ControllerError::DeadlineExceeded);
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert!(
+        calls.is_empty(),
+        "an expired run must not contact a provider: {calls:?}",
+    );
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn a_run_with_no_deadline_is_not_bounded_and_still_completes() {
+    // The other direction, and the one that would break if an unset budget were read as
+    // "zero time left": a run with no deadline must still be able to finish normally.
+    let fixture = fixture(answering("Hello there"));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("an unbounded run completes");
+    assert_eq!(outcome.state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn the_run_deadline_reaches_the_provider_in_the_request() {
+    // The defect this closes, asserted at the boundary where it mattered: a run with a
+    // deadline previously sent `limits.deadline: null`, so an adapter honouring the
+    // contract's `limits.deadline` had nothing to honour.
+    /// What the capturing provider observed.
+    ///
+    /// An enum rather than `Option<Option<UtcTimestamp>>`, because the three states are
+    /// genuinely different: the call never happened, it happened with no deadline, and it
+    /// happened with one. A nested option makes the first two indistinguishable to a
+    /// reader, which is exactly the case this test exists to separate.
+    enum Observed {
+        NeverCalled,
+        Called(Option<UtcTimestamp>),
+    }
+
+    struct Capturing {
+        seen: std::sync::Mutex<Observed>,
+        models: Vec<ModelRef>,
+    }
+
+    impl ModelProvider for Capturing {
+        fn models(&self) -> &[ModelRef] {
+            &self.models
+        }
+
+        fn open<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            request: &'a ModelCallRequest,
+            _cancel: &'a CancellationScope,
+        ) -> OpenResult<'a> {
+            if let Ok(mut guard) = self.seen.lock() {
+                *guard = Observed::Called(request.limits.deadline);
+            }
+            Box::pin(async move {
+                // Refusing is enough: the assertion is about what the request carried,
+                // not about what happened next.
+                Err(ProviderError::Unavailable)
+            })
+        }
+    }
+
+    let provider = Arc::new(Capturing {
+        seen: std::sync::Mutex::new(Observed::NeverCalled),
+        models: vec![model()],
+    });
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    let deadline = UtcTimestamp::parse("2026-09-22T12:00:30Z").expect("valid");
+    seed_with_budget(&fixture, RunBudget::with_deadline(deadline)).await;
+
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let seen = provider.seen.lock().expect("the lock is not poisoned");
+    match &*seen {
+        Observed::Called(deadline) => assert_eq!(
+            *deadline,
+            Some(UtcTimestamp::parse("2026-09-22T12:00:30Z").expect("valid")),
+            "the run's deadline must reach the provider's request",
+        ),
+        Observed::NeverCalled => unreachable!("the provider must have been called"),
+    }
+}
+
+#[tokio::test]
+async fn a_provider_timeout_error_is_reported_as_the_deadline_not_as_a_provider_fault() {
+    // The provider reports its own timeout, which means the *budget* was exhausted rather
+    // than the provider being broken. Reporting it as a provider fault would send an
+    // operator to the provider's status page when the answer is in the run's budget.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model()).fail_on_open(ProviderError::Timeout),
+    ));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a timed-out provider cannot complete a run");
+    assert_eq!(error, ControllerError::DeadlineExceeded);
+    assert_eq!(error.code(), "run.deadline_exceeded");
+    assert!(
+        !error.retryable(),
+        "a spent deadline leaves no budget to retry inside",
+    );
+}
+
+#[tokio::test]
+async fn a_deadline_exceeded_outcome_names_its_own_code_and_message() {
+    // The code and the message are what an operator and a client respectively see, so
+    // both must be distinct from a provider fault's.
+    let error = ControllerError::DeadlineExceeded;
+    assert_eq!(error.code(), "run.deadline_exceeded");
+    assert_eq!(error.terminal_state(), RunState::Failed);
+    assert!(
+        error.message().contains("time budget"),
+        "{}",
+        error.message()
+    );
+    assert!(!error.is_unimplemented());
 }

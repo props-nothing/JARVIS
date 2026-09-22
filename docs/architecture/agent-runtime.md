@@ -237,6 +237,55 @@ transition it writes carries the version it **read**, so a run that completed in
 between is refused rather than overwritten. That is what keeps a real outcome from
 being replaced by a failure, and it is asserted directly.
 
+### Implemented evidence (`BRN-008`, budgets)
+
+This document's native-runtime step 5 says "repeat within turn, token, cost, time,
+and tool budgets", and its "durable run record" list includes "model/tool usage and
+budget state". The **time** half of that is implemented.
+
+`jarvis_domain::run::budget` holds the budget and the pure arithmetic that decides
+whether it is spent. The arithmetic is in the domain because the answer must not
+depend on which layer asks: the controller, a future workflow engine, and a future
+tool ledger all spend the same budget the same way. `BudgetStatus` is deliberately
+three-valued — `Unbounded`, `Remaining`, `Expired` — because "there is no deadline"
+and "the deadline is far away" are different facts, and a boolean would make an
+unbounded run indistinguishable from a comfortable one. The deadline instant itself
+counts as expired, so the answer never depends on sub-nanosecond timing.
+
+Two things were wrong before this, and both were silent:
+
+- **A run had no deadline at all.** `agent_runs.deadline_at` and `budget_json` were
+  schema columns with no port able to populate them, so they were always NULL, and
+  the budget the run was created under could not be read back. That is the storage
+  architecture's "a column that can never be correct" shape, and it was invisible
+  because nothing read them.
+- **The controller sent no deadline to the provider.** `build_request` set
+  `limits.deadline: null` unconditionally, so a provider honouring the contract's own
+  `limits.deadline` had nothing to honour, and the contract's per-call budget was
+  decorative. This is the same class of defect as the unmodelled `settings` block
+  found in `BRN-001`: a contract field the code carried but never populated.
+
+The controller now bounds **both** awaits — the provider `open` and each individual
+frame wait — so a provider that never answers and a provider that stalls mid-stream
+are both bounded. The bound is re-derived per frame rather than fixed at the first
+one: a stream that has already consumed most of its time has little left, and
+bounding it by the original allowance would let it exceed the run's own limit. A run
+whose deadline had already passed is failed from `AwaitingModel` **before a provider
+is contacted**, so no model call is recorded and nothing is billed.
+
+`ProviderError::Timeout` is a new, separate variant. A deadline JARVIS set is not the
+same fact as an unreachable provider: an operator reading a provider fault looks at
+the provider's status page, while the answer here is in the configured budget. It is
+also deliberately **not** retryable — an expired deadline leaves no budget to retry
+inside, and the retry decision belongs to whichever layer owns the budget.
+
+**What is not implemented, and is not claimed:** the token and cost ceilings are
+carried into the request but nothing sums usage against them, so a run cannot yet
+*refuse* a step for exceeding a token budget; there is no turn budget, because the
+controller still performs exactly one model turn; and `agent_steps.timeout_ms` has no
+port, so per-step timeouts exist only as the run-level `step_timeout_ms`. `ACC-073`
+therefore remains open for token, cost, byte, retry, and concurrency exhaustion.
+
 ## Durable Run Record
 
 A run minimally tracks:

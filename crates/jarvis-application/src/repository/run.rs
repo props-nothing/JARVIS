@@ -18,6 +18,7 @@
 
 use crate::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ConversationId, PrincipalId, RunActivityEventId, RunId, WorkspaceId};
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion};
 use jarvis_domain::time::UtcTimestamp;
@@ -44,10 +45,23 @@ pub struct NewRun {
     pub objective_ref: Option<String>,
     /// The instant the run was created.
     pub created_at: UtcTimestamp,
+    /// The per-run wall-clock deadline, which `agent_runs.deadline_at` stores.
+    ///
+    /// Held separately from [`budget`](Self::budget) because the schema keeps it in its
+    /// own column: a deadline is queried and ordered by (a startup pass or a scheduler
+    /// wants runs ordered by when they expire), while the rest of the budget is opaque.
+    pub deadline_at: Option<UtcTimestamp>,
+    /// The full run budget, serialized into `agent_runs.budget_json`.
+    ///
+    /// Stored rather than re-derived on every process start, because recovery reads this
+    /// run when the request that created it no longer exists. A budget reconstructed
+    /// from current defaults would silently re-fund a run whose deadline had already
+    /// passed, which is the opposite of what a budget is for.
+    pub budget: RunBudget,
 }
 
 impl NewRun {
-    /// Builds a run creation request.
+    /// Builds a run creation request with no deadline and no budget cap.
     ///
     /// # Errors
     ///
@@ -61,6 +75,36 @@ impl NewRun {
         principal_id: PrincipalId,
         objective_ref: Option<String>,
         created_at: UtcTimestamp,
+    ) -> Result<Self, RepositoryError> {
+        Self::with_budget(
+            id,
+            workspace_id,
+            conversation_id,
+            principal_id,
+            objective_ref,
+            created_at,
+            RunBudget::default(),
+        )
+    }
+
+    /// Builds a run creation request under `budget`.
+    ///
+    /// The deadline is taken from the budget rather than passed separately, so a run
+    /// cannot be stored with a `deadline_at` column that disagrees with the budget the
+    /// executor will read. The two representations are one input here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Conflict`] when `objective_ref` is over
+    /// [`MAX_REFERENCE_BYTES`] or contains a NUL byte.
+    pub fn with_budget(
+        id: RunId,
+        workspace_id: WorkspaceId,
+        conversation_id: ConversationId,
+        principal_id: PrincipalId,
+        objective_ref: Option<String>,
+        created_at: UtcTimestamp,
+        budget: RunBudget,
     ) -> Result<Self, RepositoryError> {
         if objective_ref.as_ref().is_some_and(|value| {
             value.is_empty() || value.len() > MAX_REFERENCE_BYTES || value.contains('\0')
@@ -76,6 +120,8 @@ impl NewRun {
             principal_id,
             objective_ref,
             created_at,
+            deadline_at: budget.deadline,
+            budget,
         })
     }
 }
@@ -111,6 +157,14 @@ pub struct StoredRun {
     pub completed_at: Option<UtcTimestamp>,
     /// The normalized error code, when it failed.
     pub error_code: Option<String>,
+    /// The per-run wall-clock deadline, when one was set.
+    ///
+    /// Carried on the read rather than looked up separately, because the recovery pass
+    /// needs it to decide whether an interrupted run had already run out of time: a
+    /// run whose deadline passed is not "interrupted work", it is expired work.
+    pub deadline_at: Option<UtcTimestamp>,
+    /// The run budget this run was created under.
+    pub budget: RunBudget,
 }
 
 impl StoredRun {
@@ -610,6 +664,7 @@ mod tests {
     use super::{EventVisibility, MAX_REFERENCE_BYTES, NewRun, StoredRun};
     use crate::repository::RepositoryError;
     use jarvis_domain::ids::{ConversationId, PrincipalId, RunId, WorkspaceId};
+    use jarvis_domain::run::budget::RunBudget;
     use jarvis_domain::run::state::{RunState, RunVersion};
     use jarvis_domain::time::UtcTimestamp;
 
@@ -689,6 +744,8 @@ mod tests {
             updated_at: now(),
             completed_at: Some(now()),
             error_code: None,
+            deadline_at: None,
+            budget: RunBudget::default(),
         };
         assert!(run.is_terminal());
     }

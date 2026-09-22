@@ -32,6 +32,7 @@ use jarvis_domain::ids::{
     WorkspaceId,
 };
 use jarvis_domain::model::stream::Role;
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::RunState;
 
 use crate::cancellation::CancellationScope;
@@ -56,6 +57,15 @@ use crate::run_controller::{ControllerError, RunController};
 /// crate is not a dependency of the application layer, and a test in the daemon
 /// asserts the two agree.
 pub const MAX_OBJECTIVE_BYTES: usize = 32 * 1024;
+
+/// The default wall-clock budget given to a created run, in milliseconds.
+///
+/// Fifteen minutes. Every run needs *some* deadline, because the budget is what bounds a
+/// provider that never answers: without one the run has no deadline at all, so a hang
+/// leaves it non-terminal until a daemon restart recovers it. This is a default rather
+/// than a ceiling, and it is deliberately generous — a bound tight enough to interrupt
+/// real work would trade a hang for false failures.
+pub const DEFAULT_RUN_BUDGET_MS: u64 = 900_000;
 
 /// The scoped operation name for run creation, used in the idempotency key.
 pub const CREATE_OPERATION: &str = "runs.create";
@@ -317,6 +327,23 @@ impl RunService {
         let run_id = RunId::from_uuid(uuid::Uuid::now_v7());
         let created_at = self.now()?;
 
+        // Every run gets a budget, derived here rather than left unset. An unset budget
+        // is not a neutral default: it means the run has no deadline at all, so a
+        // provider that hangs would hold it open indefinitely and the run would never
+        // reach a terminal state on its own. The default is bounded and finite, and a
+        // caller that needs a different one can supply it once the schema carries
+        // typed overrides.
+        let budget =
+            RunBudget::expiring_after(created_at, DEFAULT_RUN_BUDGET_MS).map_err(|error| {
+                // A fixed message rather than the budget error's own text: the error is a
+                // bound on a constant, so a caller can do nothing about it, and the
+                // client-visible message must not carry developer detail.
+                RunServiceError::invalid(
+                    error.code(),
+                    "The run's time budget could not be established.",
+                )
+            })?;
+
         // The key is checked *before* anything is created, because a replay must not
         // leave an orphan conversation behind. The digest is over the inputs that
         // define the request, not over a serialized body: two requests that differ only
@@ -361,7 +388,7 @@ impl RunService {
             .ports
             .runs
             .create_run_idempotent(
-                NewRun::new(
+                NewRun::with_budget(
                     run_id,
                     context.workspace_id,
                     conversation.id,
@@ -370,6 +397,7 @@ impl RunService {
                     // belongs in artifacts, and the column is bounded.
                     Some(truncate_reference(objective)),
                     created_at,
+                    budget,
                 )?,
                 run_received_event(run_id, created_at),
                 NewIdempotencyRecord {

@@ -41,6 +41,7 @@ use jarvis_domain::ids::{
 };
 use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::Role;
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::{RunState, RunVersion};
 use jarvis_domain::time::UtcTimestamp;
 
@@ -251,14 +252,46 @@ fn stored_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, RepositoryErro
             .map(|value| parse_time(&value, "completed_at"))
             .transpose()?,
         error_code: opt_text(row, "error_code")?,
+        // Read back rather than defaulted. A stored budget that cannot be interpreted
+        // must not silently become "no budget": that would re-fund a run whose deadline
+        // had passed, which is the failure mode the column exists to prevent.
+        deadline_at: opt_text(row, "deadline_at")?
+            .map(|value| parse_time(&value, "deadline_at"))
+            .transpose()?,
+        budget: match opt_text(row, "budget_json")? {
+            Some(encoded) => {
+                serde_json::from_str(&encoded).map_err(|_| RepositoryError::Corrupted {
+                    column: "budget_json",
+                })?
+            }
+            None => RunBudget::default(),
+        },
     })
 }
 
-/// Selects the run columns a transaction-local read needs.
-const RUN_SELECT: &str = "SELECT id, workspace_id, conversation_id, principal_id, state, version, \
-     objective_ref, created_at, started_at, updated_at, completed_at, \
-     error_code, waiting_kind, waiting_ref \
-     FROM agent_runs WHERE workspace_id = ? AND id = ?";
+/// The run columns every run read selects.
+///
+/// A macro rather than a `const`, because `concat!` accepts a macro invocation that
+/// expands to a literal but not a `const` item, and the point is that the list is written
+/// **once**. Two reads previously carried their own copies, which is how the two columns
+/// added for run budgets (`deadline_at`, `budget_json`) reached one read and missed the
+/// other — the miss surfaced as `Corrupted { column: "deadline_at" }` on a valid row. A
+/// duplicated column list is a defect generator: adding a column means remembering every
+/// copy, and the failure appears in whichever one was forgotten.
+macro_rules! run_columns {
+    () => {
+        "id, workspace_id, conversation_id, principal_id, state, version, \
+         objective_ref, created_at, started_at, updated_at, completed_at, \
+         error_code, waiting_kind, waiting_ref, deadline_at, budget_json"
+    };
+}
+
+/// Selects the run columns for one scoped run.
+const RUN_SELECT: &str = concat!(
+    "SELECT ",
+    run_columns!(),
+    " FROM agent_runs WHERE workspace_id = ? AND id = ?"
+);
 
 /// Reads one run inside `executor`.
 ///
@@ -311,14 +344,24 @@ async fn insert_run(
     let result = sqlx::query(
         "INSERT INTO agent_runs (\
              id, workspace_id, conversation_id, parent_run_id, principal_id, \
-             objective_ref, state, version, created_at, updated_at\
-         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?)",
+             objective_ref, state, version, deadline_at, budget_json, \
+             created_at, updated_at\
+         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?, ?, ?)",
     )
     .bind(run.id.to_string())
     .bind(run.workspace_id.to_string())
     .bind(run.conversation_id.to_string())
     .bind(run.principal_id.to_string())
     .bind(run.objective_ref.as_deref())
+    // The deadline column and the serialized budget come from the same value, so the
+    // two cannot disagree: a run whose `deadline_at` said one instant while its budget
+    // said another would make the executor and a scheduler draw different conclusions
+    // about how much time is left.
+    .bind(run.deadline_at.as_ref().map(ToString::to_string))
+    .bind(
+        serde_json::to_string(&run.budget)
+            .map_err(|_| RepositoryError::Conflict { what: "run_budget" })?,
+    )
     .bind(run.created_at.to_string())
     .bind(run.created_at.to_string())
     .execute(&mut **tx)
@@ -411,18 +454,19 @@ impl RunRepository for SqliteRepositories {
         run: RunId,
     ) -> RepositoryFuture<'_, RunResumeState> {
         Box::pin(async move {
-            let row = sqlx::query(
-                "SELECT id, workspace_id, conversation_id, principal_id, state, version, \
-                        objective_ref, created_at, started_at, updated_at, completed_at, \
-                        error_code, waiting_kind, waiting_ref \
-                 FROM agent_runs WHERE workspace_id = ? AND id = ?",
-            )
-            .bind(workspace.to_string())
-            .bind(run.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| RepositoryError::Query)?
-            .ok_or(RepositoryError::NotFound)?;
+            // Read through the shared helper rather than a third column list. Its predicate
+            // is identical to `RUN_SELECT`'s, and the first version of this method carried
+            // its own copy — which is how the two columns added for run budgets reached two
+            // reads and missed this one, failing as `Corrupted { column: "deadline_at" }` on
+            // a perfectly valid row. A duplicated column list is a defect generator, so the
+            // duplicates are removed where the predicate allows it rather than patched.
+            let row = sqlx::query(RUN_SELECT)
+                .bind(workspace.to_string())
+                .bind(run.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| RepositoryError::Query)?
+                .ok_or(RepositoryError::NotFound)?;
             Ok(RunResumeState {
                 run: stored_run(&row)?,
                 waiting_kind: opt_text(&row, "waiting_kind")?,
@@ -847,14 +891,13 @@ impl RunRepository for SqliteRepositories {
             // this read to one workspace would silently leave every other workspace's
             // interrupted runs non-terminal forever, which is why it is unscoped and
             // each entry carries its own workspace.
-            let rows = sqlx::query(
-                "SELECT id, workspace_id, conversation_id, principal_id, state, version, \
-                     objective_ref, created_at, started_at, updated_at, completed_at, \
-                     error_code, waiting_kind, waiting_ref \
-                 FROM agent_runs \
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                run_columns!(),
+                " FROM agent_runs \
                  WHERE state NOT IN ('completed', 'failed', 'cancelled') \
-                 ORDER BY created_at ASC LIMIT ?",
-            )
+                 ORDER BY created_at ASC LIMIT ?"
+            ))
             .bind(i64::from(MAX_INCOMPLETE_RUNS))
             .fetch_all(&self.pool)
             .await

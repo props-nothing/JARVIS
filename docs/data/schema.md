@@ -161,7 +161,6 @@ created_at, started_at, updated_at, completed_at
 ```
 
 State and waiting fields have constraints preventing incompatible combinations.
-
 ### `agent_steps`
 
 ```text

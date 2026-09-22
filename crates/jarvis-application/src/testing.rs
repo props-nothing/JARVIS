@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
+use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunLifecycle;
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
@@ -55,6 +56,8 @@ struct RunRow {
     error_code: Option<String>,
     waiting_kind: Option<String>,
     waiting_ref: Option<String>,
+    deadline_at: Option<UtcTimestamp>,
+    budget: RunBudget,
 }
 
 impl RunRow {
@@ -72,6 +75,8 @@ impl RunRow {
             updated_at: self.updated_at,
             completed_at: self.lifecycle.terminal_at(),
             error_code: self.error_code.clone(),
+            deadline_at: self.deadline_at,
+            budget: self.budget,
         }
     }
 }
@@ -178,6 +183,25 @@ impl InMemoryRepositories {
     pub fn recorded_deltas(&self) -> Result<Vec<(String, String)>, RepositoryError> {
         self.with(|store| Ok(store.deltas.clone()))
     }
+
+    /// Returns every model call attempt recorded, with its stored state.
+    ///
+    /// Exposed so a test can assert that a call abandoned by a timeout or a cancellation
+    /// was closed rather than left `Pending` — a pending attempt reads downstream as
+    /// outstanding work, so a finished run would look live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn recorded_calls(&self) -> Result<Vec<(NewModelCall, ModelCallState)>, RepositoryError> {
+        self.with(|store| {
+            Ok(store
+                .calls
+                .values()
+                .map(|call| (call.call.clone(), call.state))
+                .collect())
+        })
+    }
 }
 
 impl RunRepository for InMemoryRepositories {
@@ -212,6 +236,8 @@ impl RunRepository for InMemoryRepositories {
                         error_code: None,
                         waiting_kind: None,
                         waiting_ref: None,
+                        deadline_at: run.deadline_at,
+                        budget: run.budget,
                     },
                 );
                 // The opening event is appended in the same call as the row, exactly
@@ -519,6 +545,8 @@ impl RunRepository for InMemoryRepositories {
                         error_code: None,
                         waiting_kind: None,
                         waiting_ref: None,
+                        deadline_at: run.deadline_at,
+                        budget: run.budget,
                     },
                 );
                 store.events.push(opening_event);
