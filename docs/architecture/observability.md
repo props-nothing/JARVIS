@@ -256,6 +256,11 @@ voice subsystems do:
   stored ZIP with a fixed timestamp, so the same inputs produce identical bytes.
   Log tails are bounded to 256 KiB per file over at most 5 files and begin on a
   record boundary, and every member passes through the log writer's redactor.
+  The bound is on what the process **allocates**, not only on what the bundle
+  keeps: the tail is read from the end of the file, so a multi-gigabyte log is
+  never read into memory. Reading a file whole and slicing the tail out of it
+  would satisfy "the member is bounded" while leaving an unbounded allocation —
+  inside the one tool an operator runs when something is already wrong.
 - Excluded classes are recorded in the manifest as
   `excluded_classes`, not only asserted in prose.
 

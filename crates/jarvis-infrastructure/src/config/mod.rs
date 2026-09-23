@@ -9,7 +9,7 @@ pub mod atomic;
 pub mod loader;
 pub mod secret;
 
-pub use atomic::{MAX_CONFIG_BYTES, read_bounded, write_atomic};
+pub use atomic::{MAX_CONFIG_BYTES, read_bounded, read_tail_window, write_atomic};
 pub use loader::{
     Config, ConfigOverrides, ENV_ALLOWLIST, EnvApplication, LogLevel, ModelSection, PrivacySection,
     RuntimeSection, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, StorageKind, StorageSection,

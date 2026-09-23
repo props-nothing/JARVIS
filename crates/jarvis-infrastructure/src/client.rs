@@ -15,6 +15,15 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum response body the CLI will read.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// The maximum number of bytes this client reads from a discovery file.
+///
+/// This is the constant `diagnostics` documented — "the maximum number of bytes this process reads
+/// from a discovered JSON file" — and until this it was enforced nowhere: every read of that file
+/// used `std::fs::read`, which allocates the whole thing first. A discovery record is a few hundred
+/// bytes, so a megabyte is a thousand times the real size and still far below anything that matters
+/// in memory, which is what makes it a bound rather than a limit an operator could hit.
+pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+
 /// A discovered, running daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
@@ -130,13 +139,45 @@ pub fn discover(discovery_path: &Path) -> Result<Discovered, ClientError> {
     if !discovery_path.exists() {
         return Err(ClientError::NotRunning);
     }
-    let bytes = std::fs::read(discovery_path).map_err(|_| ClientError::NotRunning)?;
+    let bytes = read_discovery_bounded(discovery_path)?;
     let file = DiscoveryFile::parse(&bytes).map_err(ClientError::Invalid)?;
     Ok(Discovered {
         base_url: file.base_url,
         instance_id: file.instance_id,
         pid: file.pid,
     })
+}
+
+/// Reads a discovery file within [`MAX_SOURCE_BYTES`].
+///
+/// The bound is at the read rather than in the parser, because `DiscoveryFile::parse` takes a
+/// `&[u8]` — by the time it can compare a length, the allocation has already happened, so a
+/// length check inside it guards against malformed *content* rather than against memory use. This
+/// file is read by every CLI command, and it is the one input in a profile that some other
+/// process could have written, so it is the read to bound.
+///
+/// A file over the bound is [`ClientError::Invalid`] with [`DiscoveryReject::Malformed`], because
+/// from a client's point of view it is the same fault as an unparseable file and its advice is the
+/// same. The specific reason is deliberately not distinguished in the wire-facing error: the
+/// operator's next step is identical, and the file's size is not information worth reflecting.
+fn read_discovery_bounded(path: &Path) -> Result<Vec<u8>, ClientError> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).map_err(|_| ClientError::NotRunning)?;
+    if metadata.len() > MAX_SOURCE_BYTES {
+        return Err(ClientError::Invalid(DiscoveryReject::Malformed));
+    }
+    let file = std::fs::File::open(path).map_err(|_| ClientError::NotRunning)?;
+    let mut bytes = Vec::new();
+    // Bounded by `take`, not only by the metadata check: the file could grow between the two
+    // calls, and a discovery file is exactly the kind of small file another process writes.
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ClientError::NotRunning)?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(ClientError::Invalid(DiscoveryReject::Malformed));
+    }
+    Ok(bytes)
 }
 
 /// What answered at a published daemon address.
@@ -460,7 +501,7 @@ fn rejection_code(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, discover, read_credential};
+    use super::{ClientError, MAX_SOURCE_BYTES, discover, read_credential, read_discovery_bounded};
     use jarvis_protocol::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -488,6 +529,61 @@ mod tests {
         assert_eq!(found.base_url, "http://127.0.0.1:43127");
         assert_eq!(found.pid, 14240);
         assert_eq!(found.instance_id, record.instance_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_discovery_file_over_the_read_bound_is_refused_at_the_read() {
+        // `MAX_SOURCE_BYTES` documented "the maximum number of bytes this process reads from a
+        // discovered JSON file" and was **enforced nowhere**: every read of this file was a
+        // `std::fs::read`, which allocates the whole thing before any check can run. A declared
+        // bound with no enforcement point reads as coverage — the constant exists, the doc comment
+        // is specific, and nothing consults it.
+        //
+        // The file is the one input in a profile some other process could have written, and the CLI
+        // reads it on **every** command, so it is the read that matters. `DiscoveryFile::parse` has
+        // its own `MAX_DISCOVERY_BYTES` check, but it takes a `&[u8]`: by the time it can compare a
+        // length, the allocation has already happened.
+        //
+        // **Asserted on the reader, not through `discover`, and that is the whole point.** An
+        // assertion through `discover` passes against the *unbounded* implementation too, because
+        // `std::fs::read` returns the bytes and the parser then rejects them — the same observable
+        // outcome by a different mechanism. Verified: the first version of this test passed with
+        // `std::fs::read` restored. A bound on a *resource* cannot be proven by an assertion on a
+        // *result*, so the test drives the layer that enforces it.
+        let dir = temp_dir("discover-oversized");
+        let path = dir.join("discovery.json");
+        let oversized = vec![b'{'; usize::try_from(MAX_SOURCE_BYTES).expect("fits") + 1];
+        std::fs::write(&path, &oversized).expect("write");
+
+        let error = read_discovery_bounded(&path)
+            .expect_err("an oversized file must be refused by the read itself");
+        assert_eq!(error, ClientError::Invalid(DiscoveryReject::Malformed));
+
+        // Exactly the bound is inside the rule, so the refusal is a bound rather than an
+        // approximation of one. Its content is invalid, so it is refused later and for a different
+        // reason — which is how this assertion tells the two apart.
+        let at_bound = vec![b'{'; usize::try_from(MAX_SOURCE_BYTES).expect("fits")];
+        std::fs::write(&path, &at_bound).expect("write");
+        let read = read_discovery_bounded(&path).expect("exactly the bound is inside it");
+        assert_eq!(read.len(), at_bound.len());
+        assert!(
+            DiscoveryFile::parse(&read).is_err(),
+            "and its content is what rejects it",
+        );
+
+        // And through `discover` the oversized file reads as unusable rather than as a missing
+        // daemon, so an operator is sent to `doctor` rather than looking for a process that is
+        // running perfectly well.
+        std::fs::write(&path, &oversized).expect("write");
+        let surfaced = discover(&path).expect_err("an oversized file must be refused");
+        assert_eq!(surfaced, ClientError::Invalid(DiscoveryReject::Malformed));
+        assert!(
+            surfaced.advice().contains("doctor"),
+            "{}",
+            surfaced.advice()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

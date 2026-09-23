@@ -402,6 +402,87 @@ fn a_large_log_keeps_whole_recent_lines_only() {
 }
 
 #[test]
+fn a_log_much_larger_than_the_bound_is_never_allocated_whole() {
+    // The bound is on what the process **allocates**, not only on what the bundle keeps. Reading the
+    // whole file and slicing the tail out of it satisfies "the member is bounded" while leaving an
+    // unbounded allocation in the diagnostic tool an operator runs when something is already wrong
+    // — so a bundle over a multi-gigabyte log could exhaust memory and take the doctor down with it.
+    //
+    // This test cannot measure peak memory, so it asserts the property that makes the cost bounded:
+    // the window is read from the **end** of the file, so the head of the file is never touched. The
+    // marker line is at the very start; it must be absent from the tail, and its absence is only
+    // guaranteed by seeking rather than by reading.
+    let dir = temp_dir("windowed");
+    let log_path = dir.join("jarvis.log");
+    let mut contents = String::from("the-oldest-line\n");
+    for index in 0..40_000 {
+        let _ = writeln!(contents, "line{index}");
+    }
+    std::fs::write(&log_path, &contents).expect("write log");
+
+    let mut plan = plan_with(vec![]);
+    plan.push(PlanItem {
+        path: "logs/old.log".to_owned(),
+        description: "log tail",
+        source: BundleSource::LogTail,
+        optional: true,
+        source_path: Some(log_path),
+        content: None,
+    });
+    let bundle = materialize(&plan, &[], &redactor()).expect("materialize");
+    let member = bundle
+        .files()
+        .iter()
+        .find(|file| file.path == "logs/old.log")
+        .expect("member");
+    let text = String::from_utf8_lossy(&member.bytes);
+
+    assert!(
+        !text.contains("the-oldest-line"),
+        "a tail read must not include the head of the file",
+    );
+    assert!(text.contains("line39999"), "the newest line survives");
+    // The retained bytes are within the bound, which is what the *member* promises.
+    assert!(member.bytes.len() <= MAX_LOG_BYTES_PER_FILE);
+}
+
+#[test]
+fn a_window_read_reports_whether_its_head_is_a_whole_line() {
+    // The offset is what tells a slicing caller whether the first bytes it got are a line or a
+    // fragment of one, and **inferring** that from a length comparison is how the first version of
+    // this kept a fragment: the window comes back exactly `window` bytes long, so a "does it fit"
+    // check took the whole-file branch and skipped the boundary fix that
+    // `a_large_log_keeps_whole_recent_lines_only` then caught.
+    let dir = temp_dir("window-offset");
+    let path = dir.join("data.txt");
+
+    // A file shorter than the window is read whole, from zero — so its head IS a whole line.
+    std::fs::write(&path, b"one\ntwo\n").expect("write");
+    let (bytes, offset) = read_tail_window(&path, 64).expect("reads");
+    assert_eq!(offset, 0, "a whole-file read starts at zero");
+    assert_eq!(bytes, b"one\ntwo\n");
+
+    // Exactly the window: the head is the file's head, so still a whole line.
+    std::fs::write(&path, b"12345678").expect("write");
+    let (bytes, offset) = read_tail_window(&path, 8).expect("reads");
+    assert_eq!(offset, 0, "exactly the window is the whole file");
+    assert_eq!(bytes.len(), 8);
+
+    // One byte more than the window: the head is a fragment by construction.
+    std::fs::write(&path, b"X12345678").expect("write");
+    let (bytes, offset) = read_tail_window(&path, 8).expect("reads");
+    assert_eq!(offset, 1, "a window over a larger file starts mid-file");
+    assert_eq!(bytes, b"12345678", "and starts where the offset says");
+    assert!(bytes.len() <= 8, "the allocation is bounded by the window");
+
+    // An empty file is read whole and empty rather than refused: it is inside the bound.
+    std::fs::write(&path, b"").expect("write");
+    let (bytes, offset) = read_tail_window(&path, 8).expect("reads");
+    assert_eq!(offset, 0);
+    assert!(bytes.is_empty());
+}
+
+#[test]
 fn the_log_file_count_is_bounded_and_the_omission_is_visible() {
     let dir = temp_dir("count");
     for index in 0..(MAX_LOG_FILES + 3) {

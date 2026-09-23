@@ -1826,6 +1826,50 @@ Foundation TODO remains incomplete.
   allocates the whole file — a declared bound with no enforcement point, which is the class
   `BRN-018` and `BRN-021` both belong to.
   972 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-023` Make the size bounds bounds **on what is allocated**, not on what is retained.
+  Found by the standing `MAX_*` sweep — the technique that found `BRN-018` — and it found four
+  sites, one of which was a real memory hazard.
+  - **`MAX_LOG_BYTES_PER_FILE` bounded the member and not the read.** `read_log_tail` did
+    `std::fs::read` of the whole log and then sliced the tail out of the result, so a
+    multi-gigabyte log was read into memory in full — **inside the support bundle**, the one tool an
+    operator runs when something is already wrong. The cost is now proportional to what is retained:
+    a new `read_tail_window` seeks to the window and reads only that.
+  - **`MAX_SOURCE_BYTES` was declared and enforced nowhere**, while its doc comment said "the maximum
+    number of bytes this process reads from a discovered JSON file". Every read of that file was a
+    `std::fs::read`: the client's `discover` (on **every** CLI command) and both `lifecycle::discovery`
+    reads, the second of which runs during **shutdown** on a path whose ownership is not yet
+    established — so the file is the untrusted one. The constant moved to `client`, where the reading
+    happens, and `diagnostics` re-exports it, so there is one value with one enforcement point rather
+    than two names for one idea.
+  - **The parser's own bound cannot substitute.** `DiscoveryFile::parse` checks `MAX_DISCOVERY_BYTES`,
+    but it takes a `&[u8]`: by the time it can compare a length, the allocation has already happened.
+    A bound on a *resource* has to live at the read, which is a different layer from a bound on
+    *content*.
+  - **A declared bound with a stated number and no enforcement point reads as coverage** — the
+    constant exists, the doc comment is specific, and nothing consults it.
+  **Two mistakes of mine, both instructive:**
+  - **My first test asserted the wrong layer, and passed against the bug.** Both discovery tests
+    drove `discover`/`remove_if_owned` and asserted the *outcome* — which is **identical** with the
+    fix reverted, because `std::fs::read` returns the bytes and the parser then rejects them. A bound
+    on a resource cannot be proven by an assertion on a result. Verified by restoring the unbounded
+    implementation and watching the test pass, which is the only way that class of mistake is found.
+    The assertions now drive the reader itself, and the reverted implementation fails both.
+  - **Reading only the window makes the head partial by construction**, so the old early-return
+    (`if text.len() <= MAX`) took the whole-file branch and kept a fragment — caught by a
+    **pre-existing** test asserting the tail begins on a record boundary. The fix was to stop
+    *inferring* partiality from a length comparison and have `read_tail_window` **return the offset
+    it started at**, so the fact is stated rather than derived. A function that returns a window
+    should say where the window begins.
+  **Falsified four ways, each compiling:** the window read starting at zero fails three diagnostics
+  tests including the offset one; and reverting each discovery reader to `std::fs::read` fails its
+  own test. Verified on the real daemon: both E2E journeys pass and `jarvis ask` answers, so the
+  bounded reads did not change any observable behaviour.
+  **Still open:** `auth.invalid` and `auth.scope_denied` remain produced by no route (`BRN-021`), and
+  the unreferenced-column list from `BRN-020` is unchanged — `agent_steps` (`attempt_count`,
+  `input_fingerprint`, `input_ref`, `output_ref`, `timeout_ms`, `next_attempt_at`) and `agent_runs`
+  (`context_manifest_id`, `plan_summary_ref`, `result_ref`, `error_ref`). Those are tables with no
+  port at all, so they belong to the tool-fabric milestone rather than to a bound sweep.
+  976 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

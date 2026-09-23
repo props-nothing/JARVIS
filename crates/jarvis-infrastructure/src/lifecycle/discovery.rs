@@ -10,6 +10,43 @@ use std::path::Path;
 
 use jarvis_protocol::{DiscoveryFile, DiscoveryReject};
 
+/// The largest discovery document this process will read.
+///
+/// The parser validates the record but has no input bound — bounding a `&[u8]` is not something it
+/// can do, because the bytes are already in memory by then (`MAX_DISCOVERY_BYTES` is checked
+/// against the slice's length, which is too late to stop the allocation). So the bound belongs at
+/// the read, and this is the read.
+///
+/// It matters most in [`remove_if_owned`]: that function runs during **shutdown**, on a path whose
+/// ownership is not yet established, so the file it reads is the untrusted one. A file placed there
+/// by anything else would otherwise be read into memory in full before a single field was checked.
+pub const MAX_DISCOVERY_READ_BYTES: u64 = 1024 * 1024;
+
+/// Reads a discovery file within [`MAX_DISCOVERY_READ_BYTES`].
+///
+/// The metadata check is a cheap early refusal; the read itself is bounded by `take`, so a file
+/// that grows between the two calls cannot extend the allocation past the bound. An over-limit file
+/// is [`DiscoveryError::Read`] rather than [`DiscoveryError::Invalid`]: "this file is too big to be
+/// a discovery record" is a fact about the file, and parsing it to say so would be the very read
+/// being avoided.
+fn read_bounded(path: &Path) -> Result<Vec<u8>, DiscoveryError> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).map_err(|_| DiscoveryError::Read)?;
+    if metadata.len() > MAX_DISCOVERY_READ_BYTES {
+        return Err(DiscoveryError::Read);
+    }
+    let file = std::fs::File::open(path).map_err(|_| DiscoveryError::Read)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_DISCOVERY_READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DiscoveryError::Read)?;
+    if bytes.len() as u64 > MAX_DISCOVERY_READ_BYTES {
+        return Err(DiscoveryError::Read);
+    }
+    Ok(bytes)
+}
+
 /// An error raised while publishing or removing a discovery file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryError {
@@ -64,7 +101,7 @@ pub fn publish(path: &Path, record: &DiscoveryFile) -> Result<(), DiscoveryError
     // planted at the temp name cannot redirect the write.
     crate::config::atomic::write_atomic(path, &bytes).map_err(|_| DiscoveryError::Publish)?;
 
-    let written = std::fs::read(path).map_err(|_| DiscoveryError::Read)?;
+    let written = read_bounded(path)?;
     let parsed = DiscoveryFile::parse(&written).map_err(DiscoveryError::Invalid)?;
     if parsed != *record {
         return Err(DiscoveryError::Publish);
@@ -82,7 +119,7 @@ pub fn remove_if_owned(path: &Path, instance_id: &str) -> Result<(), DiscoveryEr
     if !path.exists() {
         return Ok(());
     }
-    let bytes = std::fs::read(path).map_err(|_| DiscoveryError::Read)?;
+    let bytes = read_bounded(path)?;
 
     // An unparseable file is not provably ours, so it is left for the operator
     // rather than deleted.
@@ -97,7 +134,7 @@ pub fn remove_if_owned(path: &Path, instance_id: &str) -> Result<(), DiscoveryEr
 mod tests {
     use jarvis_protocol::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile};
 
-    use super::{DiscoveryError, publish, remove_if_owned};
+    use super::{DiscoveryError, MAX_DISCOVERY_READ_BYTES, publish, read_bounded, remove_if_owned};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -116,6 +153,54 @@ mod tests {
             api_major: 1,
             started_at: "2026-09-21T00:00:00Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn shutdown_refuses_an_oversized_file_at_the_read() {
+        // `remove_if_owned` runs during **shutdown**, on a path whose ownership has not been
+        // established yet — so the file it reads is the untrusted one. A file placed there by
+        // anything else would previously have been read into memory in full before a single field
+        // was consulted, because the parser's own size check takes a `&[u8]` and by then the
+        // allocation has already happened.
+        //
+        // **Asserted on the reader rather than through `remove_if_owned`, and that is deliberate.**
+        // Through the caller this passes against the *unbounded* implementation too: `std::fs::read`
+        // returns the bytes, the parse fails, and an unparseable file is not provably ours — so the
+        // observable outcome is identical by a different mechanism. A bound on a *resource* cannot
+        // be proven by an assertion on a *result*. Verified: the first version of this test passed
+        // with `std::fs::read` restored.
+        //
+        // The refusal is `Read` rather than `Invalid`, and that is the operator-facing distinction:
+        // "this file is too big to be a discovery record" is a fact about the file, and parsing it
+        // to say so would be the very read being avoided.
+        let dir = temp_dir("oversized");
+        let path = dir.join("discovery.json");
+        let oversized = vec![b'{'; usize::try_from(MAX_DISCOVERY_READ_BYTES).expect("fits") + 1];
+        std::fs::write(&path, &oversized).expect("write");
+
+        assert_eq!(read_bounded(&path), Err(DiscoveryError::Read));
+
+        // Exactly the bound is read rather than refused, so the refusal is a bound and not an
+        // approximation of one. Its content is what fails afterwards.
+        let at_bound = vec![b'{'; usize::try_from(MAX_DISCOVERY_READ_BYTES).expect("fits")];
+        std::fs::write(&path, &at_bound).expect("write");
+        assert_eq!(
+            read_bounded(&path)
+                .expect("exactly the bound is inside it")
+                .len(),
+            at_bound.len(),
+        );
+
+        // And through the caller, an unreadable file is left alone: it is not provably ours, so
+        // shutdown must not delete something it could not identify.
+        std::fs::write(&path, &oversized).expect("write");
+        assert_eq!(
+            remove_if_owned(&path, "instance-a"),
+            Err(DiscoveryError::Read),
+        );
+        assert!(path.exists(), "a refused read must not delete the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

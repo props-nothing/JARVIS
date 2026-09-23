@@ -33,6 +33,8 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::config::read_tail_window;
+
 // `Redactor` is re-exported here so a caller of this module does not need a
 // direct `jarvis-observability` dependency just to pass the redactor the bundle
 // API requires. The other items are internal to this module.
@@ -72,8 +74,16 @@ pub const MAX_LOG_BYTES_PER_FILE: usize = 256 * 1024;
 /// The maximum number of log files a bundle includes.
 pub const MAX_LOG_FILES: usize = 5;
 
-/// The maximum number of bytes this process reads from a discovered JSON file.
-pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// The bound on reading a discovered JSON file, re-exported from where it is enforced.
+///
+/// This constant used to be **declared here and enforced nowhere**: it documented "the maximum
+/// number of bytes this process reads from a discovered JSON file" while every such read was a
+/// `std::fs::read`, which allocates the whole file before any check could run. A declared bound
+/// with no enforcement point reads as coverage, so the fix is not to add a check here but to move
+/// the constant to the code that does the reading — [`crate::client::discover`] and
+/// `lifecycle::discovery` — and re-export it, so there is one value with one enforcement point
+/// rather than two names for one idea.
+pub use crate::client::MAX_SOURCE_BYTES;
 
 /// How serious a finding is.
 ///
@@ -929,21 +939,41 @@ pub fn add_log_tails(plan: &mut BundlePlan, log_directory: &Path) -> Vec<PathBuf
 }
 
 /// Reads a bounded, complete-line tail from a log item's source file.
+///
+/// The bound is on what the process **allocates**, not only on what the bundle keeps. An earlier
+/// version read the whole file and sliced the tail out of the result, so a multi-gigabyte log would
+/// have been read into memory in full — inside the diagnostic tool an operator runs when something
+/// is already wrong, which is the worst place for an unbounded allocation. The window is now read
+/// from the end of the file, so the cost is proportional to the bytes retained.
 fn read_log_tail(item: &PlanItem) -> Result<String, BundleError> {
     let path = item.source_path.as_ref().ok_or(BundleError::LogEncoding)?;
-    let bytes = std::fs::read(path).map_err(|_| BundleError::LogRead { path: path.clone() })?;
+    // The offset says whether the head of what was read is a whole line or a fragment: a non-zero
+    // offset means the window began mid-file, so the first line is partial by construction. That
+    // is stated rather than inferred, because inferring it from a length comparison is how an
+    // earlier version kept a fragment: the window is exactly the bound long, so a "does it fit"
+    // check took the whole-file branch and skipped the boundary fix.
+    let (bytes, offset) = read_tail_window(path, MAX_LOG_BYTES_PER_FILE as u64)
+        .map_err(|_| BundleError::LogRead { path: path.clone() })?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
-    if text.len() <= MAX_LOG_BYTES_PER_FILE {
+    if offset == 0 {
         return Ok(text);
     }
-    // Keep the *newest* complete lines: a bundle is about the recent failure.
-    let start = text.len() - MAX_LOG_BYTES_PER_FILE;
-    let start = floor_char_boundary(&text, start);
-    // Drop the leading partial line so the tail begins at a record boundary.
-    match text[start..].find('\n') {
-        Some(offset) => Ok(text[start + offset + 1..].to_owned()),
-        None => Ok(text[start..].to_owned()),
+    // Drop the leading partial line so the tail begins at a record boundary, then keep the newest
+    // complete lines: a bundle is about the recent failure.
+    let after_break = match text.find('\n') {
+        Some(index) => &text[index + 1..],
+        // No newline at all in the window means the newest line is longer than the bound, so there
+        // is no complete line to keep.
+        None => return Ok(String::new()),
+    };
+    if after_break.len() <= MAX_LOG_BYTES_PER_FILE {
+        return Ok(after_break.to_owned());
+    }
+    let start = floor_char_boundary(after_break, after_break.len() - MAX_LOG_BYTES_PER_FILE);
+    match after_break[start..].find('\n') {
+        Some(index) => Ok(after_break[start + index + 1..].to_owned()),
+        None => Ok(after_break[start..].to_owned()),
     }
 }
 

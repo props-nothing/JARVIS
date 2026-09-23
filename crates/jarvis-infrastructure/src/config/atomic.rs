@@ -7,7 +7,7 @@
 //! Unix and Windows (it maps to `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`).
 
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,6 +55,50 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, ConfigError> {
         });
     }
     Ok(contents)
+}
+
+/// Reads the last `window` bytes of a file, without allocating the whole thing.
+///
+/// The support bundle needs the *newest* complete lines of a log file, and its earlier
+/// implementation read the entire file and then sliced the tail out of it — so the bound was on
+/// what the bundle **kept** rather than on what the process **allocated**. A multi-gigabyte log
+/// directory would therefore have been read into memory in full, which is the opposite of the
+/// property the bound was documented to provide: an unbounded allocation inside the diagnostic
+/// tool an operator runs when something is already wrong.
+///
+/// Seeking to the window and reading only that keeps the cost proportional to what is retained.
+///
+/// **Returns the offset it started at**, and that is not incidental: a caller that slices a tail
+/// needs to know whether the first bytes it received are a whole line or a fragment of one. A
+/// non-zero offset means the window began mid-file, so the head is partial **by construction** —
+/// and inferring that from a length comparison is how the first version of this got it wrong: the
+/// window is exactly `window` bytes long, so a "does it fit" check took the whole-file branch and
+/// kept a fragment. The offset states the fact instead of leaving it to be derived.
+///
+/// A file shorter than the window is read whole, from offset zero, rather than refused: it is
+/// already inside the bound, so there is nothing to bound.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] for any I/O failure.
+pub fn read_tail_window(path: &Path, window: u64) -> Result<(Vec<u8>, u64), ConfigError> {
+    let read_error = || ConfigError::Read {
+        path: path.to_path_buf(),
+    };
+    let metadata = fs::metadata(path).map_err(|_| read_error())?;
+    let length = metadata.len();
+    let start = length.saturating_sub(window);
+
+    let mut file = fs::File::open(path).map_err(|_| read_error())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| read_error())?;
+    // `take` rather than a `read_to_end`, so a file that grows between the metadata call and the
+    // read cannot extend the allocation past the window.
+    let mut contents = Vec::new();
+    file.take(window)
+        .read_to_end(&mut contents)
+        .map_err(|_| read_error())?;
+    Ok((contents, start))
 }
 
 /// Atomically replaces `path` with `bytes`.
