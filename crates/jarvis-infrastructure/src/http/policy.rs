@@ -626,6 +626,14 @@ fn policy_error_response(error: &PolicyServiceError) -> Response {
         PolicyServiceError::VersionConflict { .. }
         | PolicyServiceError::Contradictory { .. }
         | PolicyServiceError::Unsatisfied(_) => StatusCode::CONFLICT,
+        // The caller proved no identity, and `401` is the status a client responds to by
+        // authenticating. Its code is shared with this surface's own authentication refusal, so a
+        // client's existing handling applies unchanged.
+        PolicyServiceError::Unauthenticated => StatusCode::UNAUTHORIZED,
+        // The identity was proved but not at the required level, which is a `403`: retrying the
+        // same credentialed request changes nothing, and the remedy is a step-up challenge rather
+        // than a corrected body.
+        PolicyServiceError::InsufficientAssurance => StatusCode::FORBIDDEN,
         PolicyServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error_response(status, error.code(), message_for(error), error.retryable())
@@ -645,6 +653,10 @@ fn message_for(error: &PolicyServiceError) -> &'static str {
             "The submitted rules contradict the policy already in force."
         }
         PolicyServiceError::Invalid { .. } => "The submitted policy is not usable.",
+        PolicyServiceError::Unauthenticated => "An authenticated identity is required.",
+        PolicyServiceError::InsufficientAssurance => {
+            "This change requires a stronger authentication assurance."
+        }
         PolicyServiceError::Storage(_) => "The policy could not be read.",
     }
 }
@@ -692,15 +704,70 @@ pub fn evaluation_instant(now: UtcTimestamp) -> (IsoDate, UtcTimestamp) {
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_class_of, locality_of, rejection_reason_of, residency_of, retention_of,
-        retention_requirement_of, sensitivity_of, telemetry_of, training_requirement_of,
-        training_use_of,
+        endpoint_class_of, locality_of, policy_error_response, rejection_reason_of, residency_of,
+        retention_of, retention_requirement_of, sensitivity_of, telemetry_of,
+        training_requirement_of, training_use_of,
     };
+    use axum::http::StatusCode;
+    use jarvis_application::policy_service::PolicyServiceError;
     use jarvis_domain::model::identity::EndpointClass;
     use jarvis_domain::model::policy::{
         EffectiveResidency, EffectiveRetention, EffectiveTrainingUse, Locality, ProviderRetention,
         RejectionReason, Sensitivity, Telemetry, TrainingUse,
     };
+
+    /// Reads a response body, so an assertion can be about the envelope rather than the status.
+    async fn body_of(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body is readable");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The two assurance refusals a grant can meet, and the status/code a client receives.
+    ///
+    /// Both are new variants of `PolicyServiceError`, and both would otherwise have been reported as
+    /// the domain's `model.exception_required` — which names neither the missing identity nor the
+    /// level that was short, and so cannot be actioned differently. The remedy differs: one asks the
+    /// caller to authenticate, the other to complete a step-up.
+    ///
+    /// Asserted through the real mapper rather than a service call, because **there is no route that
+    /// grants an exception** — `BRN-013` records that absence, and this is consequently the layer a
+    /// client would actually meet. A status assertion alone would not be enough either: the codes
+    /// are what an operator's runbook keys on, so both are asserted.
+    #[tokio::test]
+    async fn the_assurance_refusals_have_their_own_statuses_and_codes() {
+        for (label, error, status, code) in [
+            (
+                "a caller that proved no identity",
+                PolicyServiceError::Unauthenticated,
+                StatusCode::UNAUTHORIZED,
+                "auth.credential_rejected",
+            ),
+            (
+                "a caller short of the required assurance",
+                PolicyServiceError::InsufficientAssurance,
+                StatusCode::FORBIDDEN,
+                "model.exception_required",
+            ),
+        ] {
+            let response = policy_error_response(&error);
+            assert_eq!(response.status(), status, "{label}");
+            let body = body_of(response).await;
+            assert!(
+                body.contains(&format!(r#""code":"{code}""#)),
+                "{label} must carry {code}: {body}",
+            );
+            // Neither is retryable. Re-authenticating and completing a step-up are **different
+            // requests**, so telling a client to repeat this one unchanged would spend its budget on
+            // a certain failure — and for the guest case it would also invite an authentication
+            // retry loop against a route that needs a challenge, not a credential.
+            assert!(
+                body.contains(r#""retryable":false"#),
+                "{label} must not be retryable: {body}",
+            );
+        }
+    }
 
     /// Every wire value must be the contract's spelling, and none may be the domain's prose.
     ///

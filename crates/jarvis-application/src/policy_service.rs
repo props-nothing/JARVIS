@@ -44,7 +44,7 @@ use crate::repository::RepositoryError;
 use crate::repository::policy::{
     JarvisPolicyException, ModelDataPolicyRepository, NewPolicyVersion, StoredPolicyVersion,
 };
-use crate::request_context::RequestContext;
+use crate::request_context::{AuthenticationAssurance, RequestContext};
 
 /// Why a policy evaluation could not be answered.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +107,22 @@ pub enum PolicyServiceError {
         /// The stable, namespaced code for what was wrong.
         code: &'static str,
     },
+    /// The caller held no verified identity, so it cannot be the principal accountable for a grant.
+    ///
+    /// Separate from [`Invalid`](Self::Invalid) and from a step-up refusal because the three call
+    /// for different remedies: this one asks the caller to authenticate, while an unmet step-up
+    /// asks it to complete a challenge, and a malformed request asks it to correct the request. All
+    /// three would otherwise report the domain's `model.exception_required`, which names neither the
+    /// missing identity nor the level that was short.
+    Unauthenticated,
+    /// The caller proved an identity, but not at the level this grant requires.
+    ///
+    /// The requirement is derived from the rule and the scope — a locality grant crosses a boundary
+    /// by construction, and a grant naming a classification is sensitive even when its rule does
+    /// not — so this refusal can only be discovered by attempting the grant. It reports the
+    /// contract's own `model.exception_required`, which is the code an operator's runbook already
+    /// keys on.
+    InsufficientAssurance,
     /// The store could not be read.
     Storage(RepositoryError),
 }
@@ -125,6 +141,15 @@ impl PolicyServiceError {
             // own `jarvis.invalid_policy_layer`. Collapsed to one arm because they are the same
             // decision — report the code the layer that refused produced.
             Self::Invalid { code } | Self::Contradictory { code } => code,
+            // An identity that was never proved is `auth.credential_rejected`, the code this
+            // surface already uses for a caller it did not authenticate. Reporting the contract's
+            // policy code would send an operator to inspect a policy for a request that never got
+            // as far as one.
+            Self::Unauthenticated => "auth.credential_rejected",
+            // The requirement is derived from the grant, so it is only discoverable by attempting
+            // it — and the contract lists `model.exception_required` as the minimum stable code for
+            // exactly this refusal.
+            Self::InsufficientAssurance => "model.exception_required",
             Self::Storage(error) => error.code(),
         }
     }
@@ -145,10 +170,31 @@ impl PolicyServiceError {
             | Self::Unsatisfied(_)
             | Self::CandidatesUnbounded { .. }
             | Self::Contradictory { .. }
-            | Self::Invalid { .. } => false,
+            | Self::Invalid { .. }
+            | Self::Unauthenticated
+            | Self::InsufficientAssurance => false,
             Self::VersionConflict { .. } => true,
             Self::Storage(error) => error.retryable(),
         }
+    }
+}
+
+/// Maps the assurance a caller proved onto the level a grant is judged against.
+///
+/// # Errors
+///
+/// Returns [`PolicyServiceError::Unauthenticated`] for [`AuthenticationAssurance::Guest`]. A guest
+/// is a caller that proved no identity at all, and a grant is accountable to a principal — so
+/// treating it as merely "standard" would let an anonymous caller create a durable record of a
+/// relaxation and be named on it. The security rules require an identity to be authenticated
+/// *before* a tenant or workspace is resolved, and a guest is the state before that happened.
+fn required_assurance_of(
+    held: AuthenticationAssurance,
+) -> Result<RequiredAssurance, PolicyServiceError> {
+    match held {
+        AuthenticationAssurance::Guest => Err(PolicyServiceError::Unauthenticated),
+        AuthenticationAssurance::Standard => Ok(RequiredAssurance::Standard),
+        AuthenticationAssurance::Elevated => Ok(RequiredAssurance::Elevated),
     }
 }
 
@@ -194,13 +240,6 @@ pub struct GrantRequest {
     pub single_use: bool,
     /// When it stops being usable.
     pub expires_at: UtcTimestamp,
-    /// The assurance the granting principal holds.
-    ///
-    /// A **required** input rather than a value read from ambient state, because the step-up rule
-    /// is part of whether the grant may exist: a caller that could omit it would get a grant whose
-    /// own record says which assurance was required while nothing checked the grantor held it. The
-    /// HTTP layer supplies it from the authenticated client, which is the only place it is trusted.
-    pub granting_assurance: RequiredAssurance,
     /// The policy version to grant it against, or `None` for the workspace's active policy.
     pub policy: Option<PolicyVersionRef>,
 }
@@ -464,6 +503,25 @@ impl PolicyService {
         granted_at: UtcTimestamp,
         exception_id: jarvis_domain::ids::PolicyExceptionId,
     ) -> Result<JarvisPolicyException, PolicyServiceError> {
+        // The assurance the grant is judged against is the one the caller **proved**, which the
+        // server resolved into the context — never a value the caller stated. It used to be a field
+        // on `GrantRequest` documented as "supplied by the HTTP layer from the authenticated
+        // client", which was a promise nothing kept: no route grants an exception, and the
+        // assurance sits on the context beside the principal it belongs to. A separate copy is the
+        // same shape as the caller-supplied identity the security rules forbid, and it would have
+        // made the step-up rule — the one thing the field exists for — decided by whoever filled in
+        // the request.
+        //
+        // The assurance the grant is judged against is the one the caller **proved**, which the
+        // server resolved into the context — never a value the caller stated. It used to be a field
+        // on `GrantRequest` documented as "supplied by the HTTP layer from the authenticated
+        // client", which was a promise nothing kept: no route grants an exception, and the
+        // assurance sits on the context beside the principal it belongs to. A separate copy is the
+        // same shape as the caller-supplied identity the security rules forbid, and it would have
+        // made the step-up rule — the one thing the field exists for — decided by whoever filled in
+        // the request.
+        let granting_assurance = required_assurance_of(context.assurance)?;
+
         // The reference is resolved before the record is built, so a grant against a version that
         // does not exist is refused rather than stored against nothing.
         let reference = match request.policy {
@@ -479,7 +537,7 @@ impl PolicyService {
             workspace_id: context.workspace_id,
             policy: reference,
             granting_principal_id: context.principal_id,
-            granting_assurance: request.granting_assurance,
+            granting_assurance,
             rule: request.rule,
             scope: request.scope.clone(),
             reason_ref: request.reason_ref.clone(),
@@ -612,12 +670,22 @@ mod tests {
     use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
     use crate::testing::InMemoryRepositories;
 
+    /// A context at `Standard` assurance, which is the ordinary authenticated case.
     fn context() -> RequestContext {
+        context_at(AuthenticationAssurance::Standard)
+    }
+
+    /// A context whose **server-resolved** assurance is `assurance`.
+    ///
+    /// A parameter rather than a second helper, because the assurance is a property of the
+    /// authenticated request rather than a different kind of request, and a step-up test needs to
+    /// vary exactly that one field.
+    fn context_at(assurance: AuthenticationAssurance) -> RequestContext {
         RequestContext::new(
             RequestId::from_uuid(uuid::Uuid::from_u128(1)),
             CorrelationId::from_uuid(uuid::Uuid::from_u128(2)),
             PrincipalId::from_uuid(uuid::Uuid::from_u128(3)),
-            AuthenticationAssurance::Standard,
+            assurance,
             WorkspaceId::from_uuid(uuid::Uuid::from_u128(4)),
             RequestChannel::Api,
         )
@@ -711,7 +779,11 @@ mod tests {
         request(candidates, Locality::ApprovedCloudAllowed)
     }
 
-    /// A grant request for `rule` with `scope`, at elevated assurance.
+    /// A grant request for `rule` with `scope`.
+    ///
+    /// Carries no assurance: the level a grant is judged against is the one the caller **proved**,
+    /// which the server resolved into the request context. A field here would let whoever filled in
+    /// the request decide the step-up rule, which is the one thing the rule exists to prevent.
     fn grant_request(rule: PolicyRuleKey, scope: ExceptionScope) -> GrantRequest {
         GrantRequest {
             rule,
@@ -719,7 +791,6 @@ mod tests {
             reason_ref: "operator approved".to_owned(),
             single_use: false,
             expires_at: UtcTimestamp::parse("2027-01-01T00:00:00Z").expect("valid"),
-            granting_assurance: RequiredAssurance::Elevated,
             policy: None,
         }
     }
@@ -738,7 +809,11 @@ mod tests {
 
         let granted = service
             .grant_exception(
-                &context(),
+                // Elevated, because a locality grant widens where content may travel and the
+                // contract requires step-up for that. The assurance comes from the context now, so
+                // a grant this shape is only obtainable by a caller that proved the stronger
+                // identity.
+                &context_at(AuthenticationAssurance::Elevated),
                 &grant_request(
                     PolicyRuleKey::Locality,
                     ExceptionScope {
@@ -792,32 +867,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_grant_needing_step_up_is_refused_at_standard_assurance() {
+    async fn a_grant_needing_step_up_is_refused_for_a_standard_context() {
         // The rule the contract states — "Sensitive or cross-border exceptions require
-        // policy-defined step-up/approval" — enforced through the service, so the HTTP layer cannot
-        // bypass it by passing a standard assurance for a cross-border grant.
+        // policy-defined step-up/approval" — enforced against the assurance the **server resolved
+        // into the context**, so neither the request body nor the caller can choose it.
+        //
+        // **This is the assertion that makes the rule real.** Before this, `GrantRequest` carried a
+        // `granting_assurance` field documented as "supplied by the HTTP layer from the
+        // authenticated client" — a promise nothing kept, since no route grants an exception and
+        // the assurance already sits on the context beside the principal it belongs to. The first
+        // version of this test set that field, so it proved the *domain* checked whatever it was
+        // handed while the value it checked was the caller's to pick. It now varies the one thing a
+        // real request cannot forge.
         let (service, repositories) = service();
         put(&service, 0, local_only()).await.expect("creates");
 
-        let mut standard = grant_request(PolicyRuleKey::Locality, ExceptionScope::default());
-        standard.granting_assurance = RequiredAssurance::Standard;
-        standard.scope.locality = Some(Locality::PrivateNetworkAllowed);
+        let mut request = grant_request(PolicyRuleKey::Locality, ExceptionScope::default());
+        request.scope.locality = Some(Locality::PrivateNetworkAllowed);
 
         let error = service
-            .grant_exception(&context(), &standard, at(), exception_id(3))
+            .grant_exception(
+                &context_at(AuthenticationAssurance::Standard),
+                &request,
+                at(),
+                exception_id(3),
+            )
             .await
             .expect_err("a cross-border grant needs step-up");
         assert_eq!(error.code(), "model.exception_required");
         assert!(exceptions(&repositories).is_empty());
 
-        // And the same grant at elevated assurance succeeds, so the refusal is about the assurance
-        // rather than about the grant being impossible.
-        standard.granting_assurance = RequiredAssurance::Elevated;
+        // And the **same request** at a context that completed a step-up succeeds, so the refusal is
+        // about the assurance rather than about the grant being impossible.
         service
-            .grant_exception(&context(), &standard, at(), exception_id(3))
+            .grant_exception(
+                &context_at(AuthenticationAssurance::Elevated),
+                &request,
+                at(),
+                exception_id(3),
+            )
             .await
-            .expect("elevated is accepted");
+            .expect("an elevated context is accepted");
         assert_eq!(exceptions(&repositories).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_grant_from_a_guest_is_refused_because_a_grant_is_accountable() {
+        // A guest proved no identity at all. Treating it as merely "standard" would let an anonymous
+        // caller create a durable record of a policy relaxation and be **named** on it — and the
+        // whole point of an exception's `granting_principal_id` is that somebody is accountable for
+        // it.
+        //
+        // The refusal is `auth.credential_rejected` rather than the contract's
+        // `model.exception_required`, because this surface already uses that code for a caller it
+        // did not authenticate and an operator's remedy — authenticate first — is a different one
+        // from completing a step-up.
+        let (service, repositories) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let error = service
+            .grant_exception(
+                &context_at(AuthenticationAssurance::Guest),
+                &grant_request(PolicyRuleKey::AllowFallback, ExceptionScope::default()),
+                at(),
+                exception_id(4),
+            )
+            .await
+            .expect_err("an unauthenticated caller cannot grant");
+        assert_eq!(error.code(), "auth.credential_rejected");
+        assert!(
+            !error.retryable(),
+            "re-authenticating is not the same request retried",
+        );
+        assert!(exceptions(&repositories).is_empty());
     }
 
     #[tokio::test]
@@ -856,7 +978,9 @@ mod tests {
 
         service
             .grant_exception(
-                &context(),
+                // Elevated for the same reason as the other locality grants: a widened locality is
+                // what needs step-up.
+                &context_at(AuthenticationAssurance::Elevated),
                 &grant_request(
                     PolicyRuleKey::Locality,
                     ExceptionScope {
@@ -943,7 +1067,7 @@ mod tests {
         // Grant the locality relaxation the refusal named.
         service
             .grant_exception(
-                &context(),
+                &context_at(AuthenticationAssurance::Elevated),
                 &grant_request(
                     PolicyRuleKey::Locality,
                     ExceptionScope {
@@ -1001,7 +1125,12 @@ mod tests {
         expiring.expires_at = UtcTimestamp::parse("2026-08-01T00:00:00Z").expect("valid");
         let issued_at = UtcTimestamp::parse("2026-07-01T00:00:00Z").expect("valid");
         service
-            .grant_exception(&context(), &expiring, issued_at, exception_id(8))
+            .grant_exception(
+                &context_at(AuthenticationAssurance::Elevated),
+                &expiring,
+                issued_at,
+                exception_id(8),
+            )
             .await
             .expect("stored while still valid");
 

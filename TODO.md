@@ -1870,6 +1870,80 @@ Foundation TODO remains incomplete.
   (`context_manifest_id`, `plan_summary_ref`, `result_ref`, `error_ref`). Those are tables with no
   port at all, so they belong to the tool-fabric milestone rather than to a bound sweep.
   976 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-024` Decide the step-up rule from the assurance the caller **proved**, not one it was
+  told. Found by following the two "recorded gap" doc comments the exception module carries, and
+  the first one turned out to be describing a different defect than the one that existed.
+  - **`GrantRequest` carried a `granting_assurance` field**, documented as "supplied by the HTTP
+    layer from the authenticated client, which is the only place it is trusted". That was a promise
+    nothing kept, and it was checkable: **no route grants an exception**, and the assurance already
+    sits on `RequestContext` beside the `principal_id` it belongs to. So the step-up rule — the one
+    thing the field existed for — was compared against a value the caller filling in the request
+    chose. A caller could claim `Elevated` and obtain a durable relaxation of exactly the rules the
+    contract requires a challenge for. **The trusted copy was never the one being read**, and the
+    fix is to delete the untrusted one rather than to keep them in step.
+  - **`grant_exception` now reads `context.assurance`**, which the server resolves from the
+    credential, and a map (`required_assurance_of`) refuses `Guest` outright: a guest proved no
+    identity, and a grant is accountable to a principal. Treating it as merely "standard" would let
+    an anonymous caller create a durable record of a policy relaxation and be **named** on it.
+  - **Two new error variants, because one code cannot name three remedies.** `Unauthenticated`
+    reports `auth.credential_rejected` (`401` — the code this surface already uses, so a client's
+    existing handling applies), and `InsufficientAssurance` reports the contract's own
+    `model.exception_required` (`403`). Collapsing them to the domain's single
+    `model.exception_required` would tell an operator to inspect a policy for a request that never
+    authenticated.
+  - **The existing test was asserting the wrong actor, and had to be rewritten rather than
+    adjusted.** `a_grant_needing_step_up_is_refused_at_standard_assurance` set the request's
+    assurance field, so it proved the *domain* checked whatever it was handed while the value it
+    checked was the caller's to pick — a green test over a hole. It now varies the one thing a real
+    request cannot forge, and the same `GrantRequest` is refused from a standard context and
+    accepted from an elevated one.
+  - **Four existing tests then failed, and each failure was correct**: every one granted a
+    **locality** exception, which crosses a boundary the contract requires step-up for. They now
+    present an elevated context — the path an operator actually takes.
+  **Falsified two ways, each compiling:** replacing the derived assurance with a hardcoded
+  `Elevated` fails both the step-up test and the guest test; and collapsing `InsufficientAssurance`
+  onto the `401` status fails the mapper test with `left: 401, right: 403`.
+  **The docs claimed the opposite of the truth**, and both were corrected in the same change:
+  `exception.rs` said the type "has no producer above the domain" and the contract said
+  "`AuthenticatedClient` hardcodes `Standard`, so a step-up exception is un-grantable over the wire".
+  What is actually true is narrower and still open: the rule is now enforced server-side, but **no
+  route grants an exception at all**, so the entire lifecycle is reachable only from inside the
+  process. Adding the route needs a step-up challenge and an owner decision.
+  978 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-025` Sweep doc comments that assert a caller exists. Found by counting the references of
+  every public function in the workspace and noticing three whose count was **1** — their own
+  definition — while each carried a doc comment stating what a caller does with it.
+  **A doc comment claiming a caller is a claim a grep can falsify, and nothing checks it.** The
+  three were not the same kind of problem, and telling them apart was the work:
+  - **`event_matches_run`** — "A free function rather than inline, so the check the transaction
+    relies on is separately named and testable." Nothing called it, and the transaction **could
+    not**: `transition` builds every lookup from `event.run_id` itself, so there was no comparison
+    against "the run the transition moves" anywhere. The rule read as enforced because a function
+    named after it existed. **Deleted**, and the reason it cannot be enforced at that layer is now
+    recorded where the lookup happens — `RunTransition` carries no run identity at all, so the
+    adapter has nothing to compare against and the obligation sits with the caller that holds the
+    `RunRef` (the create path *can* state and check it, and does, in `insert_run`).
+  - **`model_ref_of`** — "Exposed so a caller that only needs the provider/model pair does not have
+    to construct a `StoredModelCall` to get it." `stored_model_call` rebuilds exactly that pair and
+    its revision inline, and that is where every read of a stored call goes. A second
+    implementation of one parse, with no caller. **Deleted.**
+  - **`is_client_visible`** — "Returns whether `visibility` may be shown to an ordinary client."
+    No caller either, but **not** a defect: the client-facing event page filters in SQL
+    (`visibility = 'public'`) and the in-memory double filters on the variant, both stronger than
+    routing either through this function. The real risk was different and I only saw it by
+    thinking about what the missing caller implies — a third `EventVisibility` variant would
+    compile here (correctly returning false) while the **SQL string literal** silently excluded it
+    from every read. So the predicate stays and is now held to the two filter sites by
+    `the_visibility_filter_is_the_public_variant_only`, which asserts the variants, their stored
+    spellings, and the adapter's behaviour.
+  **Falsified two ways, each compiling:** making the predicate accept `Operator` fails with
+  `Operator must be false to a client`; deleting the SQL `visibility = 'public'` clause fails two
+  tests and the failure body shows the operator event in a client's page.
+  **The general lesson, now recorded:** a doc comment that says "so a caller can…" is a claim about
+  the codebase, and it is exactly as falsifiable as a schema column with no writer — but it is
+  invisible to the compiler, to clippy, and to the docs gate, which checks links and IDs rather than
+  whether a sentence is still true.
+  979 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

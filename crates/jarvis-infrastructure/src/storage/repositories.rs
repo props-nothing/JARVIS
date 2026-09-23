@@ -40,7 +40,7 @@ use jarvis_domain::ids::{
     ConversationId, MessageId, ModelCallId, ModelRouteDecisionId, PrincipalId, RunActivityEventId,
     RunId, WorkspaceId,
 };
-use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
+use jarvis_domain::model::identity::{ModelId, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, Role};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::{RunState, RunVersion};
@@ -541,8 +541,19 @@ impl RunRepository for SqliteRepositories {
             }
 
             let event = write.event;
-            // The event must belong to the run the transition moves, or the
-            // transaction would commit a state change and an unrelated event.
+            // **The run is identified by the event, and that is a property of the port rather than a
+            // choice here.** `transition` takes a workspace and a `RunWrite`, not a run, and
+            // `RunTransition` carries no run identity — so "the run the transition moves" and "the
+            // run the event describes" are the same value by construction, and a caller that built
+            // the two from different runs could not be detected at this layer. The create path can
+            // state and check the rule (`insert_run` compares the opening event against the run it
+            // is inserting); this path cannot, so the obligation sits with the caller that holds the
+            // `RunRef` — the controller, which builds both from one reference.
+            //
+            // This is recorded because the file used to carry a free `event_matches_run` whose doc
+            // claimed it was "the check the transaction relies on" while nothing called it. The rule
+            // is now stated where it holds and the orphan is gone, rather than a claim standing in
+            // for an enforcement that was never there.
             let run_id = event.run_id.to_string();
             let waiting = write.waiting.as_ref();
 
@@ -1505,16 +1516,14 @@ impl ModelCallRepository for SqliteRepositories {
     }
 }
 
-/// Returns whether `event` belongs to `run`.
-///
-/// A free function rather than inline, so the check the transaction relies on is
-/// separately named and testable.
-#[must_use]
-pub fn event_matches_run(event: &NewActivityEvent, run: RunId) -> bool {
-    event.run_id == run
-}
-
 /// Returns whether `visibility` may be shown to an ordinary client.
+///
+/// A pure predicate over [`EventVisibility`], and it has **no caller**: the client-facing event page
+/// filters in SQL (`visibility = 'public'`) and the in-memory double filters on the variant
+/// directly, which are both stronger than routing either through this function. Kept as the
+/// named statement of what "public" means — the two filter sites are checked against it by
+/// `the_visibility_filter_is_the_public_variant_only`, so a third variant added to
+/// [`EventVisibility`] fails to compile here rather than silently becoming visible.
 #[must_use]
 pub const fn is_client_visible(visibility: EventVisibility) -> bool {
     matches!(visibility, EventVisibility::Public)
@@ -1529,32 +1538,3 @@ mod policy_store;
 
 #[path = "repositories/exception.rs"]
 mod exception_store;
-
-/// Rebuilds a [`ModelRef`] from its stored parts.
-///
-/// Exposed so a caller that only needs the provider/model pair does not have to
-/// construct a [`StoredModelCall`] to get it.
-///
-/// # Errors
-///
-/// Returns [`RepositoryError::Corrupted`] when either part is not a valid name.
-pub fn model_ref_of(
-    provider: &str,
-    model: &str,
-    revision: Option<&str>,
-) -> Result<ModelRef, RepositoryError> {
-    let provider = ProviderId::parse(provider).map_err(|_| RepositoryError::Corrupted {
-        column: "provider_id",
-    })?;
-    let model =
-        ModelId::parse(model).map_err(|_| RepositoryError::Corrupted { column: "model_id" })?;
-    let base = ModelRef::new(provider, model);
-    match revision {
-        Some(value) => Ok(base.with_revision(ModelRevision::parse(value).map_err(|_| {
-            RepositoryError::Corrupted {
-                column: "model_revision",
-            }
-        })?)),
-        None => Ok(base),
-    }
-}

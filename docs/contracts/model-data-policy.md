@@ -395,10 +395,20 @@ to — the same "a reader and no writer" shape as the dead `route_decision_id` c
 `resolve_model`'s roster check catches a withdrawn model before an attempt is made, and the
 adapter's own check catches a roster it disagrees with.
 
-**One limit is recorded rather than fixed.** `AuthenticatedClient` hardcodes
-`AuthenticationAssurance::Standard`, so **no HTTP client can ever be Elevated** and a step-up
-exception is un-grantable over the wire — that needs a step-up challenge and an owner decision
-rather than a code change.
+**One limit is recorded rather than fixed.** No HTTP route grants an exception, so the whole
+exception lifecycle is reachable only from a caller inside the process — the contract's API section
+names three policy endpoints and none of them is a grant. The step-up rule itself is now decided
+from the assurance the caller **proved**: `PolicyService::grant_exception` reads it from
+`RequestContext::assurance`, which the server resolves from the credential, rather than from a field
+on the request. It previously took a `granting_assurance` field documented as "supplied by the HTTP
+layer from the authenticated client", which was a promise nothing kept — there is no such layer, and
+the assurance already sits on the context beside the principal it belongs to. A separate copy is the
+shape the security rules forbid for identity, and it would have made the step-up rule decided by
+whoever filled in the request. A caller that proved no identity is now refused with
+`auth.credential_rejected`, because a grant is accountable to a principal and an anonymous caller is
+not one; a caller that proved an identity but not at the required level gets
+`model.exception_required` with `403`. **Adding the route needs a step-up challenge and an owner
+decision, not a code change.**
 
 **An absent ceiling is not a permissive one.** A run created in a workspace with no policy
 records **no** policy and no ceiling, and the controller then holds nothing back while the

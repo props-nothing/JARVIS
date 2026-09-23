@@ -421,6 +421,15 @@ impl<'a> RunWrite<'a> {
     /// because a `completed` run's stale `error_code` would describe a failure that did not
     /// happen, and a retried run that failed once must not keep reporting that failure after it
     /// succeeds. That reliance is why the rule is asserted here rather than left to each caller.
+    ///
+    /// **The event's run is deliberately not checked here, and cannot be.**
+    /// [`RunTransition`](jarvis_domain::run::lifecycle::RunTransition) carries no run identity at
+    /// all — only the two states, the expected version, the actor, the reason, and the instant — so
+    /// there is nothing on this type to compare "the run the transition moves" against. The rule
+    /// belongs to the layer that knows the run, and it lives there: the adapter checks the opening
+    /// event in `insert_run` and the transitioning event in `transition`, because the run is a
+    /// parameter of both. Asserting it here would require adding a run field to the transition,
+    /// which is a domain change rather than a validation one.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
         self.transition.to.is_waiting() == self.waiting.is_some()

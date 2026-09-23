@@ -12,7 +12,7 @@
 //! attempt, a foreign workspace, and a terminal run are all *refused*, and that a
 //! refusal changed nothing.
 
-use super::SqliteRepositories;
+use super::{SqliteRepositories, is_client_visible};
 use jarvis_application::repository::RepositoryError;
 use jarvis_application::repository::conversation::{
     ConversationRepository as _, NewConversation, NewMessage,
@@ -1454,6 +1454,68 @@ async fn a_run_records_the_runtime_that_executed_it() {
         .await
         .expect("the run loads");
     assert_eq!(stored.runtime, Some(runtime));
+}
+
+#[tokio::test]
+async fn the_visibility_filter_is_the_public_variant_only() {
+    // `is_client_visible` is the *statement* of what "public" means, but it has no caller: the
+    // client-facing event page filters in SQL (`visibility = 'public'`) and the in-memory double
+    // filters on the variant directly, and both of those are stronger than routing either one
+    // through this function. That leaves the predicate as documentation — unless it is held to the
+    // two filter sites, which is what this test does.
+    //
+    // The risk it closes is a third variant: a `Team` or `Internal` visibility added to the enum
+    // would compile here (the `matches!` still returns false for it, correctly) while the SQL string
+    // literal in the page query says `'public'` and would silently *exclude* the new variant from
+    // every read — a filter that looks right and quietly means something else. Enumerating the
+    // variants here means an addition fails to compile in this test rather than in production.
+    for (visibility, visible) in [
+        (EventVisibility::Public, true),
+        (EventVisibility::Operator, false),
+    ] {
+        assert_eq!(
+            is_client_visible(visibility),
+            visible,
+            "{visibility:?} must be {visible} to a client",
+        );
+        // And the stored spelling is what the SQL literal must match, so the two are tied together
+        // rather than the query carrying a hand-written string that could drift.
+        let stored = visibility.as_str();
+        if visible {
+            assert_eq!(stored, "public", "the SQL filter names this spelling");
+        } else {
+            assert_ne!(
+                stored, "public",
+                "the SQL filter must not match this spelling"
+            );
+        }
+    }
+
+    // The behaviour, not only the predicate: an operator-only event must not appear in a client's
+    // page. Asserted through the real adapter because that is where the SQL literal lives.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    let mut hidden = event(run_id(), 2, "run.operator_only");
+    hidden.visibility = EventVisibility::Operator;
+    repositories
+        .append_event(workspace(), hidden)
+        .await
+        .expect("the operator event is appended");
+
+    // The append *succeeded*, which is the evidence the row was written: the adapter reports a
+    // sequence collision or a missing run as a typed conflict, so a page with no operator event
+    // above is the filter doing the work rather than a failed write.
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 50)
+        .await
+        .expect("the page loads");
+    assert!(
+        page.events
+            .iter()
+            .all(|stored| stored.visibility == EventVisibility::Public),
+        "a client page must carry no operator event: {:?}",
+        page.events,
+    );
 }
 
 #[tokio::test]

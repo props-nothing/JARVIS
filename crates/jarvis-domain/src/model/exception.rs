@@ -47,14 +47,14 @@ use crate::time::UtcTimestamp;
 /// Declared here rather than imported from `jarvis-application` because the dependency runs
 /// application -> domain and the ordering means the domain cannot name it.
 ///
-/// **No mapping exists yet, and this type currently has no producer above the domain.** A route
-/// to grant an exception over HTTP does not exist, `PolicyService::grant_exception` takes this
-/// value directly from its caller, and `AuthenticatedClient` hardcodes
-/// `AuthenticationAssurance::Standard` — so no HTTP client can ever be `Elevated`, and every
-/// step-up grant is un-grantable over the wire. Recording the absence rather than an intended
-/// mapping: a doc comment claiming a boundary translation that nothing performs is the same
-/// shape as a column with no writer, and it reads as coverage until somebody greps for the
-/// function.
+/// **No HTTP route grants an exception**, so this value has no producer above
+/// `PolicyService::grant_exception`: the contract's API section names three policy endpoints and
+/// none of them is a grant, and `BRN-013` records that as the outstanding gap. The service derives
+/// it from the assurance the caller **proved** — `RequestContext::assurance`, which the server
+/// resolves from the credential — rather than from anything a request can state, because a
+/// caller-supplied assurance would let whoever filled in the body choose the step-up rule. An
+/// [`AuthenticationAssurance::Guest`] context is refused rather than treated as standard, since a
+/// grant is accountable to a principal and an anonymous caller is not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequiredAssurance {
@@ -403,6 +403,12 @@ impl PolicyException {
     /// refusal is at grant time because the alternative — issuing a grant that records an elevated
     /// requirement while the principal was only standard — would store a record whose own field says
     /// it should not exist.
+    ///
+    /// **Where that value comes from is the whole of the rule**, so it is stated here: the caller of
+    /// this constructor must pass the assurance **the principal proved**, never one it was told. The
+    /// application layer takes it from `RequestContext::assurance`, which is server-resolved, so a
+    /// request body cannot choose it. A constructor that accepted "the assurance required" would make
+    /// the check below compare a value against itself.
     ///
     /// # Errors
     ///
