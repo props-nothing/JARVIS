@@ -43,7 +43,7 @@ pub enum RecoveryAction {
     ///
     /// No work is lost, because a parked run was not doing anything: its durable state
     /// says what it waits for. This slice records the classification but does not
-    /// resume it — see [`docs/architecture/agent-runtime.md`] on waits being
+    /// resume it — see `docs/architecture/agent-runtime.md` on waits being
     /// first-class — because nothing here can satisfy a dependency yet.
     Resumable {
         /// The state it was parked in, which is what a resuming caller must know.

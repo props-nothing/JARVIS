@@ -70,12 +70,20 @@ pub const CURRENT_VERSION_FILE: &str = "current.version";
 /// The maximum accepted version length.
 pub const MAX_VERSION_LEN: usize = 64;
 
-/// The maximum number of version directories a caller should keep reachable.
-///
-/// Pruning is for reclaiming disk space, not for destroying every path back to a
-/// working state, so a caller should never reduce the versions root to the active
-/// version alone.
-pub const MAX_RETAINED_VERSIONS: usize = 8;
+// **There is deliberately no upper bound on how many version directories may exist.** A
+// `MAX_RETAINED_VERSIONS = 8` used to be declared here, was referenced by no code, and could not be
+// enforced by anything: `plan_prune` removes **one named version** and refuses the active one and
+// the recorded rollback target, so it has no way to say "too many — drop the oldest". A count bound
+// needs a bulk-prune operation, and none exists (the CLI has `status`, `update`, `rollback`, and
+// `uninstall`, which is also what `FND-012` records).
+//
+// The safety property the constant gestured at is real and is enforced structurally instead, by the
+// two per-version refusals: a prune pass over every installed version can never remove the active
+// one or the rollback target, so it cannot remove every path back to a working state. That is
+// asserted by `the_active_version_and_the_rollback_target_are_never_pruned` and
+// `a_prune_all_never_removes_every_path_back_to_a_working_version`. Deleting the constant rather
+// than wiring it to a fabricated consumer keeps "a declared bound is coverage" from being true by
+// accident — the class this project has already found four times.
 
 /// The prefix applied to every version directory name.
 pub const VERSION_PREFIX: &str = "v";

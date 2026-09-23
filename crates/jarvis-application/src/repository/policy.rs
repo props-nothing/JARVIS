@@ -206,7 +206,7 @@ pub trait ModelDataPolicyRepository: Send + Sync {
     /// Returns [`RepositoryError::Conflict`] when the identity already exists, and
     /// [`RepositoryError::Query`] for a driver failure. The record's own rules — a waivable rule,
     /// a bounded reason, a step-up requirement that was met — are enforced by
-    /// [`PolicyException::grant`], so this method cannot be handed an invalid one; a record read
+    /// [`JarvisPolicyException::grant`], so this method cannot be handed an invalid one; a record read
     /// from a database written by another build is re-validated on the way out instead.
     fn grant_exception(
         &self,

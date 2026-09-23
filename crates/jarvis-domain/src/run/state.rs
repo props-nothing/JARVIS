@@ -23,8 +23,18 @@ pub const MAX_REASON_BYTES: usize = 256;
 
 /// Where a run is in its lifecycle.
 ///
-/// The full controller state set. Clients see [`WireRunState`] instead, because the
-/// local control API deliberately exposes fewer states than the controller tracks.
+/// The full controller state set. Clients see the coarser set on `RunView.state` instead —
+/// produced by `jarvis_infrastructure::http::runs::wire_state` from the constants in
+/// `jarvis_protocol::run::run_state` — because the local control API deliberately exposes
+/// fewer states than the controller tracks.
+///
+/// This line used to name a `WireRunState` type that **does not exist anywhere in the
+/// workspace**. The reference was never checked: rustdoc's `broken_intra_doc_links` is a
+/// warning by default and this project did not deny it, so a doc comment pointing a reader at
+/// a type nobody had written read exactly like one that resolved. It is the same class of
+/// defect as a doc comment claiming a caller for a function none calls, and it is fixed by
+/// naming where the projection actually lives rather than by inventing the type the sentence
+/// assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {

@@ -277,10 +277,30 @@ does not select one.
   parses and displays as `2024-06-19T19:22:45Z`. `Timestamp` is
   nanosecond-precision and cannot represent leap seconds: a parsed second of
   `60` is constrained to `59`.
+- **The rendered form varies in width and does not sort chronologically; `Z` is not the whole
+  story.** `Z` fixes the *offset*, not the *length*, and only non-zero fractional digits are
+  rendered: `2026-09-20T12:00:00.000Z` and `2026-09-20T12:00:00Z` produce the identical string
+  `2026-09-20T12:00:00Z` (measured — `jiff` omits zero fraction digits rather than padding), while
+  `2026-09-20T12:00:00.123456789Z` renders at 30 characters. Because `.` (`0x2E`) sorts before `Z`
+  (`0x5A`), the canonical strings **order wrongly as text**: `12:00:00.1Z` < `12:00:00Z`
+  byte-wise though it is the later instant, so a `TEXT` `ORDER BY`, `<`, or `<=` on a timestamp
+  column is not chronological. `jiff::Timestamp`'s own `Ord` is correct, so ordering belongs on the
+  value. Two claims that relied on fixed width or on text agreement were wrong and are now stated
+  narrowly: `UtcTimestamp`'s doc said the value "has exactly one string form" (there is exactly
+  one canonical string per instant, but not a fixed width, and the string is not order-preserving),
+  and `storage::lock::acquire` compared `expires_at <= ?` as TEXT for a lease check. That module
+  was deleted as uncalled, so no current code path depends on it — the defect was latent, not
+  active — but the rule is now written in `docs/contracts/common-conventions.md` and asserted by
+  `jarvis-domain`'s `the_canonical_forms_of_one_instant_are_equal_while_their_text_order_is_not`
+  rather than left to a doc comment.
 - `Timestamp::now()` panics on an unreasonable system clock and is not used in
   library code. `jarvis-infrastructure` provides a `SystemClock` that reads the
   OS clock fallibly (`SystemTime` plus `TryFrom<SystemTime>`) and surfaces the
-  domain error instead of panicking.
+  domain error instead of panicking. **This claim was false when written and is true now.**
+  `storage::lock::acquire` called `Timestamp::now().to_string()` — the workspace's only such call —
+  which contradicted a doc comment in the very same file naming `Timestamp::now()` as the thing
+  this project avoids. The module had no caller and was deleted; a grep for `Timestamp::now()`
+  now finds only that comment.
 - Domain library errors are `thiserror` 2.0.20 enums. Each variant carries a
   stable namespaced code (for example `jarvis.invalid_timestamp`) and a
   `retryable` flag describing this operation, not the error class in every
@@ -330,13 +350,42 @@ does not select one.
   path source. Failure to resolve a home/profile is explicit, never replaced by
   the current directory.
 - Mutable database/runtime/log data uses local, non-roaming paths on Windows.
-  User-edited config may use the platform config path. Tests assert the exact
-  resolved table on each native OS.
+  User-edited config may use the platform config path.
+  - **This rule was violated by the code that cited it.** `ProfilePaths::standard`
+    used `ProjectDirs::data_dir()`, which is `{FOLDERID_RoamingAppData}` on
+    Windows, while this note, `docs/architecture/process-topology.md`, and a
+    comment in `paths.rs` all stated that durable data is local. A roaming
+    profile is copied between machines at logon and, on a slow-link profile,
+    synced through a temporary offline store — so a live SQLite file with its
+    `-wal` and `-shm` siblings would travel, and a database opened on two
+    machines with a mid-flight write-ahead log is corrupt. The durable data root
+    is now `ProjectDirs::data_local_dir()`.
+  - **The check that would have caught it is now the cheap one:** a test compares
+    `data_dir()` against `data_local_dir()` directly. Asserting a literal like
+    `AppData\Local` would have been Windows-only, and this suite already runs on
+    Windows — the platform whose answer was wrong — so a host-specific literal is
+    exactly the assertion that cannot see this class. Two accessors of one API
+    distinguish the two answers on the one platform that has two.
+- **The claim "tests assert the exact resolved table on each native OS" was
+  removed, because it was false** — and it is the kind of false claim that
+  suppresses the work: a reader who trusted it would not check the table, and
+  two of the table's five rows named paths this build has never produced (`OS
+  local cache/Jarvis`, and logs at `~/Library/Logs` / `$XDG_STATE_HOME`). What is
+  asserted instead is the **relational** structure that holds on every platform:
+  the durable-data row equals the local accessor, and the database, logs, and
+  runtime live under the data root while the cache does not. Both are checkable
+  from any host.
 - Unix directories are created owner-only and files are created with mode
-  `0o600`, accounting for `umask`; permissions are queried back. Windows uses
-  an owner/system-only DACL and queries it back before publishing discovery or
-  credential material. The exact Windows binding must be reviewed with the
-  manifest change that introduces it.
+  `0o600`, accounting for `umask`; permissions are queried back. On Windows this
+  build creates the directory and **queries nothing back**: the earlier claim
+  here that Windows "uses an owner/system-only DACL and queries it back before
+  publishing discovery or credential material" described enforcement that does
+  not exist, and contradicted the bullet above it. `verify_directory_permissions`
+  is Unix-only, and the non-Unix `create_dir_owner_only` is a bare
+  `fs::create_dir_all` whose own comment says the Known Folder's inherited ACL is
+  the only protection. That is a real, bounded gap — it is the deferred DACL work,
+  and the honest statement is the narrow one: containment under a Known Folder is
+  enforced and asserted, and the ACL is inherited rather than verified.
 - Single-instance ownership uses a held writable file handle and
   `try_lock()`. A lock file's contents are diagnostic only; PID text never
   proves ownership. A stale unlocked file is repairable.

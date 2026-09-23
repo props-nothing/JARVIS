@@ -371,7 +371,14 @@ Dependencies: all Milestone 0 exit criteria.
   depends on `OWN-001` through `OWN-005`.
   Evidence (PARTIAL): install, update, rollback, prune, and uninstall now exist as
   `jarvis_infrastructure::install` with a plan-first CLI (`jarvis install
-  status|update|rollback|uninstall`). The install root and the user profile are
+  status|update|rollback|uninstall`). **`plan_prune` exists but has no CLI subcommand**, and the
+  sentence above listed it beside a subcommand list that omits it — corrected rather than left,
+  because "prune exists with a CLI" is how a reviewer concludes `MAX_RETAINED_VERSIONS` is
+  enforced somewhere. It was not: the constant was referenced by nothing, and could not be, since
+  `plan_prune` removes one named version and has no way to say "too many — drop the oldest". It was
+  deleted in `BRN-031`; the safety property it gestured at (a bulk prune can never remove every
+  path back to a working state) is enforced by the two per-version refusals and asserted directly.
+  The install root and the user profile are
   **separate roots**, and every operation refuses a path inside the profile, so
   "uninstall retains user data" is structural rather than intended: removing
   versioned program directories cannot reach the database. A version becomes
@@ -862,7 +869,12 @@ Foundation TODO remains incomplete.
   boundary** — `wire_state` collapses twelve domain states onto the contract's seven,
   which is what `BRN-005` deferred here because the architecture forbids domain states
   doubling as UI strings; a test asserts it is both total and coarser, and that the three
-  terminal states stay one-to-one. **The authenticated identity is an extractor** —
+  terminal states stay one-to-one. (**`BRN-035` corrected this paragraph's implication:** "asserts it
+  is total and coarser" was accurate but read as though the *values* were checked, and they
+  were not — the covering test compared the count of distinct wire states, so renaming one arm
+  passed. The seven names now live in `jarvis_protocol::run::run_state` and a contract test
+  compares the set against the document in both directions.) **The authenticated identity is an
+  extractor** —
   `AuthenticatedClient` is a `FromRequestParts` implementation, so a handler that lacks a
   credential cannot run, which makes "this route requires authentication" a property of
   its signature rather than a middleware promise in another file, and a test asserts all
@@ -2034,6 +2046,429 @@ Foundation TODO remains incomplete.
     `auth.credential_rejected` unlisted; and isolating the other direction, a table row for
     `auth.invalid` fails with `auth.invalid must not be a listed code`.
   986 workspace tests. Both doc gates green. **DO NOT COMMIT.**
+- [x] `BRN-028` Test the authentication cases the contract claims, and stop claiming a control it does
+  not have. Found by reading the contract's own authentication section against `RegisteredClient`.
+  - **A stored field that cannot exist.** The contract said the daemon stores "a one-way verifier,
+    client ID, creation time, **scopes**, and revocation state" and that authentication "reject[s]
+    credentials from another profile, revoked clients, and **unknown scopes**". `RegisteredClient`
+    has four fields and `enroll_owner_client` constructs all four; **there is no scope anywhere in
+    the repository's auth code**, and `identity-workspaces.md` places scoped sessions in later work
+    ("exchanged for a scoped session") — which this contract already says requires a separate
+    device-enrollment contract. So both sentences described a control that does not exist, and a
+    client or reviewer would read them as current. Corrected to state that the credential is
+    **owner-wide and carries no grants**, with the scoped-session model explicitly deferred.
+  - **An evidence claim wider than its tests.** The Milestone 1 note said test 2's four cases —
+    "missing, malformed, wrong-profile, and revoked" — were covered. Two were: the
+    indistinguishability test compared missing against a **wrong but well-formed** token (the good
+    token with one character appended), and a separate test covered revocation. **Malformed and
+    another-profile were untested while being asserted as covered.**
+  - **Why those two were worth driving rather than inferring:** they take a different internal path.
+    A malformed credential fails while **decoding, before any comparison**, so `verify` returns
+    `CredentialError::Malformed` — a *different variant* from the `Rejected` every other case
+    produces. And another profile's credential is well-formed and hashes correctly; it is simply
+    unknown to this daemon, which is the case the "another profile" rule exists for and the one a
+    hostile local user would actually present. New
+    `a_malformed_or_foreign_credential_is_indistinguishable_from_a_missing_one` drives both against
+    the no-credential response, since that is the response a caller can already produce and the one
+    indistinguishability must be *from*.
+  - **The handler test could not carry the malformed case on its own, and that shaped the fix.**
+    `require_authentication` maps *any* `CredentialError` to one response, so a mutation that
+    propagates the variant leaks through the **body** while the handler test's body-equality still
+    holds. `ClientRegistry::authenticate`'s doc states the collapse ("unknown, malformed, and revoked
+    credentials all produce this same value"), so the assertion now lives where the collapse happens:
+    `a_malformed_credential_collapses_to_the_same_rejection_as_a_stranger` asserts the **code** over
+    four malformed spellings plus a foreign credential.
+  - **Falsified twice, and the second mutation was the discriminating one.** Propagating the error at
+    the middleware fails the equality test *and* the new one, but only on the body — which is the
+    weaker signal. Propagating it at the **registry** leaks `jarvis.credential_malformed` and fails
+    **only the targeted test**, with the handler equality staying green — exactly the discrimination
+    that shows the two assertions cover different layers.
+  988 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-029` Reconcile the local control API's endpoint list, its capability list, and the create
+  response with the route table. Found by reading the contract's "Public Endpoints" block against the
+  router, then following each concrete claim beside it. **Three defects, and the third is a test
+  defect that made the second invisible.**
+  - **A `PUT` the endpoint list never named.** The block listed seven routes; the router serves
+    **ten**. `GET`/`PUT /api/v1/model-data-policy` and `GET /api/v1/model-data-policy/effective` were
+    absent from the one section whose purpose is to enumerate the surface. A client reading only this
+    contract could not discover them, and a reviewer checking the surface against the document would
+    find the document short rather than the code. All three now appear, with a note that their
+    request/response shapes are owned by `model-data-policy.md`.
+  - **A `Location` header the contract promised and the daemon never sent.** The create step said
+    "Successful creation returns `202 Accepted`, a `Location` header, and: …", and
+    `created_response` built only a body. A `202` without `Location` gives a client a status it can
+    see and no way to address what it created, so every client would build the path from the id —
+    which is how two clients come to disagree about a URL the daemon owns. Now emitted from the same
+    builder as `links.self`, so the header and the body cannot name different resources.
+  - **A capability list that had drifted in both directions at once, hidden by a test whose name
+    claimed the check it did not make.** The contract's status example advertised
+    `runs.create/read/cancel/events` while the daemon advertised **only `system.status`** — so a
+    client reading the example would call an operation the daemon never advertised, and a client
+    reading the daemon would not learn the run routes exist. The protocol test was named
+    `the_status_example_names_the_capabilities_the_daemon_actually_serves` and its comment said "the
+    daemon's own route table must agree", **but it only read the contract's example and compared it
+    to a literal list** — the document against itself. It could never see the daemon, and
+    `jarvis-protocol` cannot: it does not depend on `jarvis-infrastructure`.
+    **A test that states a property in its name and checks a weaker one is worse than an absent
+    test, because the name is what a reviewer trusts instead of verifying.** The daemon half now
+    lives in `jarvis-infrastructure::http`'s
+    `the_advertised_capabilities_cover_every_routed_operation`, beside the router; the protocol test
+    is renamed to what it actually does and keeps the document-vs-protocol check.
+  - The advertised set is now `SYSTEM_CAPABILITIES` (seven entries) rather than a literal inside the
+    handler, so a route added without its capability is a test failure instead of an omission a
+    client discovers by probing. The contract documents the field as **advertised, not
+    authoritative** — it is not consulted before serving a route, so it can grant nothing.
+  - **Falsified four ways, each compiling:** omitting the header fails
+    `a_create_names_the_created_resource_in_a_location_header`; setting `Location` to the *events*
+    path fails on the header/body comparison with both values shown; shrinking the advertised set to
+    `system.status` fails naming `runs.create` and its route. A fourth mutation that rebuilt the
+    path with `format!` **survived, and that is correct** — it produces the identical string, so it
+    is behaviourally equivalent rather than a defect. Recorded because a surviving mutation needs a
+    reason, not a reflex.
+  - **Journey A extended to read response headers**, which it could not before: the `request` helper
+    exposed only status and body, so the header half of a contract was unobservable end to end. It
+    now asserts `Location == links.self` against the **real daemon**, which is the only evidence that
+    the header survives serialization.
+  990 workspace tests. Both doc gates green. **DO NOT COMMIT.**
+- [x] `BRN-030` Make startup recovery reach **every** interrupted run, and make a bounded read say so.
+  Found by applying the previous round's technique — a test whose name claims a cross-check its body
+  cannot perform — and then following the claim it hid.
+  - **The test-shaped defect first:** `the_double_enforces_scope_like_the_real_adapter` claimed in its
+    name to compare the test double against the SQLite adapter. It cannot: `jarvis-application` does
+    not depend on `jarvis-infrastructure`, so the test drove the double and asserted against the
+    double. Renamed to what it does. The same sweep found **nine comment claims of parity** inside
+    `testing.rs` ("matching the adapter's ordering", "the adapter's unconditional bind") — each a
+    claim the crate cannot check. Those comments are how the real defect below stayed invisible.
+  - **The real defect, found by checking one of those claims.** `testing.rs` said its
+    `incomplete_runs` was "matching the adapter's ordering" — and the adapter had
+    `LIMIT MAX_INCOMPLETE_RUNS` while the double returned **everything**. A double that enforces
+    *less* than its adapter is the dangerous direction: a test passes against behaviour the
+    production store never produces.
+  - **What the divergence was hiding is the point.** The adapter's bound is a *page size*, and
+    `reconcile` read **one** page and stopped. Interrupted runs are ordered **oldest-first**, so the
+    runs a single page leaves behind are the **newest** — and they stay non-terminal on that restart
+    and every later one, because each pass recovers the same oldest page and reports success. A
+    profile with more than 500 interrupted runs silently never recovers the most recent ones, which
+    is the exact state this whole pass exists to prevent. The bound read as a memory optimisation and
+    was in fact a correctness hole.
+  - **Two further consequences, both invisible from the bound alone.** `is_complete` was
+    `failures.is_empty()` — so a truncated read reported as a clean pass. It is now the conjunction
+    with a new `incomplete_store` fact, because "no write failed" is not "no run was left". And
+    `start` now **fails** on `incomplete_store` rather than logging a count, since readiness is
+    defined as classification having completed.
+  - **Design change: the read reports its own boundedness.** `incomplete_runs` returns a new
+    `RecoveryPage { runs, bounded }`, and the adapter reads **one past** the bound so `bounded` is
+    observed rather than inferred from `len() == MAX` — an inference that would silently become
+    wrong if the bound moved, and that a store returning exactly its limit would satisfy. The double
+    now enforces the same bound.
+  - **The loop had to be able to conclude as well as continue**, and the reason is specific: a
+    refused write leaves its run in the state the read looks for, so a full page that settled
+    **nothing** would be re-read for ever — on the startup path. That judgement is now a pure
+    function, `page_outcome(bounded, settled) -> Drained | More | Stalled`, because a wrong
+    `continue` hangs and a wrong `break` strands runs; the pure function is the only way to assert
+    both without one of them hanging the suite.
+  - **A test-harness lesson worth recording.** Reversing the loop's stall branch was caught — but as
+    a **hang that ran for ever**, not as a failing assertion, because the fixture's future resolved
+    on first poll and `tokio::time::timeout` **cannot preempt a future that never awaits** on a
+    current-thread runtime. Adding one `yield_now()` to the refusing fixture turned the same mutation
+    into a clean 10-second `Elapsed(())` with a message naming the defect. Killing the hung run also
+    left a stray test binary, which is what `BRN-008` recorded breaking the *next* build.
+  - **Falsified two ways, each compiling:** reverting to a single-page read fails
+    `recovery_drains_a_store_holding_more_than_one_page` with `abandoned: 500` against `503` — three
+    runs stranded, exactly the shape of the production bug; and continuing on a stalled page fails
+    `a_page_that_settles_nothing_...` with `Elapsed(())`.
+  - Also fixed: the recovery read returning `RecoveryPage` rather than a bare `Vec` at **every** call
+    site (adapter tests, the recovery tests, the daemon), and `MAX_INCOMPLETE_RUNS`'s doc, which now
+    says why a bound here is a page size and not a total.
+  993 workspace tests. Both doc gates + `--changed-file` green. **DO NOT COMMIT.**
+- [x] `BRN-031` Collapse the duplicated default deadline, and delete a bound nothing could enforce.
+  Found by the standing `MAX_*`/`DEFAULT_*` sweep, which listed every such constant with two or fewer
+  references. **Three findings, one class: a value that exists in two places, or in one place it
+  cannot act.**
+  - **The same default, declared twice.** `jarvis_domain::run::budget::DEFAULT_RUN_DEADLINE_MS` and
+    `jarvis_application::run_service::DEFAULT_RUN_BUDGET_MS` were both `900_000` with **nothing
+    comparing them**, and the domain's copy had no production caller — so the *documented* default
+    was one the daemon never used. Editing either alone would have left the default written to a
+    run's budget disagreeing with the default the domain publishes, and no test could see it: each
+    crate asserted its constant against its own `900_000` literal, which is the number written twice
+    rather than an agreement. Collapsed with `pub use … as DEFAULT_RUN_BUDGET_MS`, so the value has
+    one definition and every caller's spelling is unchanged. The alias is honest because
+    `jarvis-application` may depend on `jarvis-domain` and does.
+  - **A claimed agreement test that does not exist.** `MAX_OBJECTIVE_BYTES`'s doc said "a test in
+    the daemon asserts the two agree" with `jarvis_protocol::run::MAX_RUN_INPUT_BYTES`. The daemon's
+    only test checks profile source names, and **nothing anywhere compares the two** — nor can it
+    from either crate: `jarvis-application` cannot depend on `jarvis-protocol`, and vice versa for
+    the service's constant. The comparison now lives in `jarvis-infrastructure`, which depends on
+    both: `the_objective_bound_is_the_one_the_wire_bound_enforces`. The failure it prevents is
+    asymmetric and quiet — raising the wire bound alone would let the handler accept text the
+    service then refuses with `422`, telling a caller its body was too long by a route that had
+    already agreed to take it.
+  - **A bound nothing could enforce.** `MAX_RETAINED_VERSIONS = 8` was referenced by **no code, no
+    test, and no document**. It could not have a consumer: `plan_prune` removes one named version
+    and refuses the active one and the rollback target, so there is no operation that could say "too
+    many — drop the oldest", and the CLI has no prune subcommand. Deleted, with the reasoning
+    recorded in place, because the safety property it gestured at is real and **is** enforced —
+    structurally, by those two per-version refusals, and asserted by
+    `the_active_version_and_the_rollback_target_are_never_pruned` and
+    `a_prune_all_never_removes_every_path_back_to_a_working_version`. That is the fourth time this
+    project has found "a declared bound read as coverage"; here the honest fix was removal, not
+    wiring it to a fabricated consumer.
+  - **Corrected a `TODO.md` claim that made the third finding look covered:** `FND-012` listed prune
+    beside a CLI subcommand list that omits it, which is how a reviewer concludes the bound is
+    enforced somewhere.
+  - **Falsified (compiling):** raising `MAX_RUN_INPUT_BYTES` to 64 KiB fails the new agreement test
+    with `left: 65536, right: 32768`. The alias needs no mutation — it is one definition, so there
+    is nothing left to disagree.
+  994 workspace tests — **one** new test, and this line said 996 for a while. Corrected, because the
+  count is the kind of claim that gets read as evidence: I had written "+3" from the number of
+  *findings* rather than the number of tests, and the two crates' own suites already covered the
+  alias and the deletion (nothing to test — one has no second copy left and the other is gone).
+  Both doc gates + `--changed-file` green. **DO NOT COMMIT.**
+- [x] `BRN-032` Sweep public functions for the ones a doc comment claims a caller for and none calls.
+  Found by counting every `pub fn`'s references — technique (3) — and reading the doc comment of each
+  one whose only reference was its own definition. **Three dead functions, and the class is why they
+  survived: a doc comment saying "so a caller can…" is a claim nothing checks.**
+  - **`no_context_manifest()`** returned `None` for a run's `agent_runs.context_manifest_id`, with a
+    doc saying "a caller that needs a manifest id now uses this so the field's absence is explicit
+    rather than a hardcoded string appearing in two places later". **No caller existed** — not in
+    production, not in a test, not in a doc — and it was `#[must_use]`, which is the tell: it
+    marked itself as something a caller ought to heed while nothing heeded it. Deleted. When a
+    manifest is genuinely persisted the `Option` belongs on the read of a stored run, not in a free
+    function returning a constant.
+  - **`SupportBundle::total_bytes()`** summed the included members' lengths, and the CLI prints the
+    **archive** size from `export_bundle`'s outcome instead. A second size computation beside the
+    real one is worse than an unused getter: it is the one a later reader reaches for when adding a
+    "bundle size" line, and it would then disagree with what is printed for any bundle whose members
+    compress. (This project writes stored entries, so the two agree *today* — exactly the
+    coincidence that would keep a wrong implementation alive.) Deleted; `files()` stays, because the
+    preview's own test reads it.
+  - **`redacted_log_bytes(path, redactor)`** wrapped `read_log_tail` + `redact_text` for "a caller
+    that already knows its source". No caller. **Checked before deleting rather than after:** the
+    bundle path redacts log members itself (`BundleSource::LogTail => read_log_tail(item)`, then
+    `redact_text`), so this was a second entry point to one guarantee, not the guarantee. The
+    `clean-machine-smoke` canary — plant a real credential in a real log, export, assert the archive
+    omits it — still passes, which is the independent evidence that no redaction path was lost.
+  - **Falsification here is the compiler plus three journeys** rather than a mutation: deleting a
+    function nothing calls cannot be shown to break a test, so the honest evidence is that the
+    workspace builds, all suites pass, and the canary still reports "the exported archive omits the
+    planted credential". Claiming a mutation would have been theatre.
+  - **Also corrected my own previous `TODO` note:** `BRN-031` said 996 workspace tests; the real
+    total was 994, and its one new test brought 993 → 994. I had written "+3" from the number of
+    *findings* rather than tests. **A self-authored count is read as evidence downstream, which is
+    why it is worth re-deriving instead of continuing the sequence.**
+  994 workspace tests (unchanged — this round deletes code and adds no test). Both doc gates green;
+  all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-033` Verify the schema-compatibility refusals the migrations table specifies. Found by
+  reading `docs/data/migrations.md`'s startup-behaviour table as a checklist — the technique that
+  found `BRN-021` — and asking which rows have evidence. **Three of five had none**, while the table
+  reads as a specification of behaviour a reader would take as implemented.
+  - **`DB newer than binary | Refuse writes/start, preserve state, explain update`.** Both halves
+    were unverified: `StorageError::SchemaTooNew` is produced by `read_compatibility` and the daemon
+    maps it to `StartupError::Storage`, but nothing drove a `start` into it. New
+    `a_database_written_by_a_newer_binary_is_refused_and_left_untouched` seeds a database whose
+    compatibility record names a future version, then asserts the refusal **and** that the record
+    still names the future version — the second is what makes "preserve state" true, since a refusal
+    that helpfully downgraded the record would leave the database claiming to be older than it is.
+    Also asserts the message names the remedy, that the failure is not retryable, that discovery was
+    not published, and that the lock was released so the operator can fix the binary and retry.
+  - **`Checksum mismatch | Refuse readiness; require diagnosis`.** `run`'s own doc calls this out as
+    why it does not pass `set_ignore_missing`, and nothing tested it. New
+    `a_checksum_mismatch_is_refused_rather_than_applied_over` corrupts the recorded checksum of an
+    applied migration (bytes flipped, not the row deleted — a missing row reads as "not applied" and
+    would take the ordinary path) and asserts `jarvis.db_migrate`, not retryable.
+  - **Two rows are left `not implemented` in the table rather than given a test.** `start` migrates
+    unconditionally, so there is no branch for "explicit approval required" or "repair-required" to
+    take — and a test of behaviour that does not exist is exactly the false evidence the column
+    exists to prevent. **A table of states with no way to tell which are real is how a reader
+    concludes a control exists.**
+  - **A stale doc on the constant every reader checks:** `TARGET_SCHEMA_VERSION` said "Bumped to `3`
+    by `000003_idempotency.sql`" while reading `5` — two migrations had been added without
+    revisiting the sentence. A migration that forgets to bump the constant fails a test; a *doc*
+    that forgets is silent. The doc now carries a version → migration table so the next omission is
+    visible in review rather than in a downgrade.
+  - **`has_pending`'s doc claimed a caller that does not exist** — "this is what lets startup decide
+    between 'migrate safely' and 'report readiness false' **before it changes anything**", which
+    `start` does not do (it migrates, then reads compatibility). Corrected to describe the intent as
+    intent, keeping the function for what it actually is: the honest way for a test to read migration
+    state without applying anything.
+  - **Falsification, and one mutation that proved nothing.** Reversing the daemon's check order
+    (compatibility before migration) is caught by seven *other* daemon tests, and by mine not at all —
+    it still refuses. I recorded that rather than claiming credit for it. The mutation I wanted for
+    the preserve-state assertion could not be expressed: placing the write after
+    `read_compatibility` leaves it unreachable behind the early return, so the mutant never runs —
+    a *mutation* error, not a test gap, and re-running it until it "passed" would have been a false
+    result. Checked sqlx's own source to be sure of what I was asserting: the checksum comparison is
+    **not** gated by `ignore_missing` (which short-circuits only the version-missing check), so the
+    refusal my test drives cannot be disabled that way.
+  996 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-034` Put the durable database in the **local** data directory, not the roaming one. Found
+  by reading `docs/architecture/process-topology.md`'s platform-path table — the technique that
+  found `BRN-033` — and checking each row against the pinned path crate instead of against the other
+  docs. **A real data-integrity defect, in the one line that decided where the database lives.**
+  - **`ProfilePaths::standard` used `ProjectDirs::data_dir()`, which is
+    `{FOLDERID_RoamingAppData}` on Windows** — while the field's own doc said "the local,
+    non-roaming data directory", while `log_dir` three lines below already used
+    `data_local_dir()`, while this module's header documented the choice, and while three documents
+    (the architecture table, the Rust-foundation evidence note, and `docs/data/`) all stated the
+    non-roaming rule. **Four places agreed; the line that mattered disagreed.**
+  - **Why it matters rather than being cosmetic:** a domain account's `AppData\Roaming` is copied
+    between machines at logon, and on a slow-link profile is synced through a temporary offline
+    store. A live SQLite file would travel with its `-wal` and `-shm` siblings — and a database
+    opened on two machines while its write-ahead log is mid-flight is **corrupt**, not merely stale.
+    The roaming choice also defeated the deliberate local/non-roaming split between `config` and
+    `data`.
+  - **No test could see it, and that is the transferable part.** `standard()` branches on the *host*
+    platform, so every assertion in the module ran on Windows — the one platform whose answer was
+    wrong — and `data_dir()` and `data_local_dir()` return the **same** value on macOS and Linux,
+    where most of this project's work is reviewed. The pre-existing comment even said "Mutable state
+    must be local, never roaming" while the assertion beside it only checked the path was non-empty.
+  - **The check is now cheap and platform-independent:** the new test compares
+    `data_dir()` against `data_local_dir()` **directly** rather than against a literal like
+    `AppData\Local`. A literal would be Windows-only, which is exactly the shape that cannot see this
+    class; two accessors of one API distinguish the two answers on the one platform that has two.
+    **Falsified by reverting to `data_dir()`:** fails with
+    `left: "C:\Users\...\AppData\Roaming\JARVIS\JARVIS\data"`, `right: "...\AppData\Local\..."`.
+  - **Two more rows of the same table named nothing real**, and each is the kind a reader takes as
+    already true: the cache row said "OS local cache/Jarvis" (not a path the pinned crate can
+    produce, and not what the code does — it is `{LocalAppData}\JARVIS\JARVIS\cache`), and the logs
+    row said `~/Library/Logs` / `$XDG_STATE_HOME/jarvis/logs` where this build has one log directory
+    under the data root. **Verified by running a probe against the real resolver rather than by
+    reasoning about it** — which caught an error in my *own* correction: logs and runtime are under
+    `<durable data>/`, not siblings of it. The probe was deleted afterwards, because a probe that
+    stays becomes a second path-resolution surface nothing owns.
+  - **A second, independent false claim, in an evidence note.** `rust-foundation.md` said "Tests
+    assert the exact resolved table on each native OS" — they did not — and separately claimed
+    Windows "uses an owner/system-only DACL and **queries it back** before publishing discovery or
+    credential material", contradicting the deferral bullet above it and describing enforcement that
+    does not exist: `verify_directory_permissions` is Unix-only and the non-Unix
+    `create_dir_owner_only` is a bare `fs::create_dir_all`. Both corrected to the narrow truth
+    (containment is enforced and asserted; the ACL is inherited, not verified). **A false "tests
+    assert this" is the claim that stops the next reader from checking.**
+  - Added `the_documented_platform_table_matches_the_resolved_paths`, which asserts the *relational*
+    structure the table publishes — data root equals the local accessor, database/logs/runtime under
+    it, cache outside it, and the three subdirectory names — because those hold on every platform
+    while a host-specific literal does not.
+  998 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-035` Give the client-visible run-state vocabulary **one definition**, and check it
+  against the contract for **values** rather than for shape. Found by working the schema sweep
+  (`agent_steps` and `model_*` first, both honestly documented as unbuilt) into the enumerated
+  `CHECK` constraints, then asking of the one that named a real type — `agent_runs.state` — whether
+  the migration's own claim ("a state added there without a migration here would fail this CHECK")
+  was **enforced by anything**. It was not: no test reads a migration, and the claim is a comment.
+  - **The real defect was one step away.** The domain→wire projection
+    (`jarvis_infrastructure::http::runs::wire_state`) maps the twelve domain states onto the seven
+    the local control API exposes, and the contract states that set — "Initial states are
+    `received`, `context_building`, `model_running`, and `responding`. Terminal states are
+    `completed`, `failed`, and `cancelled`." Its covering test asserted the image's **cardinality**
+    (`assert_eq!(unique.len(), 7)`) and three terminal names. **Any seven distinct strings satisfy
+    that**, so renaming one arm — `context_building` to `context_built` — kept the count, kept the
+    terminals, and left the daemon emitting a state the contract does not publish, with every build
+    gate and all three end-to-end journeys still green. The set existed twice: as bare literals in
+    a `match`, and as English prose in a paragraph nothing read.
+  - **My first fix was vacuous, and the mutation said so.** I compared the projection's image
+    against the protocol constants the projection is *spelled from* — so renaming the constant moved
+    both sides together and the assertion stayed green (`INFRA_MUTANT=0`) while the protocol test
+    caught it. A test comparing two things derived from one definition is the same failure as a
+    double that shares the code's assumptions, one level down. **Replaced with the assertion a
+    rename cannot move:** the *grouping* the contract promises in prose — planning is
+    indistinguishable from context-building to a client, and the five work-outstanding states are
+    indistinguishable from each other — which is a statement about domain values, not about strings.
+    Re-falsified by regrouping them, which now fails. The document comparison lives in the crate
+    that can read the document.
+  - `jarvis_protocol::run::run_state` is the new owner of the seven names, next to the
+    `event_type` constants that already did this for event names. The projection spells its arms
+    from them, so the vocabulary cannot diverge by an edit at a call site.
+  - New test `the_wire_state_vocabulary_is_exactly_the_one_the_contract_publishes` reads
+    `docs/contracts/local-control-api.md`, extracts the two sentences' backticked names, and asserts
+    **both directions** — a state the contract names with no constant fails, and a constant with no
+    mention in the contract fails — plus that the two published sets are disjoint. The boundary test
+    was **rewritten in place** rather than added to, so the count below rises by one rather than two.
+  - **A second, larger instance of the same class found while fixing it.** Running `cargo doc` —
+    which **no gate had ever done** — reported **21 unresolved intra-doc links**, two of them naming
+    a type (`WireRunState`) that **does not exist anywhere in the workspace**, including the sentence
+    explaining where the wire-state projection lives. Rustdoc reports these as warnings by default,
+    nothing ran rustdoc, and no gate denied the lint, so a doc comment pointing a reader at a symbol
+    nobody wrote read exactly like one that resolves. Fixed all 21; each crate root now denies
+    `rustdoc::broken_intra_doc_links`; and CI gained a `cargo doc --workspace --no-deps` step, since
+    a `deny` that never fires is decoration. **Not** run with `-D warnings`: that additionally denies
+    `redundant_explicit_links` and `private_intra_doc_links`, which are style complaints about links
+    that *do* resolve, and widening a gate past the defect is how it gets relaxed later.
+    **Falsified:** inserting one broken link now fails the doc build (`101`) instead of warning.
+  - **A tooling trap, recorded because it silently corrupted a file.** To mutate a constant I used
+    PowerShell's `Set-Content -Encoding UTF8`, which prepends a **UTF-8 BOM** (`EF BB BF`) on
+    Windows PowerShell 5.1 — confirmed by reading the first bytes back. The file still compiled, so
+    nothing reported it; `cargo fmt` was the only thing that would have. Removed the BOM and switched
+    mutations to `[System.IO.File]::WriteAllText` with `UTF8Encoding($false)`. `AGENTS.md` says never
+    to edit via the terminal, and this is a concrete reason why beyond the stated rule. The
+    `clippy::panic` denial also caught `panic!` inside the new test helper — `clippy.toml` allows
+    `expect`/`unwrap` in tests but not `panic`, and this file's JSON tests already use
+    `unreachable!` for the same case, so the helper now matches them.
+  - Corrected the documents that described the projection as more checked than it was: the
+    contract's "enforced by construction" bullet (`local-control-api.md`), `agent-runtime.md`'s
+    projection note, and the earlier milestone `TODO` note whose "a test asserts it is both total
+    and coarser" was true but read as though the values were checked.
+  999 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-036` Delete the maintenance-lock machinery nothing called, after its runbook step told an
+  operator to use it — and correct the timestamp-ordering convention the same module relied on.
+  Found by working technique (2) (schema columns → writer *and* reader) to the end of the sweep:
+  `application_locks` is created by `000001_initial.sql` and, by a substring grep, had **no writer**.
+  - **A substring grep of a column name is not a grep of the module that owns it.** The next check —
+    grep the *module* — found `storage::lock`, a complete lease implementation with tests for
+    acquisition, refusal, lease reclamation, and owner-checked release. So the correct statement was
+    not "no writer" but "a writer **and** all its callers are missing": `acquire_lock` and
+    `release_lock` appeared exactly once each, in the `pub use` line of `storage/mod.rs`. **A table
+    plus a tested module reads as an implemented control**, and the tests made it read better than
+    it was.
+  - **And a document told an operator to use it.** `docs/data/migrations.md`'s Local Upgrade Flow
+    began "Stop or drain daemon and **acquire profile maintenance lock**" — a step that could not be
+    performed by any command, with no way for an operator to discover that. The guard that actually
+    prevents two daemons sharing a profile is the held file lock in `lifecycle::InstanceGuard`
+    (taken before startup work, asserted by daemon startup tests); the row-level lease is a
+    *different* mechanism — a visible holder and reclaimable expiry — and remains unimplemented.
+  - `storage/lock.rs` and its re-exports are **deleted** rather than kept in case: an uncalled
+    module is a claim, and this one had a runbook and a schema heading restating it. The
+    `application_locks` table stays (migrations are checksum-pinned and applied databases exist);
+    the module doc now says plainly that the table has no reader and no writer, and
+    `docs/architecture/storage-data.md`'s "advisory locks or lease rows coordinate singleton jobs"
+    bullet is marked as a **target, not a description**.
+  - **A second defect fell out of the deletion, and it was the more interesting one.** Deleting the
+    module removed the workspace's **only** production call to `jiff::Timestamp::now()` — which
+    `docs/research/integrations/rust-foundation.md` already asserted was "not used in library code"
+    while it was, and which the deleted file's own doc called out as the thing this project avoids.
+    Time now enters through `domain::clock::Clock` and the `SystemClock` adapter everywhere.
+  - **I then made an evidence mistake worth recording.** To check timestamp handling I read
+    timestamp strings out of `%TEMP%\jarvis-acceptance-gate-*` and reported "both shapes appear in a
+    real database". **That database was not this project's** — probing it showed `daemon_instances`,
+    `users`, and `workspaces` tables and no `application_locks`, while this repo creates
+    `agent_runs`, `agent_steps`, `application_locks`, `conversations`. A directory whose *name*
+    matched was treated as evidence. Re-derived everything from this repo's own code and tests,
+    which is stronger anyway; **the finding survives, the citation does not.**
+  - **The real timestamp finding, measured rather than assumed.** `UtcTimestamp`'s doc said the value
+    "has exactly one string form", and `common-conventions.md` said RFC 3339 text "agrees with
+    chronological order". A probe over the domain's own type refutes the second: `Z` fixes the
+    offset but not the width, and since `.` (`0x2E`) sorts before `Z` (`0x5A`),
+    **`2026-09-20T12:00:00.1Z` sorts *before* `2026-09-20T12:00:00Z`** although it is the later
+    instant. So a `TEXT` `ORDER BY`/`<`/`<=` over these strings is not chronological and can name
+    the wrong row — which is exactly what the deleted lease's `expires_at <= ?` predicate assumed.
+    **No current code path depends on it** (`incomplete_runs` and exception `list` order by
+    `created_at`/`issued_at` for a bound and a stable order, not chronology), so the defect is
+    **latent, not active** — recorded as such rather than dramatized. I also got the *mechanism*
+    wrong in my first correction: I claimed a zero fraction renders at a different width, the test
+    refuted it (`jiff` **omits** zero digits, so `…:00.000Z` and `…:00Z` are the same string), and
+    the convention and doc now state the measured rule with an assertion beside it
+    (`the_canonical_forms_of_one_instant_are_equal_while_their_text_order_is_not`) so the warning
+    cannot go stale silently.
+  - Corrected `docs/contracts/common-conventions.md` (Time), `docs/data/migrations.md` (runbook),
+    `docs/data/schema.md` (the `application_locks` heading), `docs/architecture/storage-data.md`
+    (target vs description), `docs/research/integrations/rust-foundation.md` (two claims), and
+    `time.rs`'s own doc.
+  - **The count goes DOWN, and the arithmetic matters.** Deleting `storage::lock` removed its five
+    tests (acquisition, refusal, lease reclamation, owner-checked release, scope independence) and I
+    added one here, so **995** = 999 − 5 + 1. Written out because a falling count in a round that
+    added a test looks like a typo, and because the alternative — keeping five green tests for a
+    module nothing calls — is what made this defect look implemented in the first place.
+  995 workspace tests (−4 net: −5 deleted lock tests, +1 new). Both doc gates green; all three
+  journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

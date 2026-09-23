@@ -156,10 +156,22 @@ fn every_json_example_in_the_local_control_api_contract_is_parseable_json() {
 }
 
 #[test]
-fn the_status_example_names_the_capabilities_the_daemon_actually_serves() {
-    // A drift test with teeth: the contract lists the capability strings, and the daemon's own
-    // route table must agree. A route added without a capability, or a capability left behind
-    // by a removed route, is exactly the drift contract test 12 names.
+fn the_status_example_lists_the_capabilities_the_contract_documents() {
+    // **This test used to be named `the_status_example_names_the_capabilities_the_daemon_actually_serves`
+    // and claimed in its comment that "the daemon's own route table must agree". It never looked at
+    // the daemon** — it read the contract's own example and compared it to a literal list, so it
+    // compared the document to itself and stayed green while the daemon advertised only
+    // `system.status` against seven served operations.
+    //
+    // The rename is the honest half of the fix: this crate does not depend on
+    // `jarvis-infrastructure`, so it **cannot** see the route table, and a name promising a check
+    // this file cannot perform is what a reviewer would trust instead of verifying. The
+    // daemon-side assertion now lives in `jarvis_infrastructure::http`'s
+    // `the_advertised_capabilities_cover_every_routed_operation`, beside the router it checks.
+    //
+    // What this test still does, and why it is worth keeping here: it holds the contract's example
+    // to the operations **this crate's wire types** define, so the document and the protocol cannot
+    // disagree about what the surface is called.
     let examples = examples_in("docs/contracts/local-control-api.md").expect("the document reads");
     let status = examples
         .iter()
@@ -176,7 +188,15 @@ fn the_status_example_names_the_capabilities_the_daemon_actually_serves() {
     // The contract's own list is the authority, and every entry names an operation the
     // contract documents. Asserting the *set* rather than a count means a rename is caught
     // rather than merely a removal.
-    for required in ["runs.create", "runs.read", "runs.cancel", "runs.events"] {
+    for required in [
+        "system.status",
+        "runs.create",
+        "runs.read",
+        "runs.cancel",
+        "runs.events",
+        "policy.read",
+        "policy.write",
+    ] {
         assert!(
             capabilities.iter().any(|value| value == required),
             "the contract's status example must advertise {required}: {capabilities:?}",
@@ -188,6 +208,22 @@ fn the_status_example_names_the_capabilities_the_daemon_actually_serves() {
         assert!(
             capabilities.iter().any(|value| value == operation),
             "{operation} is served but not advertised",
+        );
+    }
+    // The policy routes are listed in the contract's endpoint block, which is what makes
+    // `policy.read`/`policy.write` operations of *this* surface rather than another document's.
+    // Asserted so the two lists cannot drift apart again.
+    let document =
+        std::fs::read_to_string(repository_root().join("docs/contracts/local-control-api.md"))
+            .expect("the contract reads");
+    for route in [
+        "GET  /api/v1/model-data-policy",
+        "PUT  /api/v1/model-data-policy",
+        "GET  /api/v1/model-data-policy/effective",
+    ] {
+        assert!(
+            document.contains(route),
+            "an advertised policy capability must be a routable endpoint: {route}",
         );
     }
 }
@@ -301,4 +337,106 @@ fn the_three_terminal_event_types_are_exactly_the_ones_the_contract_lists() {
     ] {
         assert!(!terminals.contains(&name), "{name} is not terminal");
     }
+}
+
+/// Collects the backticked names a sentence in a contract document lists.
+///
+/// The sentence is located by a literal prefix (`Initial states are`) and ends at its own
+/// first period, so the extraction follows the prose rather than a line break — the sentence
+/// currently wraps across two lines, and a line-based reader would silently collect half of it
+/// and pass.
+///
+/// Hand-written for the same reason the JSON extractor above is: the shape is narrow and a
+/// Markdown parser would be a dependency the research gate requires evidence for. Its
+/// limitation is that it takes the **first** occurrence of the prefix, which is asserted
+/// non-trivially by the tests below requiring every named state to be a constant.
+///
+/// A missing sentence is `unreachable!` rather than `panic!` for two reasons: this module's
+/// crate denies `clippy::panic` (the workspace policy allows `expect`/`unwrap` in tests but not
+/// `panic`), and `unreachable!` is the spelling the JSON tests in this file already use for the
+/// same "this cannot happen, and if it does the message says what moved" case.
+fn sentence_list(contract: &str, prefix: &str) -> Vec<String> {
+    let Some(start) = contract.find(prefix) else {
+        unreachable!("the contract must still contain {prefix:?}");
+    };
+    let rest = &contract[start + prefix.len()..];
+    let Some(end) = rest.find('.') else {
+        unreachable!("the sentence after {prefix:?} must end");
+    };
+    let mut found = Vec::new();
+    let mut remaining = &rest[..end];
+    while let Some(open) = remaining.find('`') {
+        let after = &remaining[open + 1..];
+        let Some(close) = after.find('`') else {
+            break;
+        };
+        found.push(after[..close].to_owned());
+        remaining = &after[close + 1..];
+    }
+    assert!(
+        !found.is_empty(),
+        "the sentence after {prefix:?} must name at least one state",
+    );
+    found
+}
+
+#[test]
+fn the_wire_state_vocabulary_is_exactly_the_one_the_contract_publishes() {
+    // **The defect this closes.** `jarvis_infrastructure::http::runs::wire_state` projects the
+    // twelve domain states onto the states a client sees, and its own test asserted the image's
+    // *cardinality* (seven) and three terminal names. Any seven distinct strings satisfy that, so
+    // renaming one arm — `context_building` to `context_built` — kept the count, kept the
+    // terminals, and left the daemon emitting a state the contract does not publish while every
+    // gate and every journey stayed green. The projection was checked for shape, never for
+    // *value*, and the contract's set existed only as English prose in a paragraph nothing read.
+    //
+    // This asserts it in **both directions**, which is the only way the two can be shown to
+    // describe the same set rather than merely overlapping ones: a constant the contract does not
+    // publish fails, and a state the contract publishes with no constant fails.
+    let contract =
+        std::fs::read_to_string(repository_root().join("docs/contracts/local-control-api.md"))
+            .expect("the contract reads");
+
+    let initial = sentence_list(&contract, "Initial states are");
+    let terminal = sentence_list(&contract, "Terminal states are");
+
+    let owned: Vec<&str> = vec![
+        super::run_state::RECEIVED,
+        super::run_state::CONTEXT_BUILDING,
+        super::run_state::MODEL_RUNNING,
+        super::run_state::RESPONDING,
+        super::run_state::COMPLETED,
+        super::run_state::FAILED,
+        super::run_state::CANCELLED,
+    ];
+
+    // Direction one: every state the contract publishes is one this crate defines. Without
+    // this, a state added to the contract would be a value no daemon can emit.
+    for name in initial.iter().chain(terminal.iter()) {
+        assert!(
+            owned.contains(&name.as_str()),
+            "the contract publishes {name:?} but `jarvis_protocol::run::run_state` does not define \
+             it; defined here: {owned:?}",
+        );
+    }
+    // Direction two: every state this crate defines is one the contract publishes. Without this,
+    // a constant could be added, wired into the projection, and shipped as a client-visible value
+    // the contract never promised.
+    for name in &owned {
+        assert!(
+            initial.contains(&(*name).to_owned()) || terminal.contains(&(*name).to_owned()),
+            "`jarvis_protocol::run::run_state` defines {name:?}, which the contract does not \
+             publish; the contract states: {initial:?} and {terminal:?}",
+        );
+    }
+
+    // And the two published sets are disjoint, which is what makes "terminal" mean something: a
+    // state in both would let a client reading `initial` treat a finished run as live.
+    for name in &initial {
+        assert!(
+            !terminal.contains(name),
+            "{name:?} is published as both an initial and a terminal state",
+        );
+    }
+    assert_eq!(initial.len() + terminal.len(), owned.len());
 }

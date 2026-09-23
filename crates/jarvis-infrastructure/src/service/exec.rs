@@ -88,7 +88,8 @@ pub async fn run_program(program: &str, args: &[String]) -> Result<CommandOutcom
 /// Runs `program` with `args` synchronously, returning whether it succeeded.
 ///
 /// This exists for a read-only status query that the synchronous
-/// [`ServiceController::status`] contract needs. The same bounds apply: a fixed
+/// [`ServiceController::status`][crate::service::ServiceController::status] contract needs. The
+/// same bounds apply: a fixed
 /// argument vector, no shell, a bounded wait, and bounded captured output.
 ///
 /// # Errors

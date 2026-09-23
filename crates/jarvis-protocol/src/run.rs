@@ -4,7 +4,7 @@
 //! inspecting, cancelling, and streaming a native run (see
 //! `docs/contracts/local-control-api.md`). They live in `jarvis-protocol` rather
 //! than in the HTTP adapter so the contract has one serialization definition that
-//! a client, the daemon, and a fixture test all share — a type defined inside the
+//! a client, the daemon, and a fixture test all share â€” a type defined inside the
 //! server would let the two sides drift while both still compiled.
 //!
 //! Three decisions are deliberate:
@@ -61,7 +61,7 @@ pub struct CreateRunRequest {
     /// derived from the workspace, and the workspace is resolved **server-side** from the
     /// authenticated client. A client therefore cannot name its own workspace's active policy
     /// without first reading it, and requiring the field would make every run uncreatable until an
-    /// operator had configured a policy — including on a fresh installation.
+    /// operator had configured a policy â€” including on a fresh installation.
     ///
     /// Absent means "govern this run by the workspace's active policy", which is the only
     /// resolution a client could have named. Present means the caller pinned a version, and it is
@@ -202,8 +202,8 @@ pub struct RunEventFrame {
 
 /// One rendered server-sent event.
 ///
-/// Keeps the SSE framing rules — a fixed field order, an `id`, and a terminating
-/// blank line — in one place, so a writer cannot produce a frame a client's parser
+/// Keeps the SSE framing rules â€” a fixed field order, an `id`, and a terminating
+/// blank line â€” in one place, so a writer cannot produce a frame a client's parser
 /// will not accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -263,6 +263,43 @@ pub mod event_type {
     pub const FAILED: &str = "run.failed";
     /// The run was cancelled.
     pub const CANCELLED: &str = "run.cancelled";
+}
+
+/// The client-visible run states this contract exposes.
+///
+/// `RunView.state` carries one of these, and the contract states the set twice â€” the initial
+/// four and the three terminal ones â€” so a client switches on a value that is fixed here
+/// rather than at each call site. Same reasoning as [`event_type`]: a typo is invisible in
+/// this build and breaks a consumer.
+///
+/// **Why this module did not exist, and why that mattered.** The projection that produces
+/// these strings lives in the HTTP adapter (`jarvis_infrastructure::http::runs::wire_state`)
+/// because `docs/architecture/agent-runtime.md` forbids domain state names doubling as wire
+/// strings â€” so the adapter is the right *place* for the mapping. But the adapter is not a
+/// place the contract can be compared against: `jarvis-application` cannot depend on
+/// `jarvis-protocol`, and the adapter's own test could only count how many distinct strings
+/// the projection produced. It asserted the image's **cardinality** (seven) and three
+/// terminal names, so renaming any one of the seven kept the count, kept the terminals, and
+/// passed every gate and every journey â€” the projection and the contract could disagree
+/// about the client-visible state set with nothing failing.
+///
+/// With the vocabulary owned here, the adapter spells its arms from these constants and this
+/// crate â€” which reads the contract document â€” asserts the set against it in both directions.
+pub mod run_state {
+    /// The run exists and has not started work.
+    pub const RECEIVED: &str = "received";
+    /// Identity, policy, and context are being resolved, or a decision is being taken.
+    pub const CONTEXT_BUILDING: &str = "context_building";
+    /// Work is outstanding: a model call, an approval, a tool, or a parked dependency.
+    pub const MODEL_RUNNING: &str = "model_running";
+    /// The final answer is being produced.
+    pub const RESPONDING: &str = "responding";
+    /// The run finished with a result.
+    pub const COMPLETED: &str = "completed";
+    /// The run ended in a normalized error.
+    pub const FAILED: &str = "failed";
+    /// The run ended because cancellation was requested.
+    pub const CANCELLED: &str = "cancelled";
 }
 
 /// Builds the payload for an output-text delta.
@@ -331,7 +368,7 @@ mod tests {
         // The field is optional because only the daemon can resolve a workspace's active policy:
         // the identifier is derived from the workspace, which is resolved server-side, so a client
         // cannot name it without first reading it. Omitting the field is therefore the ordinary
-        // case — and it must parse, because requiring it would make every run uncreatable until an
+        // case â€” and it must parse, because requiring it would make every run uncreatable until an
         // operator had configured a policy.
         let json = r#"{
             "conversation_id": null,

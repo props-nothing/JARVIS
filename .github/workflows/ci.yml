@@ -96,6 +96,20 @@ jobs:
       - name: Run Clippy with warnings denied
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # A doc comment pointing at a symbol that does not exist reads exactly like one that
+      # resolves; the only difference is whether anything checks. `BRN-035` found 21 broken
+      # intra-doc links — two of them naming a type that was never written — and they had survived
+      # every gate, because rustdoc reports them as warnings and no gate ran rustdoc at all. Each
+      # library crate now denies `rustdoc::broken_intra_doc_links`, but a `deny` only fires when
+      # rustdoc runs, and nothing else here runs it: `clippy` compiles doc comments without
+      # resolving their links. This step is therefore what makes the crate-level denies real rather
+      # than decorative. It does **not** pass `-D warnings`: that would additionally deny
+      # `redundant_explicit_links` and `private_intra_doc_links`, which are style complaints about
+      # links that *do* resolve — widening the gate past the defect is how a gate gets relaxed
+      # later instead of kept.
+      - name: Resolve every documentation link
+        run: cargo doc --workspace --no-deps --all-features
+
   test:
     name: workspace tests
     runs-on: ubuntu-24.04

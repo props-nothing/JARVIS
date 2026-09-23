@@ -66,13 +66,33 @@ pub struct ReconciliationReport {
     /// non-terminal, so a caller that hides the failure leaves a run nobody will look at
     /// again until the next restart.
     pub failures: Vec<(RunId, &'static str)>,
+    /// Whether the store still held interrupted runs this pass did not read.
+    ///
+    /// Distinct from `failures`, and the distinction is the whole reason it exists: a failure is a
+    /// run that was *touched* and could not be settled, while this is a run that was never
+    /// *reached*. Collapsing the two would make "nothing failed" look like "nothing is left".
+    pub incomplete_store: bool,
 }
 
 impl ReconciliationReport {
-    /// Returns whether every incomplete run was recovered.
+    /// Returns whether the pass recovered everything it saw **and saw everything**.
+    ///
+    /// Both halves matter and only one used to be checked. "No write failed" is not "no run was
+    /// left behind": the store reads interrupted runs one bounded page at a time, ordered
+    /// oldest-first, so a single-page pass against a store holding more than
+    /// [`MAX_INCOMPLETE_RUNS`](crate::repository::run::MAX_INCOMPLETE_RUNS) would report a clean
+    /// recovery while leaving the **newest** runs non-terminal — and would do so on every restart,
+    /// because the same oldest page would be recovered each time. A caller asking "did recovery
+    /// finish" has to mean both, so this returns the conjunction rather than the failure check.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.failures.is_empty()
+        self.failures.is_empty() && !self.incomplete_store
+    }
+
+    /// Returns whether the pass examined at least one run.
+    #[must_use]
+    pub fn examined_anything(&self) -> bool {
+        self.examined() > 0
     }
 
     /// Returns the number of runs this pass examined.
@@ -97,91 +117,144 @@ pub async fn reconcile(
     runs: &Arc<dyn RunRepository>,
     at: UtcTimestamp,
 ) -> Result<ReconciliationReport, RecoveryError> {
-    let incomplete = runs.incomplete_runs().await.map_err(RecoveryError::Read)?;
-
     let mut report = ReconciliationReport {
         summary: RecoverySummary::default(),
         failures: Vec::new(),
+        incomplete_store: false,
     };
 
-    for entry in incomplete {
-        // The classification is asked per run rather than derived here, so the fate of an
-        // interrupted run has exactly one definition.
-        let Some(action) = classify(entry.run.state) else {
-            // Unreachable in practice, because the read only returns non-terminal runs.
-            // Skipped rather than treated as an error, so a store that returned a
-            // terminal run cannot cause a spurious recovery write.
-            continue;
-        };
+    // **The read is paged, because a bound is a page size and not a total.** One pass handled one
+    // page, and interrupted runs come oldest-first, so a store holding more than
+    // `MAX_INCOMPLETE_RUNS` interrupted runs would have its newest ones left non-terminal — on
+    // this restart and every later one, because each pass would recover the same oldest page and
+    // stop. That is the precise state this pass exists to prevent, hiding behind a bound that
+    // looked like it only limited memory.
+    //
+    // The loop terminates on either of two facts, and both are needed:
+    //
+    //   - the store reports it stopped at its bound (`bounded == false` means it saw everything);
+    //   - a pass recovered nothing. Without this, a page of runs whose writes all failed would be
+    //     read, fail, and be read again for ever — because a failed write leaves the run
+    //     non-terminal, which is exactly what this read looks for. **A repair loop must be able to
+    //     conclude as well as continue**, and the only honest conclusion is "this page did not
+    //     change, so another read of it would behave the same".
+    loop {
+        let page = runs.incomplete_runs().await.map_err(RecoveryError::Read)?;
+        let bounded = page.bounded;
+        let before = report.summary.total();
 
-        let sequence = match runs
-            .next_event_sequence(entry.workspace_id, entry.run.id)
-            .await
-        {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                report.failures.push((entry.run.id, error.code()));
-                continue;
+        for entry in page.runs {
+            apply(runs, entry, at, &mut report).await;
+        }
+
+        // The decision is a pure function so both of its dangerous answers are assertable: a
+        // `loop` with the wrong condition hangs the startup path, and a `break` with the wrong one
+        // strands runs for ever.
+        match page_outcome(bounded, report.summary.total() - before) {
+            PageOutcome::Drained => {
+                report.incomplete_store = false;
+                break;
             }
-        };
-
-        // The reason comes from the classification, whose own test asserts it is
-        // non-empty and inside the bound. A failure here would mean that invariant broke,
-        // so it is reported as a failed recovery rather than papered over with a
-        // fallback reason — a recovered run with an invented reason would be worse than
-        // one left for the next pass.
-        let Ok(reason) = TransitionReason::new(action.reason()) else {
-            report
-                .failures
-                .push((entry.run.id, "jarvis.invalid_transition_reason"));
-            continue;
-        };
-
-        let transition = RunTransition::new(
-            entry.run.state,
-            action.target_state(),
-            entry.run.version,
-            // The actor is the supervisor, not the controller: this transition was not a
-            // decision the run made, and recording it as one would misattribute it.
-            TransitionActor::Supervisor,
-            reason,
-            at,
-        );
-
-        let event = NewActivityEvent {
-            run_id: entry.run.id,
-            sequence,
-            // The event type names the *outcome*, so a client following the stream learns
-            // the run ended rather than being told a state changed to nothing.
-            event_type: terminal_event_for(action).to_owned(),
-            // The payload carries the classification and the state the run was in, which
-            // is what an operator needs to tell "was parked" from "lost work".
-            payload_json: Some(recovery_payload(action, entry.run.state)),
-            visibility: EventVisibility::Public,
-            occurred_at: at,
-        };
-
-        // The outcome travels on the write so a recovered run's own row carries the code a
-        // client reads. `RecoveryAction` already computes it for the event payload, so the two
-        // cannot disagree about why the run ended.
-        let write = match action.target_state() {
-            RunState::Failed => RunWrite::new(&transition, event)
-                .failed_with(TerminalOutcome::failed(action.error_code())),
-            _ => RunWrite::new(&transition, event),
-        };
-        match runs.transition(entry.workspace_id, write).await {
-            Ok(_) => {
-                if action.was_resumable() {
-                    report.summary.parked = report.summary.parked.saturating_add(1);
-                } else {
-                    report.summary.abandoned = report.summary.abandoned.saturating_add(1);
-                }
+            PageOutcome::More => {}
+            PageOutcome::Stalled => {
+                report.incomplete_store = true;
+                break;
             }
-            Err(error) => report.failures.push((entry.run.id, error.code())),
         }
     }
 
     Ok(report)
+}
+
+/// Applies one interrupted run's recovery, recording the outcome on `report`.
+///
+/// Extracted from the pass so the paging loop above reads as paging rather than as a mix of paging
+/// and recovery, and so there is exactly one place a run's fate is decided and recorded.
+async fn apply(
+    runs: &Arc<dyn RunRepository>,
+    entry: crate::repository::run::IncompleteRun,
+    at: UtcTimestamp,
+    report: &mut ReconciliationReport,
+) {
+    // The classification is asked per run rather than derived here, so the fate of an
+    // interrupted run has exactly one definition.
+    let Some(action) = classify(entry.run.state) else {
+        // Unreachable in practice, because the read only returns non-terminal runs.
+        // Skipped rather than treated as an error, so a store that returned a
+        // terminal run cannot cause a spurious recovery write.
+        return;
+    };
+
+    let sequence = match runs
+        .next_event_sequence(entry.workspace_id, entry.run.id)
+        .await
+    {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            report.failures.push((entry.run.id, error.code()));
+            return;
+        }
+    };
+
+    // The reason comes from the classification, whose own test asserts it is
+    // non-empty and inside the bound. A failure here would mean that invariant broke,
+    // so it is reported as a failed recovery rather than papered over with a
+    // fallback reason — a recovered run with an invented reason would be worse than
+    // one left for the next pass.
+    let Ok(reason) = TransitionReason::new(action.reason()) else {
+        report
+            .failures
+            .push((entry.run.id, "jarvis.invalid_transition_reason"));
+        return;
+    };
+
+    let transition = RunTransition::new(
+        entry.run.state,
+        action.target_state(),
+        entry.run.version,
+        // The actor is the supervisor, not the controller: this transition was not a
+        // decision the run made, and recording it as one would misattribute it.
+        TransitionActor::Supervisor,
+        reason,
+        at,
+    );
+
+    let event = NewActivityEvent {
+        run_id: entry.run.id,
+        sequence,
+        // The event type names the *outcome*, so a client following the stream learns
+        // the run ended rather than being told a state changed to nothing.
+        event_type: terminal_event_for(action).to_owned(),
+        // The payload carries the classification and the state the run was in, which
+        // is what an operator needs to tell "was parked" from "lost work".
+        payload_json: Some(recovery_payload(action, entry.run.state)),
+        visibility: EventVisibility::Public,
+        occurred_at: at,
+    };
+
+    // The outcome travels on the write so a recovered run's own row carries the code a
+    // client reads. `RecoveryAction` already computes it for the event payload, so the two
+    // cannot disagree about why the run ended.
+    let write = match action.target_state() {
+        RunState::Failed => RunWrite::new(&transition, event)
+            .failed_with(TerminalOutcome::failed(action.error_code())),
+        _ => RunWrite::new(&transition, event),
+    };
+    match runs.transition(entry.workspace_id, write).await {
+        Ok(_) => {
+            if action.was_resumable() {
+                report.summary.parked = report.summary.parked.saturating_add(1);
+            } else {
+                report.summary.abandoned = report.summary.abandoned.saturating_add(1);
+            }
+        }
+        Err(error) => {
+            // The run stays non-terminal, so the next pass — or the next restart — will see it
+            // again. Counted rather than returned, because stopping here would leave every later
+            // run non-terminal too.
+            report.failures.push((entry.run.id, error.code()));
+        }
+    }
 }
 
 /// The terminal event type for a recovery action.
@@ -210,6 +283,39 @@ fn recovery_payload(action: RecoveryAction, was_in: RunState) -> String {
         "{{\"classification\":\"{classification}\",\"was_in\":\"{was_in}\",\"parked_in\":{parked_in},\"code\":\"{}\"}}",
         action.error_code(),
     )
+}
+
+/// What a paging pass must do after handling one page.
+///
+/// A judgement made in one place rather than inline in the loop, because the dangerous case is
+/// subtle: a page whose writes all failed leaves its runs in exactly the state the next read
+/// looks for, so "read again" is not always the right answer. Getting this wrong in the
+/// conservative direction is an infinite loop on the startup path; getting it wrong in the
+/// permissive direction is a run left non-terminal for ever. A pure function is the only way to
+/// assert both without one of them hanging a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageOutcome {
+    /// The store held nothing more, and everything offered was handled.
+    Drained,
+    /// The store held more than this page, and this page changed something, so read on.
+    More,
+    /// The store held more than this page and this page changed **nothing**, so reading it again
+    /// would behave identically. Stopped, and the store is reported as still holding runs.
+    Stalled,
+}
+
+/// Decides what to do after one page.
+///
+/// `settled` counts the runs this page actually moved, which is what makes the difference between
+/// continuing and stopping. A page can be full and settle nothing when every write failed, or when
+/// every run was already terminal between the read and the write.
+#[must_use]
+fn page_outcome(bounded: bool, settled: u64) -> PageOutcome {
+    match (bounded, settled) {
+        (false, _) => PageOutcome::Drained,
+        (true, 0) => PageOutcome::Stalled,
+        (true, _) => PageOutcome::More,
+    }
 }
 
 #[cfg(test)]

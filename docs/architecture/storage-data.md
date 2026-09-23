@@ -140,7 +140,13 @@ Target configuration:
 - workspace/principal filters are mandatory in queries;
 - optional row-level security is defense in depth, not a substitute for
   application authorization;
-- advisory locks or lease rows coordinate singleton jobs where appropriate;
+- advisory locks or lease rows coordinate singleton jobs where appropriate —
+  **and this sentence is a target, not a description.** No advisory lock or
+  lease row is acquired anywhere in the product today: `application_locks` exists
+  with no writer, and the guard that actually prevents two daemons from sharing a
+  local profile is the held file lock in `lifecycle::InstanceGuard`. The
+  distinction matters because a reader who takes this line as implemented will
+  assume a crashed holder's lease is reclaimable, which nothing implements;
 - `FOR UPDATE SKIP LOCKED`-style job claims are evaluated for workers;
 - pgvector indexes are selected from measured corpus/recall needs;
 - connection pools are bounded per process and expose saturation metrics;

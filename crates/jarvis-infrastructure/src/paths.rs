@@ -69,9 +69,8 @@ impl ProfilePaths {
         let project_dirs = ProjectDirs::from("com", "JARVIS", "JARVIS")
             .ok_or(InfrastructureError::HomeDirectoryUnavailable)?;
 
-        // `runtime_dir` and `state_dir` are `None` on Windows and macOS. The
-        // local data directory is the portable choice for transient runtime
-        // state on those platforms.
+        // `runtime_dir` and `state_dir` are `None` on Windows and macOS. The local data directory
+        // is the portable choice for transient runtime state on those platforms.
         let local_root = project_dirs.data_local_dir().to_path_buf();
         let runtime_dir = project_dirs
             .runtime_dir()
@@ -80,7 +79,30 @@ impl ProfilePaths {
         Ok(Self {
             mode: ProfileMode::Standard,
             config_dir: project_dirs.config_dir().to_path_buf(),
-            data_dir: project_dirs.data_dir().to_path_buf(),
+            // **The LOCAL data directory, not `data_dir()` — and they are different directories on
+            // Windows.** `directories` 6.0.0 maps these two accessors to two known folders:
+            //
+            // | Accessor | Windows folder | Example |
+            // | --- | --- | --- |
+            // | `data_dir()` | `{FOLDERID_RoamingAppData}` | `C:\Users\Alice\AppData\Roaming` |
+            // | `data_local_dir()` | `{FOLDERID_LocalAppData}` | `C:\Users\Alice\AppData\Local` |
+            //
+            // This used `data_dir()` while its own doc said "the local, non-roaming data directory"
+            // and while `log_dir` below already used the local one and the module documented the
+            // choice — so the module's two most important directories disagreed about the rule it
+            // states. The consequence is the one roaming profiles exist to produce: a domain
+            // account's `AppData\Roaming` is copied between machines at logon and on a slow-link
+            // profile is synced through a temporary offline store, so a live SQLite file with its
+            // `-wal` and `-shm` siblings would travel — and a database opened from two machines
+            // while its write-ahead log is mid-flight is corrupt, not merely stale. `docs/data/`
+            // fixes the rule ("roaming profile never carries a live database file between
+            // machines"); this is the line that was not obeying it.
+            //
+            // No test could see it: `standard()` branches on the *host* platform, so every
+            // assertion in this module runs on Windows CI against the one platform whose answer is
+            // wrong, and `data_dir()` and `data_local_dir()` are the same value on Unix — where
+            // most of this project's work is reviewed.
+            data_dir: local_root.clone(),
             cache_dir: project_dirs.cache_dir().to_path_buf(),
             log_dir: local_root.join("log"),
             runtime_dir,
@@ -449,6 +471,110 @@ mod tests {
         // Mutable state must be local, never roaming.
         assert!(!paths.data_dir().as_os_str().is_empty());
         assert!(!paths.log_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn the_standard_data_directory_is_the_local_one_not_the_roaming_one() {
+        // **This is the assertion the comment above used to stand in for.** That comment has said
+        // "Mutable state must be local, never roaming" for as long as the test has existed, while
+        // the assertion beside it only checked that the path was non-empty — so the rule was
+        // stated, unchecked, and violated: `data_dir` was `project_dirs.data_dir()`, which is
+        // `{FOLDERID_RoamingAppData}` on Windows.
+        //
+        // It is compared against `data_local_dir()` **directly** rather than against a literal like
+        // `AppData\Local`. A literal would only be right on Windows, and a Windows-only assertion
+        // is exactly how this survived: this project's CI runs the whole suite on the one platform
+        // whose answer was wrong, so a host that "looked right" locally was the only host where it
+        // could be wrong quietly. Two accessors of one API is a comparison that holds on every
+        // platform and still distinguishes the two answers on the one that has two.
+        //
+        // On Unix both accessors are `$XDG_DATA_HOME` or `~/.local/share`, so this assertion cannot
+        // fail there — which is honest: the defect did not exist there. What it does guarantee is
+        // that the *code* names the local accessor, so the invariant holds on every platform
+        // including the ones this project cannot run.
+        let project_dirs = directories::ProjectDirs::from("com", "JARVIS", "JARVIS")
+            .expect("a test host must have a home directory");
+        let paths = ProfilePaths::standard().expect("a test host must have a home directory");
+
+        assert_eq!(
+            paths.data_dir(),
+            project_dirs.data_local_dir(),
+            "the durable data directory must be the local one; a roaming profile would carry a live \
+             database between machines",
+        );
+        // And the two accessors are genuinely different on this host, so the assertion above is a
+        // real comparison rather than a tautology. Asserted as a fact about the platform rather
+        // than skipped, so on the platform where they differ the test is provably distinguishing
+        // them — and if a future `directories` release collapses them, this fails loudly instead of
+        // letting the check above quietly stop meaning anything.
+        #[cfg(windows)]
+        assert_ne!(
+            project_dirs.data_dir(),
+            project_dirs.data_local_dir(),
+            "on Windows the two data accessors must be different directories, or this test is \
+             checking nothing",
+        );
+    }
+
+    #[test]
+    fn the_documented_platform_table_matches_the_resolved_paths() {
+        // `docs/architecture/process-topology.md` publishes a table of platform paths, and it is
+        // the kind of table a reader trusts rather than checks — it said "OS local cache/Jarvis" for
+        // the cache (a location the pinned crate cannot produce) and put logs at
+        // `~/Library/Logs/Jarvis` and `$XDG_STATE_HOME/jarvis/logs`, neither of which this build
+        // has. Two of its five rows named nothing real, and nothing compared them to the code.
+        //
+        // Only the **relational** facts are asserted here, because they are the ones that hold on
+        // every platform: that the durable data root is the local one (asserted above), that the
+        // database, logs, and runtime live *under* it, and that the cache is outside it. Prefix
+        // relationships are checkable from any host, whereas asserting
+        // `C:\Users\...\AppData\Local` would pass on Windows, skip on Unix, and — this is the
+        // point — be incapable of noticing the roaming mistake, which is the bug that was here.
+        let paths = ProfilePaths::standard().expect("a test host must have a home directory");
+
+        assert!(
+            paths.database_dir().starts_with(paths.data_dir()),
+            "the database belongs under the durable data root: {}",
+            paths.database_dir().display(),
+        );
+        assert!(
+            paths.log_dir().starts_with(paths.data_dir()),
+            "logs belong under the durable data root: {}",
+            paths.log_dir().display(),
+        );
+        assert!(
+            paths.runtime_dir().starts_with(paths.data_dir())
+                || paths.runtime_dir().starts_with(std::env::temp_dir()),
+            "runtime state belongs under the durable data root (or a platform runtime dir): {}",
+            paths.runtime_dir().display(),
+        );
+        // The cache is deliberately *outside* the data root: it is reclaimable, and a backup or a
+        // repair that operated on the data root must not find it there.
+        assert!(
+            !paths.cache_dir().starts_with(paths.data_dir()),
+            "the cache must not live inside the durable data root: {}",
+            paths.cache_dir().display(),
+        );
+        // And the subdirectory names the table publishes are the ones the code builds. Asserted as
+        // file-name components rather than as full paths, so this holds on every platform.
+        assert_eq!(
+            paths
+                .database_dir()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("db"),
+        );
+        assert_eq!(
+            paths.log_dir().file_name().and_then(|name| name.to_str()),
+            Some("log"),
+        );
+        assert_eq!(
+            paths
+                .runtime_dir()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("run"),
+        );
     }
 
     #[test]

@@ -559,13 +559,16 @@ impl SupportBundle {
     pub fn excluded(&self) -> &[String] {
         &self.excluded
     }
-
-    /// Returns the total uncompressed size of the bundle.
-    #[must_use]
-    pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|file| file.bytes.len() as u64).sum()
-    }
 }
+
+// **`SupportBundle::total_bytes()` was here and is deleted.** It summed the included files' lengths,
+// and nothing called it: not the CLI, which prints the **archive** size from
+// `export_bundle`'s outcome, not the sum of the members. A duplicate size computation beside the
+// real one is worse than an unused getter — it is the one a later reader would reach for when
+// adding a "bundle size" line, and it would then disagree with the printed size for any bundle
+// whose members compress (this project writes stored entries, so they happen to match today, which
+// is exactly the kind of coincidence that makes a second implementation survive unnoticed).
+// `SupportBundle::files()` stays: the preview's own test reads it to assert what a bundle contains.
 
 /// One file inside a materialized bundle.
 #[derive(Debug)]
@@ -1093,27 +1096,6 @@ fn hex(bytes: &[u8]) -> String {
         out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     out
-}
-
-/// Collects one log file into a redacted archive member.
-///
-/// This exists so a caller that already knows its source can reuse the same
-/// bounded, redacted read path the plan uses.
-///
-/// # Errors
-///
-/// Returns [`BundleError::LogRead`] when the file cannot be read.
-pub fn redacted_log_bytes(path: &Path, redactor: &Redactor) -> Result<Vec<u8>, BundleError> {
-    let item = PlanItem {
-        path: "logs/log".to_owned(),
-        description: "bounded redacted tail of one local log file",
-        source: BundleSource::LogTail,
-        optional: true,
-        source_path: Some(path.to_path_buf()),
-        content: None,
-    };
-    let text = read_log_tail(&item)?;
-    Ok(redact_text(&text, redactor).into_bytes())
 }
 
 /// Returns the marker substitution redaction performs.

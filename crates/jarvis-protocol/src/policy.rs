@@ -126,7 +126,7 @@ pub struct ActivePolicyResponse {
 /// nothing", which the contract distinguishes from an empty set that would permit nothing, so
 /// the field must be able to be absent. On a **write**, a client that omits a field has stated
 /// no policy for it, and defaulting that to "unrestricted" would grant more than the caller
-/// asked for — so the omission is a parse failure ([`deny_unknown_fields`] plus a required
+/// asked for — so the omission is a parse failure (`deny_unknown_fields` plus a required
 /// field) rather than a permissive default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

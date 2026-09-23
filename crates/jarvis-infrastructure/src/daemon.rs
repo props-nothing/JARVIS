@@ -392,7 +392,7 @@ pub async fn start(
     // follow the discovery publication, or a client could reach a daemon that has not
     // yet settled the runs it is about to serve.
     let ports = run_ports(Arc::clone(&repositories));
-    let recovery = jarvis_application::recovery::reconcile(
+    let report = jarvis_application::recovery::reconcile(
         &ports.runs,
         crate::time::SystemClock::new()
             .now()
@@ -400,7 +400,17 @@ pub async fn start(
     )
     .await
     .map_err(|_| StartupError::Recovery)?;
-    let recovery = recovery.summary;
+    // **A pass that could not read the whole store is not a clean pass.** The store offers
+    // interrupted runs one bounded page at a time, and the pass pages through them until drained;
+    // if it stops on a page that settled nothing, runs remain non-terminal. Reporting only the
+    // recovered counts here would tell the operator the profile is settled when it is not, and the
+    // runs left behind are precisely the ones nothing else will look at. It is reported as a
+    // *failed startup* rather than a warning because readiness is defined as "recovery
+    // classification completed", and it has not.
+    if report.incomplete_store {
+        return Err(StartupError::Recovery);
+    }
+    let recovery = report.summary;
 
     // 5. Publish discovery before readiness, so a ready daemon is always
     // discoverable.
@@ -621,6 +631,88 @@ mod tests {
         let record = jarvis_protocol::DiscoveryFile::parse(&bytes).expect("valid discovery");
         assert_eq!(record.instance_id, daemon.instance_id());
         assert_eq!(record.base_url, daemon.base_url().expect("base url"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_database_written_by_a_newer_binary_is_refused_and_left_untouched() {
+        // `docs/data/migrations.md` fixes the startup behaviour in a table: "DB newer than binary |
+        // Refuse writes/start, preserve state, explain update". The refusal exists
+        // (`StorageError::SchemaTooNew`, produced by `read_compatibility`) and the daemon maps it
+        // to `StartupError::Storage` — but **nothing tested it end to end**, so the two facts that
+        // make the row true were unverified: that a `start` actually refuses, and that it refuses
+        // *without writing*, which is the half that matters to someone who downgraded a binary.
+        //
+        // The newer version is written **before** the daemon starts, the way a newer binary would
+        // have left it, rather than by starting a daemon, stopping it, and editing the file — a
+        // `RunningDaemon` holds the single-instance lock until it is dropped, so that shape would
+        // be refused for `jarvis.instance_already_held` before it reached the version check, and
+        // the test would assert the wrong refusal.
+        let root = temp_root("schema-too-new");
+        let settings = config(&root);
+        let future = crate::storage::schema::TARGET_SCHEMA_VERSION + 1;
+
+        let seeded = crate::storage::Database::open(&settings.database_path)
+            .await
+            .expect("the database opens");
+        crate::storage::migrate::run(seeded.pool())
+            .await
+            .expect("this build migrates it");
+        sqlx::query("UPDATE schema_version SET schema_version = ? WHERE id = 1")
+            .bind(future)
+            .execute(seeded.pool())
+            .await
+            .expect("the record is bumped to a future version");
+        seeded.close().await;
+
+        let error = start(
+            &settings,
+            clients(&root),
+            "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e0c".to_owned(),
+            "2026-09-21T00:00:00Z".to_owned(),
+        )
+        .await
+        .expect_err("a newer database must be refused");
+        assert_eq!(error.code(), "jarvis.db_schema_too_new");
+        // The message an operator reads must name the remedy. A downgrade is not something a
+        // restart fixes, so "upgrade the binary" is the whole content of the refusal.
+        assert!(
+            error.to_string().contains("newer JARVIS version"),
+            "{error}",
+        );
+        assert!(!error.retryable(), "a downgraded binary stays downgraded");
+
+        // **The record must still name the future version.** This is what makes the row's
+        // "preserve state" true: a `start` that rewrote or downgraded the record would leave the
+        // operator's database claiming to be older than it is, and the next binary to open it
+        // would read a record that lies about what is inside.
+        let after = crate::storage::Database::open(&settings.database_path)
+            .await
+            .expect("the database still opens");
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT schema_version FROM schema_version WHERE id = 1")
+                .fetch_one(after.pool())
+                .await
+                .expect("the record is readable");
+        assert_eq!(
+            recorded, future,
+            "a refused startup must not rewrite the compatibility record",
+        );
+        after.close().await;
+
+        // And nothing was published: a refused daemon must not be discoverable, or a client would
+        // find a daemon that never became ready.
+        assert!(
+            !daemon_discovery_path(&root).exists(),
+            "a refused startup must not publish discovery",
+        );
+        // The lock is released with the failed attempt, so the operator can fix the binary and
+        // start again — the same property `a_failed_startup_releases_the_lock_for_a_retry` holds
+        // for a storage failure.
+        let guard = crate::lifecycle::InstanceGuard::acquire(&settings.lock_path)
+            .expect("a refused startup must leave the profile claimable");
+        drop(guard);
 
         let _ = std::fs::remove_dir_all(&root);
     }

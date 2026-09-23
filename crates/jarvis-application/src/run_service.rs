@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use jarvis_domain::clock::Clock;
 use jarvis_domain::ids::{
-    ContextManifestId, ConversationId, CorrelationId, MessageId, ModelRouteDecisionId,
-    PolicyExceptionId, PrincipalId, RequestId, RunId, WorkspaceId,
+    ConversationId, CorrelationId, MessageId, ModelRouteDecisionId, PolicyExceptionId, PrincipalId,
+    RequestId, RunId, WorkspaceId,
 };
 use jarvis_domain::model::capability::CapabilityDescriptor;
 use jarvis_domain::model::policy::{PolicyRules, PolicyVersionRef, Sensitivity};
@@ -60,18 +60,28 @@ use crate::run_controller::{ControllerError, RunController};
 /// The contract bounds the input text to 32 KiB after UTF-8 decoding, and a
 /// different bound here would either accept text the contract refuses or refuse text
 /// the contract accepts. It is repeated rather than imported because the protocol
-/// crate is not a dependency of the application layer, and a test in the daemon
-/// asserts the two agree.
+/// crate is not a dependency of the application layer — so this crate **cannot** compare the two,
+/// and neither can the protocol crate. The comparison therefore lives in `jarvis-infrastructure`,
+/// which depends on both: `the_objective_bound_is_the_one_the_wire_bound_enforces` in `http`'s
+/// tests. This comment used to say "a test in the daemon asserts the two agree", which was false —
+/// the daemon's only test checks profile source names, and each crate's own test asserted its
+/// constant against the same literal, which is the number written twice rather than an agreement.
 pub const MAX_OBJECTIVE_BYTES: usize = 32 * 1024;
 
 /// The default wall-clock budget given to a created run, in milliseconds.
 ///
-/// Fifteen minutes. Every run needs *some* deadline, because the budget is what bounds a
-/// provider that never answers: without one the run has no deadline at all, so a hang
-/// leaves it non-terminal until a daemon restart recovers it. This is a default rather
-/// than a ceiling, and it is deliberately generous — a bound tight enough to interrupt
-/// real work would trade a hang for false failures.
-pub const DEFAULT_RUN_BUDGET_MS: u64 = 900_000;
+/// **Re-exported from the domain rather than declared here, because it used to be both.**
+/// `DEFAULT_RUN_BUDGET_MS` and `jarvis_domain::run::budget::DEFAULT_RUN_DEADLINE_MS` were separate
+/// constants that happened to hold the same number, with nothing comparing them — and the domain's
+/// copy had no production caller at all, so it was the *documented* default that the daemon never
+/// used. Editing either one alone would have left the default that is written to a run's budget
+/// disagreeing with the default the domain publishes, and no test could see it: each constant was
+/// asserted against its own literal by its own crate's tests.
+///
+/// The alias keeps every existing caller spelling the same, so the fix is a deletion rather than a
+/// rename. `jarvis-application` may depend on `jarvis-domain`, and does, so there is no boundary
+/// being crossed — this is a value with exactly one definition now.
+pub use jarvis_domain::run::budget::DEFAULT_RUN_DEADLINE_MS as DEFAULT_RUN_BUDGET_MS;
 
 /// The scoped operation name for run creation, used in the idempotency key.
 pub const CREATE_OPERATION: &str = "runs.create";
@@ -1128,15 +1138,15 @@ pub fn api_request_context(
     )
 }
 
-/// The context manifest identifier a run's answer was assembled under.
-///
-/// Reserved for the context slice to populate; a caller that needs a manifest id now
-/// uses this so the field's absence is explicit rather than a hardcoded string
-/// appearing in two places later.
-#[must_use]
-pub fn no_context_manifest() -> Option<ContextManifestId> {
-    None
-}
+// **`no_context_manifest()` was here and is deleted.** It returned `None` for a run's
+// `agent_runs.context_manifest_id`, and its doc said "a caller that needs a manifest id now uses
+// this so the field's absence is explicit". No caller existed — not in production, not in a test,
+// and not in a doc — so it was the absence made explicit for nobody, while the column stayed NULL
+// for every run because nothing populates it at all (`agent-runs.md` records that the
+// `context_manifests` table is `MEM-008`). Its own `must_use` marked it as something a caller
+// ought to heed, which is exactly the shape that makes a dead function read as load-bearing.
+// When the manifest is persisted, the read of a stored run is where the `Option` belongs — not a
+// free function returning a constant.
 
 #[cfg(test)]
 mod tests;

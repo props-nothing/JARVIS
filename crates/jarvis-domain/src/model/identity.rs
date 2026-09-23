@@ -68,7 +68,12 @@ macro_rules! owner_name {
     ($name:ident, $kind:literal, $doc:literal) => {
         #[doc = $doc]
         ///
-        /// The value is a lowercase dotted slug (see [`validate_name`]); it is
+        // Not a link: `validate_name` is private to this crate, and rustdoc refuses to send the
+        // reader of a **public** item's documentation to a private symbol. As plain code text the
+        // name still tells a maintainer where the rule lives without promising a link that cannot
+        // be followed. (Rustdoc reported this as `private-intra-doc-links` the moment the lint was
+        // denied, which is why it is fixed here rather than left as a warning.)
+        /// The value is a lowercase dotted slug (see `validate_name`); it is
         /// stored exactly as validated, so there is only one spelling per
         /// identity and a lookup cannot miss on case or separators.
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

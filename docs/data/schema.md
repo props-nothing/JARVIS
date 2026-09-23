@@ -677,6 +677,15 @@ correlation and safe metadata. Payloads and secrets are not copied here.
 Track migration checksums/status, scoped maintenance locks, and bounded safe
 operational findings.
 
+**`application_locks` is created but unused.** The table and its lease semantics are specified
+here, and a `storage::lock` module once implemented them, but no code path in the product ever
+acquired or released a row — so the table has no writer, and `docs/data/migrations.md`'s upgrade
+runbook has been corrected to stop telling an operator to acquire one. Do not read this heading as
+evidence that a maintenance lock is taken: the guard against two daemons sharing a profile is the
+held file lock in `lifecycle::InstanceGuard`. A row-level lease is a distinct mechanism (a visible
+holder and expiry, reclaimable after a crash) and is still unimplemented; a later slice should add
+it with a caller attached rather than keep it in case.
+
 ## Critical Constraints and Indexes
 
 - Foreign keys include workspace where practical to prevent cross-workspace

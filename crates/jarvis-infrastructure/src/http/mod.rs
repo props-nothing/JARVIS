@@ -269,6 +269,28 @@ pub fn authority_of(address: SocketAddr) -> String {
     }
 }
 
+/// The capability strings this daemon advertises on the status endpoint.
+///
+/// A named constant rather than a literal inside the handler, because the contract publishes this
+/// list and a client negotiates against it: a capability that exists only as a literal is one no
+/// test can hold to the route table, which is how the contract's example came to advertise four
+/// run capabilities while the daemon served seven operations and advertised one.
+///
+/// **Advertised, not authoritative.** This list states what the surface can do; it is not an
+/// authorization decision, and it is not checked before serving a route. A capability missing here
+/// would still be served — which is why the list is asserted against the router rather than
+/// trusted, and why adding a route without adding its capability is a test failure rather than a
+/// silent omission a client would discover by probing.
+pub const SYSTEM_CAPABILITIES: [&str; 7] = [
+    "system.status",
+    "runs.create",
+    "runs.read",
+    "runs.cancel",
+    "runs.events",
+    "policy.read",
+    "policy.write",
+];
+
 /// The `{"status":"live"}` body.
 #[derive(Debug, Serialize)]
 struct StatusToken {
@@ -284,7 +306,7 @@ struct SystemStatus {
     state: &'static str,
     profile: &'static str,
     storage: StorageStatus,
-    capabilities: Vec<&'static str>,
+    capabilities: &'static [&'static str],
 }
 
 /// The bounded storage status sub-object.
@@ -830,7 +852,7 @@ async fn system_status(State(state): State<Arc<ApiState>>) -> Json<SystemStatus>
             kind: "sqlite",
             status: "ready",
         },
-        capabilities: vec!["system.status"],
+        capabilities: &SYSTEM_CAPABILITIES,
     })
 }
 
@@ -1143,6 +1165,87 @@ mod tests {
             "unknown and wrong must be indistinguishable"
         );
         let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_foreign_credential_is_indistinguishable_from_a_missing_one() {
+        // The contract's authentication section requires the daemon to "reject credentials from
+        // another profile" and to return "the same safe response for unknown, malformed, and
+        // revoked credentials"; its required-tests list names all four cases for test 2. Two were
+        // covered — missing (unauthenticated) and revoked — and the third test sent the good token
+        // with one character appended, which is a **wrong but well-formed** credential.
+        //
+        // The two untested cases take a genuinely different internal route, which is why they were
+        // worth adding rather than assuming they behave like the wrong-credential case:
+        //
+        //   - a **malformed** credential fails when decoding, before any hash comparison, so the
+        //     domain error is `CredentialError::Malformed` — a *different* variant from the
+        //     `Rejected` every other case produces. `ClientRegistry::authenticate` collapses it
+        //     back to `Rejected`, so the response is the same; that collapse is the property under
+        //     test, and asserting it is what stops a later refactor from propagating the variant
+        //     and disclosing `jarvis.credential_malformed` to a caller.
+        //   - a credential **from another profile** is well-formed, decodes, and hashes correctly;
+        //     it simply is not in this daemon's registry. This is the case the "another profile"
+        //     rule exists for, and it is the one a hostile local user would actually present — a
+        //     real credential from their own JARVIS install, not a typo.
+        //
+        // Asserted against the **no-credential** response rather than against each other, because
+        // that is the response a caller can already produce, so it is the one
+        // indistinguishability has to be *from*.
+        let fixture = fixture("auth-indistinguishable");
+        let missing = get(
+            &fixture.app,
+            "/api/v1/system/status",
+            &[("jarvis-api-version", "1")],
+        )
+        .await;
+
+        // A second profile, enrolled independently, whose credential this daemon has never seen.
+        // The enrollment is real — same generator, same store — so the bytes differ only in being
+        // unknown here, which is the whole point.
+        let other_dir = temp_dir("auth-indistinguishable-other");
+        let other_destination = ClientCredentialPath::in_config_dir(&other_dir);
+        let (_, other_credential) =
+            enroll_owner_client("owner", "2026-09-21T00:00:00Z", &other_destination)
+                .expect("the second profile enrolls");
+        let foreign = other_credential.to_presentation_text();
+        // Asserted, not assumed: if enrollment ever became deterministic — derived from a fixed
+        // seed, a build constant, or the client id — the "foreign" credential would silently *be*
+        // this daemon's own, and the case would pass because the credential is valid rather than
+        // because a foreign one is refused. The test would then prove the opposite of its name.
+        assert_ne!(
+            foreign, fixture.token,
+            "the second profile must hold a genuinely different credential",
+        );
+
+        for (label, presented) in [
+            ("malformed", "not-a-credential-at-all".to_owned()),
+            ("empty", String::new()),
+            ("foreign", foreign),
+        ] {
+            let (status, body) = get(
+                &fixture.app,
+                "/api/v1/system/status",
+                &[
+                    ("jarvis-api-version", "1"),
+                    ("authorization", &format!("Bearer {presented}")),
+                ],
+            )
+            .await;
+            assert_eq!(
+                (status, body.as_str()),
+                (missing.0, missing.1.as_str()),
+                "a {label} credential must be indistinguishable from an absent one",
+            );
+            // Named separately from the equality above: this is the value the malformed path could
+            // leak, and it is not the code an absent credential gets.
+            assert!(
+                !body.contains("credential_malformed"),
+                "a {label} credential must not disclose its own failure kind: {body}",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     #[tokio::test]
@@ -1724,6 +1827,145 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         parsed["run_id"].as_str().expect("a run id").to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_objective_bound_is_the_one_the_wire_bound_enforces() {
+        // Two crates bound the same quantity for the same reason, and one comment claimed "a test in
+        // the daemon asserts the two agree" — **which was false**. `jarvis_protocol`'s
+        // `MAX_RUN_INPUT_BYTES` is checked by the handler that reads the body, and
+        // `jarvis_application`'s `MAX_OBJECTIVE_BYTES` is checked by the service that stores it;
+        // `jarvis-application` cannot depend on `jarvis-protocol` (the flow is protocol -> nothing
+        // app-side), so the two literals cannot be compared from either crate alone. Each crate's
+        // own test asserted its constant against `32 * 1024`, which is the same number written
+        // twice — proving the two agree with a literal, not with each other.
+        //
+        // This crate depends on **both**, so it is the only place the comparison can live. The
+        // failure it prevents is quiet and asymmetric: raising the protocol's bound alone would let
+        // the handler accept text the service then refuses with a `422`, so a caller would be told
+        // its well-formed body was too long by a route that had already agreed to take it.
+        assert_eq!(
+            jarvis_protocol::run::MAX_RUN_INPUT_BYTES,
+            jarvis_application::run_service::MAX_OBJECTIVE_BYTES,
+            "the wire bound and the stored-objective bound must be the same limit",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("objective-bound"));
+    }
+
+    #[tokio::test]
+    async fn a_create_names_the_created_resource_in_a_location_header() {
+        // The contract's create step requires "a `Location` header", and the daemon sent none —
+        // so a client had a `202` it could see and no addressable resource. Every client would
+        // then have to build the run's path from its id, which is how two clients come to disagree
+        // about a URL the daemon owns.
+        //
+        // Asserted against the body's `links.self` rather than against a literal path: the two must
+        // name the same resource, and comparing either to a hand-written string would let both
+        // drift together while the test stayed green.
+        let (app, token) = runs_fixture("create-location").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/runs")
+                    .header("host", TEST_AUTHORITY)
+                    .header("jarvis-api-version", "1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", format!("key-{}", uuid::Uuid::now_v7()))
+                    .header("content-length", create_body("hello").len().to_string())
+                    .body(Body::from(create_body("hello")))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("a create must name the created resource")
+            .to_str()
+            .expect("header is text")
+            .to_owned();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body reads");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("the body is JSON");
+        assert_eq!(
+            location,
+            parsed["links"]["self"].as_str().expect("a self link"),
+            "the header and the body must name one resource",
+        );
+        // A run's path, not an absolute URL: the authority is the daemon's own loopback address
+        // and echoing it would put a bind detail into a response a client may forward anywhere.
+        assert!(location.starts_with("/api/v1/runs/"), "{location}");
+        let _ = std::fs::remove_dir_all(temp_dir("create-location"));
+    }
+
+    #[tokio::test]
+    async fn the_advertised_capabilities_cover_every_routed_operation() {
+        // The contract publishes this list and a client negotiates against it. It had drifted in
+        // **both** directions at once: the contract's example named four run capabilities while
+        // the daemon advertised only `system.status`, so a client reading the example would call
+        // an operation the daemon never advertised, and a client reading the daemon would not know
+        // the run routes existed at all.
+        //
+        // The existing protocol test was named for exactly this check —
+        // `the_status_example_names_the_capabilities_the_daemon_actually_serves` — but it only read
+        // the **contract's** example and asserted it against a literal list, so it compared the
+        // document to itself and could never see the daemon. Its comment claimed "the daemon's own
+        // route table must agree"; nothing made it. **A test that states a property in its name and
+        // checks a weaker one is worse than an absent test**, because the name is what a reviewer
+        // trusts. The daemon half lives here, where the route table is.
+        //
+        // Every capability must name a route this daemon actually serves, and every routed
+        // operation must be advertised. Asserted as a set in both directions rather than by count,
+        // so a rename fails instead of merely a removal.
+        let (app, token) = runs_fixture("capabilities").await;
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/system/status",
+            &[
+                ("authorization", format!("Bearer {token}")),
+                ("jarvis-api-version", "1".to_owned()),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let advertised: Vec<String> = parsed["capabilities"]
+            .as_array()
+            .expect("capabilities is an array")
+            .iter()
+            .map(|value| value.as_str().expect("a capability is a string").to_owned())
+            .collect();
+
+        // The surface's operations, each with the route that serves it. A capability the daemon
+        // does not serve would send a client to an endpoint that refuses it.
+        let served = [
+            ("system.status", "/api/v1/system/status"),
+            ("runs.create", "/api/v1/runs"),
+            ("runs.read", "/api/v1/runs/{run_id}"),
+            ("runs.cancel", "/api/v1/runs/{run_id}/cancel"),
+            ("runs.events", "/api/v1/runs/{run_id}/events"),
+            ("policy.read", "/api/v1/model-data-policy"),
+            ("policy.write", "/api/v1/model-data-policy"),
+        ];
+        for (capability, route) in served {
+            assert!(
+                advertised.iter().any(|value| value == capability),
+                "{capability} is served by {route} but not advertised: {advertised:?}",
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            served.len(),
+            "an advertised capability must name a served operation: {advertised:?}",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("capabilities"));
     }
 
     #[tokio::test]
@@ -3175,11 +3417,107 @@ mod tests {
         let unique: std::collections::BTreeSet<&str> = wire.iter().copied().collect();
         assert!(unique.len() < all.len(), "{wire:?}");
         assert_eq!(unique.len(), 7, "{unique:?}");
+
+        // **The partition — which is the part a rename cannot move.** The three assertions above
+        // are satisfied by any seven distinct strings, so a first attempt at this test compared
+        // the image against the protocol's constants and stopped there. A mutation showed that
+        // was **vacuous**: the arms are spelled *from* those constants, so renaming the constant
+        // moved both sides together and the assertion stayed green while the wire value changed.
+        // (A test comparing two things derived from one definition is the same failure as a
+        // double that shares the code's assumptions, one level down.)
+        //
+        // What this test can establish *without* the contract document is the **grouping** the
+        // contract promises in prose — that planning is indistinguishable from context-building
+        // to a client, and that the five work-outstanding states are indistinguishable from each
+        // other. That is a statement about the domain values, not about the strings, so no
+        // spelling of the vocabulary can satisfy or defeat it. The document comparison lives in
+        // `jarvis-protocol`'s contract tests, which can read the document; the two halves
+        // together are what pin both the grouping and the names.
+        let group = |state: RunState| super::wire_state(state);
+        assert_eq!(
+            group(RunState::ContextBuilding),
+            group(RunState::Planning),
+            "a decision being taken reads to a client as part of building the request",
+        );
+        for state in [
+            RunState::AwaitingModel,
+            RunState::AwaitingApproval,
+            RunState::ExecutingTool,
+            RunState::Observing,
+            RunState::Waiting,
+        ] {
+            assert_eq!(
+                group(state),
+                group(RunState::AwaitingModel),
+                "{state:?} must read as work outstanding, with the fine detail in the events",
+            );
+        }
+        // A collapse of the *terminal* states would be a defect rather than a coarsening, so
+        // assert the two directions the grouping above must not have swallowed: no working state
+        // shares a wire value with a terminal one, and a terminal run never reads as live.
+        for state in [
+            RunState::Received,
+            RunState::ContextBuilding,
+            RunState::Planning,
+            RunState::AwaitingModel,
+            RunState::AwaitingApproval,
+            RunState::ExecutingTool,
+            RunState::Observing,
+            RunState::Waiting,
+            RunState::Responding,
+        ] {
+            assert!(
+                !state.is_terminal(),
+                "{state:?} is listed here as non-terminal",
+            );
+            assert!(
+                ![
+                    jarvis_protocol::run::run_state::COMPLETED,
+                    jarvis_protocol::run::run_state::FAILED,
+                    jarvis_protocol::run::run_state::CANCELLED,
+                ]
+                .contains(&group(state)),
+                "{state:?} must not read as a finished run",
+            );
+        }
+
+        // And every arm names a protocol constant rather than an inline literal, so the guarantee
+        // the contract test establishes attaches to this projection. This is the only content in
+        // this comparison: with the arms spelled from the constants the two sets move together, so
+        // what it really refuses is an arm that spells its own string.
+        let contract: std::collections::BTreeSet<&str> = [
+            jarvis_protocol::run::run_state::RECEIVED,
+            jarvis_protocol::run::run_state::CONTEXT_BUILDING,
+            jarvis_protocol::run::run_state::MODEL_RUNNING,
+            jarvis_protocol::run::run_state::RESPONDING,
+            jarvis_protocol::run::run_state::COMPLETED,
+            jarvis_protocol::run::run_state::FAILED,
+            jarvis_protocol::run::run_state::CANCELLED,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            unique,
+            contract,
+            "every arm must yield a protocol constant and every constant must be reachable: \
+             only in the protocol is {contract:?}, only here is {:?}",
+            unique.difference(&contract).collect::<Vec<_>>(),
+        );
+
         // The terminal states are one-to-one, so a client never sees a finished run
         // described by a non-terminal wire state.
-        assert_eq!(super::wire_state(RunState::Completed), "completed");
-        assert_eq!(super::wire_state(RunState::Failed), "failed");
-        assert_eq!(super::wire_state(RunState::Cancelled), "cancelled");
+        assert_eq!(
+            super::wire_state(RunState::Completed),
+            jarvis_protocol::run::run_state::COMPLETED,
+        );
+        assert_eq!(
+            super::wire_state(RunState::Failed),
+            jarvis_protocol::run::run_state::FAILED,
+        );
+        assert_eq!(
+            super::wire_state(RunState::Cancelled),
+            jarvis_protocol::run::run_state::CANCELLED,
+        );
     }
 
     /// A policy surface fixture backed by a real migrated database.

@@ -25,7 +25,7 @@
 //! depends on both sides agreeing about key order, whitespace, and numeric form,
 //! and the failure mode is a signature that verifies for one writer and not
 //! another. Detached-over-bytes has no such ambiguity. Both the signer and the
-//! verifier here use [`manifest_bytes`] / [`sign_manifest`] from this module, so
+//! verifier here use `manifest_bytes` / [`sign_manifest`][sign_manifest] from this module, so
 //! the two sides cannot drift apart.
 //!
 //! ## Trust anchor

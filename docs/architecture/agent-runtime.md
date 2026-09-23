@@ -99,7 +99,12 @@ because each was a defect the diagram had rather than a stylistic choice:
   than by reading or by driving a single path.
 
 State names are domain concepts, not UI strings. A transition records actor,
-reason, expected prior version, timestamp, and correlation metadata.
+reason, expected prior version, timestamp, and correlation metadata. The
+client-visible projection is therefore an explicit mapping at the API boundary rather
+than a `serde` rename on the state type, and the seven wire names are owned in
+`jarvis_protocol::run::run_state` so the daemon and a client share one definition; the
+set is asserted against `local-control-api.md` in both directions, and the grouping (which
+domain states collapse into which wire state) is asserted at the boundary.
 
 ### Implemented evidence (`BRN-005`)
 
@@ -248,6 +253,22 @@ The pass is safe to run against a live database for one structural reason: the
 transition it writes carries the version it **read**, so a run that completed in
 between is refused rather than overwritten. That is what keeps a real outcome from
 being replaced by a failure, and it is asserted directly.
+
+3. **The pass pages, because a read bound is not a reach bound.** `incomplete_runs` offers
+   interrupted runs one bounded page at a time, oldest-first, and `reconcile` loops until the store
+   is drained. Reading one page and stopping was a real defect: the store's bound hid the **newest**
+   runs, so a profile with more interrupted runs than the page held would leave them non-terminal on
+   that restart and every later one — each pass recovering the same oldest page and reporting
+   success. Two consequences are now stated in the code rather than assumed:
+   `ReconciliationReport::is_complete` means "no write failed **and** nothing was left unread", and
+   `start` fails on the latter rather than logging a count, because readiness is defined as
+   classification having completed.
+   The loop has to be able to **conclude** as well as continue, and the reason is specific: a
+   refused write leaves its run in exactly the state the read looks for, so a full page that settled
+   nothing would be re-read for ever on the startup path. That decision is a pure function
+   (`recovery::page_outcome`) precisely so both of its dangerous answers can be asserted — a wrong
+   `continue` hangs, a wrong `break` strands runs, and only one of the two is testable end to end
+   without hanging the suite.
 
 ### Implemented evidence (`BRN-008`, budgets)
 

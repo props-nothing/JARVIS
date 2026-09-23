@@ -76,8 +76,17 @@ The initial owner credential is generated with at least 256 bits of operating-
 system CSPRNG entropy during local profile onboarding. The plaintext credential
 is stored in the OS credential store where available; any fallback must be
 encrypted or protected by owner-only permissions and documented by platform.
-The daemon stores a one-way verifier, client ID, creation time, scopes, and
-revocation state, not a recoverable plaintext copy in ordinary configuration.
+The daemon stores a one-way verifier, client ID, creation time, and revocation
+state, not a recoverable plaintext copy in ordinary configuration.
+
+**Scopes are not part of the local client credential in v0.1**, and this
+contract states that explicitly because an earlier version listed them among the
+stored fields. The credential is owner-wide and carries no grants: the workspace
+is resolved server-side from the authenticated owner, so a client cannot widen or
+narrow its own reach by anything it sends. The scoped-session model — a bootstrap
+credential exchanged for a session carrying explicit grants — belongs to the
+later device-enrollment contract named below, and a client must not read this
+section as promising it today.
 
 Milestone 1 supports offline same-owner enrollment performed by an explicit CLI
 onboarding command. There is no unauthenticated HTTP enrollment endpoint. Later
@@ -86,7 +95,11 @@ device enrollment requires a separate accepted challenge/consent contract.
 Authentication rules:
 
 - Compare credential verifiers in constant time.
-- Reject credentials from another profile, revoked clients, and unknown scopes.
+- Reject missing, malformed, another-profile, and revoked credentials. All four
+  return the **same** response, so a caller learns only that it is not
+  authenticated and never which of the four applied. That distinction is worth
+  withholding: it would confirm whether a presented value had the right *shape*,
+  and whether a credential from another profile exists at all.
 - Never place credentials in URLs, discovery files, logs, errors, diagnostics,
   shell arguments, or process titles.
 - Requests with an `Origin` header are rejected in v0.1. No CORS response headers
@@ -128,7 +141,17 @@ POST /api/v1/runs
 GET  /api/v1/runs/{run_id}
 GET  /api/v1/runs/{run_id}/events
 POST /api/v1/runs/{run_id}/cancel
+GET  /api/v1/model-data-policy
+PUT  /api/v1/model-data-policy
+GET  /api/v1/model-data-policy/effective
 ```
+
+The three policy routes are served **on this same surface, under the same authentication, version
+negotiation, `Host`/`Origin`/forwarding rules, media-type rule, and error envelope** as every route
+above. They were absent from this list while being routable, which is the defect a list of endpoints
+is supposed to prevent: a client reading only this contract could not discover them, and a reviewer
+checking the surface against the document would find the document short. Their request and response
+shapes are owned by `docs/contracts/model-data-policy.md`, which is why only the paths appear here.
 
 Unknown routes return the common error envelope. All `/api/v1` responses use
 `application/json` except the event stream. Request bodies are bounded to 64 KiB
@@ -171,9 +194,23 @@ through authenticated status/doctor paths.
   "state": "ready",
   "profile": "default",
   "storage": {"kind":"sqlite","status":"ready"},
-  "capabilities": ["runs.create","runs.read","runs.cancel","runs.events"]
+  "capabilities": [
+    "system.status",
+    "runs.create",
+    "runs.read",
+    "runs.cancel",
+    "runs.events",
+    "policy.read",
+    "policy.write"
+  ]
 }
 ```
+
+`capabilities` is the negotiation list: a client reads it to learn which operations this build
+serves before attempting one. It is **advertised, not authoritative** — it is not consulted before
+serving a route, so it cannot be used to grant or withhold anything, and a client must still handle
+a refusal from any route it calls. The daemon's list is asserted against its own route table by a
+test, so a route added without its capability fails rather than being discovered by probing.
 
 The response never includes filesystem paths, secret references, connection
 strings, environment values, raw internal errors, or another client's data.
@@ -210,7 +247,8 @@ The server resolves and authorizes the referenced model policy in the active
 workspace. A request may add typed stricter overrides in a later schema, but it
 cannot supply provider evidence or weaken workspace policy.
 
-Successful creation returns `202 Accepted`, a `Location` header, and:
+Successful creation returns `202 Accepted`, a `Location` header naming the created run's resource
+path (the same path the response body carries as `links.self`), and:
 
 ```json
 {
@@ -480,8 +518,20 @@ names no request.
 - On restart, terminal runs remain terminal. Nonterminal runs are recovered to
   an explicit resumable or failed state; they are never inferred complete from
   partial text.
+  - **Every** nonterminal run is reached, not the first page of them. The store offers them one
+    bounded page at a time, oldest-first, and the pass pages through until the store is drained —
+    so the runs a bound would otherwise hide are the **newest**, which is the opposite of what an
+    operator would guess and exactly the ones a single-page pass would strand on every restart.
+    This is stated because a bound on a read is not a bound on what recovery reaches, and a
+    500-run limit reads like a guarantee rather than a page size.
+  - A pass that stops on a full page which settled **nothing** (every write refused, or every run
+    already settled between the read and the write) reports the store as still holding runs, and
+    the daemon **fails startup** rather than reporting ready. It does not loop: a refused write
+    leaves its run in the state the read looks for, so continuing would re-read the same page for
+    ever on the startup path.
 - Readiness stays false until migrations, integrity preconditions, and recovery
-  classification complete.
+  classification complete, and it is not reported when the store still holds interrupted runs
+  the pass could not settle.
 - The daemon drains new mutations before shutdown while bounded in-flight work
   reaches a persisted state.
 
@@ -512,6 +562,18 @@ implemented in `jarvis-infrastructure`:
 
 - the `http` module's own tests cover the indistinguishable authentication
   response, the version-negotiation failure, and the rejections below;
+- the four cases test 2 names are each driven: **missing** and **wrong** in
+  `a_wrong_credential_gets_the_same_response_as_a_missing_one`, **revoked** in
+  `a_revoked_client_is_refused`, and **malformed** and **another-profile** in
+  `a_malformed_or_foreign_credential_is_indistinguishable_from_a_missing_one`.
+  The last two took a genuinely different internal path — a malformed credential
+  fails while decoding, before any comparison, and another profile's credential is
+  well-formed and simply unknown here — so they are asserted rather than inferred
+  from the wrong-credential case. The malformed path is also pinned where the
+  collapse happens: `ClientRegistry::authenticate` maps `CredentialError::Malformed`
+  to `Rejected`, and `a_malformed_credential_collapses_to_the_same_rejection_as_a_stranger`
+  holds it there, because the handler maps *any* error to one response and so cannot
+  by itself reveal that a distinct variant escaped;
 - `tests/daemon_serving.rs` repeats the `Host` rejections over a **real socket**,
   where a real client chooses the header and a proxy would rewrite it. A router
   test alone would not prove the control holds on the wire, because a loopback
@@ -551,6 +613,18 @@ intention:
   because `agent-runtime.md` forbids domain state names doubling as wire strings. The
   three terminal states map one-to-one, so a client never sees a finished run
   described by a non-terminal state.
+  **The seven names are owned in one place** — `jarvis_protocol::run::run_state` — and the
+  projection spells its arms from those constants, so the vocabulary the daemon emits and the
+  vocabulary a client switches on cannot diverge by an edit at a call site. The set itself is
+  asserted against this document **in both directions** by a contract test in `jarvis-protocol`:
+  a state named here with no constant fails, and a constant defined with no mention here fails.
+  This sentence previously read as though the projection's agreement with the contract were
+  enforced when only its *shape* was: the covering test compared the number of distinct wire
+  states (`7`) and three terminal names, so renaming one arm kept the count, kept the terminals,
+  and left the daemon emitting a state this document does not publish — with every build gate
+  and every end-to-end journey still green. The projection is now also asserted to *group* the
+  domain states as described above (planning with context building; the five work-outstanding
+  states together), which is the half of the claim a vocabulary rename cannot move.
 - **Authentication is a property of the handler.** `AuthenticatedClient` is a
   `FromRequestParts` extractor, so a route that lacks a credential cannot run and
   cannot be reached by forgetting a middleware call. All four run routes are asserted
@@ -641,6 +715,21 @@ a startup concern of the whole profile. Scoping it to one workspace would leave 
   pass continues, so a single unsettleable run cannot leave the rest non-terminal. The
   report distinguishes a completed pass from a partial one, so a caller cannot read
   "nothing to do" out of a pass that could not read.
+- **The read is paged, and "no failures" is not "no runs left".** `incomplete_runs` returns one
+  bounded page (`RecoveryPage`, `MAX_INCOMPLETE_RUNS` = 500) **and says whether it stopped at its
+  bound**; the pass loops until the store is drained. This was a real defect rather than a
+  hypothetical: the pass read one page and stopped, and because interrupted runs are ordered
+  oldest-first the runs it left behind were the **newest** — unrecovered on that restart and on
+  every later one, since each pass recovered the same oldest page and reported success. The
+  consequence is visible in two places: `ReconciliationReport::is_complete` is now
+  `failures.is_empty() && !incomplete_store` (it was the failure check alone, so a truncated read
+  read as a clean pass), and `start` **fails** on `incomplete_store` rather than logging a count,
+  because readiness is defined as classification having completed.
+- **The loop can conclude as well as continue.** A page whose writes all fail settles nothing, and
+  a refused write leaves its run in the state the read looks for — so "read again" would re-read
+  the same page for ever on the startup path. The decision is a pure function
+  (`recovery::page_outcome`), which is the only way to assert both dangerous answers: continuing on
+  a stalled page is an infinite loop, and stopping on a changing page strands the newest runs.
 - **`TransitionActor::Supervisor`** records that the daemon ended the run, not the run.
   Recording it as the controller would attribute a decision to the run that the run
   never made.

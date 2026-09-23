@@ -265,7 +265,15 @@ function request(record, credential, method, path, body, extraHeaders = {}) {
           } catch {
             json = undefined;
           }
-          resolve({ status: response.statusCode, text, json });
+          // Headers are exposed because a response header is part of the contract too: the
+          // create step promises a `Location`, and a body-only assertion cannot see whether the
+          // daemon sent one. Lower-cased, because HTTP header names are case-insensitive and a
+          // test keyed on one spelling would depend on the runtime's casing.
+          const responseHeaders = {};
+          for (const [name, value] of Object.entries(response.headers)) {
+            responseHeaders[name.toLowerCase()] = value;
+          }
+          resolve({ status: response.statusCode, text, json, headers: responseHeaders });
         });
       },
     );
@@ -697,8 +705,20 @@ async function main() {
       fail(`a run under a permitting policy must be accepted, got ${governed.status}`, governed.text);
     } else if (typeof governed.json?.run_id !== "string") {
       fail("the accepted run must name its identifier", governed.text);
+    } else if (governed.headers.location !== governed.json?.links?.self) {
+      // The contract's create step promises a `Location` header, and the daemon sent none until
+      // this round — so a client had a `202` it could see and no addressable resource. Compared
+      // against the body's own `links.self` rather than a literal path, because the two must name
+      // the same resource; asserting either against a hand-written string would let both drift
+      // together while the check stayed green. Asserted **over the wire** because the header is
+      // what a real client reads, and the handler test cannot prove the daemon serialized it.
+      fail(
+        "a create must name the created resource in a Location header matching links.self",
+        `location=${governed.headers.location} self=${governed.json?.links?.self}\n${governed.text}`,
+      );
     } else {
       pass("a run is created under the active policy and answers 202");
+      pass("the create names the created resource in a Location header");
     }
 
     // The runtime the create named is **recorded on the row**, not only validated. The handler

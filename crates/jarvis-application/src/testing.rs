@@ -7,7 +7,7 @@
 //! invisible to the integration tests in another crate that need them too.
 //!
 //! **The important design point:** these doubles do not reimplement the transition
-//! rules. [`RunLifecycle`](jarvis_domain::run::lifecycle::RunLifecycle) — the domain
+//! rules. [`RunLifecycle`] — the domain
 //! value — is the single authority for edge legality, version ordering, and terminal
 //! absorption, exactly as it is in the SQLite adapter. A double that copied those
 //! rules would be a second implementation that could disagree with the first, and a
@@ -39,8 +39,9 @@ use crate::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelCallState, NewModelCall, StoredModelCall,
 };
 use crate::repository::run::{
-    IdempotencyClaim, MAX_EVENT_PAGE, NewActivityEvent, NewIdempotencyRecord, NewRun, RunEventPage,
-    RunRepository, RunResumeState, StoredActivityEvent, StoredRun, validate_idempotency_key,
+    IdempotencyClaim, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord,
+    NewRun, RecoveryPage, RunEventPage, RunRepository, RunResumeState, StoredActivityEvent,
+    StoredRun, validate_idempotency_key,
 };
 use crate::repository::{RepositoryError, RepositoryFuture};
 
@@ -650,7 +651,7 @@ impl RunRepository for InMemoryRepositories {
         })
     }
 
-    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<crate::repository::run::IncompleteRun>> {
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, RecoveryPage> {
         Box::pin(async move {
             self.with(|store| {
                 let mut incomplete: Vec<crate::repository::run::IncompleteRun> = store
@@ -666,8 +667,32 @@ impl RunRepository for InMemoryRepositories {
                     .collect();
                 // Oldest first, matching the adapter's ordering, so a test that asserts
                 // the order is asserting the same order a recovery pass would see.
+                //
+                // "Matching the adapter's ordering" is a claim this crate **cannot check**: it does
+                // not depend on `jarvis-infrastructure`, so double and adapter cannot be compared
+                // from here. Where an agreement matters it is asserted in the adapter's own tests,
+                // and this comment says what the double does rather than what the adapter does.
+                // That distinction is not pedantry: this comment used to assert parity while the
+                // double omitted the adapter's `LIMIT`, and a double that enforces **less** than
+                // its adapter lets a test pass against behaviour the production store never
+                // produces.
                 incomplete.sort_by_key(|entry| entry.run.created_at);
-                Ok(incomplete)
+                // **The bound, which this double used to omit while its comment above claimed to
+                // match the adapter's ordering.** The adapter had `LIMIT MAX_INCOMPLETE_RUNS` and
+                // this returned everything, so a test could not see the bounded case at all — and
+                // the difference was invisible because `jarvis-application` cannot depend on
+                // `jarvis-infrastructure` to compare against the real thing. A double that
+                // enforces *less* than its adapter is the dangerous direction: a test passes
+                // against behaviour the production store would not produce.
+                //
+                // One past the bound, like the adapter, so `bounded` is observed rather than
+                // inferred from a length comparison.
+                let bounded = incomplete.len() > MAX_INCOMPLETE_RUNS as usize;
+                incomplete.truncate(MAX_INCOMPLETE_RUNS as usize);
+                Ok(RecoveryPage {
+                    runs: incomplete,
+                    bounded,
+                })
             })
         })
     }
@@ -1427,9 +1452,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_double_enforces_scope_like_the_real_adapter() {
-        // A foreign run must be `NotFound`, not a forbidden result, because the API
-        // requires the two to be indistinguishable.
+    async fn a_foreign_run_is_refused_as_not_found_by_the_double() {
+        // Renamed from `the_double_enforces_scope_like_the_real_adapter`, which claimed a comparison
+        // this crate **cannot** make: `jarvis-application` does not depend on
+        // `jarvis-infrastructure`, so there is no adapter here to compare against. The test drove
+        // the double and asserted about the double, while its name told a reviewer that double and
+        // adapter agreement had been checked — and that agreement is where the real defect was
+        // hiding (`incomplete_runs` enforced no bound while the adapter's did).
+        //
+        // What is actually tested, and still worth testing: the double applies the workspace scope
+        // as a predicate rather than a post-filter, so a foreign run is `NotFound` and not a
+        // forbidden result — the API requires the two to be indistinguishable.
         let repositories = repos();
         seed(&repositories).await;
         let foreign = WorkspaceId::from_uuid(id(99));

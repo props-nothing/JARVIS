@@ -12,7 +12,8 @@
 //! Two properties matter more than the SQL itself:
 //!
 //! - **The state write and its activity event commit together.**
-//!   [`RunRepositoryImpl::transition`] opens one transaction, applies the state
+//!   [`RunRepository::transition`][jarvis_application::repository::run::RunRepository::transition]
+//!   opens one transaction, applies the state
 //!   change with an optimistic version predicate, and appends the event before
 //!   committing. `docs/architecture/storage-data.md` names this the first required
 //!   atomic use case, and doing it in two statements would leave a window in which
@@ -32,8 +33,8 @@ use jarvis_application::repository::model_call::{
 };
 use jarvis_application::repository::run::{
     EventVisibility, IdempotencyClaim, IncompleteRun, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
-    NewActivityEvent, NewIdempotencyRecord, NewRun, RunEventPage, RunRepository, RunResumeState,
-    RunRuntime, RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
+    NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage, RunEventPage, RunRepository,
+    RunResumeState, RunRuntime, RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
@@ -1003,13 +1004,19 @@ impl RunRepository for SqliteRepositories {
         })
     }
 
-    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<IncompleteRun>> {
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, RecoveryPage> {
         Box::pin(async move {
             // The predicate is on the stored state rather than on `completed_at`, so a
             // run whose completion instant was somehow absent is still found. Scoping
             // this read to one workspace would silently leave every other workspace's
             // interrupted runs non-terminal forever, which is why it is unscoped and
             // each entry carries its own workspace.
+            //
+            // **One past the bound**, so `bounded` is observed rather than inferred. Reading
+            // exactly the bound and comparing the length would report "complete" for a store
+            // holding exactly the bound, and would silently start lying if the bound changed;
+            // asking for one more row costs one row and makes the answer a fact about the store.
+            let limit = i64::from(MAX_INCOMPLETE_RUNS) + 1;
             let rows = sqlx::query(concat!(
                 "SELECT ",
                 run_columns!(),
@@ -1017,13 +1024,14 @@ impl RunRepository for SqliteRepositories {
                  WHERE state NOT IN ('completed', 'failed', 'cancelled') \
                  ORDER BY created_at ASC LIMIT ?"
             ))
-            .bind(i64::from(MAX_INCOMPLETE_RUNS))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| RepositoryError::Query)?;
 
-            let mut incomplete = Vec::with_capacity(rows.len());
-            for row in &rows {
+            let bounded = rows.len() > MAX_INCOMPLETE_RUNS as usize;
+            let mut incomplete = Vec::with_capacity(rows.len().min(rows.capacity()));
+            for row in rows.iter().take(MAX_INCOMPLETE_RUNS as usize) {
                 let run = stored_run(row)?;
                 // A state the domain cannot interpret is corruption, and it is reported
                 // rather than skipped: skipping would leave the run non-terminal with
@@ -1035,7 +1043,10 @@ impl RunRepository for SqliteRepositories {
                     waiting_ref: opt_text(row, "waiting_ref")?,
                 });
             }
-            Ok(incomplete)
+            Ok(RecoveryPage {
+                runs: incomplete,
+                bounded,
+            })
         })
     }
 }

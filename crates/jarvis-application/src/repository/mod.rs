@@ -7,14 +7,16 @@
 //! `jarvis-infrastructure` implements these; nothing here names a database.
 //!
 //! The method set is deliberately purpose-specific rather than generic CRUD, as
-//! `storage-data.md` requires. [`RunRepository::transition`] is the important one:
+//! `storage-data.md` requires. [`RunRepository::transition`][run::RunRepository::transition] is
+//! the important one:
 //! it enforces the expected version and state and reports a conflict instead of
 //! silently overwriting concurrent work, and it appends the run's durable activity
 //! event **in the same transaction** — the first of that document's required atomic
 //! use cases, "transition run state and append its durable activity event".
 //!
 //! Scope is a parameter, not an implicit filter. Every read takes a
-//! [`WorkspaceId`], and a run from another workspace is reported as absent rather
+//! [`WorkspaceId`][jarvis_domain::ids::WorkspaceId], and a run from another workspace is
+//! reported as absent rather
 //! than as forbidden, because the local control API requires that "a run from
 //! another scope is indistinguishable from a missing run".
 

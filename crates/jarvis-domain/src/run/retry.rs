@@ -12,8 +12,9 @@
 //! [`FailureSite`] is a required input rather than a detail the caller may omit: a
 //! connection reset *before* the provider accepted the call cannot have consumed
 //! anything, while a failure *after* acceptance may have produced output, been billed,
-//! and left a provider-side record. Those two situations can carry the *same*
-//! [`ProviderError`], so the error alone cannot decide — and a retry policy that looked
+//! and left a provider-side record. Those two situations can carry the *same* error
+//! ([`FailureClass::Permanent`] versus [`FailureClass::Transient`] is a separate axis), so the
+//! classification alone cannot decide — and a retry policy that looked
 //! only at the error would retry the ambiguous case, which is the one the contract names.
 //!
 //! ## Why the retry must fit inside the deadline

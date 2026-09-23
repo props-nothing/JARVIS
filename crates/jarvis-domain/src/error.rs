@@ -235,7 +235,7 @@ impl ErrorCode {
     /// Creates an error code from a namespaced string.
     ///
     /// A code that does not carry the JARVIS prefix is replaced by
-    /// [`ErrorCode::internal`] so an accidental non-namespaced code can never
+    /// [`ErrorCode::INTERNAL`] so an accidental non-namespaced code can never
     /// reach a client.
     #[must_use]
     pub const fn new(code: &'static str) -> Self {

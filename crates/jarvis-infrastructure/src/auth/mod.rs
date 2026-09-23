@@ -387,6 +387,54 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_credential_collapses_to_the_same_rejection_as_a_stranger() {
+        // `authenticate`'s doc states that "unknown, malformed, and revoked credentials all produce
+        // this same value, so a caller cannot distinguish them" — a claim about all three, and only
+        // **two** were asserted: the stranger test and the revoked test, both of which produce
+        // `Rejected` directly.
+        //
+        // A malformed credential takes a genuinely different path: it fails while decoding, before
+        // any comparison, so `verify` returns `Malformed`. That distinct variant is why the collapse
+        // is worth asserting rather than assuming — a caller receiving it would learn that its
+        // credential was *shaped* wrong rather than unknown, which is a real disclosure when the
+        // credential came from another profile or from a probe.
+        //
+        // The HTTP layer cannot catch this on its own: it maps the error through `unauthenticated()`
+        // today, so reverting the collapse to `?` would surface `jarvis.credential_malformed`, and
+        // the existing handler test would fail on the *body equality* rather than on the property
+        // being named. Asserting it at the registry pins the collapse where it happens.
+        let credential = GeneratedCredential::generate().expect("entropy");
+        let mut registry = ClientRegistry::new();
+        registry.register(client("owner", &credential));
+
+        for (label, presented) in [
+            ("empty", ""),
+            ("not-base64", "!!!!"),
+            ("too-short", "AAAA"),
+            ("wrong-length", &"A".repeat(44)),
+        ] {
+            let error = registry
+                .authenticate(presented)
+                .expect_err("a malformed credential must be rejected");
+            assert_eq!(
+                error.code(),
+                "jarvis.credential_rejected",
+                "a {label} credential must not disclose that it was malformed",
+            );
+        }
+
+        // And a *well-formed* credential that this daemon has never seen — the other-profile case
+        // the contract names. It decodes and hashes correctly, so it can only be refused by
+        // comparison, which is the path the stranger test takes; asserted here so all three cases
+        // the doc names are held to one value in one place.
+        let foreign = GeneratedCredential::generate().expect("entropy");
+        let error = registry
+            .authenticate(&foreign.to_presentation_text())
+            .expect_err("a foreign profile's credential must be rejected");
+        assert_eq!(error.code(), "jarvis.credential_rejected");
+    }
+
+    #[test]
     fn the_registry_holds_more_than_one_credential_without_length_leak() {
         // Two clients whose presentations differ in length class must both work,
         // which is why verification decodes before hashing rather than comparing

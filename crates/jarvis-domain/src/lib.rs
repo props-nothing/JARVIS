@@ -10,6 +10,13 @@
 //! and bounded text rather than with a JSON implementation or a provider SDK, so an
 //! adapter normalizes at its own boundary.
 #![forbid(unsafe_code)]
+// A doc comment pointing at a symbol that does not exist reads exactly like one that resolves;
+// the only difference is whether anything checks. `BRN-035` found 21 such links, two of them
+// naming a type (`WireRunState`) that was never written — including the sentence explaining where
+// the wire-state projection lives. Rustdoc reports these as warnings by default, which the rest of
+// the workspace's gates ignored, so the links could rot silently. Denied here rather than left at
+// `warn`, because "checked by a warning nothing reads" is the same as unchecked.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod clock;
 pub mod context;

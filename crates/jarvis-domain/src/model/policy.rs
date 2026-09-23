@@ -8,7 +8,8 @@
 //!
 //! The merge is implemented as a fold over layers ordered from strongest to
 //! weakest, where each layer may only *narrow* the accumulated result. That is why
-//! [`Mergeable::merge_stricter`] returns an error when it cannot express a
+//! [`PolicyRules::merge_stricter`] returns an error when it
+//! cannot express a
 //! narrowing: refusing is what keeps an unimplemented interaction between two
 //! rules from silently permitting more than either rule allowed.
 //!

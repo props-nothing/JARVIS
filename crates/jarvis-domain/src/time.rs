@@ -20,10 +20,22 @@ use crate::error::DomainError;
 
 /// An absolute instant in UTC with nanosecond precision.
 ///
-/// The value is normalized to UTC on construction, so it has exactly one string
+/// The value is normalized to UTC on construction, so it has exactly one canonical
 /// form: RFC 3339 with a `Z` offset. Offset-bearing input is accepted and
 /// converted, which makes it impossible for two different-looking strings to
 /// denote two different stored values for the same instant.
+///
+/// **One canonical string per instant — but a variable-width column, and a string that does not
+/// sort chronologically.** Zero fractional digits are omitted, so `2026-09-20T12:00:00.000Z` and
+/// `2026-09-20T12:00:00Z` render identically (measured), while
+/// `2026-09-20T12:00:00.123456789Z` renders at 30 characters. That variability breaks lexical
+/// ordering, which is easy to assume and wrong: `.` is `0x2E` and `Z` is `0x5A`, so
+/// `12:00:00.1Z` sorts **before** `12:00:00Z` even though it is later. **A `TEXT` `<`, `<=`, or
+/// `ORDER BY` over these strings is therefore not chronological**, and a column compared that way
+/// can name the wrong row. Ordering and range predicates on the *values* are correct
+/// (`jiff::Timestamp` is `Ord`); see
+/// `the_canonical_forms_of_one_instant_are_equal_while_their_text_order_is_not` for the assertion
+/// and `docs/contracts/common-conventions.md` for the rule a SQL predicate must follow.
 ///
 /// JARVIS does not model leap seconds: `jiff` constrains a parsed second of `60`
 /// to `59`.
@@ -250,6 +262,61 @@ mod tests {
     fn offsets_are_normalized_to_utc() {
         let instant = UtcTimestamp::parse("2024-06-19 15:22:45-04").expect("valid instant");
         assert_eq!(instant.to_string(), "2024-06-19T19:22:45Z");
+    }
+
+    #[test]
+    fn the_canonical_forms_of_one_instant_are_equal_while_their_text_order_is_not() {
+        // **Two assumptions about this type were wrong, and this test pins the measured facts.**
+        //
+        // The first was mine, while correcting the doc: I wrote that a zero fractional part is
+        // *padded to a different width*, so `…:00Z` and `…:00.000Z` were two strings for one
+        // instant. `jiff` **omits** zero fraction digits, so they render identically and the type
+        // has one canonical string per instant exactly as its doc always said. The test that
+        // asserted the opposite failed, which is the only reason the claim did not reach a
+        // document.
+        //
+        // The second is the one that matters, and it was asserted nowhere while a convention
+        // stated its opposite: **the canonical strings do not sort chronologically.** `.` (0x2E)
+        // sorts before `Z` (0x5A), so a fractional instant sorts *before* the whole second it
+        // follows. `docs/data/migrations.md`'s maintenance-lock lease compared `expires_at <= ?`
+        // as TEXT, and `docs/contracts/common-conventions.md` said text comparison "agrees with
+        // chronological order for instants that are not equal" — which this measurement refutes.
+        let whole = UtcTimestamp::parse("2026-09-20T12:00:00Z").expect("valid instant");
+        let padded = UtcTimestamp::parse("2026-09-20T12:00:00.000Z").expect("valid instant");
+        let fraction = UtcTimestamp::parse("2026-09-20T12:00:00.1Z").expect("valid instant");
+
+        // One canonical string per instant: a zero fraction is dropped, not padded. So a SQL `=`
+        // between two spellings of one instant *does* match, and the earlier worry was unfounded.
+        assert_eq!(whole.to_string(), padded.to_string());
+        assert_eq!(whole.to_string(), "2026-09-20T12:00:00Z");
+        assert_eq!(fraction.to_string(), "2026-09-20T12:00:00.1Z");
+
+        // …**and the fraction is the instant that follows**, as a value.
+        assert!(whole < fraction);
+
+        // …**but its string sorts first.** This is the direction that makes a TEXT predicate
+        // unsound, and it is asserted rather than described so that a future change to the display
+        // form cannot quietly make the convention's warning stale.
+        assert!(
+            fraction.to_string() < whole.to_string(),
+            "{fraction} must sort before {whole} under byte comparison, which is why a TEXT \
+             range predicate is not chronological",
+        );
+
+        // The carry case, which a "shorter string is smaller" rule would also get wrong in the
+        // other direction: the largest sub-second fraction still sorts before the next whole second
+        // **only because `0` < `1`**, so the failure above is not universal — it is exactly the
+        // zero-fraction boundary. Pinned so the convention can state the boundary rather than a
+        // blanket rule.
+        let last_fraction =
+            UtcTimestamp::parse("2026-09-20T12:00:00.999999999Z").expect("valid instant");
+        let next_whole = UtcTimestamp::parse("2026-09-20T12:00:01Z").expect("valid instant");
+        assert!(last_fraction.to_string() < next_whole.to_string());
+        assert!(last_fraction < next_whole);
+
+        // And the value comparison is correct in both cases, which is what a caller who needs
+        // chronological order must use.
+        assert!(fraction < next_whole && whole < next_whole);
     }
 
     #[test]

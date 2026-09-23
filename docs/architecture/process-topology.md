@@ -111,15 +111,49 @@ data, state, cache, logs, runtime discovery, and secrets.
 
 | Purpose | Windows target | macOS target | Linux target |
 | --- | --- | --- | --- |
-| Config | `%APPDATA%/Jarvis` | `~/Library/Application Support/Jarvis` | `$XDG_CONFIG_HOME/jarvis` |
-| Durable data | `%LOCALAPPDATA%/Jarvis/data` | `~/Library/Application Support/Jarvis/data` | `$XDG_DATA_HOME/jarvis` |
-| Mutable state | `%LOCALAPPDATA%/Jarvis/state` | `~/Library/Application Support/Jarvis/state` | `$XDG_STATE_HOME/jarvis` |
-| Cache | OS local cache/Jarvis | `~/Library/Caches/Jarvis` | `$XDG_CACHE_HOME/jarvis` |
-| Logs | `%LOCALAPPDATA%/Jarvis/logs` | `~/Library/Logs/Jarvis` | `$XDG_STATE_HOME/jarvis/logs` |
+| Config | `%APPDATA%\JARVIS\JARVIS\config` | `~/Library/Application Support/com.JARVIS.JARVIS/config` | `$XDG_CONFIG_HOME/jarvis` |
+| Durable data | `%LOCALAPPDATA%\JARVIS\JARVIS\data` | `~/Library/Application Support/com.JARVIS.JARVIS/data` | `$XDG_DATA_HOME/jarvis` |
+| Database | `<durable data>\db` | `<durable data>/db` | `<durable data>/db` |
+| Cache | `%LOCALAPPDATA%\JARVIS\JARVIS\cache` | `~/Library/Caches/com.JARVIS.JARVIS` | `$XDG_CACHE_HOME/jarvis` |
+| Logs | `<durable data>\log` | `<durable data>/log` | `<durable data>/log` |
+| Runtime/transient | `<durable data>\run` | `<durable data>/run` | `$XDG_RUNTIME_DIR/jarvis` |
 
-Exact paths must be verified against the selected Rust path crate and installer
-behavior before implementation. Portable mode uses an explicit root and never
-silently mixes with installed-profile state.
+Logs and runtime are **under the durable data root** on every platform, not
+siblings of it: this build derives one local data root and hangs both beneath it,
+so a platform-specific log location would describe a build that does not exist.
+`Runtime/transient` is the only row that differs by platform — `directories`
+returns a runtime directory on Linux only, so Windows and macOS fall back to
+`<durable data>/run`.
+
+These rows are the mapping `directories` 6.0.0 produces for the project path
+`com.JARVIS.JARVIS`, with JARVIS's own subdirectories beneath it — not an
+aspiration. Three corrections were needed when this table was first checked
+against the pinned crate and the code, and each is the kind a reader would have
+taken as already true:
+
+- **Durable data is the *local* directory, and this row was already right** —
+  `%LOCALAPPDATA%`, not `%APPDATA%`. That is what made the code's use of
+  `ProjectDirs::data_dir()` (which is `{FOLDERID_RoamingAppData}` on Windows) a
+  defect worth fixing rather than a documented choice: this table, the Rust
+  foundation evidence note, and a comment in `paths.rs` all stated the
+  non-roaming rule, so the code was violating a decision three documents had
+  already made.
+- **The cache row said "OS local cache/Jarvis"**, which is not a path the pinned
+  crate can produce and is not what the code does: it is
+  `{FOLDERID_LocalAppData}\JARVIS\JARVIS\cache` on Windows and
+  `~/Library/Caches/com.JARVIS.JARVIS` on macOS. A row that names no real
+  location cannot be checked by anyone.
+- **The logs directory is `log`, singular**, and on macOS and Linux it sits under
+  the *data* root rather than `~/Library/Logs` or `$XDG_STATE_HOME` — this build
+  has one log directory and derives it from the local data root on every
+  platform, so a platform-specific log location would describe a build that does
+  not exist.
+
+Exact paths are produced by `jarvis_infrastructure::paths::ProfilePaths::standard`,
+and `the_standard_data_directory_is_the_local_one_not_the_roaming_one` asserts the
+durable-data row against the pinned crate directly rather than against a literal,
+so the row cannot drift from the code again on any platform. Portable mode uses an
+explicit root and never silently mixes with installed-profile state.
 
 ## Startup Order
 

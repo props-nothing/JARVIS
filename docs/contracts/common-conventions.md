@@ -35,6 +35,15 @@ An external ID alone is never globally unique or trusted authorization context.
 ## Time
 
 - Absolute timestamps are RFC 3339 UTC strings with `Z`.
+- **`Z` fixes the offset; the rendered width still varies, and the strings do not sort
+  chronologically.** Zero fractional digits are omitted, so stored values include both
+  `2026-09-20T12:00:00Z` (20 characters) and `2026-09-20T12:00:00.123456789Z` (30). Because `.`
+  (`0x2E`) sorts before `Z` (`0x5A`), a fractional instant sorts **before** the whole second it
+  follows: `12:00:00.1Z` < `12:00:00Z` as text, though it is the later instant. Therefore a
+  `TEXT` comparison, `ORDER BY`, or range predicate over a timestamp column is **not**
+  chronological and may name the wrong row. Order by, or compare, parsed instants — or bind a
+  fixed-width canonical form. (An earlier version of this bullet said text comparison "agrees with
+  chronological order for instants that are not equal"; that was measured and is false.)
 - Durations and deadlines use explicit names such as `timeout_ms`.
 - Recurrence stores timezone/IANA zone plus schedule, not only a UTC offset.
 - Expiry comparisons use an injected authoritative application clock.

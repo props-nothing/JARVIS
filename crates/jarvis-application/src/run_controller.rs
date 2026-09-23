@@ -4,7 +4,7 @@
 //! machine and that `BRN-005` recorded as *not done*: the state machine existed, but
 //! nothing drove it. It is also where the preceding slices meet — it budgets context
 //! through [`crate::context`](jarvis_domain::context), calls a provider through
-//! [`ModelProvider`](crate::model::ModelProvider), and persists every transition with
+//! [`ModelProvider`], and persists every transition with
 //! its public event through [`crate::repository`].
 //!
 //! The architecture's "Native Runtime" list is the shape of [`RunController::execute`]:
@@ -1888,7 +1888,8 @@ mod tests;
 /// The model a controller would select for `provider`.
 ///
 /// Retained for the no-policy case and for tests that assert the *provider's own* selection. The
-/// run path uses [`RunController::run_model`], which prefers a stored route.
+/// run path uses `RunController::resolve_model`, which prefers a stored route (see
+/// `ask_model`, which is where that preference is applied).
 ///
 /// # Errors
 ///

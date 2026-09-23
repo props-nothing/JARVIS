@@ -423,7 +423,7 @@ impl<'a> RunWrite<'a> {
     /// succeeds. That reliance is why the rule is asserted here rather than left to each caller.
     ///
     /// **The event's run is deliberately not checked here, and cannot be.**
-    /// [`RunTransition`](jarvis_domain::run::lifecycle::RunTransition) carries no run identity at
+    /// [`RunTransition`] carries no run identity at
     /// all — only the two states, the expected version, the actor, the reason, and the instant — so
     /// there is nothing on this type to compare "the run the transition moves" against. The rule
     /// belongs to the layer that knows the run, and it lives there: the adapter checks the opening
@@ -532,7 +532,31 @@ pub struct IncompleteRun {
 /// Bounded for the same reason every other read here is: a database left with a very
 /// large number of interrupted runs must not be pulled into memory at once by the
 /// startup path.
+///
+/// **A bound here is not a bound on what recovery reaches, and this one is a page size rather
+/// than a total.** Because interrupted runs are ordered oldest-first, the runs a bound hides are
+/// the **newest** — so a read that returned one page and stopped would leave the most recently
+/// interrupted runs non-terminal forever, across every restart, which is the exact state this
+/// read exists to prevent. `ReconciliationReport::is_complete` therefore has to distinguish
+/// "nothing failed" from "nothing was left unread", which is why the caller is told when the page
+/// was full. See [`RecoveryPage`].
 pub const MAX_INCOMPLETE_RUNS: u32 = 500;
+
+/// One page of interrupted runs, and whether the read was bounded.
+///
+/// The `bounded` flag is the point of this type. Every other read that returns at most N rows
+/// can treat a full page as "there may be more"; recovery is the one place where returning early
+/// leaves durable work half-done, so the fact that the store stopped at its bound has to travel
+/// to the caller rather than being inferred from `runs.len() == MAX_INCOMPLETE_RUNS` — an
+/// inference that would silently become wrong if the bound ever changed, and that a caller
+/// returning exactly its limit for an unbounded store would satisfy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPage {
+    /// The interrupted runs, oldest first.
+    pub runs: Vec<IncompleteRun>,
+    /// Whether the store stopped at its bound with runs still unread.
+    pub bounded: bool,
+}
 
 /// What a recovery pass did.
 ///
@@ -842,7 +866,11 @@ pub trait RunRepository: Send + Sync {
     /// interpret, because a run whose state is unreadable must not be skipped: skipping
     /// it would leave it non-terminal with nobody aware, which is the exact failure this
     /// operation exists to prevent.
-    fn incomplete_runs(&self) -> RepositoryFuture<'_, Vec<IncompleteRun>>;
+    ///
+    /// The result reports whether the read stopped at its bound, because a caller that
+    /// assumed it saw everything would report a clean recovery while leaving the newest runs
+    /// non-terminal — see [`MAX_INCOMPLETE_RUNS`].
+    fn incomplete_runs(&self) -> RepositoryFuture<'_, RecoveryPage>;
 }
 
 #[cfg(test)]

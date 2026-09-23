@@ -124,20 +124,28 @@ fn principal_for(client_id: &str) -> uuid::Uuid {
 /// It lives here rather than in the domain because
 /// `docs/architecture/agent-runtime.md` states that "state names are domain concepts,
 /// not UI strings".
+///
+/// The arms are spelled from `jarvis_protocol::run::run_state` rather than from inline
+/// literals, so the vocabulary is defined once. That was not true before: the seven strings
+/// existed only as literals in this `match` and as prose in the contract, and the test that
+/// covered this function compared the *number* of distinct results — so a rename here kept
+/// the count at seven, kept the three terminal names, and left the projection and the
+/// contract disagreeing about what a client sees.
 #[must_use]
 pub const fn wire_state(state: RunState) -> &'static str {
+    use jarvis_protocol::run::run_state as wire;
     match state {
-        RunState::Received => "received",
-        RunState::ContextBuilding | RunState::Planning => "context_building",
+        RunState::Received => wire::RECEIVED,
+        RunState::ContextBuilding | RunState::Planning => wire::CONTEXT_BUILDING,
         RunState::AwaitingModel
         | RunState::AwaitingApproval
         | RunState::ExecutingTool
         | RunState::Observing
-        | RunState::Waiting => "model_running",
-        RunState::Responding => "responding",
-        RunState::Completed => "completed",
-        RunState::Failed => "failed",
-        RunState::Cancelled => "cancelled",
+        | RunState::Waiting => wire::MODEL_RUNNING,
+        RunState::Responding => wire::RESPONDING,
+        RunState::Completed => wire::COMPLETED,
+        RunState::Failed => wire::FAILED,
+        RunState::Cancelled => wire::CANCELLED,
     }
 }
 
@@ -635,7 +643,17 @@ pub(crate) fn context_for(
 }
 
 /// Renders a created run as the contract's `202` response.
+///
+/// Carries a `Location` header naming the created resource, as the contract's create step
+/// requires. It is a real defect to omit it rather than a cosmetic one: a `201`/`202` without
+/// `Location` gives a client a status it can see and no way to address what it just created,
+/// so every client would have to build the path from the id itself — which is exactly how two
+/// clients come to disagree about a URL the daemon owns. The value is the same relative path
+/// the response body already exposes as `links.self`, taken from one builder so the header and
+/// the body cannot name different resources.
 fn created_response(request_id: Option<&str>, created: &CreatedRun) -> Response {
+    let run_id = created.run_id.to_string();
+    let links = run_links(&run_id);
     let body = CreateRunResponse {
         run_id: created.run_id.to_string(),
         conversation_id: created.conversation_id.to_string(),
@@ -643,9 +661,17 @@ fn created_response(request_id: Option<&str>, created: &CreatedRun) -> Response 
         // The persisted instant, not one invented here, so the response and the stored
         // run cannot report different creation times.
         created_at: created.created_at.to_string(),
-        links: run_links(&created.run_id.to_string()),
+        links,
     };
-    json_response(request_id, StatusCode::ACCEPTED, &body)
+    let mut response = json_response(request_id, StatusCode::ACCEPTED, &body);
+    if let Ok(value) = header::HeaderValue::from_str(&body.links.self_path) {
+        // A `HeaderValue` rejects control characters, and this value is a fixed path built from
+        // a validated UUID, so a failure here would mean the path builder changed. Dropping the
+        // header rather than panicking keeps a malformed path from turning into a 500 after the
+        // run was already created — the run exists and the body still addresses it.
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
 }
 
 /// Maps a service error to its contract status and envelope.

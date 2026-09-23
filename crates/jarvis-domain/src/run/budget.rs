@@ -9,7 +9,7 @@
 //! ## Why the arithmetic lives here
 //!
 //! Whether a deadline has passed is a pure question about two instants, and the answer
-//! must not depend on which layer asks. Putting [`Budget::remaining`] in the domain means
+//! must not depend on which layer asks. Putting [`RunBudget::exceeded_by`] in the domain means
 //! the controller, a future workflow engine, and a future tool ledger all spend the same
 //! budget the same way — and, more importantly, that "this run is out of time" is not
 //! derived separately in each of them.
@@ -77,14 +77,16 @@ pub struct RunRoute {
 ///
 /// Every field is optional, because "no token cap" and "a cap of zero" are different
 /// facts and conflating them would make an unset budget read as an exhausted one. The
-/// same reasoning as [`Usage`](crate::model::stream::Usage), which keeps unset counters
+/// same reasoning as [`Usage`], which keeps unset counters
 /// absent rather than zero.
 ///
 /// Deliberately **not** `Copy`, unlike the rest of this module's value types. The routed
 /// model owns a provider-qualified identifier whose revision is a borrowed-free string, so
 /// the budget is `Clone` and no longer trivially copyable. Copying it was never load-bearing:
-/// the one place that relied on it was building a [`StoredRun`] out of a run row, and that
-/// site now clones explicitly.
+/// the one place that relied on it was building a `StoredRun` out of a run row, and that
+/// site now clones explicitly. (The name is left in prose rather than as an intra-doc link
+/// because `StoredRun` is an application-layer type and this is the domain: linking it would
+/// be the dependency the boundary forbids, and rustdoc said so.)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunBudget {

@@ -1,5 +1,8 @@
 //! Application orchestration over JARVIS domain ports.
 #![forbid(unsafe_code)]
+// See `jarvis-domain`'s crate root: a doc link to a nonexistent symbol is indistinguishable from
+// a resolving one until something checks, so unresolved links are denied rather than warned.
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod cancellation;
 pub mod context_assembly;

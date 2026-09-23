@@ -52,8 +52,9 @@ use crate::time::UtcTimestamp;
 /// none of them is a grant, and `BRN-013` records that as the outstanding gap. The service derives
 /// it from the assurance the caller **proved** — `RequestContext::assurance`, which the server
 /// resolves from the credential — rather than from anything a request can state, because a
-/// caller-supplied assurance would let whoever filled in the body choose the step-up rule. An
-/// [`AuthenticationAssurance::Guest`] context is refused rather than treated as standard, since a
+/// caller-supplied assurance would let whoever filled in the body choose the step-up rule. A
+/// request whose assurance is [`RequiredAssurance::Standard`] at
+/// the *authenticated context* level is refused rather than treated as standard, since a
 /// grant is accountable to a principal and an anonymous caller is not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -2121,7 +2121,7 @@ async fn the_recovery_read_carries_the_deadline_and_budget_too() {
         .expect("the run is created");
 
     let incomplete = repositories.incomplete_runs().await.expect("readable");
-    let entry = incomplete.first().expect("the run is interrupted");
+    let entry = incomplete.runs.first().expect("the run is interrupted");
     assert_eq!(entry.run.deadline_at, Some(deadline), "{entry:?}");
     assert_eq!(entry.run.budget.deadline, Some(deadline), "{entry:?}");
 }
@@ -2421,12 +2421,12 @@ async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_s
         .incomplete_runs()
         .await
         .expect("the interrupted run is readable");
-    assert_eq!(incomplete.len(), 1, "{incomplete:?}");
-    assert_eq!(incomplete[0].run.id, run_id());
+    assert_eq!(incomplete.runs.len(), 1, "{incomplete:?}");
+    assert_eq!(incomplete.runs[0].run.id, run_id());
     // The workspace travels with the entry, because the read is unscoped and the write
     // needs a scope.
-    assert_eq!(incomplete[0].workspace_id, workspace());
-    assert_eq!(incomplete[0].run.state, RunState::ContextBuilding);
+    assert_eq!(incomplete.runs[0].workspace_id, workspace());
+    assert_eq!(incomplete.runs[0].run.state, RunState::ContextBuilding);
 
     let settled = repositories
         .transition(
@@ -2435,7 +2435,7 @@ async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_s
                 &RunTransition::new(
                     RunState::ContextBuilding,
                     RunState::Failed,
-                    incomplete[0].run.version,
+                    incomplete.runs[0].run.version,
                     TransitionActor::Supervisor,
                     reason("interrupted_while_working"),
                     now(),
@@ -2453,6 +2453,7 @@ async fn an_interrupted_run_is_read_back_for_recovery_and_settled_through_real_s
             .incomplete_runs()
             .await
             .expect("readable")
+            .runs
             .is_empty(),
         "a settled run must no longer be offered for recovery",
     );
@@ -2496,8 +2497,12 @@ async fn recovery_finds_interrupted_runs_in_every_workspace_at_once() {
         .expect("created");
 
     let incomplete = repositories.incomplete_runs().await.expect("readable");
-    assert_eq!(incomplete.len(), 2, "{incomplete:?}");
-    let workspaces: Vec<WorkspaceId> = incomplete.iter().map(|entry| entry.workspace_id).collect();
+    assert_eq!(incomplete.runs.len(), 2, "{incomplete:?}");
+    let workspaces: Vec<WorkspaceId> = incomplete
+        .runs
+        .iter()
+        .map(|entry| entry.workspace_id)
+        .collect();
     assert!(workspaces.contains(&workspace()), "{workspaces:?}");
     assert!(workspaces.contains(&other_workspace()), "{workspaces:?}");
 }
@@ -2566,6 +2571,7 @@ async fn a_terminal_run_is_never_offered_for_recovery() {
             .incomplete_runs()
             .await
             .expect("readable")
+            .runs
             .is_empty(),
         "cancelled and failed runs are terminal",
     );
@@ -2608,7 +2614,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
         .expect("applies");
 
     let incomplete = repositories.incomplete_runs().await.expect("readable");
-    let entry = incomplete.first().expect("the run is interrupted");
+    let entry = incomplete.runs.first().expect("the run is interrupted");
     // A working run has no dependency, which is a real value and not a missing one.
     assert_eq!(entry.waiting_kind, None, "{entry:?}");
     assert_eq!(entry.waiting_ref, None, "{entry:?}");
@@ -2663,7 +2669,7 @@ async fn recovery_waiting_fields_are_read_back_for_a_parked_run() {
         .expect("applies");
 
     let incomplete = repositories.incomplete_runs().await.expect("readable");
-    let entry = incomplete.first().expect("the parked run is found");
+    let entry = incomplete.runs.first().expect("the parked run is found");
     assert_eq!(entry.waiting_kind.as_deref(), Some("timer"), "{entry:?}");
     assert_eq!(entry.waiting_ref.as_deref(), Some("wake-1"), "{entry:?}");
     assert!(
