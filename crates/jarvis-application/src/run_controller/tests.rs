@@ -1419,6 +1419,144 @@ async fn the_usage_the_provider_reported_is_recorded_on_the_call() {
     );
 }
 
+/// The `run.usage` events a run published, as `(sequence, payload)`.
+fn usage_events(fixture: &Fixture) -> Vec<(u64, String)> {
+    fixture
+        .repositories
+        .recorded_events()
+        .expect("the events are readable")
+        .into_iter()
+        .filter(|event| event.event_type == "run.usage")
+        .map(|event| {
+            (
+                event.sequence,
+                event
+                    .payload_json
+                    .expect("a usage event carries its payload"),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_usage_is_published_as_its_own_event() {
+    // `run.usage` is one of the contract's **minimum first-slice event types**, and nothing
+    // published it: every activity event went through a state transition, so an informational
+    // event was *unwritable* and `jarvis_protocol::run::usage_payload` had no caller. A client
+    // following the stream therefore could not learn what a call consumed without making a
+    // separate read.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        reported_usage(1234, 5678),
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let published = usage_events(&fixture);
+    assert_eq!(published.len(), 1, "{published:?}");
+    let (_, payload) = &published[0];
+    assert!(
+        payload.contains(r#""output_tokens":1234"#),
+        "the event must report what the provider said: {payload}",
+    );
+    assert!(
+        payload.contains(r#""call_id":"#),
+        "the report must name the call it describes, or two calls are indistinguishable: {payload}",
+    );
+}
+
+#[tokio::test]
+async fn an_unreported_counter_is_omitted_from_the_event_rather_than_sent_as_zero() {
+    // "Unknown is not zero" is the contract's own rule for usage, and an event is a durable public
+    // statement: writing `0` for a count the provider did not report would publish a measurement
+    // nobody made. The provider here reports **only** an output count.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        Usage {
+            output_tokens: Some(7),
+            provider_reported: true,
+            ..Usage::default()
+        },
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let published = usage_events(&fixture);
+    assert_eq!(published.len(), 1, "{published:?}");
+    let (_, payload) = &published[0];
+    assert!(payload.contains(r#""output_tokens":7"#), "{payload}");
+    assert!(
+        !payload.contains("input_tokens"),
+        "an unreported counter must be omitted, not sent as zero: {payload}",
+    );
+}
+
+#[tokio::test]
+async fn a_call_with_no_reported_usage_publishes_no_usage_event() {
+    // The other direction, and the one that keeps the event meaningful: a provider that reported
+    // nothing has not reported a zero, so there is no measurement to publish. Publishing an empty
+    // report would make "the provider said nothing" indistinguishable from "the provider said
+    // nothing happened" — and a client switching on the event type would see a usage event with
+    // nothing in it.
+    let fixture = fixture(answering("done"));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    assert!(
+        usage_events(&fixture).is_empty(),
+        "a call with no reported usage must publish no usage event",
+    );
+}
+
+#[tokio::test]
+async fn a_usage_event_does_not_advance_the_runs_version() {
+    // A version is the optimistic-concurrency token a *transition* states it expects. Bumping it
+    // for a report that changed no state would make two workers' transitions refuse each other for
+    // a write neither of them made — the concurrency control is about state, and a report is not
+    // state. This also pins the ordering: the usage event is appended after the call's outcome and
+    // before the run completes, so it takes a sequence without disturbing the transition chain.
+    let fixture = fixture(answering_with_usage("Hello there", reported_usage(10, 20)));
+    seed(&fixture).await;
+
+    let before = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads")
+        .version;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+    let after = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads")
+        .version;
+
+    // The version advanced for the transitions the run legitimately made and for no other reason.
+    // Asserted as "the usage event's own sequence exists and the chain is contiguous", because the
+    // count of transitions is not what this test is about.
+    let sequences: Vec<u64> = fixture
+        .repositories
+        .recorded_events()
+        .expect("readable")
+        .into_iter()
+        .map(|event| event.sequence)
+        .collect();
+    assert!(
+        sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "the sequence must stay contiguous with an informational event in it: {sequences:?}",
+    );
+    assert!(after.get() > before.get(), "the run advanced");
+}
+
 #[tokio::test]
 async fn usage_from_a_separate_update_frame_is_recorded_too() {
     // The contract says a `usage.updated` frame may arrive before, with, or *after* output

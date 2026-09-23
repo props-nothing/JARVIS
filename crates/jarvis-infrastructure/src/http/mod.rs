@@ -1885,6 +1885,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_usage_event_type_and_payload_match_the_protocol_shape() {
+        use jarvis_domain::model::stream::Usage;
+        // The application layer cannot depend on `jarvis-protocol`, so the `run.usage` event type
+        // and its payload shape exist twice: once as a local literal and hand-built string in
+        // `jarvis_application::run_controller`, once as `jarvis_protocol::event_type::USAGE` and
+        // `jarvis_protocol::run::usage_payload`. This is the cross-check the workspace applies to
+        // every such duplicated contract string, and both halves are asserted because either
+        // drifting breaks a different kind of client: a wrong event type is ignored as unknown, a
+        // wrong field name is read as absent.
+        assert_eq!(
+            jarvis_application::run_controller::USAGE_EVENT_TYPE,
+            jarvis_protocol::event_type::USAGE,
+            "an event type is what a client switches on",
+        );
+
+        // The field **names** must agree, asserted by parsing both as JSON and comparing key sets
+        // for the case both shapes can express — a provider that reported both counters.
+        let both = Usage {
+            input_tokens: Some(11),
+            output_tokens: Some(22),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let hand_built: serde_json::Value = serde_json::from_str(
+            &jarvis_application::run_controller::usage_payload_for_wire(&both),
+        )
+        .expect("the hand-built payload is valid JSON");
+        let from_protocol = jarvis_protocol::run::usage_payload(11, 22);
+        for key in ["input_tokens", "output_tokens"] {
+            assert_eq!(
+                hand_built.get(key),
+                from_protocol.get(key),
+                "both shapes must carry {key} with the same value",
+            );
+        }
+
+        // And a counter the provider did **not** report is omitted from the hand-built shape rather
+        // than written as zero — the contract's "unknown is not zero", which the protocol builder
+        // cannot express at all because it takes plain integers. That difference is the reason the
+        // hand-built one exists, so it is asserted rather than left implicit.
+        let only_output = Usage {
+            output_tokens: Some(22),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let omitted: serde_json::Value = serde_json::from_str(
+            &jarvis_application::run_controller::usage_payload_for_wire(&only_output),
+        )
+        .expect("valid JSON");
+        assert_eq!(omitted.get("output_tokens"), Some(&serde_json::json!(22)));
+        assert!(
+            omitted.get("input_tokens").is_none(),
+            "an unreported counter must be absent, not zero: {omitted}",
+        );
+    }
+
+    #[tokio::test]
     async fn a_cancel_reaches_a_terminal_state_and_is_truthful_about_the_timing() {
         let (app, token) = runs_fixture("runs-cancel").await;
         let run_id = create_run(&app, &token, "hello").await;

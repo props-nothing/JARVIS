@@ -522,6 +522,50 @@ impl RunRepository for InMemoryRepositories {
         })
     }
 
+    fn append_event(
+        &self,
+        workspace: WorkspaceId,
+        event: NewActivityEvent,
+    ) -> RepositoryFuture<'_, u64> {
+        Box::pin(async move {
+            self.with(|store| {
+                if store
+                    .runs
+                    .get(&event.run_id)
+                    .is_none_or(|row| row.workspace_id != workspace)
+                {
+                    return Err(RepositoryError::NotFound);
+                }
+                // The sequence must be the next one, mirroring the adapter's unique constraint: a
+                // caller that computed a stale value fails rather than writing a gap a client is
+                // required to refuse. The double enforces it rather than trusting the caller,
+                // because a double that accepted any sequence would let a test assert an ordering
+                // the real store refuses.
+                let maximum = store
+                    .events
+                    .iter()
+                    .filter(|existing| existing.run_id == event.run_id)
+                    .map(|existing| existing.sequence)
+                    .max()
+                    .unwrap_or(0);
+                if event.sequence != maximum.saturating_add(1) {
+                    return Err(RepositoryError::Conflict {
+                        what: "activity_sequence",
+                    });
+                }
+                let sequence = event.sequence;
+                store.events.push(NewActivityEvent {
+                    payload_json: event.payload_json.clone(),
+                    ..event
+                });
+                // The run's version is deliberately untouched: a report is not a state change, and
+                // bumping the version would make two workers' transitions refuse each other for a
+                // write neither of them made.
+                Ok(sequence)
+            })
+        })
+    }
+
     fn load_events(
         &self,
         workspace: WorkspaceId,

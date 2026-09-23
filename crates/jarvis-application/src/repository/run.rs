@@ -612,6 +612,30 @@ pub trait RunRepository: Send + Sync {
     /// Returns [`RepositoryError::NotFound`] for an absent or foreign run.
     fn next_event_sequence(&self, workspace: WorkspaceId, run: RunId) -> RepositoryFuture<'_, u64>;
 
+    /// Appends one activity event **without** changing the run's state.
+    ///
+    /// A separate operation from [`transition`](Self::transition), because not every public event
+    /// is a state change. The contract's minimum first-slice list includes `run.usage`, which
+    /// reports what a call consumed and leaves the run exactly where it was — and before this the
+    /// only way to write an event was to write a transition with it, so an informational event was
+    /// **unwritable** and `run.usage` was never published at all.
+    ///
+    /// The run's `version` is deliberately **not** advanced. A version is the optimistic-concurrency
+    /// token a transition states it expects, so bumping it for a report that changed no state would
+    /// make two workers' transitions refuse each other for a write neither of them made — the
+    /// concurrency control is about state, and a report is not state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an absent or foreign run, and
+    /// [`RepositoryError::Conflict`] when the event's sequence is not the next one — a gap in the
+    /// sequence is what a client is required to refuse rather than skip.
+    fn append_event(
+        &self,
+        workspace: WorkspaceId,
+        event: NewActivityEvent,
+    ) -> RepositoryFuture<'_, u64>;
+
     /// Reads a page of a run's public activity events in ascending sequence order.
     ///
     /// The read is scoped by workspace **and by visibility**, so an operator-only

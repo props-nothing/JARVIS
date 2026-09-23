@@ -323,6 +323,18 @@ Minimum event types for the first slice are `run.received`,
 `run.usage`, and the three terminal variants. Clients ignore unknown additive
 event types but never ignore a sequence gap or unknown terminal state.
 
+A **report is not a state change**, and `run.usage` is the case that makes the distinction concrete:
+it is a public event that leaves the run exactly where it was. The store therefore has an append that
+is not a transition, and the run's `version` is deliberately **not** advanced by it — a version is the
+optimistic-concurrency token a *transition* states it expects, so bumping it for a report would make
+two workers' transitions refuse each other for a write neither of them made.
+
+The usage event carries `call_id` and the counters the provider **reported**, each omitted when it
+reported none: the contract's own "unknown is not zero" applies to a durable statement, since writing
+`0` for an unreported count would publish a measurement nobody made. A provider that reported nothing
+produces **no** usage event at all, rather than an empty one a client switching on the type would
+have to interpret.
+
 ## Common Error Envelope
 
 Errors use an appropriate HTTP status and this shape:

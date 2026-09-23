@@ -503,6 +503,13 @@ async fn a_read_failure_is_reported_rather_than_looking_like_a_clean_pass() {
         ) -> crate::repository::RepositoryFuture<'_, u64> {
             Box::pin(async { Err(crate::repository::RepositoryError::Query) })
         }
+        fn append_event(
+            &self,
+            _workspace: WorkspaceId,
+            _event: NewActivityEvent,
+        ) -> crate::repository::RepositoryFuture<'_, u64> {
+            Box::pin(async { Err(crate::repository::RepositoryError::Query) })
+        }
         fn load_events(
             &self,
             _workspace: WorkspaceId,

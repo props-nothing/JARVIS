@@ -1233,12 +1233,26 @@ impl RunController {
             call_id,
             ModelCallState::Completed,
             RecordedOutcome {
-                usage,
+                usage: usage.clone(),
                 finish_reason,
                 first_output_at: None,
             },
         )
         .await?;
+
+        // And the usage is published as its own event, which the contract lists as a **required**
+        // first-slice event type and which nothing published before this: the only way to write an
+        // activity event was to write a transition with it, so an informational event was
+        // unwritable and a client following the stream could not see what the call consumed.
+        //
+        // Published only when the provider reported **at least one counter**, because unknown is
+        // not zero: an event is a durable public statement, and publishing `0, 0` for a provider
+        // that said nothing would record a measurement nobody made.
+        if let Some(reported) = usage.as_ref()
+            && reported.has_any_counter()
+        {
+            self.publish_usage(run, call_id, reported).await?;
+        }
 
         // AwaitingModel -> Responding -> Completed, then the answer is stored.
         self.complete_run(
@@ -1813,6 +1827,45 @@ impl RunController {
             .map_err(ControllerError::Repository)
     }
 
+    /// Publishes a `run.usage` event reporting what a call consumed.
+    ///
+    /// A **separate event** rather than a field on the terminal frame, because the contract lists
+    /// `run.usage` as one of the minimum first-slice event types and a client following the stream
+    /// switches on it. It is appended without a transition — the run's state is unchanged — which
+    /// is why the repository grew an append that is not a state write.
+    ///
+    /// Both counters are optional in `Usage` and absent means **unreported**, so each is omitted
+    /// rather than sent as `0` when the provider did not report it. The caller has already checked
+    /// that at least one counter is present, so this never publishes an event that says nothing.
+    async fn publish_usage(
+        &self,
+        run: RunRef,
+        call_id: ModelCallId,
+        usage: &Usage,
+    ) -> Result<(), ControllerError> {
+        let payload = usage_payload(usage, Some(call_id));
+        let sequence = self
+            .runs
+            .next_event_sequence(run.workspace, run.run_id)
+            .await
+            .map_err(ControllerError::Repository)?;
+        self.runs
+            .append_event(
+                run.workspace,
+                NewActivityEvent {
+                    run_id: run.run_id,
+                    sequence,
+                    event_type: USAGE_EVENT.to_owned(),
+                    payload_json: Some(payload),
+                    visibility: EventVisibility::Public,
+                    occurred_at: self.now()?,
+                },
+            )
+            .await
+            .map_err(ControllerError::Repository)?;
+        Ok(())
+    }
+
     /// Loads a run, mapping a storage failure.
     async fn load(&self, run: RunRef) -> Result<StoredRun, ControllerError> {
         self.runs
@@ -1874,6 +1927,58 @@ fn classify(error: ProviderError) -> FailureClass {
 /// same call.
 fn usage_of(drained: &DrainedTurn) -> Option<Usage> {
     drained.usage.clone()
+}
+
+/// The event type a usage report is published as.
+///
+/// A local literal rather than `jarvis_protocol::event_type::USAGE`, because this crate cannot
+/// depend on `jarvis-protocol`. The two are asserted equal by a cross-check test, which is the
+/// technique the workspace uses for every such duplicated contract string — a divergence would be
+/// invisible here and would break a client that switches on the event type.
+///
+/// Public so that cross-check can name it rather than restating the literal, which would make the
+/// test agree with a second copy of the value instead of with the value itself.
+pub const USAGE_EVENT_TYPE: &str = "run.usage";
+
+/// The event type a usage report is published as, inside this module.
+const USAGE_EVENT: &str = USAGE_EVENT_TYPE;
+
+/// Builds the public `run.usage` payload.
+///
+/// Mirrors `jarvis_protocol::run::usage_payload`'s field names, and the two are asserted equal by
+/// a cross-check test. Built by hand for the same reason the failed-run payload is: the application
+/// layer has no JSON *dependency*, and every value here comes from a closed set — optional `u64`
+/// counters, which can be no other character — so no escaping is required and no caller text can
+/// reach the document.
+///
+/// Both counters are omitted when absent rather than written as `0`, because the contract's own
+/// rule is that **unknown is not zero**: a provider that did not report a count has not reported
+/// a measured zero, and a client must be able to tell the two apart. `jarvis_protocol`'s builder
+/// takes plain integers and therefore cannot express that absence at all.
+///
+/// Public so the cross-check can call it rather than a second copy of the shape.
+#[must_use]
+pub fn usage_payload_for_wire(usage: &Usage) -> String {
+    usage_payload(usage, None)
+}
+
+/// Builds the payload, naming the call when the caller knows it.
+///
+/// The call identifier is optional rather than mandatory so the cross-check can compare the
+/// counter fields against `jarvis_protocol`'s builder, which has no call to name. A published
+/// event always supplies one — two calls in a run would otherwise be indistinguishable.
+fn usage_payload(usage: &Usage, call_id: Option<ModelCallId>) -> String {
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(call_id) = call_id {
+        fields.push(format!("\"call_id\":\"{call_id}\""));
+    }
+    if let Some(input) = usage.input_tokens {
+        fields.push(format!("\"input_tokens\":{input}"));
+    }
+    if let Some(output) = usage.output_tokens {
+        fields.push(format!("\"output_tokens\":{output}"));
+    }
+    format!("{{{}}}", fields.join(","))
 }
 
 /// Folds one non-output frame into the turn being drained.

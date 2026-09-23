@@ -1016,6 +1016,119 @@ async fn next_event_sequence_refuses_an_absent_run_rather_than_answering_one() {
 }
 
 #[tokio::test]
+async fn an_event_can_be_appended_without_transitioning_the_run() {
+    // The port had no way to append an event *without* a state change, so an informational event
+    // was unwritable: every activity event went through `transition`, and the contract's required
+    // `run.usage` report could not be published at all. This proves both halves — the event lands
+    // and the run's state and version are untouched.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let before = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("loads");
+    let sequence = repositories
+        .next_event_sequence(workspace(), run_id())
+        .await
+        .expect("a sequence");
+    repositories
+        .append_event(
+            workspace(),
+            NewActivityEvent {
+                run_id: run_id(),
+                sequence,
+                event_type: "run.usage".to_owned(),
+                payload_json: Some(r#"{"output_tokens":7}"#.to_owned()),
+                visibility: EventVisibility::Public,
+                occurred_at: now(),
+            },
+        )
+        .await
+        .expect("the event appends");
+
+    let after = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("loads");
+    assert_eq!(
+        after.state, before.state,
+        "a report is not a transition, so the state must not move",
+    );
+    assert_eq!(
+        after.version, before.version,
+        "a report must not advance the optimistic-concurrency token a transition states",
+    );
+
+    // And it is readable through the event read, with its payload intact.
+    let page = repositories
+        .load_events(workspace(), run_id(), 1, 50)
+        .await
+        .expect("readable");
+    let stored = page
+        .events
+        .iter()
+        .find(|event| event.event_type == "run.usage")
+        .expect("the appended event is retained");
+    assert_eq!(
+        stored.payload_json.as_deref(),
+        Some(r#"{"output_tokens":7}"#)
+    );
+}
+
+#[tokio::test]
+async fn appending_at_a_stale_sequence_is_refused_rather_than_writing_a_gap() {
+    // The contract requires a client to refuse a sequence gap rather than skip it, so writing one
+    // must be impossible. The unique constraint on `(run_id, sequence)` is what enforces it, and
+    // this asserts the refusal rather than the constraint's existence.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    // Sequence 1 is already taken by the run's opening `run.received` event.
+    let error = repositories
+        .append_event(
+            workspace(),
+            NewActivityEvent {
+                run_id: run_id(),
+                sequence: 1,
+                event_type: "run.usage".to_owned(),
+                payload_json: None,
+                visibility: EventVisibility::Public,
+                occurred_at: now(),
+            },
+        )
+        .await
+        .expect_err("a taken sequence must be refused");
+    assert_eq!(
+        error.code(),
+        "storage.conflict",
+        "a conflict is not a transport fault a blind retry might fix",
+    );
+}
+
+#[tokio::test]
+async fn appending_to_an_absent_run_is_not_found_rather_than_a_constraint_fault() {
+    // The two are different answers with different remedies, so an absent run must not surface as
+    // a foreign-key violation.
+    let (_database, repositories) = repository().await;
+    let error = repositories
+        .append_event(
+            workspace(),
+            NewActivityEvent {
+                run_id: run_id(),
+                sequence: 1,
+                event_type: "run.usage".to_owned(),
+                payload_json: None,
+                visibility: EventVisibility::Public,
+                occurred_at: now(),
+            },
+        )
+        .await
+        .expect_err("an absent run must be refused");
+    assert_eq!(error, RepositoryError::NotFound);
+}
+
+#[tokio::test]
 async fn a_message_appends_at_increasing_positions() {
     let (_database, repositories) = repository().await;
     seed(&repositories).await;

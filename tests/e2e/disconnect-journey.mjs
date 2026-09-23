@@ -395,6 +395,32 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
+    // 1b. The contract's `run.usage` event is actually published.
+    //
+    // `run.usage` is one of the minimum first-slice event types, and this is checked over a
+    // **real daemon** because the defect it closes was structural: every activity event went
+    // through a state transition, so an informational event was *unwritable* and the type was
+    // never published by anything. A unit test could not have caught it, because the port had no
+    // way to express the write at all.
+    //
+    // The scripted provider reports no usage, so the assertion is that the event is **absent**
+    // rather than present with zeros — "unknown is not zero", applied to a durable statement.
+    const usageFrames = events.filter((frame) => frame.event === "run.usage");
+    const terminal = events.find((frame) => TERMINALS.includes(frame.event));
+    if (usageFrames.length > 0) {
+      const payload = usageFrames[0].data ? JSON.parse(usageFrames[0].data).payload : undefined;
+      if (!payload || !payload.call_id) {
+        fail("a run.usage event must name the call it describes", JSON.stringify(usageFrames[0]));
+      } else {
+        pass("a run.usage event was published and names its call");
+      }
+    } else if (!terminal) {
+      fail("the run reached no terminal event", JSON.stringify(events));
+    } else {
+      pass("no run.usage event for a provider that reported no usage, which is not a measured zero");
+    }
+
+    // ---------------------------------------------------------------------
     // 2. Cancellation is explicit, and reaches a durable terminal state.
     // ---------------------------------------------------------------------
     const toCancel = await createRun(record, credential, "cancel me");

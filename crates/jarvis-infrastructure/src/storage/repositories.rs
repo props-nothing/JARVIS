@@ -683,6 +683,64 @@ impl RunRepository for SqliteRepositories {
         })
     }
 
+    fn append_event(
+        &self,
+        workspace: WorkspaceId,
+        event: NewActivityEvent,
+    ) -> RepositoryFuture<'_, u64> {
+        Box::pin(async move {
+            let run_id = event.run_id.to_string();
+            let sequence = event.sequence;
+            // The insert states the sequence the caller computed, and the unique constraint on
+            // `(run_id, sequence)` is what makes a gap impossible: a caller that computed a stale
+            // next-sequence fails rather than writing at a position a client would refuse as a gap.
+            //
+            // The run is checked in the same statement's transaction by way of the foreign key,
+            // and an absent run is reported as `NotFound` below rather than as a constraint fault —
+            // the two are different answers and a caller's remedy differs.
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE workspace_id = ? AND id = ?")
+                    .bind(workspace.to_string())
+                    .bind(&run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|_| RepositoryError::Query)?;
+            if exists.is_none() {
+                return Err(RepositoryError::NotFound);
+            }
+
+            let inserted = sqlx::query(
+                "INSERT INTO run_activity_events (\
+                     id, workspace_id, run_id, sequence, event_type, payload_json, \
+                     visibility, occurred_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(workspace.to_string())
+            .bind(&run_id)
+            .bind(
+                i64::try_from(sequence)
+                    .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?,
+            )
+            .bind(&event.event_type)
+            .bind(event.payload_json.as_deref())
+            .bind(event.visibility.as_str())
+            .bind(event.occurred_at.to_string())
+            .execute(&self.pool)
+            .await;
+
+            match inserted {
+                Ok(result) if result.rows_affected() == 1 => Ok(sequence),
+                // A duplicate sequence is the same caller-visible conflict the transition path
+                // maps, so it maps to `Conflict` here too rather than to `Query`: a conflict is not
+                // a transport fault a blind retry might fix.
+                Ok(_) | Err(_) => Err(RepositoryError::Conflict {
+                    what: "activity_sequence",
+                }),
+            }
+        })
+    }
+
     fn load_events(
         &self,
         workspace: WorkspaceId,

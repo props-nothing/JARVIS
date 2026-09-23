@@ -1644,6 +1644,38 @@ Foundation TODO remains incomplete.
     dependency is a research-gate change. I attempted it, hit the dependency wall, and **reverted
     cleanly** rather than leave a half-wired field.
   946 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-019` Publish the `run.usage` event, so the contract's required first-slice event type
+  exists at all. Found by grepping the contract's **minimum event type list** against the code.
+  **The gap was structural, not a missing line.** `run.usage` is one of the contract's minimum
+  first-slice event types, `jarvis_protocol::run::usage_payload` had no caller, and the repository's
+  **only** way to write an activity event was `transition` — so an event that reports something
+  without changing state was *unwritable*. A client following the stream could not learn what a call
+  consumed without making a second read; a unit test could not have caught it, because the port had
+  no way to express the write.
+  - **A new `RunRepository::append_event`**, which appends one activity event and **does not**
+    advance the run's `version`. That is the design point rather than a detail: a version is the
+    optimistic-concurrency token a *transition* states it expects, so bumping it for a report that
+    changed no state would make two workers' transitions refuse each other for a write neither of
+    them made. The adapter's unique constraint on `(run_id, sequence)` is what makes a gap
+    impossible, and a taken sequence is `storage.conflict` rather than a transport fault.
+  - **Emitted only when the provider reported at least one counter**, with each counter omitted when
+    unreported. `Usage`'s counters are `Option` because **unknown is not zero**, and a public event
+    is a durable statement: publishing `0, 0` for a provider that said nothing would record a
+    measurement nobody made. The event names its `call_id`, or two calls in one run would be
+    indistinguishable.
+  - **Both spellings of the contract string are cross-checked.** The application layer cannot depend
+    on `jarvis-protocol` and has no JSON *dependency*, so the event type and payload shape exist
+    twice — a local literal and a hand-built string, against `event_type::USAGE` and `usage_payload`.
+    A test asserts the event types are equal and the field names and values agree, which is the
+    technique this workspace applies to every duplicated contract string. It also asserts the one
+    thing the protocol builder *cannot* express: an unreported counter is absent rather than zero.
+  - **The protocol builder's signature documents the difference**: it takes plain `u64`s, so it can
+    express counters but not their absence — which is exactly why the hand-built shape is needed and
+    not a duplication for its own sake.
+  **Falsified:** removing the emission publishes no usage event (the test fails with zero found);
+  the real-daemon journey asserts both directions — an event naming its call when one is published,
+  and **no** event for the scripted provider that reports no usage.
+  955 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its
