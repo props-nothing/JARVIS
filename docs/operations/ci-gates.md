@@ -14,13 +14,23 @@ claims is
 | Workflow | Lane | What it proves |
 | --- | --- | --- |
 | `CI` | `docs` | The documentation, requirement, TODO, contract, and evidence structures are consistent, and the service assertion holds on every platform's rendering |
-| `CI` | `lint` | `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| `CI` | `lint` | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo doc --workspace --no-deps --all-features` |
 | `CI` | `test` | `cargo test --workspace --all-features` on Linux x86_64 |
 | `Native targets` | `native` | Per-target build, test, and clean-machine journey on each tier-1 target |
 
 The `docs` lane runs `node --test scripts/validate-docs.test.mjs` **before**
 `node scripts/validate-docs.mjs`. The order matters: a weakened validator must not
 be able to pass the gate it implements.
+
+The `lint` lane's `cargo doc` step is what makes the crate-level
+`#![deny(rustdoc::broken_intra_doc_links)]` real. `clippy` compiles doc comments
+without resolving their links, so without a step that runs rustdoc, a doc link
+pointing at a symbol that does not exist is **indistinguishable from one that
+resolves** — `BRN-035` found 21 such links, two of them naming a type that was never
+written anywhere in the workspace. The step deliberately does **not** pass
+`-D warnings`, which would additionally deny `redundant_explicit_links` and
+`private_intra_doc_links` — style complaints about links that *do* resolve — and
+widening a gate past the defect it was added for is how a gate gets relaxed later.
 
 ## The Service Assertion Guard
 
@@ -219,6 +229,7 @@ node scripts/validate-docs.mjs
 node scripts/service-assertion-check.mjs
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --all-features
 cargo test --workspace
 cargo build -p jarvisd -p jarvis-cli
 node scripts/clean-machine-smoke.mjs target/debug

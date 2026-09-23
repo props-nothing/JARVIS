@@ -103,8 +103,14 @@ impl Sensitivity {
     /// that judges it, and `jarvis-protocol` renders the wire form. A `serde(rename_all)` derive is
     /// not enough, because the stored message label is built by hand and would have to repeat the
     /// spelling — which is how a message ends up labelled with something the decision did not
-    /// classify. `context_assembly::parse_sensitivity` is the inverse and has a test asserting the
-    /// two agree over every variant.
+    /// classify.
+    ///
+    /// `context_assembly::parse_sensitivity` is the inverse, and the two are in **different crates**,
+    /// so nothing here can compare them directly. The agreement is asserted by
+    /// `context_assembly_tests::every_label_jarvis_writes_is_readable_and_no_other_is`, which calls
+    /// **this** function for every variant and requires the parser to read each one back. That test
+    /// previously iterated a hand-written label array instead, so drifting one arm here — the change
+    /// that makes the product write a label it cannot read — passed every gate; see `BRN-037`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

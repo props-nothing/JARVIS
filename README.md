@@ -78,7 +78,8 @@ flowchart TB
 6. Complete upstream research and its manifest gate before touching an external
     integration or boundary-affecting dependency.
 7. Run `cargo fmt --check`,
-    `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
+    `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+    `cargo doc --workspace --no-deps --all-features`, and
     `cargo test --workspace` for Rust changes.
 
 The root agent instructions are mandatory for human and AI-assisted changes.

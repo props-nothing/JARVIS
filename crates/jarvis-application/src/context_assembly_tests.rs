@@ -140,8 +140,57 @@ fn a_message_whose_label_cannot_be_read_is_refused_rather_than_assumed() {
 
 #[test]
 fn every_label_jarvis_writes_is_readable_and_no_other_is() {
-    // Asserted as a set so a new variant added to `Sensitivity` without a label here
-    // fails this test rather than silently becoming an unreadable message at runtime.
+    // **This test used to assert half of what its comment claimed.** The comment said "a new variant
+    // added to `Sensitivity` without a label here fails this test", and the body only iterated
+    // `PARSEABLE_SENSITIVITY_LABELS` asserting each parses. `Sensitivity::as_str` — the function
+    // that actually *writes* the label a message carries — was never called, and nothing compared
+    // the domain enum to the array at all. So the two could drift in the direction that matters:
+    // add a variant and an `as_str` arm, leave the array alone, and the writer produces a label this
+    // parser returns `None` for. The run then fails with `UnlabelledMessage` on a message the
+    // product labelled itself, and every test passes.
+    //
+    // The missing assertion is the one that cannot drift: the parser must accept **exactly** the
+    // labels the domain produces. Both directions are asserted, because they fail differently —
+    // a label the parser rejects breaks runs, and a label the parser accepts that nothing writes is
+    // dead vocabulary a reader would take as a supported input.
+    use jarvis_domain::model::policy::Sensitivity;
+
+    // Every variant the domain can render must parse. This is the direction that was missing, and
+    // it reaches `as_str` rather than a copy of its output.
+    let all = [
+        Sensitivity::Public,
+        Sensitivity::Internal,
+        Sensitivity::Confidential,
+        Sensitivity::Restricted,
+    ];
+    for variant in all {
+        assert_eq!(
+            parse_sensitivity(variant.as_str()),
+            Some(variant),
+            "{} writes {variant:?}, so the parser must read it back",
+            variant.as_str(),
+        );
+    }
+
+    // The domain can render exactly four labels, so the accepted set must be exactly four. A fifth
+    // would be a label nothing writes; a fourth would mean a variant went unrendered.
+    assert_eq!(
+        all.len(),
+        PARSEABLE_SENSITIVITY_LABELS.len(),
+        "the domain's variants and the labels JARVIS writes must be one set: {all:?} against \
+         {PARSEABLE_SENSITIVITY_LABELS:?}",
+    );
+
+    // And the array is the domain's own rendering, spelled once. Asserted element-by-element rather
+    // than by a `map`, so a failure names the position that drifted.
+    for (index, variant) in all.iter().enumerate() {
+        assert_eq!(
+            PARSEABLE_SENSITIVITY_LABELS[index],
+            variant.as_str(),
+            "position {index} must be the label {variant:?} renders",
+        );
+    }
+
     for label in PARSEABLE_SENSITIVITY_LABELS {
         assert!(
             parse_sensitivity(label).is_some(),

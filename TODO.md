@@ -2469,6 +2469,50 @@ Foundation TODO remains incomplete.
     module nothing calls — is what made this defect look implemented in the first place.
   995 workspace tests (−4 net: −5 deleted lock tests, +1 new). Both doc gates green; all three
   journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-037` Make the sensitivity label round-trip test assert what its comment claimed, so drifting
+  the **writer** cannot pass. Found by sweeping every `enum -> &str` mapping against its reverse
+  parser — the pattern the domain documents as "an inverse and a test asserting the two agree over
+  every variant".
+  - **The two halves live in different crates, which is why the gap survived.** `Sensitivity::as_str`
+    renders the label a message carries; `context_assembly::parse_sensitivity` reads it back in
+    `jarvis-application`. Nothing could compare them directly, so the agreement rested entirely on
+    one test — and that test **only iterated `PARSEABLE_SENSITIVITY_LABELS`**, a hand-written array,
+    asserting each entry parses. It compared the parser against a copy of the parser's own arms. The
+    array's doc even said its existence was what made "a new `Sensitivity` variant added without a
+    label here a test failure" — so the comment claimed the check the body did not perform.
+  - **The failure mode is a run that fails on a message the product labelled itself.** `as_str` has
+    exactly one production caller (`run_service`, writing a message row). Add a variant, add its
+    `as_str` arm, forget the parser: the writer stores `secret`, the reader returns `None`, and the
+    run dies with `AssemblyError::UnlabelledMessage` — while every gate is green. **A comment saying
+    "a test asserts this" is a claim a grep falsifies and nothing checks.**
+  - The test now iterates the **domain's variants**, calls `as_str` for each, and requires the parser
+    to read it back — plus asserts the array equals the domain's rendering element-by-element, and
+    that the two sets have the same size in both directions.
+  - **Falsified in the direction that matters, with a control.** Drifting the array
+    (`restricted` → `restrictedx`) fails at "position 3 must be the label Restricted renders". But
+    that is the easy direction, which the old test also caught. The decisive mutation drifts
+    **`as_str`** (`restricted` → `restricted_content`): the new test fails with
+    "restricted_content writes Restricted, so the parser must read it back", and I then **temporarily
+    reinstalled the old test body and confirmed it passed that same mutant** (`OLD_TEST_WITH_WRITER_MUTANT=0`)
+    — the difference between "a test exists" and "a test checks the thing".
+  - **First mutation attempt was invalid and I discarded it.** My `Replace` of the enum body dropped
+    its closing brace, so the failure was a syntax error (`unclosed delimiter`), which falsifies
+    nothing — no logic changed. Redone with the edit tool so the file stayed valid. A mutation that
+    fails to compile is not evidence; it is a typo with a red exit code.
+  - **Also fixed a documentation drift I created in `BRN-035`.** I added a `cargo doc` step to the CI
+    `lint` lane but did not update what the docs say CI runs: `docs/operations/ci-gates.md`'s "What
+    Runs On Every Push" table and its local-gate list both omitted it. `AGENTS.md`, `CONTRIBUTING.md`,
+    and `README.md` now list it too, with the reason it is not run under `-D warnings`.
+  995 workspace tests (net 0: the corrected test replaced its own body). Both doc gates green; all
+  three journeys pass. **DO NOT COMMIT.**
+  - **Checked and cleared, so a later round does not re-investigate:** 17 `.rs` files in the working
+    copy have CRLF endings while 94 are LF, despite `.gitattributes` declaring `*.rs text eol=lf`.
+    That is **not** a defect and not caused by these edits — untouched CRLF files (`clock.rs`,
+    `live_events.rs`, `context/manifest.rs`) report **clean** in `git status`, and the diff for the
+    CRLF file edited here is surgical (`13 insertions / 5 deletions`, not a whole-file rewrite),
+    because `core.autocrlf=true` and `.gitattributes` normalize the comparison. **Do not "fix" it:**
+    rewriting endings would be a whole-file churn with no behavioural change, and it would show up
+    as a suspicious diff in review.
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

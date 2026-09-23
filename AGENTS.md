@@ -144,8 +144,16 @@ Once the Rust workspace exists, the normal checks are:
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --all-features
 cargo test --workspace
 ```
+
+The `cargo doc` step is not decoration: each library crate denies
+`rustdoc::broken_intra_doc_links`, and until this command runs nothing evaluates it. `clippy`
+compiles doc comments without resolving their links, so a doc link naming a symbol that does not
+exist reads exactly like one that resolves. Do **not** add `-D warnings` here — that denies
+`redundant_explicit_links` and `private_intra_doc_links`, which are style complaints about links
+that do resolve.
 
 Also run the narrow package or test target first. Add broader checks for
 migrations, installers, generated contracts, UI, or cross-platform behavior as

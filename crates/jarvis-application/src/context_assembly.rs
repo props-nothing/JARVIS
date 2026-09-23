@@ -255,11 +255,19 @@ pub fn estimate_tokens(text: &str) -> Option<u64> {
 
 /// Every sensitivity label JARVIS writes.
 ///
-/// Exposed as a constant so a test can assert the parser handles exactly this set, which
-/// is what makes a new `Sensitivity` variant added without a label here a test failure
-/// rather than an unreadable message at runtime. The set mirrors
-/// `Sensitivity`'s own `serde(rename_all = "snake_case")` form, so the stored label and
-/// the wire label are the same spelling.
+/// The set mirrors `Sensitivity`'s own `serde(rename_all = "snake_case")` form, so the stored label
+/// and the wire label are the same spelling. The domain owns the spellings and renders them in
+/// `Sensitivity::as_str`; this array is the **parser's** half, and the two live in different crates
+/// so neither can check the other.
+///
+/// **The agreement is asserted, not assumed, and the test had to be corrected to do it.** The
+/// comment here used to say this array's existence "makes a new `Sensitivity` variant added without
+/// a label here a test failure", and the test beside it only iterated *this* array — so it checked
+/// that the parser accepts the parser's own list, which is `parse_sensitivity`'s `match` compared
+/// with a copy of its own arms. A fifth variant added to the domain with a new `as_str` arm would
+/// have been written into every message and rejected by this parser, failing the run with
+/// `UnlabelledMessage` while every gate passed. The test now calls `Sensitivity::as_str` for every
+/// variant and requires each to parse back (`BRN-037`).
 pub const PARSEABLE_SENSITIVITY_LABELS: [&str; 4] =
     ["public", "internal", "confidential", "restricted"];
 

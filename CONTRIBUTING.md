@@ -59,8 +59,12 @@ Once the workspace exists:
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo doc --workspace --no-deps --all-features
 cargo test --workspace
 ```
+
+The `cargo doc` step exists because the library crates deny `rustdoc::broken_intra_doc_links`,
+which only a rustdoc invocation evaluates. See `AGENTS.md`'s Rust quality bar.
 
 Additional checks will cover:
 
