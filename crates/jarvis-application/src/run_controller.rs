@@ -53,10 +53,10 @@ use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, Workspac
 use jarvis_domain::model::identity::ModelRef;
 use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::model::stream::{
-    InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
+    FinishReason, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
     PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome, Usage,
 };
-use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget};
+use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget, RunRoute};
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::retry::{FailureClass, FailureSite, RetryDecision};
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
@@ -383,6 +383,35 @@ impl Step {
             outcome: Some(TerminalOutcome::failed(code)),
         }
     }
+
+    /// Returns the public payload this step's event carries, when it carries one.
+    ///
+    /// A **failed** run's event carries the code it settled with, because a client that only
+    /// follows the event stream otherwise learns that a run stopped without learning why: the code
+    /// is on the run's own row, so a streaming client would have to make a separate read to see it.
+    /// The terminal event is the last thing such a client receives, which makes it the wrong place
+    /// to omit the answer.
+    ///
+    /// `retryable` is always `false`, and that is a fact about the outcome rather than a default:
+    /// reaching this code means the run is terminal, and a terminal run is not going to be retried
+    /// by resending anything — the retry policy is consulted *before* a failure is written, so a
+    /// run that arrives here has already had its retry decision made.
+    ///
+    /// Built by hand rather than through a serializer, following
+    /// [`crate::recovery::recovery_payload`] — the application layer has `serde_json` only as a
+    /// dev-dependency, and adding it as a real dependency is a research-gate change. The
+    /// justification is the same one that function records: every value here comes from a
+    /// **closed set** — a `&'static str` code from the controller's own error list and a literal
+    /// boolean — so no escaping is required and no caller text can reach the document.
+    ///
+    /// A **cancellation** deliberately carries no payload yet, and that is a named gap rather than
+    /// an oversight: its reason is caller-supplied text, so it *does* need escaping, and
+    /// hand-rolling that would be the ad-hoc string manipulation the architecture forbids. Closing
+    /// it needs a serializer at this layer or a sanitised reason at the boundary.
+    fn payload(&self) -> Option<String> {
+        self.outcome
+            .map(|TerminalOutcome { code }| format!("{{\"code\":\"{code}\",\"retryable\":false}}"))
+    }
 }
 
 /// What one model-call attempt produced.
@@ -406,6 +435,26 @@ enum AttemptOutcome {
         /// that the run gave up.
         error: ProviderError,
     },
+}
+
+/// What a provider reported about one attempt, as recorded on its outcome row.
+///
+/// Three fields rather than three parameters, for the reason the outcome struct itself is
+/// named rather than positional: the two `Option` values here are of different types and
+/// would be transposable in a call — and a transposition would record a usage block as a
+/// finish reason, which reads downstream as a corrupted row rather than as a mistake.
+///
+/// `Default` is the honest value for an attempt that failed before the provider reported
+/// anything, so a failure path says "nothing was reported" by omission rather than by naming
+/// three `None`s at each site.
+#[derive(Debug, Clone, Default)]
+struct RecordedOutcome {
+    /// The usage the provider reported, when it reported any.
+    usage: Option<Usage>,
+    /// Why the provider stopped, when it reached a terminal.
+    finish_reason: Option<FinishReason>,
+    /// When the first output arrived, when it did.
+    first_output_at: Option<UtcTimestamp>,
 }
 
 /// Everything one model turn needs besides the run it belongs to.
@@ -447,6 +496,15 @@ struct DrainedTurn {
     /// and "the provider said nothing" are different facts: the first is a measurement
     /// against which a ceiling can be checked, the second cannot check anything.
     usage_reported: bool,
+    /// Why the provider stopped producing output, from the terminal frame.
+    ///
+    /// Captured because the finish reason is a fact about the request that only the provider can
+    /// supply, and the schema and the port both carry it: a run that stopped on `length` is not
+    /// the same as one that stopped on `stop`, and without this a reconciliation pass or an
+    /// operator could not tell "the model was cut off by its own token limit" from "the model
+    /// finished". The domain retains an unmodelled provider reason as `FinishReason::Other`
+    /// precisely so a new reason stays visible instead of being flattened into a clean one.
+    finish_reason: Option<FinishReason>,
 }
 
 /// Drives one durable run to a terminal state.
@@ -592,12 +650,23 @@ impl RunController {
         )
         .await?;
 
-        // The provider must name a model *before* the run can wait on one. Checking
-        // here rather than inside the model turn means a misconfigured provider fails
-        // the run from `Planning`; resolving it after `AwaitingModel` was entered left
-        // the run waiting for a call that could never be made, in a state with no
-        // legal way out.
-        let model = match selected_model(self.provider.as_ref()) {
+        // The model comes from the run's **stored route**, when a policy selected one, and only
+        // falls back to the provider's own first served model when no policy was in force.
+        //
+        // This is the point at which a data policy constrains the call a run actually makes. The
+        // route was selected and recorded at creation, where a policy that admitted no compliant
+        // model refuses the request; here the selection is read back, so the locality,
+        // allow-list, and ceiling a policy expressed are what the daemon calls with rather than
+        // what a diagnostic endpoint reports. Taking `provider.models().first()` instead — which
+        // is what this did — let a local-only policy select a cloud model for the real call while
+        // the probe answered correctly.
+        //
+        // A stored route naming a model the provider no longer serves fails the run rather than
+        // falling back: the policy authorized *that* model, and calling a different one would
+        // perform an action nobody permitted. The provider's own selection is used only when no
+        // policy governed the run, which is the unconstrained case the budget records by carrying
+        // no route.
+        let model = match self.resolve_model(run).await {
             Ok(model) => model,
             Err(error) => {
                 self.finish(
@@ -781,6 +850,43 @@ impl RunController {
         })
     }
 
+    /// Resolves the model this run is authorized to call.
+    ///
+    /// The stored route wins when one exists, because it is what a policy selected and recorded;
+    /// the provider's own first served model is used only when **no policy was in force**, which
+    /// the run's budget records by carrying no route. Falling back when a route exists would
+    /// substitute a model nobody authorized for one that was, which is the leak this exists to
+    /// prevent.
+    ///
+    /// A stored route naming a model the provider no longer serves is
+    /// [`ControllerError::NoModelServed`] rather than a silent fallback: the policy authorized that
+    /// model, so calling a different one would perform an action no rule permitted. The answer is
+    /// the same code the no-model case uses, because the operator's remedy is the same — the route
+    /// cannot be honoured, so the configuration must change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Repository`] when the run cannot be read and
+    /// [`ControllerError::NoModelServed`] when neither a stored route nor a served model exists.
+    async fn resolve_model(&self, run: RunRef) -> Result<ModelRef, ControllerError> {
+        let budget = self.load(run).await?.budget;
+        if let Some(route) = budget.route.as_ref() {
+            // A routed model must still be served. The provider is the only thing that knows, and
+            // a route naming a model it does not serve is configuration drift rather than a policy
+            // decision, so it is reported instead of being quietly replaced.
+            if self
+                .provider
+                .models()
+                .iter()
+                .any(|served| served == &route.model)
+            {
+                return Ok(route.model.clone());
+            }
+            return Err(ControllerError::NoModelServed);
+        }
+        selected_model(self.provider.as_ref())
+    }
+
     /// Advances a run one state, and refuses to continue if a cancellation arrived.
     async fn step_unless_cancelled(
         &self,
@@ -845,6 +951,12 @@ impl RunController {
             return Err(ControllerError::DeadlineExceeded);
         }
 
+        // The stored route is read once and its decision identifier carried into every attempt, so
+        // a retry's second `model_calls` row names the same decision as its first. Re-deriving it
+        // per attempt would let one logical call's attempts claim different routes, which is
+        // exactly what the shared `logical_call_id` exists to prevent.
+        let route = self.load(run).await?.budget.route;
+
         // One logical call spans every attempt, so the chain is auditable as one operation
         // rather than as unrelated calls that happen to be adjacent.
         let logical_call_id = ModelCallId::from_uuid(uuid::Uuid::now_v7());
@@ -852,7 +964,7 @@ impl RunController {
 
         loop {
             match self
-                .attempt_call(run, turn, logical_call_id, attempt)
+                .attempt_call(run, turn, logical_call_id, attempt, route.as_ref())
                 .await?
             {
                 AttemptOutcome::Completed(outcome) => return Ok(outcome),
@@ -932,12 +1044,18 @@ impl RunController {
     /// Returns [`AttemptOutcome::Retryable`] only for a failure the provider reported
     /// *before* accepting the call, and only for a failure the caller classified as
     /// transient. Every other path leaves the run terminal and returns `Err`.
+    ///
+    /// `route` is the run's stored selection, and its decision identifier is stamped on the
+    /// attempt's own row. The column answers "which authorization permitted this call", which is
+    /// the question an operator asks about a single call rather than about the run, and it is why
+    /// every attempt of one logical call names the same decision.
     async fn attempt_call(
         &self,
         run: RunRef,
         turn: &ModelTurn<'_>,
         logical_call_id: ModelCallId,
         attempt: u32,
+        route: Option<&RunRoute>,
     ) -> Result<AttemptOutcome, ControllerError> {
         // A fresh row per attempt, sharing the logical identity. A retry that reused the
         // row id would overwrite the first attempt's recorded outcome, which the
@@ -952,13 +1070,18 @@ impl RunController {
                 logical_call_id,
                 attempt,
                 model: turn.model.clone(),
+                // The route decision that authorized this call. `None` when no policy was in
+                // force, which is the same distinction the run's budget draws — a call recorded
+                // under no decision and one permitted by a decision that selected the same model
+                // are different facts, and only the second can be explained after the fact.
+                route_decision: route.map(|route| route.decision),
                 request_fingerprint: None,
                 started_at,
             })
             .await
             .map_err(ControllerError::Repository)?;
 
-        let request = build_request(run.run_id, call_id, turn.items, turn.budget)?;
+        let request = build_request(run.run_id, call_id, turn.model, turn.items, turn.budget)?;
 
         // Bounded by the run's own budget. A provider that never answers must not hold
         // the run open: the deadline this run declares has to be an actual bound, and an
@@ -1024,7 +1147,10 @@ impl RunController {
                 run,
                 call_id,
                 ModelCallState::Cancelled,
-                usage_of(&drained),
+                RecordedOutcome {
+                    usage: usage_of(&drained),
+                    ..RecordedOutcome::default()
+                },
             )
             .await?;
             return Err(ControllerError::Cancelled);
@@ -1062,8 +1188,16 @@ impl RunController {
                 ),
             )
             .await?;
-            self.record_call_outcome_with(run, call_id, ModelCallState::Failed, usage)
-                .await?;
+            self.record_call_outcome_with(
+                run,
+                call_id,
+                ModelCallState::Failed,
+                RecordedOutcome {
+                    usage,
+                    ..RecordedOutcome::default()
+                },
+            )
+            .await?;
             return Err(ControllerError::ToolsNotImplemented { tool_name });
         }
 
@@ -1089,10 +1223,22 @@ impl RunController {
         }
 
         // The call's outcome is recorded before the run moves on, so a completed run
-        // never leaves a model call open.
+        // never leaves a model call open. The finish reason travels with it, because "why the
+        // provider stopped" is part of the recorded outcome rather than a detail: a run cut off
+        // by its own token limit must not be indistinguishable from one the model finished.
         let completed_at = self.now()?;
-        self.record_call_outcome_with(run, call_id, ModelCallState::Completed, usage)
-            .await?;
+        let finish_reason = drained.finish_reason.clone();
+        self.record_call_outcome_with(
+            run,
+            call_id,
+            ModelCallState::Completed,
+            RecordedOutcome {
+                usage,
+                finish_reason,
+                first_output_at: None,
+            },
+        )
+        .await?;
 
         // AwaitingModel -> Responding -> Completed, then the answer is stored.
         self.complete_run(
@@ -1286,28 +1432,10 @@ impl RunController {
                         .map_err(|_| ControllerError::OutputNotPersisted)?;
                     drained.answer.push_str(delta);
                 }
-                ModelStreamEventKind::ToolCallAdded { tool_name, .. } => {
-                    // The first intent is recorded, but the loop keeps draining so the
-                    // stream's terminal is still observed: abandoning a stream early
-                    // would leave the provider's view and JARVIS's disagreeing.
-                    drained.tool_intent.get_or_insert_with(|| tool_name.clone());
-                }
-                // Usage arrives on its own frame or with the terminal, and a provider may
-                // send both. The last one wins rather than the first, because a later frame
-                // is a revision and the terminal's block is the final one — taking the
-                // first would under-count a provider that updates as it goes.
-                //
-                // Both arms assign the same thing, and they are merged rather than
-                // duplicated: a divergence between two copies of "capture the usage" is
-                // exactly how one arrival path would stop being captured.
-                ModelStreamEventKind::UsageUpdated { usage }
-                | ModelStreamEventKind::CallCompleted {
-                    usage: Some(usage), ..
-                } => {
-                    drained.usage = Some(usage.clone());
-                    drained.usage_reported = true;
-                }
-                _ => {}
+                // Everything else is recorded by folding the frame into the turn, which keeps
+                // this loop about *draining a stream* rather than about which frame carries
+                // which field. `capture` is where the pattern-ordering rule lives.
+                other => capture(&mut drained, other),
             }
         }
 
@@ -1582,29 +1710,30 @@ impl RunController {
         call_id: ModelCallId,
         state: ModelCallState,
     ) -> Result<(), ControllerError> {
-        self.record_call_outcome_with(run, call_id, state, None)
+        self.record_call_outcome_with(run, call_id, state, RecordedOutcome::default())
             .await
     }
 
-    /// Records a model call's terminal outcome along with the usage it reported.
+    /// Records a model call's terminal outcome along with what the provider reported.
     ///
-    /// The usage is written here rather than in a separate call so a completed attempt and
-    /// its consumption are one write: an attempt recorded as completed with no usage, then
-    /// updated with usage, leaves a window in which a reconciliation pass reads a finished
-    /// call as having consumed nothing — which is exactly the state a cost ceiling cannot
-    /// check.
+    /// The usage, the finish reason, and the first-output instant are written here rather than in
+    /// separate calls so a completed attempt and what it consumed are **one write**: an attempt
+    /// recorded as completed with no usage, then updated with usage, leaves a window in which a
+    /// reconciliation pass reads a finished call as having consumed nothing — which is exactly the
+    /// state a cost ceiling cannot check.
     async fn record_call_outcome_with(
         &self,
         run: RunRef,
         call_id: ModelCallId,
         state: ModelCallState,
-        usage: Option<Usage>,
+        recorded: RecordedOutcome,
     ) -> Result<(), ControllerError> {
         let completed_at = self.now()?;
         // The cost is lifted out of the usage block into its own column, because that is
         // where a cost query reads it. Both are written from one source, so they cannot
         // disagree.
-        let estimated_cost_microunits = usage
+        let estimated_cost_microunits = recorded
+            .usage
             .as_ref()
             .and_then(|reported| reported.estimated_cost_microunits);
         self.model_calls
@@ -1615,11 +1744,11 @@ impl RunController {
                     state,
                     provider_request_id: None,
                     continuation_ref: None,
-                    usage,
+                    usage: recorded.usage,
                     estimated_cost_microunits,
-                    finish_reason: None,
+                    finish_reason: recorded.finish_reason,
                     error_code: None,
-                    first_output_at: None,
+                    first_output_at: recorded.first_output_at,
                     completed_at: Some(completed_at),
                 },
             )
@@ -1664,7 +1793,11 @@ impl RunController {
             run_id: run.run_id,
             sequence,
             event_type: step.event_type.to_owned(),
-            payload_json: None,
+            // Always absent: nothing in this layer can build the payload, because
+            // `serde_json` is a dev-dependency here and this crate deliberately does not depend
+            // on `jarvis-protocol`. Recorded as a named gap rather than hand-writing JSON, which
+            // is the ad-hoc string manipulation the architecture forbids.
+            payload_json: step.payload(),
             visibility: EventVisibility::Public,
             occurred_at: now,
         };
@@ -1701,8 +1834,8 @@ mod tests;
 
 /// The model a controller would select for `provider`.
 ///
-/// Exposed so a test can assert what the controller will ask without duplicating the
-/// selection rule, and so `NoModelServed` has one definition.
+/// Retained for the no-policy case and for tests that assert the *provider's own* selection. The
+/// run path uses [`RunController::run_model`], which prefers a stored route.
 ///
 /// # Errors
 ///
@@ -1743,6 +1876,53 @@ fn usage_of(drained: &DrainedTurn) -> Option<Usage> {
     drained.usage.clone()
 }
 
+/// Folds one non-output frame into the turn being drained.
+///
+/// One function rather than a match inside the drain loop, so "which frame carries which field"
+/// has a single answer and the loop stays about reading a stream. It is also where a
+/// **pattern-ordering** rule lives, and that rule is not incidental:
+///
+/// A terminal frame carries **both** the final usage and the reason the provider stopped. Writing
+/// this as two arms — one matching `usage: Some(..)` and one matching `finish_reason` — makes the
+/// first match win, so a terminal with usage would record its usage and silently drop its reason.
+/// Both fields are therefore captured in one arm, and a test asserts both on the same frame.
+///
+/// `ToolCallAdded` records the **first** intent and keeps draining, because abandoning a stream
+/// early would leave the provider's view and JARVIS's disagreeing about whether the call finished.
+///
+/// `refused` is deliberately not folded into the finish reason: the normalized vocabulary already
+/// has `FinishReason::Refusal`, so the flag and the reason agree here rather than becoming two
+/// conflicting spellings of one fact.
+fn capture(drained: &mut DrainedTurn, kind: &ModelStreamEventKind) {
+    match kind {
+        ModelStreamEventKind::ToolCallAdded { tool_name, .. } => {
+            drained.tool_intent.get_or_insert_with(|| tool_name.clone());
+        }
+        // Usage arrives on its own frame or with the terminal, and a provider may send both. The
+        // last one wins rather than the first, because a later frame is a revision and the
+        // terminal's block is the final one — taking the first would under-count a provider that
+        // updates as it goes.
+        ModelStreamEventKind::UsageUpdated { usage } => {
+            drained.usage = Some(usage.clone());
+            drained.usage_reported = true;
+        }
+        ModelStreamEventKind::CallCompleted {
+            finish_reason,
+            usage,
+            ..
+        } => {
+            drained.finish_reason = Some(finish_reason.clone());
+            if let Some(usage) = usage {
+                drained.usage = Some(usage.clone());
+                drained.usage_reported = true;
+            }
+        }
+        // Output text is published as it arrives, and every other frame is either metadata this
+        // turn does not need or a kind the state machine has already refused.
+        _ => {}
+    }
+}
+
 /// Builds the normalized model request for one call.
 ///
 /// Deliberately a free function: it reads no port and holds no state, so making it a
@@ -1757,6 +1937,7 @@ fn usage_of(drained: &DrainedTurn) -> Option<Usage> {
 fn build_request(
     run_id: RunId,
     call_id: ModelCallId,
+    model: &ModelRef,
     items: &[RetainedItem],
     budget: &RunBudget,
 ) -> Result<ModelCallRequest, ControllerError> {
@@ -1772,6 +1953,11 @@ fn build_request(
     Ok(ModelCallRequest {
         call_id,
         run_id,
+        // The routed model, which is the same value the run's own route selected and the
+        // `model_calls` row records. Sending a request that named no model left the policy
+        // constraining the record rather than the call: an adapter was free to answer with
+        // whatever it defaulted to while the row said the routed model served it.
+        model: model.clone(),
         route_requirements: RouteRequirements::text(),
         input: InputItems::new(input)
             .map_err(|error| ControllerError::StreamRejected { code: error.code() })?,

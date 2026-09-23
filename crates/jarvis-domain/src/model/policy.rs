@@ -94,6 +94,27 @@ pub enum Sensitivity {
     Restricted,
 }
 
+impl Sensitivity {
+    /// Returns the label JARVIS stores and puts on the wire.
+    ///
+    /// The label exists in the domain because two layers need the same spelling and neither can
+    /// reach the other: `jarvis-application` writes a message's stored label and the route decision
+    /// that judges it, and `jarvis-protocol` renders the wire form. A `serde(rename_all)` derive is
+    /// not enough, because the stored message label is built by hand and would have to repeat the
+    /// spelling — which is how a message ends up labelled with something the decision did not
+    /// classify. `context_assembly::parse_sensitivity` is the inverse and has a test asserting the
+    /// two agree over every variant.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Confidential => "confidential",
+            Self::Restricted => "restricted",
+        }
+    }
+}
+
 /// Whether a route may fall back to another compliant candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -513,6 +534,49 @@ pub enum RejectionReason {
     EvidenceStale,
     /// The candidate has no evidence note at all.
     EvidenceMissing,
+    /// The content's classification exceeds the policy's sensitivity ceiling.
+    ///
+    /// This is not a fact about a candidate — the same reason is reported for every
+    /// candidate — and that is why it is checked *first*. The ceiling bounds what may be
+    /// sent at all, so a call above it is refused before any candidate's placement or
+    /// evidence is examined; a per-candidate reason would imply that some other candidate
+    /// could have carried it, which is exactly the promotion the ceiling forbids.
+    SensitivityExceedsPolicy,
+}
+
+impl RejectionReason {
+    /// Returns the policy rule this reason is about, when it is about a rule at all.
+    ///
+    /// This is the bridge between a refusal and the exception that may relax it, and it is
+    /// deliberately a **mapping** rather than a field carried beside the reason: deriving the
+    /// rule from the reason means there is exactly one place where "which rule failed" is
+    /// decided, while a second field would be a second answer to the same question.
+    ///
+    /// Three reasons return `None` and cannot be relaxed by any exception:
+    /// `CapabilityUnattested`, `EvidenceStale`, and `EvidenceMissing` are facts about
+    /// **evidence**, not about a rule an operator wrote. Nobody can grant "this provider's
+    /// capability is verified" — only a measurement or a current official source can — so
+    /// there is no rule for an exception to name and none is offered.
+    ///
+    /// The three reasons whose keys are **non**-waivable still return their key, because the
+    /// refusal has to be nameable for the relaxation path to answer "that rule cannot be
+    /// relaxed" rather than silently finding no exception for it. Whether the key may in fact
+    /// be relaxed is [`crate::model::exception::PolicyRuleKey::is_waivable`]'s answer, applied
+    /// in one place rather than implied by this mapping.
+    #[must_use]
+    pub const fn policy_rule(self) -> Option<crate::model::exception::PolicyRuleKey> {
+        use crate::model::exception::PolicyRuleKey;
+        match self {
+            Self::ProviderNotAllowed => Some(PolicyRuleKey::AllowedProviders),
+            Self::ModelNotAllowed => Some(PolicyRuleKey::AllowedModels),
+            Self::LocalityViolated => Some(PolicyRuleKey::Locality),
+            Self::RetentionUnsatisfied => Some(PolicyRuleKey::MaximumProviderRetention),
+            Self::TrainingUseUnsatisfied => Some(PolicyRuleKey::ProviderTrainingUse),
+            Self::ResidencyUnsatisfied => Some(PolicyRuleKey::ResidencyRegions),
+            Self::SensitivityExceedsPolicy => Some(PolicyRuleKey::MaximumSensitivity),
+            Self::CapabilityUnattested | Self::EvidenceStale | Self::EvidenceMissing => None,
+        }
+    }
 }
 
 /// A rejected candidate and the reason it was rejected.
@@ -570,6 +634,9 @@ impl fmt::Display for RejectionReason {
             Self::CapabilityUnattested => "capability not attested",
             Self::EvidenceStale => "evidence is stale",
             Self::EvidenceMissing => "evidence is missing",
+            Self::SensitivityExceedsPolicy => {
+                "the content exceeds the policy's sensitivity ceiling"
+            }
         };
         formatter.write_str(text)
     }
@@ -877,6 +944,7 @@ mod tests {
             RejectionReason::CapabilityUnattested,
             RejectionReason::EvidenceStale,
             RejectionReason::EvidenceMissing,
+            RejectionReason::SensitivityExceedsPolicy,
         ];
         let mut rendered: Vec<String> = reasons.iter().map(ToString::to_string).collect();
         rendered.sort();

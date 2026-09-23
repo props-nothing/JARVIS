@@ -16,10 +16,10 @@
 //! [`RepositoryError::Corrupted`] rather than as absence.
 
 use jarvis_application::repository::policy::{
-    ModelDataPolicyRepository, NewPolicyVersion, StoredPolicyVersion,
+    JarvisPolicyException, ModelDataPolicyRepository, NewPolicyVersion, StoredPolicyVersion,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
-use jarvis_domain::ids::{ModelDataPolicyId, ModelRouteDecisionId, WorkspaceId};
+use jarvis_domain::ids::{ModelDataPolicyId, ModelRouteDecisionId, PolicyExceptionId, WorkspaceId};
 use jarvis_domain::model::policy::{
     ModelDataPolicyStatus, ModelRouteDecision, PolicyRules, PolicyVersionRef,
 };
@@ -230,6 +230,66 @@ impl ModelDataPolicyRepository for SqliteRepositories {
                 decided_at: parse_time(&text(&row, "decided_at")?, "decided_at")?,
             })
         })
+    }
+
+    fn grant_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception: JarvisPolicyException,
+    ) -> RepositoryFuture<'_, ()> {
+        // Delegated to the exception store, which is where the shape of that record belongs. The
+        // trait's methods live together because Rust allows one `impl` per type, but the queries
+        // do not have to.
+        Box::pin(super::exception_store::grant(
+            &self.pool, workspace, exception,
+        ))
+    }
+
+    fn load_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+    ) -> RepositoryFuture<'_, JarvisPolicyException> {
+        Box::pin(super::exception_store::load(
+            &self.pool,
+            workspace,
+            exception_id,
+        ))
+    }
+
+    fn list_exceptions(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<JarvisPolicyException>> {
+        Box::pin(super::exception_store::list(&self.pool, workspace))
+    }
+
+    fn revoke_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(super::exception_store::revoke(
+            &self.pool,
+            workspace,
+            exception_id,
+            at,
+        ))
+    }
+
+    fn consume_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(super::exception_store::consume(
+            &self.pool,
+            workspace,
+            exception_id,
+            at,
+        ))
     }
 }
 

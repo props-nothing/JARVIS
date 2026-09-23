@@ -593,6 +593,16 @@ pub struct ModelCallRequest {
     pub call_id: ModelCallId,
     /// The run this call belongs to.
     pub run_id: RunId,
+    /// The provider/model this call must be served by.
+    ///
+    /// A routed selection rather than a preference: a data policy chose this model, so an
+    /// adapter asked to serve a **different** one has to refuse rather than substitute. Without
+    /// it the routed model was honoured only for *which* adapter was called and for what the
+    /// `model_calls` row recorded, while the wire request named no model at all — so a provider
+    /// was free to answer with whatever it defaulted to and the policy constrained the record
+    /// rather than the call. That is the same "holds on the recording path and not the wire"
+    /// shape as a column with a reader and no writer.
+    pub model: ModelRef,
     /// Hard route requirements.
     pub route_requirements: RouteRequirements,
     /// The ordered input items.
@@ -1136,6 +1146,7 @@ mod tests {
     };
     use crate::ids::{ModelCallId, ModelStreamEventId, RunId};
     use crate::model::capability::Capability;
+    use crate::model::identity::{ModelId, ModelRef, ProviderId};
     use crate::model::policy::Locality;
 
     fn call() -> ModelCallId {
@@ -1701,6 +1712,10 @@ mod tests {
         let request = ModelCallRequest {
             call_id: call(),
             run_id: RunId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c61").expect("valid"),
+            model: ModelRef::new(
+                ProviderId::parse("local.ollama").expect("valid"),
+                ModelId::parse("llama3.1").expect("valid"),
+            ),
             route_requirements: RouteRequirements::text(),
             input: InputItems::new(Vec::new()).expect("an empty list is valid"),
             tools: Vec::new(),
@@ -1713,14 +1728,49 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&request).expect("serializes");
+        // Parsed and checked by key rather than searched as a substring. The earlier version
+        // asserted the serialized text contained no `provider_`, which was a **proxy** for "no
+        // provider extension map" and stopped being one the moment `model.provider_id` — a
+        // required identity field naming *which* provider serves the call — was added. A
+        // substring check cannot tell an extension map from a required field, so it has to be
+        // stated as what it means: these top-level keys are the whole portable surface.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let keys: Vec<&str> = parsed
+            .as_object()
+            .expect("the request serializes as an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            assert!(
+                [
+                    "call_id",
+                    "run_id",
+                    "model",
+                    "route_requirements",
+                    "input",
+                    "tools",
+                    "output_schema",
+                    "settings",
+                    "limits",
+                ]
+                .contains(key),
+                "an unexpected top-level key on the portable request: {key} in {json}",
+            );
+        }
         assert!(
-            !json.contains("extension") && !json.contains("provider_"),
-            "the portable request must have no provider-owned field: {json}",
+            !keys.contains(&"settings") && !keys.contains(&"output_schema"),
+            "an empty settings block and a null schema must be omitted, not written: {json}",
         );
         assert!(
-            !json.contains("settings"),
-            "an empty settings block must be omitted, not written as an empty object: {json}",
+            !json.contains("extension"),
+            "no provider extension map may reach the portable request: {json}",
         );
+        // The model is a required *identity* rather than an extension: it names which provider
+        // and model serve the call, and the data policy's selection is what it carries.
+        assert_eq!(parsed["model"]["provider_id"], "local.ollama", "{json}");
+        assert_eq!(parsed["model"]["model_id"], "llama3.1", "{json}");
+        assert!(parsed["model"].get("revision").is_none(), "{json}");
         assert_eq!(
             request.route_requirements.modalities,
             [Modality::Text].into_iter().collect(),

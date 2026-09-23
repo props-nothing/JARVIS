@@ -271,6 +271,132 @@ fn an_unknown_budget_field_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// The routed model
+//
+// The three facts a route carries travel together on the budget: the model the run may call,
+// the decision that explains why, and the grant that permitted it. These tests are about the
+// *distinction* the field exists to draw — a run with no route is not a run whose route
+// happened to be the provider's first model, and the budget must be able to say which it is.
+// ---------------------------------------------------------------------------
+
+/// A routed model with a decision identifier, for the round-trip tests.
+fn route() -> (
+    crate::model::identity::ModelRef,
+    crate::ids::ModelRouteDecisionId,
+) {
+    (
+        crate::model::identity::ModelRef::new(
+            crate::model::identity::ProviderId::parse("local.ollama").expect("valid"),
+            crate::model::identity::ModelId::parse("llama3.1").expect("valid"),
+        ),
+        crate::ids::ModelRouteDecisionId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d")
+            .expect("valid"),
+    )
+}
+
+#[test]
+fn a_budget_with_no_route_reports_no_routed_model() {
+    // The distinction the whole field exists for: `None` means "no policy was in force", which
+    // is a fact an operator can act on. Defaulting to a route would instead claim a policy chose
+    // the provider's first model, attributing a decision to nobody.
+    let budget = RunBudget::default();
+    assert!(budget.route.is_none());
+    assert!(budget.routed_model().is_none());
+}
+
+#[test]
+fn a_route_and_the_policy_that_selected_it_are_one_value_on_the_budget() {
+    // The route is attached by the same builder the policy reference is, so a run cannot record
+    // a policy reference with no route or a route with no policy. Asserted together because the
+    // failure this guards against is one of the two being set and the other forgotten.
+    let (model, decision) = route();
+    let budget = RunBudget::default()
+        .with_policy(
+            crate::model::policy::PolicyVersionRef {
+                policy_id: crate::ids::ModelDataPolicyId::parse(
+                    "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+                )
+                .expect("valid"),
+                version: 3,
+            },
+            crate::model::policy::Sensitivity::Internal,
+        )
+        .with_route(super::RunRoute {
+            model: model.clone(),
+            decision,
+            exception_ref: None,
+        });
+
+    assert_eq!(budget.routed_model(), Some(&model));
+    assert_eq!(
+        budget.route.as_ref().map(|route| route.decision),
+        Some(decision)
+    );
+    assert!(
+        budget.policy.is_some(),
+        "the route and the policy reference are set together",
+    );
+}
+
+#[test]
+fn a_route_naming_an_exception_keeps_the_reference() {
+    // A route a grant permitted and a route that merely looks permissive are distinguishable
+    // only through this reference, which is why it is carried on the route as well as on the
+    // stored decision.
+    let (model, decision) = route();
+    let exception_id = crate::ids::PolicyExceptionId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d")
+        .expect("valid");
+    let budget = RunBudget::default().with_route(super::RunRoute {
+        model,
+        decision,
+        exception_ref: Some(exception_id.to_string()),
+    });
+
+    let stored = budget.route.as_ref().expect("a route was set");
+    assert_eq!(
+        stored.exception_ref.as_deref(),
+        Some(exception_id.to_string().as_str()),
+    );
+}
+
+#[test]
+fn a_route_round_trips_through_json_with_an_absent_exception_omitted() {
+    // `agent_runs.budget_json` holds this shape, so a route with no exception must come back
+    // without one rather than as a null-turned-empty string — which would read as a grant that
+    // exists and is named by nothing.
+    let (model, decision) = route();
+    let budget = RunBudget::default().with_route(super::RunRoute {
+        model,
+        decision,
+        exception_ref: None,
+    });
+    let encoded = serde_json::to_string(&budget).expect("serializes");
+    assert!(!encoded.contains("exception_ref"), "{encoded}");
+    let decoded: RunBudget = serde_json::from_str(&encoded).expect("deserializes");
+    assert_eq!(decoded, budget);
+}
+
+#[test]
+fn an_unknown_route_field_is_refused() {
+    // The route is `deny_unknown_fields` too, so a mistyped decision field is a failure rather
+    // than a silently dropped authorization reference — the shape where a run looks governed
+    // while the record that would explain it was discarded on read.
+    let encoded = serde_json::json!({
+        "route": {
+            "model": {
+                "provider_id": "local.ollama",
+                "model_id": "llama3.1",
+            },
+            "decision": "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            "decisionn": "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+        }
+    });
+    let error = serde_json::from_value::<RunBudget>(encoded)
+        .expect_err("a misspelled route field must not parse");
+    assert!(error.to_string().contains("decisionn"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
 // Consumption ceilings
 //
 // These are what make `max_output_tokens` and `max_cost_microunits` bounds rather than

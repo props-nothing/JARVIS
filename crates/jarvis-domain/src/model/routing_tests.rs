@@ -6,10 +6,15 @@
 //! than only that the selection failed — "no route" and "the local model was rejected
 //! because it cannot document retention" call for different operator responses.
 
-use super::{MAX_CANDIDATES, RouteCandidate, RouteRequest, select_route};
+use super::{
+    MAX_CANDIDATES, RouteCandidate, RouteRequest, RouteSelectionFailure, select_route,
+    select_route_explained,
+};
+use crate::ids::{PolicyExceptionId, PrincipalId, WorkspaceId};
 use crate::model::capability::{
     Attested, Capability, CapabilityDescriptor, Evidence, EvidenceLabel, IncrementalDelivery,
 };
+use crate::model::exception::{ExceptionScope, PolicyRuleKey};
 use crate::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId, Region};
 use crate::model::policy::{
     EffectiveRetention, FallbackPermission, Locality, PolicyRules, PolicyVersionRef,
@@ -101,6 +106,9 @@ fn local_only_request() -> RouteRequest {
         requirements: RouteRequirements::text(),
         today: today(),
         decided_at: at(),
+        // No exception is offered by default, which is the ordinary case and the state a caller
+        // that has none must be able to express. A test that needs a relaxation adds one.
+        exceptions: Vec::new(),
     }
 }
 
@@ -634,6 +642,82 @@ fn a_decision_with_no_compliant_candidate_reports_the_policy_code_not_an_empty_s
 }
 
 #[test]
+fn content_above_the_policys_sensitivity_ceiling_is_refused_before_any_candidate_is_considered() {
+    // The ceiling is `PolicyRules::maximum_sensitivity`'s only consumer above the run path, and
+    // before this check existed a `local_only` policy permitting only `public` content selected
+    // a local candidate and sent `restricted` content: the policy set a limit that nothing
+    // compared the content against. The candidate here is the SAFEST possible one, so a
+    // candidate-based rejection (locality, retention) cannot be what refuses it — only the
+    // ceiling can, which is what makes this test falsify the check rather than a coincidence.
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::LocalOnly,
+            maximum_sensitivity: Sensitivity::Public,
+            ..PolicyRules::permissive()
+        },
+        sensitivity: Sensitivity::Restricted,
+        ..local_only_request()
+    };
+    let candidates = [candidate("local.ollama", "llama3.1", EndpointClass::Local)];
+    let error = select_route(&candidates, &request).expect_err("content over the ceiling");
+    assert_eq!(error.code(), "model.policy_unsatisfied");
+
+    // The refusal names the ceiling reason rather than a candidate's, because the condition is
+    // about the content. Reporting `locality_violated` for a local candidate under a local-only
+    // policy would name a rule that is in fact satisfied.
+    let refusal = select_route_explained(&candidates, &request).expect_err("refused");
+    match refusal {
+        RouteSelectionFailure::Refused(refusal) => {
+            assert_eq!(refusal.rejected.len(), 1);
+            assert_eq!(
+                refusal.rejected[0].reason,
+                RejectionReason::SensitivityExceedsPolicy,
+            );
+        }
+        // `panic!` is denied in this crate, so the unreachable arm asserts instead. The bound is
+        // one past a single candidate, so reaching it would mean the bound is not a bound.
+        RouteSelectionFailure::CandidatesUnbounded { .. } => {
+            unreachable!("one candidate is well within the bound")
+        }
+    }
+}
+
+#[test]
+fn content_exactly_at_the_policys_sensitivity_ceiling_is_inside_it() {
+    // The other side of the boundary, asserted so a `>=`/`>` slip is caught. A ceiling of
+    // `confidential` permits confidential content: the policy names the most that may be sent,
+    // so the value it names is permitted. This is the opposite convention to the *deadline*,
+    // where the named instant is already expired — the two are different quantities and both
+    // are right for their own, which is why both sides are asserted rather than one.
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::LocalOnly,
+            maximum_sensitivity: Sensitivity::Confidential,
+            ..PolicyRules::permissive()
+        },
+        sensitivity: Sensitivity::Confidential,
+        ..local_only_request()
+    };
+    let candidates = [candidate("local.ollama", "llama3.1", EndpointClass::Local)];
+    let decision = select_route(&candidates, &request).expect("confidential is the ceiling");
+    assert_eq!(decision.requested.sensitivity, Sensitivity::Confidential);
+
+    // One step stricter is outside, so the boundary is a real edge rather than a value that
+    // happens to be permitted by both comparisons.
+    let stricter = RouteRequest {
+        rules: PolicyRules {
+            maximum_sensitivity: Sensitivity::Internal,
+            ..request.rules.clone()
+        },
+        ..request
+    };
+    assert!(
+        select_route(&candidates, &stricter).is_err(),
+        "confidential content is above an internal ceiling",
+    );
+}
+
+#[test]
 fn the_decision_records_the_policy_version_it_ran_under() {
     // Policy is mutable and a call outlives the process that made it, so a decision
     // re-derived from current state could explain a past call with rules that no longer
@@ -689,6 +773,102 @@ fn fallback_permission_is_carried_on_the_requested_side() {
 }
 
 #[test]
+fn an_exception_relaxing_a_rule_the_candidate_did_not_fail_is_not_applied() {
+    // The grant must name the rule that actually failed. A **cloud** candidate documents nothing,
+    // so it fails the `bounded_documented` retention requirement — and a `local` endpoint would
+    // *not* fail it, because a local route reports `not_applicable_local` and satisfies a retention
+    // requirement vacuously (there is no provider to retain anything). The exception here relaxes
+    // **locality**, which this candidate satisfies, so it must not be applied: applying it would
+    // record a relaxation the call never used, and the reason must still name retention.
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::ApprovedCloudAllowed,
+            maximum_provider_retention: ProviderRetention::BoundedDocumented,
+            ..PolicyRules::permissive()
+        },
+        exceptions: vec![exception(
+            PolicyRuleKey::Locality,
+            ExceptionScope {
+                locality: Some(Locality::PrivateNetworkAllowed),
+                ..ExceptionScope::default()
+            },
+        )],
+        ..local_only_request()
+    };
+    let candidates = [candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud)];
+    let refusal = select_route_explained(&candidates, &request).expect_err("retention fails");
+    match refusal {
+        RouteSelectionFailure::Refused(refusal) => {
+            assert_eq!(
+                refusal.rejected[0].reason,
+                RejectionReason::RetentionUnsatisfied,
+                "the reason names what actually failed, not the rule the grant named",
+            );
+        }
+        RouteSelectionFailure::CandidatesUnbounded { .. } => {
+            unreachable!("one candidate is bounded")
+        }
+    }
+}
+
+#[test]
+fn a_retention_exception_accepts_the_provider_default_the_grant_names() {
+    // The relaxation works in the direction it should: a cloud candidate that documents nothing is
+    // refused by a `bounded_documented` policy and admitted once a grant for that rule exists, with
+    // the decision recording the grant. Both halves are asserted, so a relaxation that applied
+    // unconditionally would fail the first assertion.
+    let strict = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::ApprovedCloudAllowed,
+            maximum_provider_retention: ProviderRetention::BoundedDocumented,
+            ..PolicyRules::permissive()
+        },
+        ..local_only_request()
+    };
+    let candidates = [candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud)];
+    assert!(select_route(&candidates, &strict).is_err());
+
+    let relaxed = RouteRequest {
+        exceptions: vec![exception(
+            PolicyRuleKey::MaximumProviderRetention,
+            ExceptionScope::default(),
+        )],
+        ..strict
+    };
+    let decision = select_route(&candidates, &relaxed).expect("the grant accepts the default");
+    assert!(decision.relied_on_exception());
+}
+
+#[test]
+fn the_first_applicable_grant_is_the_one_recorded() {
+    // A second grant would relax an already-relaxed rule, and one record keeps "why was this
+    // call permitted" answerable by naming a single durable record. Two identical grants are
+    // offered; the decision must name the first.
+    let first = exception(
+        PolicyRuleKey::MaximumProviderRetention,
+        ExceptionScope::default(),
+    );
+    let mut second = first.clone();
+    second.id = PolicyExceptionId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c95").expect("valid");
+
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::ApprovedCloudAllowed,
+            maximum_provider_retention: ProviderRetention::BoundedDocumented,
+            ..PolicyRules::permissive()
+        },
+        exceptions: vec![first.clone(), second],
+        ..local_only_request()
+    };
+    let candidates = [candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud)];
+    let decision = select_route(&candidates, &request).expect("a grant applies");
+    assert_eq!(
+        decision.exception_ref.as_deref(),
+        Some(first.id.to_string().as_str()),
+    );
+}
+
+#[test]
 fn a_required_local_only_floor_rejects_a_private_network_candidate() {
     // A requirement is a floor rather than a ceiling: `LocalOnly` means the call must not
     // leave the device, even though the policy permits a private network. The two inputs
@@ -716,4 +896,270 @@ fn a_required_local_only_floor_rejects_a_private_network_candidate() {
             .code(),
         "model.policy_unsatisfied",
     );
+}
+
+/// An exception granting `rule` with `scope`, issued before and expiring after the test instant.
+///
+/// `rule` must be waivable, because `PolicyException::grant` refuses a non-waivable one by
+/// design. A test that needs such a record stands for one written by a *different* build — one
+/// that considered the rule waivable — and mutates the field afterwards, which is why the
+/// selector checks waivability as well as the grant path doing so.
+fn exception(
+    rule: PolicyRuleKey,
+    scope: ExceptionScope,
+) -> crate::model::exception::PolicyException {
+    let waivable = if rule.is_waivable() {
+        rule
+    } else {
+        PolicyRuleKey::Locality
+    };
+    let mut granted = crate::model::exception::PolicyException::grant(
+        crate::model::exception::NewPolicyException {
+            id: PolicyExceptionId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c99").expect("valid"),
+            workspace_id: WorkspaceId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c98")
+                .expect("valid"),
+            policy: PolicyVersionRef {
+                policy_id: crate::ids::ModelDataPolicyId::parse(
+                    "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c97",
+                )
+                .expect("valid"),
+                version: 1,
+            },
+            granting_principal_id: PrincipalId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c96")
+                .expect("valid"),
+            // Elevated, so the step-up rule does not refuse the grants these tests build. The
+            // requirement itself is covered by the exception module's own tests.
+            granting_assurance: crate::model::exception::RequiredAssurance::Elevated,
+            rule: waivable,
+            scope,
+            reason_ref: "operator approved".to_owned(),
+            single_use: false,
+            issued_at: UtcTimestamp::parse("2026-09-01T00:00:00Z").expect("valid"),
+            expires_at: UtcTimestamp::parse("2026-12-01T00:00:00Z").expect("valid"),
+        },
+    )
+    .expect("a waivable rule with a bounded reason is grantable");
+    // The requested key is restored, so a non-waivable one represents a record this build would
+    // not create — the input the selector's own waivability check exists to handle.
+    granted.rule = rule;
+    granted
+}
+
+#[test]
+fn without_an_exception_a_local_only_policy_refuses_a_cloud_candidate() {
+    // The baseline the exception tests are measured against: the same candidate and the same
+    // policy, with no grant offered, is refused. Without this, a relaxation that applied
+    // unconditionally would look like a working exception.
+    let candidates = [candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud)];
+    assert!(select_route(&candidates, &local_only_request()).is_err());
+}
+
+#[test]
+fn an_exception_for_locality_admits_the_class_it_names_and_records_itself() {
+    // The feature: a grant that names `private_network_allowed` admits a private-network
+    // candidate under a local-only policy, and the decision records the exception it relied on
+    // so `relied_on_exception` has something to read — the contract requires the exception to be
+    // "included in the route decision/audit without exposing content".
+    let request = RouteRequest {
+        exceptions: vec![exception(
+            PolicyRuleKey::Locality,
+            ExceptionScope {
+                locality: Some(Locality::PrivateNetworkAllowed),
+                ..ExceptionScope::default()
+            },
+        )],
+        ..local_only_request()
+    };
+    let candidates = [candidate(
+        "private.host",
+        "m1",
+        EndpointClass::PrivateNetwork,
+    )];
+    let decision = select_route(&candidates, &request).expect("the exception admits it");
+    assert!(decision.relied_on_exception());
+    assert_eq!(
+        decision.exception_ref.as_deref(),
+        Some("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c99"),
+    );
+
+    // And it admits *only* the class it names: a cloud candidate is still refused, because the
+    // grant widened locality to `private_network_allowed`, not to `approved_cloud_allowed`.
+    let cloud = [candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud)];
+    assert!(
+        select_route(&cloud, &request).is_err(),
+        "the relaxation reaches the class it named and no further",
+    );
+}
+
+#[test]
+fn a_candidate_that_complies_without_a_grant_records_no_exception() {
+    // "A grant permitted this" and "nothing had to be permitted" are different facts, and a
+    // decision that named an exception it did not need would overstate what was relaxed. The
+    // local candidate here already complies, so the offered (but unnecessary) grant must not be
+    // recorded.
+    let request = RouteRequest {
+        exceptions: vec![exception(
+            PolicyRuleKey::Locality,
+            ExceptionScope {
+                locality: Some(Locality::PrivateNetworkAllowed),
+                ..ExceptionScope::default()
+            },
+        )],
+        ..local_only_request()
+    };
+    let candidates = [candidate("local.ollama", "llama3.1", EndpointClass::Local)];
+    let decision = select_route(&candidates, &request).expect("the local candidate complies");
+    assert!(!decision.relied_on_exception());
+    assert_eq!(decision.exception_ref, None);
+}
+
+#[test]
+fn an_expired_revoked_or_consumed_exception_cannot_relax_anything() {
+    // Each unusable state is asserted over its own mutation, because `is_usable_at` collapsing
+    // any one of the three would be invisible to a test that only checked one. The decision must
+    // then be a refusal, not a selection that silently ignored the grant.
+    let base = exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+    );
+
+    let mut expired = base.clone();
+    expired.expires_at = UtcTimestamp::parse("2026-09-22T11:00:00Z").expect("valid");
+    let mut revoked = base.clone();
+    revoked.revoked_at = Some(UtcTimestamp::parse("2026-09-22T11:00:00Z").expect("valid"));
+    let mut consumed = base.clone();
+    consumed.consumed_at = Some(UtcTimestamp::parse("2026-09-22T11:00:00Z").expect("valid"));
+
+    for (name, offered) in [
+        ("expired", expired),
+        ("revoked", revoked),
+        ("consumed", consumed),
+    ] {
+        let request = RouteRequest {
+            exceptions: vec![offered],
+            ..local_only_request()
+        };
+        let candidates = [candidate(
+            "private.host",
+            "m1",
+            EndpointClass::PrivateNetwork,
+        )];
+        assert!(
+            select_route(&candidates, &request).is_err(),
+            "a {name} exception must not relax locality",
+        );
+    }
+}
+
+#[test]
+fn an_exception_scoped_to_another_model_does_not_relax_this_candidate() {
+    // The scope is a predicate, not a hint: a grant naming one model must not relax another.
+    // Without this a grant issued for a provider's least sensitive model would silently permit
+    // every model that provider serves.
+    let request = RouteRequest {
+        exceptions: vec![exception(
+            PolicyRuleKey::Locality,
+            ExceptionScope {
+                model_id: Some("gpt-x1".to_owned()),
+                locality: Some(Locality::PrivateNetworkAllowed),
+                ..ExceptionScope::default()
+            },
+        )],
+        ..local_only_request()
+    };
+    let other = [candidate(
+        "private.host",
+        "m1",
+        EndpointClass::PrivateNetwork,
+    )];
+    assert!(
+        select_route(&other, &request).is_err(),
+        "the grant names another model, so this candidate is not covered",
+    );
+
+    // The named model still complies, so the refusal above is about the scope and not about the
+    // relaxation failing to work at all.
+    let named = [candidate(
+        "private.host",
+        "gpt-x1",
+        EndpointClass::PrivateNetwork,
+    )];
+    let decision = select_route(&named, &request).expect("the named model is covered");
+    assert!(decision.relied_on_exception());
+}
+
+#[test]
+fn an_exception_for_a_non_waivable_rule_is_never_applied() {
+    // The contract: "Exceptions cannot override non-waivable legal/administrator denies." A grant
+    // naming the ceiling or an allow-list is skipped, leaving the rules *stricter* than the grant
+    // asked for — so it can never permit a call the unrelaxed policy would refuse. Built through
+    // the struct literal rather than `grant` because `grant` refuses these outright; the record
+    // here stands for one written by a build that considered the rule waivable, which is exactly
+    // why the skip must also live in the selector.
+    let mut ceiling_grant = exception(
+        PolicyRuleKey::MaximumSensitivity,
+        ExceptionScope {
+            maximum_sensitivity: Some(Sensitivity::Restricted),
+            ..ExceptionScope::default()
+        },
+    );
+    // `grant` would refuse this; force the record into existence to stand for a foreign writer.
+    ceiling_grant.rule = PolicyRuleKey::MaximumSensitivity;
+
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::LocalOnly,
+            maximum_sensitivity: Sensitivity::Internal,
+            ..PolicyRules::permissive()
+        },
+        sensitivity: Sensitivity::Restricted,
+        exceptions: vec![ceiling_grant],
+        ..local_only_request()
+    };
+    let candidates = [candidate("local.ollama", "llama3.1", EndpointClass::Local)];
+    assert_eq!(
+        select_route(&candidates, &request)
+            .expect_err("the ceiling is non-waivable")
+            .code(),
+        "model.policy_unsatisfied",
+    );
+}
+
+#[test]
+fn a_residency_exception_admits_its_own_region_into_a_restrictive_list() {
+    // A residency relaxation permits the region the grant names, and only through the list that
+    // was already restricting. An empty list means "no restriction at this layer", so inserting
+    // into it would *create* a restriction — the opposite of a relaxation — and the grant must
+    // therefore leave an unrestricted list alone.
+    let request = RouteRequest {
+        rules: PolicyRules {
+            locality: Locality::ApprovedCloudAllowed,
+            allowed_residency_regions: ["eu".to_owned()].into_iter().collect(),
+            ..PolicyRules::permissive()
+        },
+        exceptions: vec![exception(
+            PolicyRuleKey::ResidencyRegions,
+            ExceptionScope {
+                region: Some(Region::parse("us").expect("valid")),
+                ..ExceptionScope::default()
+            },
+        )],
+        ..local_only_request()
+    };
+    let mut us_candidate = candidate("openai", "gpt-x1", EndpointClass::ApprovedCloud);
+    us_candidate.region = Some(Region::parse("us").expect("valid"));
+
+    // The list was `{eu}`; the exception adds `us`, so the US candidate is now inside it.
+    let decision = select_route(&[us_candidate.clone()], &request).expect("us was added");
+    assert!(decision.relied_on_exception());
+
+    // Without the grant the same candidate is refused, so the relaxation is what admitted it.
+    let unrelaxed = RouteRequest {
+        exceptions: Vec::new(),
+        ..request
+    };
+    assert!(select_route(&[us_candidate], &unrelaxed).is_err());
 }

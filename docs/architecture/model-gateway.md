@@ -163,13 +163,43 @@ provider's default terms were accepted, which documents nothing — and this doc
 enforced by two separate evidence predicates, since a capability and a retention term are
 established by different sources.
 
-**Not done:** the selector has no caller outside its tests, because nothing constructs a
-`RouteRequest` from a **stored** policy yet. That needs the versioned, workspace-scoped policy
-store and the `GET /api/v1/model-data-policy/effective` surface, which is the rest of
-`BRN-010`; it is also what would let the run controller pass a real sensitivity ceiling rather
-than the permissive one `BRN-006` recorded. Latency and cost budgets, current health/quota
-state, and task classification are likewise still absent from the inputs, so this list's
-routing inputs are only partly represented even in the selector.
+**Wired (`BRN-010`, completed by `BRN-014`).** The selector has callers on both the
+diagnostic and the execution path. `PolicyService::evaluate` reads the **stored** policy,
+constructs the `RouteRequest`, and calls `select_route_explained` for the
+`GET /model-data-policy/effective` probe. `RunService::create` then does the same for a run
+that will **actually execute**: it resolves the workspace's policy, selects and records a route
+*before the run is created* — so a policy that admits no compliant candidate refuses the request
+with `403 model.policy_unsatisfied` rather than creating a run that would have to be governed by
+something — and carries the result on the run's own budget as
+`RunRoute { model, decision, exception_ref }`. `RunController::resolve_model` reads that route
+back and requires the provider still to serve the named model; a route naming a model the
+provider no longer serves fails the run with `run.no_model_served` rather than falling back to
+another model, because the policy authorized *that* one. `selected_model` survives only for the
+no-policy case, which the run's budget records by carrying no route at all.
+
+The three facts a route carries travel together because they are one decision. The **model** is
+what the run may call; the **decision** is the durable record naming the considered candidates
+and their rejection reasons, which the contract requires to be auditable without storing prompt
+content; and the **exception** is the grant that permitted the call, when one was needed —
+without it a permissive-looking route and a route a grant permitted are indistinguishable after
+the fact. `model_calls.route_decision_id` records the same decision on the call row, so an
+operator asking about one call gets the authorization that permitted it.
+
+The wire model is the part that makes the selection enforceable rather than only recorded.
+`ModelCallRequest` carries a **required** `model`, and the controller sends the routed one, so a
+provider asked for a model it does not serve refuses with `model.provider_no_route` rather than
+answering with whatever it defaults to. Without it the routed model governed *which adapter was
+called* and what the `model_calls` row said, while the wire request named no model at all — so the
+policy constrained the record and a provider was free to produce the text under a different model.
+The stream's own `call.started` frame reports the **requested** model for the same reason: a frame
+is what an operator and an audit read.
+
+The candidate list is built by `jarvis_application::run_service::route_candidates`, which the
+daemon's `ProviderInventory` also calls — one builder, so the probe and a run cannot disagree about
+which models exist or where the endpoint sits.
+
+Latency and cost budgets, current health/quota state, and task classification remain absent from
+the inputs, so this list's routing inputs are only partly represented even in the selector.
 
 Data-use, retention, locality, telemetry, residency, sensitivity, evidence, and
 exception semantics are governed by the

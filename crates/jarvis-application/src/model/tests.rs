@@ -48,6 +48,12 @@ fn request() -> ModelCallRequest {
         call_id: jarvis_domain::ids::ModelCallId::parse(CALL).expect("valid"),
         run_id: jarvis_domain::ids::RunId::parse("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c62")
             .expect("valid"),
+        // The routed model the data policy selected. Required on the request, so a fixture
+        // cannot omit it and leave a test describing a call no controller may make.
+        model: ModelRef::new(
+            ProviderId::parse("scripted.local").expect("valid"),
+            ModelId::parse("fixture-1").expect("valid"),
+        ),
         route_requirements: RouteRequirements::text(),
         input: InputItems::new(Vec::new()).expect("an empty list is valid"),
         tools: Vec::new(),
@@ -678,6 +684,70 @@ fn serving_multiple_models_does_not_grant_anything_but_is_discoverable() {
     assert_eq!(provider.models().len(), 2);
     assert!(provider.models().contains(&model()));
     assert!(provider.models().contains(&second));
+}
+
+#[test]
+fn a_request_naming_a_model_the_provider_does_not_serve_is_refused() {
+    // The enforcement the wire model exists for. A data policy selected a model; an adapter
+    // asked to serve a *different* one has no route to it and must refuse rather than answer
+    // with whatever it defaults to — because the run is recorded as answered by the routed
+    // model, so a substitution would make the record describe a call that did not happen.
+    //
+    // `NoRoute` and not `InvalidRequest`: the request is well-formed and this provider simply
+    // has no route to that model, which is the same distinction the provider error list already
+    // draws for a model this build cannot reach.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime is available");
+    let withdrawn = ModelRef::new(
+        ProviderId::parse("scripted.local").expect("valid"),
+        ModelId::parse("fixture-withdrawn").expect("valid"),
+    );
+    let mut routed = request();
+    routed.model = withdrawn.clone();
+
+    let provider = deterministic().emit_text("out-1", "should never be produced");
+    let error = runtime
+        .block_on(drain(&provider, &routed, &CancellationScope::new()))
+        .expect_err("a model this provider does not serve must be refused");
+    assert_eq!(error, ProviderError::NoRoute);
+    // And nothing was opened, so the refusal costs no attempt: the run controller's retry
+    // decision reads `opens_seen`, and a refusal that counted as an attempt would let a
+    // withdrawn model consume the run's retry budget.
+    assert_eq!(provider.opens_seen(), 0);
+}
+
+#[test]
+fn the_start_frame_names_the_requested_model_rather_than_the_first_served_one() {
+    // The other half: the stream's own `call.started` is what an operator and an audit read, so
+    // it must name the model the policy selected. Echoing `models().first()` would let a run's
+    // start frame name a model nothing chose whenever the routed model is not the first served.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime is available");
+    let second = ModelRef::new(
+        ProviderId::parse("scripted.local").expect("valid"),
+        ModelId::parse("fixture-2").expect("valid"),
+    );
+    let mut routed = request();
+    routed.model = second.clone();
+
+    let provider = deterministic()
+        .also_serving(second.clone())
+        .emit_text("out-1", "hi");
+    let events = runtime
+        .block_on(drain(&provider, &routed, &CancellationScope::new()))
+        .expect("a served model opens");
+
+    match &events[0].kind {
+        ModelStreamEventKind::CallStarted { model } => assert_eq!(
+            model.as_ref(),
+            Some(&second),
+            "the start frame must name the requested model, not the provider's first",
+        ),
+        other => unreachable!("the first frame must be call.started, got {other:?}"),
+    }
+    assert_ne!(
+        second,
+        model(),
+        "the fixture is only meaningful because the routed model is not the first served",
+    );
 }
 
 #[test]

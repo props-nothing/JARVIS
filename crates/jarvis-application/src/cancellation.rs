@@ -6,6 +6,7 @@
 //! storage slices).
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,17 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub struct CancellationScope {
     token: CancellationToken,
+    /// Why the scope was cancelled, recorded when it was signalled.
+    ///
+    /// Held **on the scope** rather than beside it in a registry, because the scope is the value
+    /// that is actually signalled and cloned to every descendant: a side table keyed by run would
+    /// need a second lookup, could disagree with the signal, and would be invisible to a caller
+    /// holding only the scope. The contract's cancel event carries a reason, and a controller that
+    /// observes a boolean has no other way to learn it.
+    ///
+    /// `Arc<Mutex<..>>` rather than a plain field so a clone shares the reason: a child scope must
+    /// report the same reason its parent was cancelled with, not `None`.
+    reason: Arc<Mutex<Option<String>>>,
 }
 
 impl CancellationScope {
@@ -26,6 +38,7 @@ impl CancellationScope {
     pub fn new() -> Self {
         Self {
             token: CancellationToken::new(),
+            reason: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -38,6 +51,9 @@ impl CancellationScope {
     pub fn child(&self) -> Self {
         Self {
             token: self.token.child_token(),
+            // The reason is **shared**, not copied, so a child reports what its parent was
+            // cancelled with even though the cancellation reaches it later.
+            reason: Arc::clone(&self.reason),
         }
     }
 
@@ -46,7 +62,30 @@ impl CancellationScope {
     /// This is not atomically observed by every child while it is running, but
     /// after it returns all descendants are cancelled.
     pub fn cancel(&self) {
+        self.cancel_with_reason(None);
+    }
+
+    /// Signals cancellation, recording `reason` for whoever observes it.
+    ///
+    /// A `None` reason leaves any previously recorded one **intact** rather than clearing it: an
+    /// internal cancel that names no reason must not erase the operator's stated reason for a
+    /// cancellation already signalled.
+    pub fn cancel_with_reason(&self, reason: Option<&str>) {
+        if let Some(reason) = reason
+            && let Ok(mut held) = self.reason.lock()
+        {
+            *held = Some(reason.to_owned());
+        }
         self.token.cancel();
+    }
+
+    /// Returns the reason this scope was cancelled with, when one was recorded.
+    ///
+    /// `None` means the cancellation named no reason — an internal signaller rather than the
+    /// command endpoint — so a caller reports no reason rather than inventing one.
+    #[must_use]
+    pub fn cancel_reason(&self) -> Option<String> {
+        self.reason.lock().ok().and_then(|held| held.clone())
     }
 
     /// Returns whether cancellation has been signalled.

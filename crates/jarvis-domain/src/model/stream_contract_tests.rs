@@ -134,6 +134,51 @@ fn the_contracts_request_example_parses_as_the_normalized_request() {
     assert_eq!(parsed.limits.max_cost_microunits, None);
     assert!(parsed.tools.is_empty());
     assert!(parsed.output_schema.is_none());
+    // The routed model. Asserted by value because it is the field that makes the policy constrain
+    // the *call* rather than only the record — a type that silently dropped it would parse the
+    // example and leave a provider free to substitute its own default model.
+    assert_eq!(
+        parsed.model.provider_id.as_str(),
+        "local.ollama",
+        "the example's provider must survive the parse",
+    );
+    assert_eq!(parsed.model.model_id.as_str(), "llama3.1");
+    assert!(
+        parsed.model.revision.is_none(),
+        "an optional revision must stay absent rather than defaulting to one",
+    );
+}
+
+#[test]
+fn the_contract_requires_the_call_to_name_its_model() {
+    // The field is **required**, and this is the assertion that keeps it so: a request without a
+    // model must not parse. An optional field would make every existing fixture keep compiling
+    // while the policy stopped constraining the wire, which is precisely how the gap this closes
+    // survived — the type accepted the contract's example in which no model appeared at all.
+    let (line, json) = example_containing("docs/contracts/model-stream.md", "route_requirements");
+    let json = with_canonical_identifiers(&json);
+    let without: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let mut object = without
+        .as_object()
+        .cloned()
+        .expect("the example is an object");
+    object.remove("model");
+    let stripped = serde_json::Value::Object(object).to_string();
+
+    let error = serde_json::from_str::<super::ModelCallRequest>(&stripped)
+        .expect_err("a request naming no model must not parse");
+    assert!(
+        error.to_string().contains("model"),
+        "the failure must name the missing field: {error}",
+    );
+    // And the document states the rule in prose, so the example and the sentence cannot drift.
+    let document =
+        std::fs::read_to_string(repository_root().join("docs/contracts/model-stream.md"))
+            .expect("the contract reads");
+    assert!(
+        document.contains("`model` is **required**"),
+        "model-stream.md line {line} must state the field is required",
+    );
 }
 
 #[test]

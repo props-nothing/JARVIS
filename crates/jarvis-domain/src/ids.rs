@@ -193,6 +193,15 @@ identifier!(
      identity rather than being derived from the call it explains."
 );
 identifier!(
+    PolicyExceptionId,
+    "policy_exception",
+    "Identifies one durable model-data-policy exception. An exception is separately \
+     revocable and, when single-use, consumed once, so it needs an identity of its \
+     own rather than being named by the rule it relaxes — the rule is shared by \
+     every exception for it, and a decision must name the exact one that permitted \
+     the call."
+);
+identifier!(
     RunActivityEventId,
     "run_activity_event",
     "Identifies one durable run activity event, which is globally unique because \

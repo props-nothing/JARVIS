@@ -171,30 +171,14 @@ impl ProviderInventory {
     /// against the same instant, which is what makes two probes in one run reproducible.
     #[must_use]
     pub fn new(provider: &dyn ModelProvider, now: Option<UtcTimestamp>) -> Self {
-        let endpoint_class = provider.endpoint_class();
-        let candidates = provider
-            .models()
-            .iter()
-            .map(|model| jarvis_domain::model::routing::RouteCandidate {
-                descriptor: jarvis_domain::model::capability::CapabilityDescriptor::new(
-                    model.clone(),
-                    endpoint_class,
-                ),
-                model: model.clone(),
-                endpoint_class,
-                // The region is unknown because no provider publishes one through this port yet.
-                // An unknown region fails an allow-list rather than passing it, which is the
-                // fail-closed direction: a provider that does not say where it processes cannot
-                // be shown to be inside an allowed region.
-                region: None,
-                // No retention or training-use evidence: `BRN-011` measures capabilities and no
-                // adapter attaches provider terms yet. `None` is the honest value and it makes a
-                // policy that demands documentation refuse rather than pass on a guess.
-                retention: None,
-                training_use: None,
-            })
-            .collect();
-        Self { candidates, now }
+        // Built by the *same* function the run path uses, rather than by a second copy of this
+        // loop. Two builders would let the diagnostic probe and a real run disagree about which
+        // models exist — the failure an operator would least likely see, because the probe would
+        // report a route the run never took.
+        Self {
+            candidates: jarvis_application::run_service::route_candidates(provider),
+            now,
+        }
     }
 
     /// Returns the candidates.
@@ -1305,10 +1289,28 @@ mod tests {
     /// HTTP boundary and a double at both layers would let a serialization or scope
     /// defect survive. The database is in-memory so the fixture stays fast.
     async fn runs_fixture(tag: &str) -> (axum::Router, String) {
+        runs_fixture_with(tag, FixtureProvider::Answers).await
+    }
+
+    /// Which provider the run fixture composes.
+    ///
+    /// A parameter rather than a second fixture, because only the provider differs between them:
+    /// duplicating the enrollment, the migration, and the state assembly would mean two copies of
+    /// the composition that could drift — and a drifting fixture is how a test asserts a rule the
+    /// daemon does not keep.
+    #[derive(Debug, Clone, Copy)]
+    enum FixtureProvider {
+        /// Answers and completes, so a run reaches `Completed`.
+        Answers,
+        /// Refuses to open, so a run reaches `Failed` with a code.
+        Refuses,
+    }
+
+    async fn runs_fixture_with(tag: &str, kind: FixtureProvider) -> (axum::Router, String) {
         use crate::storage::repositories::SqliteRepositories;
         use crate::storage::{Database, migrate};
         use jarvis_application::live_events::StreamDeltaSink;
-        use jarvis_application::model::ModelProvider;
+        use jarvis_application::model::{ModelProvider, ProviderError};
         use jarvis_application::run_service::{
             RunCancellationRegistry, RunPorts, RunService, TokioSpawner,
         };
@@ -1329,18 +1331,23 @@ mod tests {
             ProviderId::parse("scripted.local").expect("valid"),
             ModelId::parse("fixture-1").expect("valid"),
         );
-        let provider: Arc<dyn ModelProvider> = Arc::new(
-            jarvis_application::model::ScriptedProvider::new(model)
-                .emit(ModelStreamEventKind::OutputItemAdded {
-                    item_id: "out-1".to_owned(),
-                })
-                .emit_text("out-1", "hello from the scripted provider")
-                .emit(ModelStreamEventKind::CallCompleted {
-                    finish_reason: FinishReason::Stop,
-                    usage: None,
-                    refused: false,
-                }),
-        );
+        let answering = jarvis_application::model::ScriptedProvider::new(model)
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "hello from the scripted provider")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            });
+        let provider: Arc<dyn ModelProvider> = match kind {
+            FixtureProvider::Answers => Arc::new(answering),
+            // `Refused` rather than `Unavailable`, because it is not retryable: a retryable
+            // failure leaves the run live so another attempt can be made, and the fixture's
+            // purpose is to reach a terminal `Failed` with a code.
+            FixtureProvider::Refuses => Arc::new(answering.fail_on_open(ProviderError::Refused)),
+        };
         let service = Arc::new(RunService::new(
             RunPorts {
                 runs: Arc::clone(&repositories)
@@ -1725,6 +1732,156 @@ mod tests {
             body.contains(r#""code":"stream.replay_unavailable""#),
             "{body}",
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reason_is_bounded_by_the_constant_declared_for_it() {
+        // `MAX_CANCEL_REASON_BYTES` was **declared and never enforced** while `MAX_RUN_INPUT_BYTES`
+        // is applied one route above it. A declared bound that nothing checks is the shape where
+        // the constant itself reads as the coverage, so this asserts the refusal rather than the
+        // constant's existence — and the run input's own bound is asserted the same way beside it.
+        let (app, token) = runs_fixture("runs-cancel-reason-bound").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let headers = run_headers(&token);
+
+        let over = "r".repeat(jarvis_protocol::MAX_CANCEL_REASON_BYTES + 1);
+        let body = serde_json::json!({ "reason": over }).to_string();
+        let (status, response) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            &headers,
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an over-long reason must be refused: {response}",
+        );
+        assert!(
+            response.contains(r#""code":"request.invalid""#),
+            "the refusal must use the contract's code: {response}",
+        );
+
+        // Exactly at the bound is accepted, so the check is a bound rather than an
+        // approximation of one.
+        let at_bound = "r".repeat(jarvis_protocol::MAX_CANCEL_REASON_BYTES);
+        let body = serde_json::json!({ "reason": at_bound }).to_string();
+        let (status, response) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            &headers,
+            &body,
+        )
+        .await;
+        assert!(
+            status == StatusCode::ACCEPTED || status == StatusCode::OK,
+            "a reason at the bound must be accepted: {status}: {response}",
+        );
+
+        // And an empty one is refused, because the contract requires a reason on a cancel: an
+        // absent explanation is not the same as a stated one, and the endpoint already defaults
+        // the *omitted body* to `user_requested`.
+        let (status, response) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            &headers,
+            r#"{"reason":""}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an empty reason must be refused: {response}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_runs_terminal_event_carries_its_code() {
+        // The three payload builders in `jarvis_protocol` had no caller and every activity event
+        // was written with `payload_json: None`, so a client following the event stream learned
+        // that a run failed without learning why — while the code sat on the run's own row, which
+        // requires a *separate* read. The terminal event is the last thing such a client receives,
+        // which makes it the wrong place to omit the answer.
+        //
+        // Asserted on the **stored events** rather than on the wire, because the handler renders
+        // whatever the repository holds: a payload that never reached the row could not be
+        // delivered however the handler rendered it.
+        let (app, token) =
+            runs_fixture_with("runs-terminal-payload", FixtureProvider::Refuses).await;
+        // A provider that always refuses fails the run before acceptance, which is the path that
+        // reaches `Step::failed` with a code.
+        let run_id = create_run(&app, &token, "hello").await;
+        let headers = run_headers(&token);
+        for _ in 0..200 {
+            let (_, current) =
+                send(&app, "GET", &format!("/api/v1/runs/{run_id}"), &headers, "").await;
+            let parsed: serde_json::Value = serde_json::from_str(&current).expect("valid");
+            if ["completed", "failed", "cancelled"]
+                .contains(&parsed["state"].as_str().unwrap_or_default())
+            {
+                break;
+            }
+        }
+
+        let (_, events) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}/events"),
+            &headers,
+            "",
+        )
+        .await;
+        assert!(
+            events.contains("run.failed"),
+            "the fixture must reach a failed terminal: {events}",
+        );
+        assert!(
+            events.contains(r#""code":"#),
+            "a failed run's terminal event must carry its code: {events}",
+        );
+        // And the code on the event is the one the run's own row reports, so a streaming client
+        // and a polling client cannot be told different reasons.
+        let (_, current) = send(&app, "GET", &format!("/api/v1/runs/{run_id}"), &headers, "").await;
+        let parsed: serde_json::Value = serde_json::from_str(&current).expect("valid");
+        let code = parsed["error_code"].as_str().expect("a failed run's code");
+        assert!(
+            events.contains(code),
+            "the event must carry the run's own code ({code}): {events}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_failure_payload_matches_the_protocol_builders_shape() {
+        // The application layer hand-builds this payload because it has no JSON *dependency*, and
+        // `jarvis-protocol` cannot be depended on from there — the flow runs protocol -> nothing
+        // app-side. That leaves **two** definitions of one wire shape: the hand-built string and
+        // `jarvis_protocol::run::failed_payload`. This is the cross-check the workspace uses for
+        // every such duplicated literal (the event-name constants have the same test), and it is
+        // cheap: without it, editing one would silently disagree with the other, and a client
+        // parsing the shape would see a field only one producer emits.
+        //
+        // Asserted over every terminal code the controller can produce, so the class fails rather
+        // than one instance.
+        for code in [
+            "run.no_model_served",
+            "run.context_objective_dropped",
+            "run.stream_interrupted",
+            "run.budget_output_tokens_exceeded",
+            "model.provider_refused",
+        ] {
+            let hand_built = format!("{{\"code\":\"{code}\",\"retryable\":false}}");
+            let from_protocol =
+                serde_json::to_string(&jarvis_protocol::run::failed_payload(code, false))
+                    .expect("the builder serializes");
+            assert_eq!(
+                hand_built, from_protocol,
+                "the hand-built payload and the protocol's builder must agree on the shape",
+            );
+        }
     }
 
     #[tokio::test]

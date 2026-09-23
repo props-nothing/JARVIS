@@ -26,6 +26,7 @@
 //!   weakest, so a later layer can only narrow an earlier one.
 
 pub mod capability;
+pub mod exception;
 pub mod identity;
 pub mod policy;
 pub mod routing;

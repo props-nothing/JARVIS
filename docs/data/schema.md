@@ -188,6 +188,11 @@ error_code, started_at, first_output_at, completed_at
 UNIQUE(logical_call_id, attempt)
 ```
 
+`route_decision_id` names the authorization that permitted the call, `finish_reason` is the
+provider's own account of why it stopped, and both are **read back** by the same port that writes
+them — a column no `SELECT` names is a value that can be written and never observed, which is how
+both of these were once stored as `NULL` on every row.
+
 Prompt/output content uses protected artifact/content references under retention
 policy rather than being duplicated in telemetry rows.
 
@@ -214,13 +219,25 @@ is selected through an optimistic transition.
 
 ```text
 id, workspace_id, policy_id, policy_version, granting_principal_id,
-rule_key, constrained_value_json, provider_model_task_scope_json,
-reason_ref, assurance, state, issued_at, expires_at, revoked_at,
-consumed_at nullable
+rule_key, scope_json, reason_ref, assurance, single_use,
+issued_at, expires_at, revoked_at, consumed_at nullable
 ```
 
 Exceptions cannot alter their scope after issue and are evaluated/revoked
-server-side.
+server-side. Three divergences from the sketch this table started as are deliberate, and
+`migrations/sqlite/000005_model_policy_exceptions.sql` records the reasoning:
+
+- **`state` is not stored.** Usability is a question about an *instant* — derived from
+  `revoked_at`, `consumed_at`, and `expires_at` — so a stored column would be wrong the moment
+  the clock passed `expires_at` and would be a second answer to a question the domain's
+  `state_at` already answers.
+- **The scope is one serialized column, not two.** The "constrained value" and the
+  "provider/model/task scope" are one `ExceptionScope` value whose fields are validated
+  together, so splitting them would be two places for the stored form and the domain type to
+  disagree. The same reasoning stores policy rules as `rules_json`.
+- **`assurance` is stored rather than recomputed.** It records what the granting principal
+  actually held, so an operator who stepped up approved *that* relaxation; re-deriving it from
+  the rule later would let a change to the step-up policy rewrite what a past grant meant.
 
 ### Implemented evidence: conversations, runs, activity, and model calls (`BRN-004`)
 

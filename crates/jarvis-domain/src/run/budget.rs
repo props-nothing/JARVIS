@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::ModelRouteDecisionId;
+use crate::model::identity::ModelRef;
 use crate::model::policy::{PolicyVersionRef, Sensitivity};
 use crate::model::stream::{CallLimits, Usage};
 use crate::run::retry::RetryPolicy;
@@ -43,13 +45,47 @@ pub const MAX_STEP_TIMEOUT_MS: u64 = 3_600_000;
 /// ceiling — a caller may supply its own, and the field is optional.
 pub const DEFAULT_RUN_DEADLINE_MS: u64 = 900_000;
 
+/// The model route a policy authorized for one run.
+///
+/// Three facts that must travel together, which is why they are one value rather than three
+/// optional fields on the budget. The **model** is what the run is permitted to call; the
+/// **decision** is the durable record that explains why that model and not another — the
+/// contract requires the considered candidates and their rejection reasons to be readable
+/// without storing prompt content, so the record cannot be reconstructed from the choice
+/// alone. And the **exception** is the one grant that permitted the call, when a grant was
+/// needed: without it `ModelRouteDecision::relied_on_exception` could not be answered for a
+/// past run, because a route that looks permissive and a route a grant permitted are only
+/// distinguishable through the reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunRoute {
+    /// The model the policy authorized.
+    pub model: ModelRef,
+    /// The durable route decision that names this model and why.
+    pub decision: ModelRouteDecisionId,
+    /// The policy exception this route relied on, when one was needed.
+    ///
+    /// Carried here as well as on the stored decision so a reader of the *run* can tell
+    /// "a grant permitted this" from "nothing had to be permitted" without loading the
+    /// decision — the same reason the budget carries both the policy reference and its
+    /// resolved ceiling rather than deriving one from the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exception_ref: Option<String>,
+}
+
 /// The budget a run is executed under.
 ///
 /// Every field is optional, because "no token cap" and "a cap of zero" are different
 /// facts and conflating them would make an unset budget read as an exhausted one. The
 /// same reasoning as [`Usage`](crate::model::stream::Usage), which keeps unset counters
 /// absent rather than zero.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Deliberately **not** `Copy`, unlike the rest of this module's value types. The routed
+/// model owns a provider-qualified identifier whose revision is a borrowed-free string, so
+/// the budget is `Clone` and no longer trivially copyable. Copying it was never load-bearing:
+/// the one place that relied on it was building a [`StoredRun`] out of a run row, and that
+/// site now clones explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunBudget {
     /// The wall-clock instant by which the run must finish.
@@ -116,18 +152,33 @@ pub struct RunBudget {
     /// recorded fact rather than an unstated default.
     #[serde(default)]
     pub retry: RetryPolicy,
+    /// The model route selection authorized for this run, when a policy was in force.
+    ///
+    /// Carried on the run for the same reason the policy reference is: the route is a
+    /// **decision**, and a decision that lives only in the process that made it cannot be
+    /// explained after a restart. The controller reads the model from here rather than
+    /// taking the provider's first served model, which is what makes a locality or
+    /// allow-list rule constrain the call a run actually makes instead of only the
+    /// diagnostic probe.
+    ///
+    /// `None` means **no policy was in force**, which is the same distinction
+    /// [`policy`](Self::policy) draws and is why this is not a defaulted route: a run under
+    /// no policy is unconstrained by design, while a defaulted route would read as a
+    /// selection somebody made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RunRoute>,
 }
 
 impl RunBudget {
     /// Builds a budget that finishes by `deadline`, with no other limit.
+    ///
+    /// Not `const`, unlike the arithmetic accessors below: the type owns a routed model whose
+    /// identifier is an owned string, so a `const fn` returning it cannot drop the value it
+    /// replaces. The const-ness was never used — every caller builds a budget at runtime.
     #[must_use]
-    pub const fn with_deadline(deadline: UtcTimestamp) -> Self {
+    pub fn with_deadline(deadline: UtcTimestamp) -> Self {
         Self {
             deadline: Some(deadline),
-            step_timeout_ms: None,
-            max_output_tokens: None,
-            max_context_tokens: None,
-            max_cost_microunits: None,
             started_at: None,
             policy: None,
             // `None`, not a permissive value. A run created with no policy in force is judged
@@ -135,7 +186,10 @@ impl RunBudget {
             // but hold nothing back" — the honest state, rather than a default that would read
             // exactly like a real policy while constraining nothing.
             max_context_sensitivity: None,
-            retry: RetryPolicy::none(),
+            // Same reasoning as the ceiling: an absent route means no policy was in force, which
+            // is a different fact from "a policy selected the provider's first model".
+            route: None,
+            ..Self::default()
         }
     }
 
@@ -146,10 +200,31 @@ impl RunBudget {
     /// ceiling forces a later reader to re-derive a decision from data that may since have been
     /// archived. The pair is one fact: "this run was held to *this* policy's ceiling".
     #[must_use]
-    pub const fn with_policy(mut self, policy: PolicyVersionRef, ceiling: Sensitivity) -> Self {
+    pub fn with_policy(mut self, policy: PolicyVersionRef, ceiling: Sensitivity) -> Self {
         self.policy = Some(policy);
         self.max_context_sensitivity = Some(ceiling);
         self
+    }
+
+    /// Returns this budget with the route the policy authorized for it.
+    ///
+    /// Set alongside [`with_policy`](Self::with_policy) by the service that resolves both from
+    /// one stored read, so the reference, the ceiling, and the route cannot describe different
+    /// policies — three fields written from two reads is exactly how a run ends up governed by
+    /// one version and recording another.
+    #[must_use]
+    pub fn with_route(mut self, route: RunRoute) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// Returns the model this run is authorized to call, when a route was selected.
+    ///
+    /// `None` means no policy was in force, so the caller falls back to the provider's own
+    /// selection — the unconstrained case, which is why it is expressible rather than defaulted.
+    #[must_use]
+    pub fn routed_model(&self) -> Option<&ModelRef> {
+        self.route.as_ref().map(|route| &route.model)
     }
 
     /// Returns the sensitivity ceiling an assembly should apply.
@@ -172,7 +247,7 @@ impl RunBudget {
     /// than read as "no context": the domain's `ContextBudget` refuses it too, and a
     /// budget that admitted a value the assembler rejects would fail at the far
     /// boundary instead of at the caller that set it.
-    pub const fn with_context_tokens(mut self, tokens: u64) -> Result<Self, BudgetError> {
+    pub fn with_context_tokens(mut self, tokens: u64) -> Result<Self, BudgetError> {
         if tokens == 0 || tokens > crate::context::budget::MAX_CONTEXT_BUDGET_TOKENS {
             return Err(BudgetError::ContextTokensOutOfRange);
         }
@@ -218,7 +293,7 @@ impl RunBudget {
     /// [`MAX_STEP_TIMEOUT_MS`]. Zero is refused rather than treated as "no bound": a
     /// zero timeout would fail every step immediately, which reads to an operator as a
     /// broken provider rather than as a misconfigured budget.
-    pub const fn with_step_timeout(mut self, millis: u64) -> Result<Self, BudgetError> {
+    pub fn with_step_timeout(mut self, millis: u64) -> Result<Self, BudgetError> {
         if millis == 0 || millis > MAX_STEP_TIMEOUT_MS {
             return Err(BudgetError::StepTimeoutOutOfRange);
         }

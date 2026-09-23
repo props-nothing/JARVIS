@@ -1221,7 +1221,10 @@ Foundation TODO remains incomplete.
   instead of the permissive one `BRN-006` recorded. The telemetry and exception rules are
   likewise modelled and unenforced. This is stated because a tested-but-uncalled selector
   is the same shape as the dead `model_calls.route_decision_id` column this work exists to
-  populate.
+  populate. **That column has since been given a writer** (`BRN-014`): the run's route is
+  selected at creation, recorded on its budget, read back by the controller, and stamped on
+  every attempt's row — so the selector, the decision store, and the column are all on the
+  execution path rather than only on the diagnostic one.
   **The persistence half is now implemented.** `migrations/sqlite/000004_model_data_policy.sql`
   raises the schema to **4** (minimum reader stays 1 — every existing table and column is
   untouched) and creates the three tables this contract's `Persistence` section names:
@@ -1316,14 +1319,10 @@ Foundation TODO remains incomplete.
   and `GET` omitted the same three fields, so a read could not be round-tripped either. Both now
   render through one nine-field function, and `a_read_after_a_write_describes_the_same_stored_row`
   asserts a write's reply and a subsequent read agree on every rule.
-  **Still not done:** the exception lifecycle (issue/expire/revoke/single-use) has a table and no
-  code, so `ModelRouteDecision::exception_ref` is always absent and no route can relax a hard
-  rule; the inventory attaches no region, retention, or training-use evidence until `BRN-011`
-  measures capabilities, which makes a policy demanding **documented** evidence refuse every
-  candidate rather than having a claim inferred for it; and the create-run policy reference is
-  still unread — now **possible** to wire rather than blocked, because the `PUT` is what lets an
-  operator create a policy, but still a separate increment since every existing E2E harness
-  submits a policy that has never existed.
+  **Still not done:** the inventory attaches no region, retention, or training-use evidence until
+  `BRN-011` measures capabilities, which makes a policy demanding **documented** evidence refuse
+  every candidate rather than having a claim inferred for it. The exception table's earlier
+  "has a table and no code" note is now closed — see the exception paragraph below.
   **The create-run reference is now read, resolved, and enforced.** `RunService::resolve_policy`
   loads the named version (or the workspace's active one when none is named) and records both the
   reference and the resolved ceiling on the run, in `RunBudget`, so the run's own row explains
@@ -1378,6 +1377,273 @@ Foundation TODO remains incomplete.
   column round-trips. **Two rules are asserted in both directions:** a `Failed` transition writes
   the code, and a `Completed` one writes `NULL`; an adapter that bound it unconditionally would
   pass the first assertion and report a stale failure on the second.
+- [x] `BRN-013` Implement the model-data-policy exception lifecycle and give the sensitivity
+  ceiling its one enforcement point. Two contract obligations that shared no code and both
+  needed the same layer.
+  **The ceiling had no consumer at all.** `PolicyRules::maximum_sensitivity` was written,
+  stored, read, merged, and compared by **nothing** — so a `local_only` policy permitting only
+  `public` content selected a local candidate and sent `restricted` content through it. The fix
+  is one check placed **before any candidate is examined**, because the ceiling bounds what may
+  be sent by *any* route: a per-candidate reason would imply another candidate might carry it.
+  New `RejectionReason::SensitivityExceedsPolicy` (`sensitivity_exceeds_policy` on the wire, so
+  the wire vocabulary is decided in one place) and `RejectionReason::policy_rule`, which maps a
+  refusal to the rule it is about — the bridge the exception relaxation is indexed by. Both
+  sides of the boundary are asserted, because the ceiling is **inclusive** while the run
+  deadline is **exclusive**, and two opposite conventions in one codebase is exactly where a
+  later reader "fixes" one to match the other.
+  **The exception lifecycle is now implemented end to end.** `jarvis_domain::model::exception`
+  holds the typed model — `PolicyRuleKey` (nine keys), `ExceptionScope`, `ExceptionState`,
+  `RequiredAssurance`, and `PolicyException` with `grant`/`state_at`/`is_usable_at` — the port
+  and its SQLite adapter implement issue/read/list/revoke/consume, and
+  `migrations/sqlite/000005_model_policy_exceptions.sql` brings the table to the contract's
+  shape, raising the schema to **5** with the minimum reader left at 1. Five rules are
+  structural rather than documented and each is falsified by a named test:
+  - **A non-waivable rule cannot be relaxed.** `PolicyRuleKey::is_waivable` refuses the grant
+    outright, and the selector **ignores** such a grant rather than honouring it — skipping
+    leaves the rules stricter than the operator asked for, so it can never permit a call the
+    unrelaxed policy would refuse, while refusing the whole evaluation would turn one unusable
+    grant into a refusal of every candidate, including ones that never needed it. The check
+    lives in both places because a record written by a *different* build, one that considered
+    the rule waivable, must still not be honoured here.
+  - **Sensitive or cross-border grants require step-up.** The requirement is derived from the
+    rule (`locality`, `residency`) **or** from the scope naming a classification, recorded on
+    the record, and enforced against the assurance the grantor actually held. The requirement
+    is a required input rather than ambient state, because a grant whose own field says which
+    assurance was required while nothing checked the grantor held it is the shape this closes.
+  - **A grant is consulted only after the unrelaxed policy has refused, and only for the rule
+    that refused.** This is what makes `relied_on_exception()` mean "this call *needed* a
+    relaxation": a candidate that already complies records no grant, and a single-use grant
+    offered to a candidate that did not need it is not consumed. **My first version applied
+    every matching grant up front**, so a grant was recorded as relied upon merely because it
+    existed — and my own test caught it (`a_candidate_that_complies_without_a_grant_records_no_exception`).
+  - **Single use is a property of the record, not a flag on the call**, and the adapter's
+    `UPDATE` carries `consumed_at IS NULL AND revoked_at IS NULL` in its `WHERE` rather than
+    being guarded by a pre-read: a read followed by an unconditional write is the shape that
+    lets two concurrent calls both consume one grant.
+  - **Revocation and consumption are state changes, never deletes**, because the contract
+    requires an exception to remain explainable after it stops being usable.
+  **Two real defects the round's own tests found, one in the new code and one pre-existing:**
+  `revoke`'s `UPDATE` lacked `AND revoked_at IS NULL`, so **re-revoking overwrote the first
+  instant** and an audit would read the wrong moment; and
+  `concurrent_transitions_on_one_run_never_fail_with_a_storage_fault` was **flaky** because it
+  used terminal targets (`Cancelled`, `Failed`), so a writer that won the race made every later
+  writer correctly report `jarvis.run_already_terminal` — a rule, not the lock contention the
+  test exists for. Both are fixed and the second is now non-terminal-only.
+  `PolicyService` gained `grant_exception`/`exception`/`exceptions`/`revoke_exception`/
+  `consume_exception`, and `evaluate` offers the workspace's stored grants to the selector. The
+  exception table's earlier note — "has a table and no code" — is therefore closed, and
+  `docs/data/schema.md` now documents the three deliberate divergences from its own sketch:
+  `state` is not stored (usability is a question about an instant), the scope is one JSON
+  column rather than two, and `assurance` **is** stored so a change to the step-up policy
+  cannot rewrite what a past grant meant.
+  **Not done:** the HTTP surface for the exception lifecycle (the service exists, no route
+  calls it), so `PUT`/`GET` for exceptions is the next increment; and a *replayed* decision
+  still re-evaluates under current grants rather than inheriting the recorded one, which is
+  what the contract means by "replaying a call re-evaluates current policy".
+- [x] `BRN-014` Make the model-data policy govern a **real** daemon run, not only a
+  diagnostic probe. Three holes that each looked closed from a unit test.
+  **This is the "a guarantee that holds on the test path and not the production path" shape**,
+  and it had three parts:
+  - **The daemon built its run ports with `policies: None`.** Every handler test passed and
+    `GET /model-data-policy/effective` answered correctly, while a real run resolved no policy,
+    recorded no ceiling, and chose no route. A `RouteRequest` was never constructed on the run
+    path at all. The fix gives `run_ports` the **same** `Arc<SqliteRepositories>` the policy
+    surface uses (built once and cloned, not constructed twice), so a probe and a run cannot
+    observe different stores. Falsified end to end: restoring `policies: None` and rebuilding
+    makes the journey's new check answer `202` to a create the policy must refuse.
+  - **The route was never selected for a run.** `RunService::create` now resolves the policy,
+    then selects and records a route **before the run exists** — so a policy that admits no
+    compliant candidate refuses the request (`403 model.policy_unsatisfied`) rather than
+    creating a run that would have to be governed by something. The route travels on the run's
+    own budget as `RunRoute { model, decision, exception_ref }`, so the model the run may call,
+    the record that explains why, and the grant that permitted it are one value a later reader
+    can see without loading the decision.
+  - **The controller called `provider.models().first()`.** `RunController::resolve_model` now
+    reads the stored route and requires the provider still to serve that model: a route naming
+    a model the provider no longer serves is `run.no_model_served`, because falling back would
+    perform an action no rule permitted. `selected_model` is retained **only** for the no-policy
+    case. Falsified: making `resolve_model` return `selected_model(provider)` unconditionally
+    fails four tests with `fixture-1` recorded where `fixture-routed` was authorized.
+  Four smaller things the work forced, each a real defect rather than a tidy-up:
+  - **`model_calls.route_decision_id` was a dead column.** It was in the schema, was named by
+    both `SELECT`s, and had **no writer** — a literal `NULL` sat where the value belonged. It is
+    now bound from `NewModelCall.route_decision` and re-parsed by `stored_model_call`, so it is
+    readable rather than write-only. Writing it immediately exposed that `load_attempts`' query
+    did not select the column at all, which a **pre-existing** test caught as
+    `Corrupted { column: "route_decision_id" }` — the read and the write have to agree, and only
+    a round-trip test can see that.
+  - **`ProviderInventory` and `route_candidates` were two builders of the same candidate list.**
+    The daemon's probe had its own loop, so the probe and the run could disagree about which
+    models exist — the failure an operator would least likely see, because the probe would
+    report a route the run never took. The probe now calls
+    `jarvis_application::run_service::route_candidates`, so there is one builder.
+  - **`RunBudget` lost `Copy`**, because a routed model owns a provider-qualified identifier.
+    Four builders became non-`const`, and three call sites now clone explicitly. The one that
+    mattered was a storage test that compared the stored budget against the same value
+    afterwards — the assertion that makes the round-trip meaningful.
+  - **`RunServiceError::PolicyUnsatisfied` maps to `403`**, not `400`: the body is well-formed
+    and the caller is authorized — its own workspace's policy refuses the call — and a `400`
+    would send a client to inspect its payload rather than its rules.
+  **Not done, recorded rather than fixed:** `AuthenticatedClient` hardcodes
+  `AuthenticationAssurance::Standard`, so **no HTTP client can ever be Elevated** and every
+  step-up exception is un-grantable over the wire — that needs an owner decision and a step-up
+  challenge, not a code change. The other limit this round recorded — `ModelCallRequest` carrying
+  no model — is closed by `BRN-015` immediately below.
+- [x] `BRN-015` Name the routed model on the wire, so a data policy constrains the **call** and
+  not only the record. Round 29's recorded limit, closed in the round that found it.
+  **The gap:** `ModelCallRequest` had no `model` field, so the controller honoured the routed
+  model for *which adapter it called* and for what the `model_calls` row recorded, while the
+  request the adapter received named no model at all. A provider was free to answer under
+  whatever model it defaults to, and the run was then recorded as answered by the routed model —
+  the same "a reader and no writer" shape as the dead `route_decision_id` column, one layer out.
+  Invisible to every test beside it because the **row was already correct**.
+  The fix is a **required** `model` on the normalized request, set from the run's stored route,
+  plus two enforcement points and one correction:
+  - **The provider port refuses a model it does not serve** (`model.provider_no_route`). Falsified
+    by removing the check: the test fails and the failure body shows the substituted model
+    serving the call — `call.started` naming `fixture-withdrawn` while `fixture-1` produced the
+    text, which is precisely the record-disagrees-with-reality outcome.
+  - **`call.started` reports the requested model**, not `models().first()`. A frame is what an
+    operator and an audit read, so echoing the provider's first model would let a run's own start
+    frame name a model nothing chose.
+  - **The field is required rather than optional**, and that is asserted: a request with no model
+    must fail to parse. An optional field would have kept every existing fixture compiling while
+    the policy stopped constraining the wire, which is exactly how this survived — the type
+    accepted a contract example in which no model appeared. Falsified by making it optional (a
+    *compiling* mutation, so the failure is the assertion and not a type error): the test fails
+    with `model: None` parsed.
+  **Two guards, because a roster is a claim:** `resolve_model`'s roster check refuses a withdrawn
+  model before an attempt is made, and the adapter's own check catches a provider that lists a
+  model and still cannot route to it. The second is driven through the whole controller, so a
+  refused open is asserted to leave the run **terminal** — the defect class this controller has
+  been fixed for repeatedly — and to attempt exactly once, since `NoRoute` is not retryable.
+  **One test was fixed rather than added.** `a_normalized_request_has_no_provider_extension_map`
+  asserted the serialized text contained no `provider_`, which was a **proxy** for "no provider
+  extension map" and stopped being one the moment `model.provider_id` — a required identity field
+  naming *which* provider serves the call — appeared. It now parses the JSON and checks the key
+  set against the whole portable surface, which states what it means instead of what it looked
+  like. That is the lesson: **a substring assertion is a proxy, and a proxy that is adjacent to
+  the rule it stands for breaks silently.**
+  Docs corrected in the same change, since three places recorded the old limit:
+  `model-stream.md` (the request example gains `model` and the prose says it is required),
+  `model-gateway.md`, and `model-data-policy.md`. 929 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-016` Spend a single-use policy exception when a run relies on it. The exception
+  lifecycle had a port, an adapter, an in-memory double, a service method, and tests, and
+  **no production caller** — so a grant an operator marked single-use permitted an unbounded
+  number of runs. The permissive direction of "a writer nothing calls", and the same shape as
+  the dead `route_decision_id` column: correct in every test beside it, absent from the path a
+  client takes.
+  **The call goes in `RunService::select_route`**, and its position is the guarantee rather than
+  an implementation detail: the decision is recorded **first**, the grant is consumed **second**,
+  and the run is created **third**. Consuming before the decision would spend a grant on a
+  selection that might then fail to record; consuming after the run exists would let a run be
+  created whose grant is still unspent if anything in between failed. Here a failure leaves the
+  grant intact and the request refused, and the decision is durable before anything is spent — so
+  an audit can always name what the grant permitted.
+  **The `single_use` predicate moved into the store's statement.** The adapter's consume
+  `UPDATE` gained `AND single_use = 1`, so "is this grant single-use, and may it still be
+  consumed" is one atomic predicate rather than a read followed by a write. A zero-row match on a
+  repeatable grant is reported as **success**, not a conflict: the caller's grant is intact and
+  still usable, and returning `Conflict` would tell it a standing grant was gone when nothing had
+  happened to it. That is the false-refusal direction — the same class as reporting a stale view
+  when the write never landed. The in-memory double implements the identical rule, because a
+  divergence between the two is invisible to a test exercising either alone.
+  **Four tests, and each direction is asserted.** A single-use grant a run relied on is spent; a
+  spent grant **refuses the next create** rather than merely carrying a timestamp (a test that
+  checked only `consumed_at` would pass against an implementation that consumed the record and
+  then ignored its state); a repeatable grant is **not** spent and still admits a second run; and
+  a grant that is merely *offered* — read on the route path but not needed — is not consumed
+  either, since a store that spent everything it was shown would leave the workspace with nothing
+  for the call that needs it. Falsified in both halves: removing the call makes the refusal test
+  report a **`CreatedRun`** for a grant already used, and removing `single_use = 1` from the
+  adapter's `UPDATE` stamps a repeatable grant as consumed.
+  **The fixture had to be a locality grant against a local-only policy**, and the first attempt
+  was wrong for a reason worth recording: the sensitivity ceiling is checked *before any candidate
+  is examined*, so no grant can rescue content above it — the only relaxation a grant can change
+  here is per-candidate, and a locality grant is the accessible one. The locality ladder is also
+  ordered **most-restrictive first** (`LocalOnly` is strictest), so a grant must name a *more*
+  permissive value than the policy's own for `max` in `relax_one` to widen it; naming a stricter
+  one would leave the policy unchanged and the test would prove nothing.
+  934 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-017` Record the finish reason the provider reported, so a truncated answer is
+  distinguishable from a finished one. The third instance of one class, found by sweeping the
+  schema for columns with no reader.
+  **The gap:** `model_calls.finish_reason` had a schema column, a line in `docs/data/schema.md`, a
+  **typed** field on `ModelCallOutcome`, and an adapter bind — and `RunController` wrote `None`
+  while **no `SELECT` named the column** and `StoredModelCall` had no field for it. So "the model
+  was cut off by its own token limit" and "the model finished" were one value on every read, while
+  the domain deliberately retains an unmodelled provider reason as `FinishReason::Other` to keep a
+  new one visible rather than flattened into a clean one. Both halves of the write/read pair were
+  individually correct, which is exactly why nothing caught it.
+  **The fix has three parts, and the third is the one the class is about:**
+  - **Capture.** `ModelStreamEventKind::CallCompleted` was matched by the controller's `_ => {}`
+    arm — the terminal frame was discarded apart from its usage. `DrainedTurn` gains
+    `finish_reason`, and the terminal is now captured explicitly.
+  - **A pattern-ordering bug I introduced and caught while writing it.** My first version had two
+    arms: `CallCompleted { usage: Some(..), .. }` and `CallCompleted { finish_reason, .. }`. The
+    first match wins in Rust, so any frame carrying **both** — which is what a terminal frame is —
+    would have recorded its usage and silently dropped its reason. Merged into one arm that
+    captures both, and `the_usage_on_a_terminal_frame_and_its_finish_reason_are_both_recorded`
+    exists specifically because a test with usage **or** a reason alone passes against that bug.
+  - **Read.** Both `SELECT`s name the column and `stored_model_call` parses it back into
+    `FinishReason`. A value this build cannot reinterpret is `Corrupted` rather than absent,
+    because reporting it absent would say the provider reported nothing when the truth is that
+    JARVIS wrote something it can no longer read — the same rule the policy-rules column follows.
+  `RecordedOutcome` replaces the bare `usage` parameter on the recording path, so the three things
+  a provider can report (usage, reason, first output) travel as one named value rather than as
+  transposable positional `Option`s; `Default` lets a failure path say "nothing was reported" by
+  omission. The in-memory double records the same field, because a divergence between it and the
+  adapter is invisible to a test exercising either alone.
+  **Falsified in both halves:** removing the capture records `None` for a `Length` stop (and fails
+  three tests), and removing the adapter's parse makes the column unreadable while the write still
+  binds it — the exact write-with-no-read shape the round is about.
+  **Not done, and named:** `first_output_at` is recorded by the controller and read by the adapter
+  with **no producer of the instant** yet, because nothing in this build measures
+  time-to-first-token — that measurement is `BRN-011`'s subject, so the honest state is a wired
+  column and an absent producer rather than a dressed-up feature.
+  940 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-018` Fix the cancellation path: an unenforced bound, a digest that folded only lengths,
+  and a terminal event that carried nothing. Three defects on one path, found by following a
+  declared constant to its enforcement point.
+  - **`MAX_CANCEL_REASON_BYTES` was declared and enforced nowhere**, while `MAX_RUN_INPUT_BYTES`
+    is applied one route above it. So a caller could post a multi-megabyte `reason` and the daemon
+    would accept it. The bound is now checked with the same three rules the run input uses (empty,
+    over the limit, NUL), and the check is asserted in both directions — an over-long reason is
+    `400 request.invalid` and a reason **exactly at** the bound is accepted, so the check is a
+    bound rather than an approximation of one. Falsified: removing the check accepts the
+    over-long reason with `202`.
+  - **The cancel idempotency digest was `reason.len()`** — folding the reason's *length* rather
+    than its content. Two reasons of equal length were therefore the same request, so a caller
+    reusing a key across two runs was told its second cancel was a replay of the first; and since
+    a replayed cancel is a no-op **by design**, the second run was never signalled while the
+    caller was told the cancel was accepted. A digest that cannot distinguish the inputs it
+    claims to identify is worse than none. Falsified: restoring the length fold makes the test
+    fail with the second cancel answered `Received` instead of a conflict.
+  - **The reason never reached anything durable, and every activity event was written with
+    `payload_json: None`** — so `jarvis_protocol`'s `cancelled_payload`, `failed_payload`, and
+    `usage_payload` were all dead, and a client following the run's event stream learned that a
+    run stopped without learning why. The **failed** case is now closed: the terminal event
+    carries `{"code":…,"retryable":false}`.
+  - **The reason travels on the `CancellationScope`**, not in a side table. The scope is the value
+    the command actually signals and the value the controller already holds, so a registry keyed
+    by run would need a second lookup, could disagree with the signal, and would be invisible to a
+    caller holding only the scope. A child shares the reason rather than copying it (a controller
+    working on a child must still report why), and a reason-less internal cancel **does not erase a
+    reason already recorded**.
+  **Two design constraints the work ran into, both real rather than inconveniences:**
+  - **`jarvis-application` cannot depend on `jarvis-protocol`** (the flow runs protocol -> nothing
+    app-side), and it has `serde_json` only as a **dev**-dependency. So the failed payload is
+    hand-built, following `recovery::recovery_payload`'s precedent — legitimate only because every
+    value comes from a **closed set** (a `&'static str` code and a literal boolean), so no escaping
+    is needed. That leaves two definitions of one wire shape, so a cross-check test asserts the
+    hand-built string equals `jarvis_protocol::run::failed_payload` for every terminal code — the
+    same technique the duplicated event-name constants use.
+  - **The cancellation payload is therefore still absent, and named rather than fudged.** Its
+    reason is caller-supplied text, so a public event needs escaping; hand-rolling a JSON escaper
+    is the ad-hoc string manipulation the architecture forbids, and adding `serde_json` as a real
+    dependency is a research-gate change. I attempted it, hit the dependency wall, and **reverted
+    cleanly** rather than leave a half-wired field.
+  946 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

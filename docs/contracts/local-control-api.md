@@ -265,6 +265,24 @@ already terminal, return `200` and its unchanged terminal state. Cancellation
 does not report `cancelled` until bounded cleanup reaches a durable terminal
 transition; a cleanup timeout becomes a truthful typed failure or recovery state.
 
+The `reason` is **bounded and required**: it is refused when empty, longer than `MAX_CANCEL_REASON_BYTES`
+(512), or containing a NUL byte, with `request.invalid`. An omitted *body* is not an absent reason —
+the endpoint defaults it to `user_requested`, because a cancel is a command a client sends and the
+contract has always required the field.
+
+**Idempotency is over the reason's content, not its presence.** The recorded digest folds the
+reason's bytes, so two cancels of two runs whose reasons have the same *length* are two different
+requests. A digest that folded only the length would report the second as a replay of the first,
+and a replayed cancel is a no-op by design — so the second run would never be signalled while its
+caller was told the cancel was accepted.
+
+The reason travels to the terminal event: the scope a cancel signals carries it, because the scope
+is what the controller already holds and a reason stored beside the signal could disagree with it.
+The event payload for a cancellation is **not yet emitted**, and that is a named gap — the reason is
+caller-supplied text, so putting it in a public event needs escaping, and hand-rolling that would be
+the ad-hoc string manipulation the architecture forbids. A **failed** run's terminal event does carry
+its code, because every value there comes from a closed set.
+
 ## Run Event Stream
 
 `GET /api/v1/runs/{run_id}/events` requires
@@ -289,6 +307,10 @@ Rules:
 - Keepalives are SSE comments and do not consume sequence numbers.
 - Exactly one terminal event is persisted: `run.completed`, `run.failed`, or
   `run.cancelled`. The server closes after delivering the terminal event.
+- A **failed** terminal event's payload carries `{"code":…,"retryable":false}`, so a client that
+  only follows the stream learns why the run stopped. Its code is the same one the run's own row
+  reports, so a streaming client and a polling client cannot be told different reasons. A
+  `completed` event carries no payload, and a `cancelled` one does not yet — see *Cancellation*.
 - A client disconnect never cancels a durable run. Cancellation uses the command
   endpoint.
 - Per-client buffers are bounded. A slow consumer is disconnected; it can replay

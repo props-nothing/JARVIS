@@ -161,7 +161,10 @@ default and are included in the route decision/audit without exposing content.
 version. `model_policy_exceptions` stores separately revocable relaxations.
 `model_route_decisions` stores the resolved policy/version, requested and
 effective data policy, evidence references, candidate rejection reason codes,
-and exception reference. Model calls reference the route decision they used.
+and exception reference. Model calls reference the route decision they used —
+`model_calls.route_decision_id`, written from the run's stored route and read
+back by the same port, so a call permitted by a decision and a call made with
+no policy in force are distinguishable rather than both reading as `NULL`.
 
 Historical records retain the policy/evidence version needed to explain a past
 decision even after current evidence expires. Replaying a call re-evaluates
@@ -362,6 +365,41 @@ client could have named. Present means the caller pinned a version, and a versio
 exist is refused rather than silently falling back — falling back would apply rules the caller
 did not name and record a decision nobody made.
 
+**The route is selected at creation, and the run executes under it.** This is `BRN-014`, and it
+closed three holes that each looked closed from a unit test:
+
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| a run is created under a policy that admits a compliant route | `RunService::select_route` builds the candidates from the provider the controller will call and records the decision **before** the run exists | `a_run_created_under_a_policy_records_the_route_and_its_decision`, `the_recorded_decision_is_the_one_the_run_route_names` |
+| a policy admitting no compliant route refuses creation | `RouteSelectionFailure::Refused` becomes `RunServiceError::PolicyUnsatisfied` (`403 model.policy_unsatisfied`) and **no run is created** | `a_policy_that_admits_no_compliant_route_refuses_creation_and_creates_no_run`; the end-to-end journey answers `202` instead of `403` when the daemon passes `policies: None` |
+| the run calls the routed model, not the provider's first | `RunController::resolve_model` reads `RunBudget::route` and requires the provider still to serve that model | `the_controller_calls_the_routed_model_rather_than_the_first_one`; making `resolve_model` return `selected_model(provider)` fails four tests with `fixture-1` recorded where `fixture-routed` was authorized |
+| a stored route naming an unserved model is refused, not replaced | the same function returns `run.no_model_served`, because falling back would perform an action no rule permitted | `a_stored_route_naming_an_unserved_model_fails_the_run_rather_than_falling_back` |
+| no policy means no route, and the run still executes | `RunBudget::route` stays `None`, so the controller falls back to the provider's own selection | `a_run_with_no_policy_records_no_route_and_still_creates`, `a_run_with_no_route_still_calls_the_providers_first_model_and_records_no_decision` |
+| every attempt of one logical call names the same decision | the route is read once before the retry loop and stamped on each attempt's row | `every_attempt_of_one_logical_call_names_the_same_decision` |
+| a call's authorization is readable, not write-only | `model_calls.route_decision_id` is bound from `NewModelCall.route_decision` and re-parsed on read | `a_call_records_the_route_decision_that_authorized_it`, `a_call_with_no_route_decision_reads_back_without_one` |
+
+The three facts a route carries — the model, the decision, and the exception reference — are one
+`RunRoute` value on the budget rather than three optional fields, because a model reference
+without its decision cannot be explained and a decision cannot be reconstructed from the choice
+alone. The **exception** reference is carried on the route as well as on the stored decision so a
+reader of the *run* can tell "a grant permitted this" from "nothing had to be permitted" without
+loading the decision.
+
+**The routed model now reaches the wire, so the selection is enforced and not only recorded.**
+`ModelCallRequest` carries a **required** `model` (see
+[the model stream contract](model-stream.md)), `RunController::build_request` sets it from the
+run's stored route, and the provider port refuses a model it does not serve with
+`model.provider_no_route`. An optional field would have kept every fixture compiling while the
+policy constrained the `model_calls` row and a provider answered under whatever model it defaulted
+to — the same "a reader and no writer" shape as the dead `route_decision_id` column. Two guards:
+`resolve_model`'s roster check catches a withdrawn model before an attempt is made, and the
+adapter's own check catches a roster it disagrees with.
+
+**One limit is recorded rather than fixed.** `AuthenticatedClient` hardcodes
+`AuthenticationAssurance::Standard`, so **no HTTP client can ever be Elevated** and a step-up
+exception is un-grantable over the wire — that needs a step-up challenge and an owner decision
+rather than a code change.
+
 **An absent ceiling is not a permissive one.** A run created in a workspace with no policy
 records **no** policy and no ceiling, and the controller then holds nothing back while the
 manifest still records every label. "A policy permitted this" and "nobody configured a policy"
@@ -402,10 +440,14 @@ forever. A contradiction is `jarvis.invalid_policy_layer` — carried as a code 
 - **`GET` omitted three rule fields entirely**, so the read could not be round-tripped either. The
   same fix applies to both, which is why the two responses now share one rendering function.
 
-**Still not done.** One thing, named rather than implied: `model_policy_exceptions` has a table
-and no code, so no exception can be granted, expired, revoked, or attached to a decision. That
-makes `ModelRouteDecision::exception_ref` always absent, leaves the contract's *Exceptions*
-section unimplemented, and is why no request can relax a hard rule.
+**The exception lifecycle is now implemented, so this paragraph's predecessor is superseded.**
+`model_policy_exceptions` has code: an exception can be granted, expired, revoked, consumed, and
+attached to a decision, and a request that a hard rule would otherwise refuse can be permitted by
+one. `ModelRouteDecision::exception_ref` is populated when — and only when — a grant was actually
+used. See *Exceptions* below for the evidence table. **Still not done:** the HTTP surface for the
+lifecycle (the service exists, no route calls it), and a replayed decision re-evaluates under
+current grants rather than inheriting the recorded one, which is what "replaying a call
+re-evaluates current policy" requires.
 
 `ProviderInventory` reports candidates whose `region`, `retention`, and `training_use` are all
 `None`, which is the honest state until `BRN-011` measures capabilities and an adapter attaches
@@ -449,16 +491,47 @@ would be invisible to a test that exercised either one alone. An absent active p
 caller has to decide whether that is permitted, and it cannot decide if the store hands back
 `PolicyRules::permissive()`.
 
-**Still not done:** `select_route` remains uncalled, because nothing yet assembles a
-`RouteRequest` from a loaded policy plus a candidate inventory. The store is the input; the
-wiring and the `GET /api/v1/model-data-policy/effective` surface are the next increment. The
-API endpoints, the exception lifecycle (issue/expire/revoke/single-use), and the
-`resource.version_conflict` HTTP mapping are all absent.
+#### Exceptions: the separately revocable relaxations
 
+`migrations/sqlite/000005_model_policy_exceptions.sql` brings `model_policy_exceptions` to the
+shape this contract's *Exceptions* section requires, and
+`jarvis_domain::model::exception` is the typed model: `PolicyRuleKey` (nine keys),
+`ExceptionScope`, `ExceptionState`, `RequiredAssurance`, and `PolicyException` with its
+`grant`, `state_at`, and `is_usable_at` predicates. The port and its SQLite adapter implement
+issue/read/list/revoke/consume, and the in-memory double mirrors them.
 
+Five rules are structural rather than documented:
 
-**Not done**: tests 2, 4 through 9 have no executable evidence yet. There is no
-persistence for `model_data_policies`, `model_policy_exceptions`, or
-`model_route_decisions` (that is `BRN-004`), so immutable version history,
-concurrent update, idempotency conflict, exception expiry/revocation/replay, and
-generated-schema drift are unimplemented rather than verified.
+| Rule here | Enforced by | Falsified by |
+| --- | --- | --- |
+| an exception cannot override a non-waivable deny | `PolicyRuleKey::is_waivable` refuses the whole grant, and `rules_for` **ignores** a non-waivable grant rather than honouring it | `a_non_waivable_rule_cannot_be_granted_an_exception_at_all`, `an_exception_for_a_non_waivable_rule_is_never_applied` |
+| sensitive or cross-border grants require step-up | `PolicyRuleKey::requires_step_up` or a scope naming a classification makes the requirement `Elevated`, and `grant` refuses a standard grantor | `a_step_up_grant_is_required_for_cross_border_and_sensitive_exceptions`, `a_grant_needing_step_up_is_refused_at_standard_assurance` |
+| an exception relaxes exactly the rule it names | `RejectionReason::policy_rule` maps the refusal to a rule and `relaxes` matches it | `an_exception_relaxing_a_rule_the_candidate_did_not_fail_is_not_applied` |
+| a decision records the exception it relied on | `selected` records `exception_ref` only when a grant was **used**, not merely offered | `a_candidate_that_complies_without_a_grant_records_no_exception`, `a_grant_reaches_route_selection_and_lets_a_refused_candidate_through` |
+| single use is consumed at most once | the adapter's `UPDATE` carries `single_use = 1 AND consumed_at IS NULL AND revoked_at IS NULL`, so the guard *and* the predicate are one statement | `a_single_use_exception_can_be_consumed_only_once`, `a_consumed_exception_cannot_then_be_revoked`, `a_repeatable_exception_is_left_untouched_by_a_consume` |
+| a grant a run relied on is **spent** | `RunService::select_route` consumes a single-use grant after the decision is durable and before the run is created | `a_single_use_grant_is_consumed_when_a_run_relies_on_it`; removing the call lets a second run be `Created` on a grant already used |
+| a spent grant admits no further run | the consumption precedes the run, so the selector finds a non-`Issued` grant and refuses | `a_spent_single_use_grant_no_longer_admits_a_second_run` |
+| a repeatable grant is never spent | `single_use = 1` is part of the consume predicate, and a zero-row match on a repeatable grant is success rather than a conflict | `a_repeatable_grant_is_not_consumed_by_a_run_that_relies_on_it`, `a_run_that_needs_no_grant_spends_none` |
+
+Three decisions in the model are worth stating, because each closes a way a relaxation could
+widen past what was granted:
+
+- **A grant is consulted only after the unrelaxed policy has refused, and only for the rule that
+  refused.** This is what makes `relied_on_exception()` mean "this call needed a relaxation" — a
+  candidate that already complies never records a grant it did not use, and a single-use grant
+  offered to a candidate that did not need it is not consumed.
+- **The expiry instant itself is expired**, the same convention the run deadline uses, while the
+  sensitivity ceiling is inclusive. The two conventions differ because the quantities do: work at
+  `T` finishes after `T`, whereas a ceiling of `confidential` permits confidential content. Both
+  boundaries are asserted from both sides.
+- **`state` is not stored.** Usability is a question about an *instant*, so it is computed at the
+  decision instant; a stored column would be wrong the moment the clock passed `expires_at`, and
+  would be a second answer to a question `state_at` already answers.
+
+`RequiredAssurance` also **gives the sensitivity ceiling its enforcement**, which is the rule that
+was missing before this work: `PolicyRules::maximum_sensitivity` had no consumer anywhere, so a
+`local_only` policy permitting only `public` content selected a local candidate and sent
+`restricted` content. `select_route_explained` now compares the request's `sensitivity` against the
+ceiling **before any candidate is examined** — the ceiling bounds what may be sent by any route, so
+a per-candidate reason would imply another candidate might carry it — and reports
+`RejectionReason::SensitivityExceedsPolicy` (`sensitivity_exceeds_policy` on the wire).

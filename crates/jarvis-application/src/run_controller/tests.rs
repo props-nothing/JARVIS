@@ -18,7 +18,7 @@ use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderI
 use jarvis_domain::model::stream::{
     ContentBlock, FinishReason, InputItem, ModelCallRequest, ModelStreamEventKind, Role, Usage,
 };
-use jarvis_domain::run::budget::{BudgetLimit, RunBudget};
+use jarvis_domain::run::budget::{BudgetLimit, RunBudget, RunRoute};
 use jarvis_domain::run::retry::RetryPolicy;
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
@@ -2367,5 +2367,488 @@ async fn a_policy_ceiling_survives_the_store_round_trip() {
     assert_eq!(
         stored.budget.context_sensitivity_ceiling(),
         Some(Sensitivity::Confidential),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The routed model
+//
+// The defect class this closes: the model a run actually called was always
+// `provider.models().first()`, so a route the policy selected was recorded, was readable from
+// the run's own budget, and constrained nothing. These tests drive the controller over a
+// provider that serves **two** models, because a provider with one model cannot distinguish
+// "the routed model was used" from "the first model was used" — the single-model fixture the
+// earlier tests use would pass against the defect.
+// ---------------------------------------------------------------------------
+
+/// A model the fixture's provider serves second, and does not list first.
+fn routed_model() -> ModelRef {
+    ModelRef::new(
+        ProviderId::parse("scripted.local").expect("valid"),
+        ModelId::parse("fixture-routed").expect("valid"),
+    )
+}
+
+/// A provider serving [`model`] first and [`routed_model`] second.
+///
+/// Order is the point: the routed model is deliberately **not** first, so an implementation
+/// that took `models().first()` would call the wrong one and the assertion would fail.
+fn routing_provider() -> ScriptedProvider {
+    ScriptedProvider::new(model())
+        .also_serving(routed_model())
+        .emit(ModelStreamEventKind::OutputItemAdded {
+            item_id: "out-1".to_owned(),
+        })
+        .emit_text("out-1", "routed answer")
+        .emit(ModelStreamEventKind::CallCompleted {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            refused: false,
+        })
+}
+
+/// A decision identifier for a stored route.
+fn decision_id() -> jarvis_domain::ids::ModelRouteDecisionId {
+    jarvis_domain::ids::ModelRouteDecisionId::from_uuid(id(90))
+}
+
+/// A budget carrying the routed model and the decision that named it.
+fn routed_budget() -> RunBudget {
+    RunBudget::default().with_route(RunRoute {
+        model: routed_model(),
+        decision: decision_id(),
+        exception_ref: None,
+    })
+}
+
+#[tokio::test]
+async fn the_controller_calls_the_routed_model_rather_than_the_first_one() {
+    // The headline assertion. `resolve_model` returning `selected_model(provider)` — which is
+    // exactly what this code did before — makes this test fail with `fixture-1` recorded
+    // instead of `fixture-routed`, and that failure is the whole point of the round.
+    let fixture = fixture(Arc::new(routing_provider()));
+    seed_with_budget(&fixture, routed_budget()).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("a run with a routed model completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].0.model,
+        routed_model(),
+        "the call must name the model the policy selected, not the provider's first",
+    );
+}
+
+#[tokio::test]
+async fn a_routed_call_records_the_decision_that_authorized_it() {
+    // The column `model_calls.route_decision_id` existed, was read, and was never written. The
+    // assertion is on the *stored* value rather than on the argument the controller passed,
+    // because the defect being closed is precisely a value that was correct in one place and
+    // absent from the row an operator reads.
+    let fixture = fixture(Arc::new(routing_provider()));
+    seed_with_budget(&fixture, routed_budget()).await;
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(
+        calls[0].0.route_decision,
+        Some(decision_id()),
+        "a call made under a policy must name the decision that permitted it",
+    );
+
+    // And it reads back through the port, so "this call was authorized by that decision" is
+    // checkable rather than write-only.
+    let stored = fixture
+        .repositories
+        .load_attempt(context().workspace_id, calls[0].0.id)
+        .await
+        .expect("the attempt loads");
+    assert_eq!(stored.route_decision, Some(decision_id()));
+    assert_eq!(stored.model_id, routed_model().model_id);
+}
+
+#[tokio::test]
+async fn a_run_with_no_route_still_calls_the_providers_first_model_and_records_no_decision() {
+    // The unconstrained case, and the direction that would break if "no route" were read as
+    // "refuse": a run with no policy in force must still complete, must call the provider's own
+    // model, and must record **no** decision — because a decision nothing made must not be
+    // invented.
+    let fixture = fixture(Arc::new(routing_provider()));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("an unpoliced run completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(
+        calls[0].0.model,
+        model(),
+        "with no route, the first model serves"
+    );
+    assert!(
+        calls[0].0.route_decision.is_none(),
+        "an unpoliced call must record no decision rather than a default one",
+    );
+}
+
+#[tokio::test]
+async fn a_stored_route_naming_an_unserved_model_fails_the_run_rather_than_falling_back() {
+    // Configuration drift: the policy authorized a model, and the provider no longer serves it.
+    // Falling back to another model would perform an action no rule permitted, so the run must
+    // fail — and fail durably, not merely return an error.
+    let fixture = fixture(Arc::new(routing_provider()));
+    seed_with_budget(
+        &fixture,
+        RunBudget::default().with_route(RunRoute {
+            model: ModelRef::new(
+                ProviderId::parse("scripted.local").expect("valid"),
+                ModelId::parse("fixture-withdrawn").expect("valid"),
+            ),
+            decision: decision_id(),
+            exception_ref: None,
+        }),
+    )
+    .await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a route the provider cannot honour must fail");
+    assert_eq!(error, ControllerError::NoModelServed);
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run is stored");
+    assert_eq!(stored.state, RunState::Failed);
+
+    // And no model call was recorded: the refusal happens before a provider is contacted, so
+    // there is nothing to bill and no open attempt for reconciliation to find.
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert!(
+        calls.is_empty(),
+        "a refused route must not reach a provider: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_attempt_of_one_logical_call_names_the_same_decision() {
+    // A retry shares one `logical_call_id`, so both of its attempt rows must name the same
+    // authorization. Re-deriving the decision per attempt would let one logical call's attempts
+    // claim different routes, which is exactly what the shared identity exists to prevent.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .also_serving(routed_model())
+            .fail_first_opens(1, ProviderError::Unavailable)
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    // A retry policy is part of the budget, so the route is attached alongside it.
+    seed_with_budget(
+        &fixture,
+        routed_budget().with_retry(RetryPolicy {
+            max_attempts: 3,
+            ..RetryPolicy::default()
+        }),
+    )
+    .await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the second attempt completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(
+        calls.len(),
+        2,
+        "one retry means two attempt rows: {calls:?}"
+    );
+    let logical: Vec<_> = calls.iter().map(|(call, _)| call.logical_call_id).collect();
+    assert_eq!(logical[0], logical[1], "both attempts are one logical call");
+    for (call, _) in &calls {
+        assert_eq!(
+            call.route_decision,
+            Some(decision_id()),
+            "every attempt names the one decision that authorized the logical call",
+        );
+        assert_eq!(
+            call.model,
+            routed_model(),
+            "and every attempt calls the routed model",
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_request_names_the_routed_model_so_the_provider_cannot_substitute() {
+    // The gap this closes, and it is the same "recording path, not the wire" shape the dead
+    // `route_decision_id` column had: the controller honoured the routed model for what the
+    // `model_calls` row said, while the request it handed the provider named **no model at
+    // all**. A provider was then free to answer with whatever it defaults to, so the row
+    // claimed the routed model served a call that a different one produced.
+    //
+    // Asserted on the **request the adapter received**, not on the row: the row was already
+    // correct, which is exactly why the defect survived the tests beside this one.
+    let provider = Arc::new(RecordingProvider::new(
+        ScriptedProvider::new(model())
+            .also_serving(routed_model())
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    seed_with_budget(&fixture, routed_budget()).await;
+
+    let outcome = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("a run with a routed model completes");
+    assert_eq!(outcome.state, RunState::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(
+        requests[0].model,
+        routed_model(),
+        "the normalized request must name the model the policy selected",
+    );
+    assert_ne!(
+        requests[0].model,
+        model(),
+        "the fixture is only meaningful because the routed model is not the provider's first",
+    );
+}
+
+#[tokio::test]
+async fn a_provider_that_declares_a_model_and_then_refuses_it_fails_the_run_terminal() {
+    // A roster is a *claim*, and an adapter can disagree with it: it lists the model and then
+    // cannot route to it. `resolve_model`'s roster check cannot catch that — only the provider
+    // can — so this asserts the second guard at the boundary and, more importantly, that the
+    // refusal reaches a **terminal** run. A provider error propagated without a transition is
+    // the defect class this controller has been fixed for repeatedly, and this is the path where
+    // the wire model makes it reachable.
+    let provider = Arc::new(RecordingProvider::new(
+        scripted_answering("must not be produced").fail_on_open(ProviderError::NoRoute),
+    ));
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    // The route names a model this provider *does* declare, so the roster check passes and the
+    // only thing that can refuse is the provider itself.
+    seed_with_budget(
+        &fixture,
+        RunBudget::default().with_route(RunRoute {
+            model: model(),
+            decision: decision_id(),
+            exception_ref: None,
+        }),
+    )
+    .await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("the provider's refusal must end the run");
+    assert_eq!(
+        error,
+        ControllerError::Provider(ProviderError::NoRoute),
+        "the provider's own code reaches the caller rather than an invented one",
+    );
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run is stored");
+    assert_eq!(
+        stored.state,
+        RunState::Failed,
+        "a refused open must leave the run terminal rather than live",
+    );
+    // `NoRoute` is not retryable, so exactly one attempt was made and the run was not left with
+    // a retry budget it would never spend.
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a non-retryable refusal must be attempted exactly once",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The recorded finish reason
+//
+// `model_calls.finish_reason` had a schema column, a line in the schema document, a **typed**
+// field on `ModelCallOutcome`, and an adapter bind — and the controller wrote `None` while no
+// `SELECT` named the column and `StoredModelCall` had no field for it. So "the model was cut off
+// by its own token limit" and "the model finished" were the same value on every read, while the
+// domain deliberately retains an unmodelled provider reason as `FinishReason::Other` to keep a new
+// one visible rather than flattened into a clean one.
+// ---------------------------------------------------------------------------
+
+/// A provider that answers and then reports `reason` as its finish reason.
+fn answering_with_reason(text: &str, reason: FinishReason) -> Arc<dyn ModelProvider> {
+    Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", text)
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: reason,
+                usage: None,
+                refused: false,
+            }),
+    )
+}
+
+#[tokio::test]
+async fn the_finish_reason_the_provider_reported_is_recorded_on_the_call() {
+    // Asserted on the **stored** value, because the defect was a value that no layer produced:
+    // the port field, the column, and the bind all existed, so asserting the argument the
+    // controller passed would have been circular.
+    let fixture = fixture(answering_with_reason(
+        "truncated answer",
+        FinishReason::Length,
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(
+        recorded[0].finish_reason,
+        Some(FinishReason::Length),
+        "a run the model cut off must be distinguishable from one it finished",
+    );
+    // And it survives a read through the port, so the column is neither write-only nor readable
+    // only through the double.
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    let stored = fixture
+        .repositories
+        .load_attempt(context().workspace_id, calls[0].0.id)
+        .await
+        .expect("the attempt loads");
+    assert_eq!(stored.finish_reason, Some(FinishReason::Length));
+}
+
+#[tokio::test]
+async fn an_unmodelled_finish_reason_is_recorded_rather_than_flattened() {
+    // The reason the domain keeps `Other { provider_value }`: a provider that reports something
+    // this build does not model must stay **visible**, because mapping it to `Stop` would make an
+    // unknown terminal look like a clean one — and the recorded outcome is where an operator would
+    // otherwise first notice.
+    let unmapped = FinishReason::other("content_filter_extended").expect("a valid reason");
+    let fixture = fixture(answering_with_reason("filtered", unmapped.clone()));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(
+        recorded[0].finish_reason,
+        Some(unmapped),
+        "an unknown provider reason must be preserved with its raw value",
+    );
+}
+
+#[tokio::test]
+async fn the_usage_on_a_terminal_frame_and_its_finish_reason_are_both_recorded() {
+    // The pattern-ordering trap this round hit while writing the capture: usage and the finish
+    // reason arrive on **one** `call.completed` frame, so two arms — one matching `usage: Some(..)`
+    // and one matching `finish_reason` — would make the first match win and silently drop the other
+    // half for exactly the frames that carry both. A test with usage **or** a reason alone would
+    // pass against that bug; this one cannot.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "a complete answer")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: Some(reported_usage(120, 80)),
+                refused: false,
+            }),
+    ));
+    seed_with_budget(&fixture, RunBudget::default()).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(
+        recorded[0].finish_reason,
+        Some(FinishReason::Stop),
+        "the terminal's finish reason must survive a terminal that also carries usage",
+    );
+    let usage = recorded[0]
+        .usage
+        .as_ref()
+        .expect("the usage on the same frame must be recorded too");
+    assert_eq!(usage.output_tokens, Some(120));
+}
+
+#[tokio::test]
+async fn a_failed_call_records_no_finish_reason() {
+    // The negative direction, and the one a shared `RecordedOutcome` could get wrong: an attempt
+    // that never reached a terminal has no finish reason, and recording one would describe a
+    // provider decision that was never made.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model()).fail_on_open(ProviderError::Refused),
+    ));
+    seed(&fixture).await;
+    let _ = execute(&fixture, &CancellationScope::new()).await;
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].1, ModelCallState::Failed);
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert!(
+        recorded[0].finish_reason.is_none(),
+        "a call that never reached a terminal has no finish reason to record",
     );
 }

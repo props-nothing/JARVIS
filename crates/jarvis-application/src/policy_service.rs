@@ -28,6 +28,9 @@
 
 use std::sync::Arc;
 
+use jarvis_domain::model::exception::{
+    ExceptionScope, NewPolicyException, PolicyException, PolicyRuleKey, RequiredAssurance,
+};
 use jarvis_domain::model::policy::{
     ModelDataPolicyStatus, ModelRouteDecision, PolicyRules, PolicyVersionRef, Sensitivity,
 };
@@ -38,7 +41,9 @@ use jarvis_domain::model::stream::RouteRequirements;
 use jarvis_domain::time::{IsoDate, UtcTimestamp};
 
 use crate::repository::RepositoryError;
-use crate::repository::policy::{ModelDataPolicyRepository, NewPolicyVersion, StoredPolicyVersion};
+use crate::repository::policy::{
+    JarvisPolicyException, ModelDataPolicyRepository, NewPolicyVersion, StoredPolicyVersion,
+};
 use crate::request_context::RequestContext;
 
 /// Why a policy evaluation could not be answered.
@@ -169,6 +174,35 @@ pub struct EvaluationRequest<'a> {
     pub today: IsoDate,
     /// The instant the evaluation runs.
     pub decided_at: UtcTimestamp,
+}
+
+/// What one grant needs.
+///
+/// A struct rather than a long argument list, for the reason the repositories' `NewMessage` is
+/// one: every field is independently meaningful and naming them beats a positional list where two
+/// same-typed strings — the reason and a scope identifier — can be transposed without the compiler
+/// noticing.
+#[derive(Debug, Clone)]
+pub struct GrantRequest {
+    /// The single rule the exception relaxes.
+    pub rule: PolicyRuleKey,
+    /// What it applies to, and the value it permits.
+    pub scope: ExceptionScope,
+    /// An operator-authored label for why it was granted.
+    pub reason_ref: String,
+    /// Whether one use consumes it.
+    pub single_use: bool,
+    /// When it stops being usable.
+    pub expires_at: UtcTimestamp,
+    /// The assurance the granting principal holds.
+    ///
+    /// A **required** input rather than a value read from ambient state, because the step-up rule
+    /// is part of whether the grant may exist: a caller that could omit it would get a grant whose
+    /// own record says which assurance was required while nothing checked the grantor held it. The
+    /// HTTP layer supplies it from the authenticated client, which is the only place it is trusted.
+    pub granting_assurance: RequiredAssurance,
+    /// The policy version to grant it against, or `None` for the workspace's active policy.
+    pub policy: Option<PolicyVersionRef>,
 }
 
 /// Reads policies and evaluates routes against them.
@@ -363,6 +397,19 @@ impl PolicyService {
         // so extracting it afterwards would be a borrow of a partially moved value.
         let policy = stored.reference();
 
+        // The workspace's exceptions are offered to the selector, which decides which — if any —
+        // actually applies. They are read here rather than taken from the caller because an
+        // exception is a durable record: a client that supplied its own would be the "editing a
+        // request body creates an exception" path the contract forbids outright. The read is
+        // bounded by the port, and an unreadable store is reported rather than treated as "no
+        // exceptions", because the two have opposite consequences — the second would refuse a
+        // call an operator had already granted.
+        let exceptions = self
+            .policies
+            .list_exceptions(context.workspace_id)
+            .await
+            .map_err(PolicyServiceError::Storage)?;
+
         let route_request = RouteRequest {
             rules: stored.rules,
             // The stored reference, so a later reader can see which rules applied even after
@@ -372,6 +419,7 @@ impl PolicyService {
             requirements: request.requirements.clone(),
             today: request.today,
             decided_at: request.decided_at,
+            exceptions,
         };
 
         match select_route_explained(request.candidates, &route_request) {
@@ -384,6 +432,159 @@ impl PolicyService {
             }
         }
     }
+
+    /// Grants an exception for one policy rule.
+    ///
+    /// The policy version is resolved here rather than accepted blindly, because an exception is
+    /// granted *against* a version and one naming a version that does not exist would be a
+    /// relaxation of rules nothing ever applied. An absent version means the workspace's active
+    /// policy, which is the ordinary case.
+    ///
+    /// The identifier is generated here rather than supplied, for the same reason a policy version
+    /// is an output: a caller that named the identity could collide with an existing grant and be
+    /// told its grant was created when the identity belonged to someone else's.
+    ///
+    /// The record is built through [`PolicyException::grant`], so every rule it enforces — a
+    /// waivable rule, a bounded reason, a usable expiry, a met step-up requirement — is checked
+    /// before the store is touched. Building the struct here and relying on the store to validate
+    /// would put those rules in two places.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyServiceError::Invalid`] for a refusal [`PolicyException::grant`] makes,
+    /// carrying the domain's own code — `model.exception_required` for a non-waivable rule or an
+    /// unmet step-up, `jarvis.invalid_transition_reason` for an unusable reason, and
+    /// `model.exception_expired` for an expiry that has already passed.
+    /// [`PolicyServiceError::NoActivePolicy`] or [`PolicyServiceError::PolicyNotFound`] when the
+    /// version cannot be resolved, and [`PolicyServiceError::Storage`] when the write fails.
+    pub async fn grant_exception(
+        &self,
+        context: &RequestContext,
+        request: &GrantRequest,
+        granted_at: UtcTimestamp,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+    ) -> Result<JarvisPolicyException, PolicyServiceError> {
+        // The reference is resolved before the record is built, so a grant against a version that
+        // does not exist is refused rather than stored against nothing.
+        let reference = match request.policy {
+            Some(reference) => {
+                let stored = self.version(context, reference).await?;
+                stored.reference()
+            }
+            None => self.active(context).await?.reference(),
+        };
+
+        let exception = PolicyException::grant(NewPolicyException {
+            id: exception_id,
+            workspace_id: context.workspace_id,
+            policy: reference,
+            granting_principal_id: context.principal_id,
+            granting_assurance: request.granting_assurance,
+            rule: request.rule,
+            scope: request.scope.clone(),
+            reason_ref: request.reason_ref.clone(),
+            single_use: request.single_use,
+            issued_at: granted_at,
+            expires_at: request.expires_at,
+        })
+        .map_err(|error| PolicyServiceError::Invalid { code: error.code() })?;
+
+        self.policies
+            .grant_exception(context.workspace_id, exception.clone())
+            .await
+            .map_err(PolicyServiceError::Storage)?;
+        Ok(exception)
+    }
+
+    /// Reads one exception in the caller's scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyServiceError::PolicyNotFound`] for an absent or foreign exception — the
+    /// store's `NotFound`, mapped through the same conversion a policy read uses, because the two
+    /// are indistinguishable by scope on purpose.
+    pub async fn exception(
+        &self,
+        context: &RequestContext,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+    ) -> Result<JarvisPolicyException, PolicyServiceError> {
+        self.policies
+            .load_exception(context.workspace_id, exception_id)
+            .await
+            .map_err(PolicyServiceError::from)
+    }
+
+    /// Lists every exception the caller's workspace holds.
+    ///
+    /// Every one, whether or not it is still usable, so an operator can see an expired or revoked
+    /// grant rather than watching it disappear. The caller decides usability from
+    /// [`PolicyException::state_at`] with the instant it cares about — the store does not know
+    /// which instant that is, and a filtered list would hide the very records an operator is
+    /// auditing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyServiceError::Storage`] for a store failure, including the bound when the
+    /// workspace holds more grants than the port allows.
+    pub async fn exceptions(
+        &self,
+        context: &RequestContext,
+    ) -> Result<Vec<JarvisPolicyException>, PolicyServiceError> {
+        self.policies
+            .list_exceptions(context.workspace_id)
+            .await
+            .map_err(PolicyServiceError::Storage)
+    }
+
+    /// Revokes an exception.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyServiceError::PolicyNotFound`] for an absent or foreign exception, and
+    /// [`PolicyServiceError::Storage`] when the store refuses — a spent grant cannot be revoked,
+    /// which the port reports as a conflict.
+    pub async fn revoke_exception(
+        &self,
+        context: &RequestContext,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> Result<(), PolicyServiceError> {
+        self.policies
+            .revoke_exception(context.workspace_id, exception_id, at)
+            .await
+            .map_err(PolicyServiceError::from)
+    }
+
+    /// Consumes a single-use exception.
+    ///
+    /// Separate from [`evaluate`](Self::evaluate) on purpose: a selection that *relied* on a
+    /// single-use exception must consume it, and that is the caller's step rather than a side
+    /// effect of evaluating. Making the selector consume it would mean an evaluation that was
+    /// merely *asked* whether a route exists — the diagnostic `GET /effective` — spent a grant the
+    /// workspace then no longer had.
+    ///
+    /// The caller that must do it is the **run path**: `RunService::select_route` consumes a
+    /// single-use grant in the same step that records the decision it relied on, so an operator's
+    /// single-use approval permits one run rather than an unbounded number of them. This method
+    /// existed with a port, an adapter, a double, and tests, and **no production caller** — the
+    /// permissive direction of a writer nothing calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyServiceError::PolicyNotFound`] for an absent or foreign exception, and
+    /// [`PolicyServiceError::Storage`] when the store refuses a second consumption or a revoked
+    /// grant.
+    pub async fn consume_exception(
+        &self,
+        context: &RequestContext,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> Result<(), PolicyServiceError> {
+        self.policies
+            .consume_exception(context.workspace_id, exception_id, at)
+            .await
+            .map_err(PolicyServiceError::from)
+    }
 }
 
 #[cfg(test)]
@@ -394,16 +595,20 @@ mod tests {
         CorrelationId, ModelDataPolicyId, PrincipalId, RequestId, WorkspaceId,
     };
     use jarvis_domain::model::capability::CapabilityDescriptor;
+    use jarvis_domain::model::exception::{
+        ExceptionScope, ExceptionState, PolicyRuleKey, RequiredAssurance,
+    };
     use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId};
     use jarvis_domain::model::policy::{
-        FallbackPermission, Locality, ModelDataPolicyStatus, PolicyRules, ProviderRetention,
-        Sensitivity, Telemetry, TrainingUse,
+        FallbackPermission, Locality, ModelDataPolicyStatus, PolicyRules, PolicyVersionRef,
+        ProviderRetention, Sensitivity, Telemetry, TrainingUse,
     };
     use jarvis_domain::model::routing::RouteCandidate;
     use jarvis_domain::model::stream::{Modality, RouteRequirements};
     use jarvis_domain::time::{IsoDate, UtcTimestamp};
 
-    use super::{EvaluationRequest, PolicyService, PolicyServiceError};
+    use super::{EvaluationRequest, GrantRequest, PolicyService, PolicyServiceError};
+    use crate::repository::policy::JarvisPolicyException;
     use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
     use crate::testing::InMemoryRepositories;
 
@@ -493,6 +698,339 @@ mod tests {
             today: IsoDate::parse("2026-09-22").expect("valid"),
             decided_at: at(),
         }
+    }
+
+    /// A request whose requirements impose **no** locality floor.
+    ///
+    /// Separate from [`request`] because the two quantities are different: the policy's `locality`
+    /// is a ceiling over what a route may use, while `RouteRequirements::locality` is a floor the
+    /// call must not go below. A test about a locality *exception* must not also set a floor, or the
+    /// floor would refuse the candidate for a reason no exception can relax and the test would be
+    /// asserting the wrong thing.
+    fn request_without_a_locality_floor(candidates: &[RouteCandidate]) -> EvaluationRequest<'_> {
+        request(candidates, Locality::ApprovedCloudAllowed)
+    }
+
+    /// A grant request for `rule` with `scope`, at elevated assurance.
+    fn grant_request(rule: PolicyRuleKey, scope: ExceptionScope) -> GrantRequest {
+        GrantRequest {
+            rule,
+            scope,
+            reason_ref: "operator approved".to_owned(),
+            single_use: false,
+            expires_at: UtcTimestamp::parse("2027-01-01T00:00:00Z").expect("valid"),
+            granting_assurance: RequiredAssurance::Elevated,
+            policy: None,
+        }
+    }
+
+    fn exception_id(value: u128) -> jarvis_domain::ids::PolicyExceptionId {
+        jarvis_domain::ids::PolicyExceptionId::from_uuid(uuid::Uuid::from_u128(value))
+    }
+
+    #[tokio::test]
+    async fn a_grant_resolves_the_active_policy_and_is_readable_back() {
+        // The grant is resolved against the active policy rather than stored against nothing, and
+        // reading it back is what proves the write reached the store — returning the built record
+        // would report a grant a failed write never created.
+        let (service, _) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let granted = service
+            .grant_exception(
+                &context(),
+                &grant_request(
+                    PolicyRuleKey::Locality,
+                    ExceptionScope {
+                        locality: Some(Locality::PrivateNetworkAllowed),
+                        ..ExceptionScope::default()
+                    },
+                ),
+                at(),
+                exception_id(1),
+            )
+            .await
+            .expect("the grant is stored");
+
+        assert_eq!(
+            granted.policy.version, 1,
+            "granted against the active policy"
+        );
+        assert_eq!(
+            granted.required_assurance,
+            RequiredAssurance::Elevated,
+            "a locality grant is cross-border, so it records the step-up it required",
+        );
+
+        let read = service
+            .exception(&context(), exception_id(1))
+            .await
+            .expect("reads back");
+        assert_eq!(read, granted);
+    }
+
+    #[tokio::test]
+    async fn a_grant_for_a_non_waivable_rule_is_refused_with_the_domain_code() {
+        // The refusal is the domain's own code rather than a service-invented one, so a client
+        // branching on `model.exception_required` sees the same spelling an exception's own
+        // lifecycle uses. And nothing is stored, which the count proves — an error alone would
+        // pass against an implementation that wrote the row first.
+        let (service, repositories) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let error = service
+            .grant_exception(
+                &context(),
+                &grant_request(PolicyRuleKey::MaximumSensitivity, ExceptionScope::default()),
+                at(),
+                exception_id(2),
+            )
+            .await
+            .expect_err("the ceiling cannot be relaxed by an exception");
+        assert_eq!(error.code(), "model.exception_required");
+        assert!(exceptions(&repositories).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_grant_needing_step_up_is_refused_at_standard_assurance() {
+        // The rule the contract states — "Sensitive or cross-border exceptions require
+        // policy-defined step-up/approval" — enforced through the service, so the HTTP layer cannot
+        // bypass it by passing a standard assurance for a cross-border grant.
+        let (service, repositories) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let mut standard = grant_request(PolicyRuleKey::Locality, ExceptionScope::default());
+        standard.granting_assurance = RequiredAssurance::Standard;
+        standard.scope.locality = Some(Locality::PrivateNetworkAllowed);
+
+        let error = service
+            .grant_exception(&context(), &standard, at(), exception_id(3))
+            .await
+            .expect_err("a cross-border grant needs step-up");
+        assert_eq!(error.code(), "model.exception_required");
+        assert!(exceptions(&repositories).is_empty());
+
+        // And the same grant at elevated assurance succeeds, so the refusal is about the assurance
+        // rather than about the grant being impossible.
+        standard.granting_assurance = RequiredAssurance::Elevated;
+        service
+            .grant_exception(&context(), &standard, at(), exception_id(3))
+            .await
+            .expect("elevated is accepted");
+        assert_eq!(exceptions(&repositories).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_grant_against_an_absent_policy_version_is_refused() {
+        // A grant is *against* a version. Storing one that names no version in force would be a
+        // relaxation of rules nothing ever applied, and the reference would make a later audit
+        // point at a policy that does not exist.
+        let (service, repositories) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let named = PolicyVersionRef {
+            policy_id: policy_id(),
+            version: 99,
+        };
+        let mut request = grant_request(
+            PolicyRuleKey::MaximumProviderRetention,
+            ExceptionScope::default(),
+        );
+        request.policy = Some(named);
+
+        let error = service
+            .grant_exception(&context(), &request, at(), exception_id(4))
+            .await
+            .expect_err("the named version does not exist");
+        assert_eq!(error.code(), "model.policy_not_found");
+        assert!(exceptions(&repositories).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoking_and_consuming_reach_the_store() {
+        // The lifecycle through the service, with the store read back for each step, so a service
+        // that returned success without writing would fail here. Both a revoked and a consumed
+        // grant are asserted, because they are different states with different causes.
+        let (service, _) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        service
+            .grant_exception(
+                &context(),
+                &grant_request(
+                    PolicyRuleKey::Locality,
+                    ExceptionScope {
+                        locality: Some(Locality::PrivateNetworkAllowed),
+                        ..ExceptionScope::default()
+                    },
+                ),
+                at(),
+                exception_id(5),
+            )
+            .await
+            .expect("stored");
+
+        let revoked_at = UtcTimestamp::parse("2026-09-23T00:00:00Z").expect("valid");
+        service
+            .revoke_exception(&context(), exception_id(5), revoked_at)
+            .await
+            .expect("revoked");
+        let read = service
+            .exception(&context(), exception_id(5))
+            .await
+            .expect("readable");
+        assert_eq!(read.revoked_at, Some(revoked_at));
+        assert_eq!(read.state_at(at()), ExceptionState::Revoked);
+
+        // A second grant, this time single-use, is consumed.
+        let mut single_use = grant_request(
+            PolicyRuleKey::MaximumProviderRetention,
+            ExceptionScope::default(),
+        );
+        single_use.single_use = true;
+        service
+            .grant_exception(&context(), &single_use, at(), exception_id(6))
+            .await
+            .expect("stored");
+
+        let consumed_at = UtcTimestamp::parse("2026-09-24T00:00:00Z").expect("valid");
+        service
+            .consume_exception(&context(), exception_id(6), consumed_at)
+            .await
+            .expect("consumed");
+        let read = service
+            .exception(&context(), exception_id(6))
+            .await
+            .expect("readable");
+        assert_eq!(read.consumed_at, Some(consumed_at));
+
+        // A second consumption is refused with the store's conflict code, so the caller learns its
+        // grant is spent rather than being told the call succeeded.
+        let error = service
+            .consume_exception(&context(), exception_id(6), consumed_at)
+            .await
+            .expect_err("a single-use grant is consumed once");
+        assert_eq!(error.code(), "storage.conflict");
+    }
+
+    #[tokio::test]
+    async fn a_grant_reaches_route_selection_and_lets_a_refused_candidate_through() {
+        // The end-to-end property this whole slice exists for: a policy refuses a candidate, a
+        // grant is issued for the rule that refused it, and the same evaluation then selects it —
+        // with the decision recording which grant permitted it. Every half is asserted, so a grant
+        // that was stored but never consulted fails here.
+        let (service, _) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let cloud = [candidate(EndpointClass::ApprovedCloud)];
+        let reference = PolicyVersionRef {
+            policy_id: policy_id(),
+            version: 1,
+        };
+        // A local-only policy refuses a cloud candidate, and the refusal names the rule. The
+        // requirements impose no locality floor, so the policy is the only thing refusing it — the
+        // condition the grant below must be able to relax.
+        let error = service
+            .evaluate(
+                &context(),
+                reference,
+                &request_without_a_locality_floor(&cloud),
+            )
+            .await
+            .expect_err("a cloud candidate violates local-only");
+        assert_eq!(error.code(), "model.policy_unsatisfied");
+
+        // Grant the locality relaxation the refusal named.
+        service
+            .grant_exception(
+                &context(),
+                &grant_request(
+                    PolicyRuleKey::Locality,
+                    ExceptionScope {
+                        locality: Some(Locality::ApprovedCloudAllowed),
+                        ..ExceptionScope::default()
+                    },
+                ),
+                at(),
+                exception_id(7),
+            )
+            .await
+            .expect("stored");
+
+        let decision = service
+            .evaluate(
+                &context(),
+                reference,
+                &request_without_a_locality_floor(&cloud),
+            )
+            .await
+            .expect("the grant lets it through");
+        assert!(
+            decision.relied_on_exception(),
+            "the decision must name the grant that permitted the call",
+        );
+        assert_eq!(
+            decision.exception_ref.as_deref(),
+            Some(exception_id(7).to_string().as_str()),
+        );
+        assert_eq!(
+            decision.effective.endpoint_class,
+            EndpointClass::ApprovedCloud
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_does_not_permit_anything() {
+        // The grant is offered to a selection made *after* its expiry, so it must be ignored and
+        // the call refused. This is the half that makes the expiry real: a stored grant whose
+        // `expires_at` is in the past would otherwise read as in force.
+        let (service, _) = service();
+        put(&service, 0, local_only()).await.expect("creates");
+
+        let mut expiring = grant_request(
+            PolicyRuleKey::Locality,
+            ExceptionScope {
+                locality: Some(Locality::ApprovedCloudAllowed),
+                ..ExceptionScope::default()
+            },
+        );
+        // Issued in July and expiring in August, so the grant is valid when it is created (which
+        // `PolicyException::grant` requires) and already expired by the evaluation instant the
+        // `request` helper uses. Setting the expiry before the issue instant would be refused at
+        // grant time instead, which is a different test.
+        expiring.expires_at = UtcTimestamp::parse("2026-08-01T00:00:00Z").expect("valid");
+        let issued_at = UtcTimestamp::parse("2026-07-01T00:00:00Z").expect("valid");
+        service
+            .grant_exception(&context(), &expiring, issued_at, exception_id(8))
+            .await
+            .expect("stored while still valid");
+
+        // The grant is stored, so the refusal below is the expiry doing the work rather than the
+        // grant never having been created.
+        let read = service
+            .exception(&context(), exception_id(8))
+            .await
+            .expect("readable");
+        assert_eq!(read.state_at(at()), ExceptionState::Expired);
+
+        let cloud = [candidate(EndpointClass::ApprovedCloud)];
+        let error = service
+            .evaluate(
+                &context(),
+                PolicyVersionRef {
+                    policy_id: policy_id(),
+                    version: 1,
+                },
+                &request_without_a_locality_floor(&cloud),
+            )
+            .await
+            .expect_err("the expired grant permits nothing");
+        assert_eq!(error.code(), "model.policy_unsatisfied");
+    }
+
+    /// Counts stored exceptions, panicking on a storage fault so an assertion reads plainly.
+    fn exceptions(repositories: &InMemoryRepositories) -> Vec<JarvisPolicyException> {
+        repositories.exceptions().expect("reads")
     }
 
     #[tokio::test]
@@ -617,7 +1155,7 @@ mod tests {
         put(&service, 0, cloud_allowed()).await.expect("creates");
 
         let cloud = [candidate(EndpointClass::ApprovedCloud)];
-        let reference = jarvis_domain::model::policy::PolicyVersionRef {
+        let reference = PolicyVersionRef {
             policy_id: policy_id(),
             version: 1,
         };
@@ -637,7 +1175,7 @@ mod tests {
         // Narrow it, then evaluate again. The same candidates must now be refused, which is what
         // proves the evaluation reads the stored rules rather than anything caller-supplied.
         put(&service, 1, local_only()).await.expect("narrows");
-        let reference = jarvis_domain::model::policy::PolicyVersionRef {
+        let reference = PolicyVersionRef {
             policy_id: policy_id(),
             version: 2,
         };
@@ -674,7 +1212,7 @@ mod tests {
         let error = service
             .evaluate(
                 &context(),
-                jarvis_domain::model::policy::PolicyVersionRef {
+                PolicyVersionRef {
                     policy_id: policy_id(),
                     version: 9,
                 },

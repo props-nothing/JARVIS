@@ -36,8 +36,9 @@ use jarvis_domain::model::policy::PolicyVersionRef;
 use jarvis_domain::run::state::RunState;
 use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
-    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, ModelPolicyRef,
-    NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame, RunView, SseEvent,
+    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
+    MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame,
+    RunView, SseEvent,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, error_response};
@@ -308,6 +309,17 @@ pub async fn cancel_run(
             Err(_) => return invalid_request("The request body is not valid for this endpoint."),
         }
     };
+    // The contract bounds the reason, and `MAX_CANCEL_REASON_BYTES` was declared for exactly
+    // this and **enforced nowhere** — while `MAX_RUN_INPUT_BYTES` is applied one route above it.
+    // A declared bound that nothing checks is the shape where the constant reads as coverage, so
+    // the check lives here rather than being assumed from the constant's existence.
+    //
+    // A NUL byte is refused for the same reason it is refused on the run input: the reason is
+    // stored on a durable event, and a value that truncates at a NUL would be persisted
+    // differently from how it was validated.
+    if reason.is_empty() || reason.len() > MAX_CANCEL_REASON_BYTES || reason.contains('\0') {
+        return invalid_request("The cancellation reason is empty or over the bounded limit.");
+    }
 
     let context = context_for(&client);
     // The status is derived from the state the **service** returns, not from a separate
@@ -508,6 +520,14 @@ fn service_error_response(error: &RunServiceError) -> Response {
         // caller's remedy is to read the policy list, which a generic "no such resource" would
         // not suggest.
         RunServiceError::NotFound | RunServiceError::PolicyNotFound => StatusCode::NOT_FOUND,
+        // The policy is in force and admits no compliant model, so the request cannot be carried
+        // out as sent. **403** rather than 400: the body is well-formed and the caller is
+        // authorized — its workspace's own policy refuses the call — and a 400 would tell a client
+        // its request was malformed, sending it to inspect the payload rather than the rules. It is
+        // the same reasoning the effective-route probe follows in reverse: there a refusal is a
+        // `200` because the probe *asked* what would comply, while here the caller asked for work
+        // to be done and the answer is that this policy forbids it.
+        RunServiceError::PolicyUnsatisfied { .. } => StatusCode::FORBIDDEN,
         RunServiceError::IdempotencyConflict => StatusCode::CONFLICT,
         RunServiceError::Storage(_) | RunServiceError::Controller(_) => {
             StatusCode::INTERNAL_SERVER_ERROR

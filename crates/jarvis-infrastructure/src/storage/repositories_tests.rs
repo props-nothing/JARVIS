@@ -26,7 +26,7 @@ use jarvis_application::repository::run::{
 };
 use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, PrincipalId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
-use jarvis_domain::model::stream::Role;
+use jarvis_domain::model::stream::{FinishReason, Role};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
@@ -234,6 +234,7 @@ fn attempt(id_value: u128, attempt_number: u32, logical: ModelCallId) -> NewMode
         logical_call_id: logical,
         attempt: attempt_number,
         model: model(),
+        route_decision: None,
         request_fingerprint: None,
         started_at: now(),
     }
@@ -391,10 +392,16 @@ async fn concurrent_transitions_on_one_run_never_fail_with_a_storage_fault() {
     // Exactly one can win; the rest must be typed version conflicts. The count is four
     // because that is `MAX_POOL_CONNECTIONS`: more writers than connections would queue
     // on the pool and reduce the overlap this test exists to create.
+    //
+    // The targets are all **non-terminal**, and that is the difference between this test failing
+    // and flaking: a writer that won with a terminal target would leave the run terminal, and every
+    // later writer would then correctly report `jarvis.run_already_terminal` — a rule, not the lock
+    // contention this test is about. Including `Cancelled` or `Failed` here made the outcome depend
+    // on which writer won the race, which is the one thing this test must not do.
     let targets = [
         RunState::ContextBuilding,
-        RunState::Cancelled,
-        RunState::Failed,
+        RunState::ContextBuilding,
+        RunState::ContextBuilding,
         RunState::ContextBuilding,
     ];
     let mut handles = Vec::new();
@@ -1124,6 +1131,54 @@ async fn a_model_call_attempt_records_and_loads() {
 }
 
 #[tokio::test]
+async fn a_call_records_the_route_decision_that_authorized_it() {
+    // The column `model_calls.route_decision_id` was in the schema, was selected by the read
+    // query, and had **no writer** — a call permitted by a decision and one made with no policy
+    // were indistinguishable. This proves both directions through the real adapter: the bound
+    // value lands in the column and the same read returns it, so the write and the read agree.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let decision_id = ModelRouteDecisionId::from_uuid(id(501));
+    let mut routed = attempt(7, 1, logical_call_id());
+    routed.route_decision = Some(decision_id);
+    repositories.record_attempt(routed).await.expect("records");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert_eq!(
+        call.route_decision,
+        Some(decision_id),
+        "the decision must round-trip through the column",
+    );
+}
+
+#[tokio::test]
+async fn a_call_with_no_route_decision_reads_back_without_one() {
+    // The other direction, and the one a ceiling-style check must not misread: a call made with
+    // no policy in force is a different fact from one permitted by a decision, so an absent
+    // authorization must come back absent rather than as a fabricated identifier.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert!(
+        call.route_decision.is_none(),
+        "an unpoliced call must not appear to have been authorized",
+    );
+}
+
+#[tokio::test]
 async fn a_retry_is_a_new_attempt_of_the_same_logical_call() {
     // The distinction the retry-ownership rule depends on: retrying reuses the
     // logical identity and gets a new attempt number, and the first attempt's
@@ -1714,7 +1769,10 @@ async fn a_run_budget_and_deadline_round_trip_through_real_columns() {
                 principal(),
                 Some("objective-1".to_owned()),
                 now(),
-                budget,
+                // Cloned because `RunBudget` owns a routed model and is no longer `Copy`: the
+                // fixture compares the stored value against this one afterwards, which is the
+                // assertion that makes the round-trip meaningful.
+                budget.clone(),
             )
             .expect("valid"),
             run_received_event(run_id(), now()),
@@ -1827,6 +1885,7 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
             logical_call_id: call_id,
             attempt: 1,
             model: model(),
+            route_decision: None,
             request_fingerprint: None,
             started_at: now(),
         })
@@ -1852,7 +1911,7 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
                 continuation_ref: None,
                 usage: Some(usage.clone()),
                 estimated_cost_microunits: usage.estimated_cost_microunits,
-                finish_reason: Some(jarvis_domain::model::stream::FinishReason::Stop),
+                finish_reason: Some(FinishReason::Stop),
                 error_code: None,
                 first_output_at: None,
                 completed_at: Some(now()),
@@ -1893,6 +1952,76 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
 }
 
 #[tokio::test]
+async fn a_call_records_the_finish_reason_it_was_completed_with() {
+    // The column was in the schema, was bound by `record_outcome`, and was named by **no**
+    // `SELECT` — while `StoredModelCall` had no field for it. So the write and the read did not
+    // agree about a column that existed, which is the shape that survives every test in between:
+    // asserting the bind alone would pass while nothing could ever read the value back.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+
+    let mut completed = outcome(ModelCallState::Completed, Some(now()));
+    completed.finish_reason = Some(FinishReason::Length);
+    repositories
+        .record_outcome(workspace(), model_call_id(), completed)
+        .await
+        .expect("records the outcome");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert_eq!(
+        call.finish_reason,
+        Some(FinishReason::Length),
+        "the finish reason must round-trip through the column",
+    );
+
+    // And the same value comes back from the chain read, so the two `SELECT`s agree. One of them
+    // selecting the column and the other not is exactly how a value becomes readable from one
+    // accessor and `Corrupted` from the other.
+    let chain = repositories
+        .load_attempts(workspace(), logical_call_id())
+        .await
+        .expect("loads the chain");
+    assert_eq!(chain.len(), 1, "{chain:?}");
+    assert_eq!(chain[0].finish_reason, Some(FinishReason::Length));
+}
+
+#[tokio::test]
+async fn a_call_with_no_finish_reason_reads_back_without_one() {
+    // The other direction: a call that reached no finish reports nothing, because reporting a
+    // reason would describe a provider decision that was never made.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+    repositories
+        .record_outcome(
+            workspace(),
+            model_call_id(),
+            outcome(ModelCallState::Completed, Some(now())),
+        )
+        .await
+        .expect("records the outcome");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert!(
+        call.finish_reason.is_none(),
+        "an absent finish reason must stay absent rather than defaulting to one",
+    );
+}
+
+#[tokio::test]
 async fn a_call_with_no_reported_usage_stores_no_block_and_no_cost() {
     // The negative direction, and the one a ceiling must not misread: an unreported usage is
     // absent, never a measured zero, so a ceiling cannot be checked against it.
@@ -1907,6 +2036,7 @@ async fn a_call_with_no_reported_usage_stores_no_block_and_no_cost() {
             logical_call_id: call_id,
             attempt: 1,
             model: model(),
+            route_decision: None,
             request_fingerprint: None,
             started_at: now(),
         })
@@ -2746,4 +2876,391 @@ async fn a_route_decision_survives_the_policy_version_it_named() {
         .expect("an archived policy still explains the decision");
     assert_eq!(stored.policy.policy_id, policy_id());
     assert_eq!(stored.policy.version, 1);
+}
+
+// ---------------------------------------------------------------------------
+//
+// The policy **exception** lifecycle. Four properties are storage rather than domain ones and
+// are proved here against a real migrated database: a grant is write-once, revocation and
+// consumption are state changes rather than deletes, consumption is at most once under
+// contention, and the scope survives the round trip. The domain can state each rule, but only
+// the primary key, the conditional `UPDATE`, and the `scope_json` column make them true.
+
+use jarvis_application::repository::policy::JarvisPolicyException;
+use jarvis_domain::ids::PolicyExceptionId;
+use jarvis_domain::model::exception::{
+    ExceptionScope, ExceptionState, NewPolicyException, PolicyRuleKey, RequiredAssurance,
+};
+
+/// An exception id distinct from the other fixtures' ids.
+fn exception_id() -> PolicyExceptionId {
+    PolicyExceptionId::from_uuid(id(710))
+}
+
+/// A grant of `rule` with `scope`, issued before and expiring after `now()`.
+fn granted_exception(
+    rule: PolicyRuleKey,
+    scope: ExceptionScope,
+    single_use: bool,
+) -> JarvisPolicyException {
+    JarvisPolicyException::grant(NewPolicyException {
+        id: exception_id(),
+        workspace_id: workspace(),
+        policy: PolicyVersionRef {
+            policy_id: policy_id(),
+            version: 1,
+        },
+        granting_principal_id: PrincipalId::from_uuid(id(711)),
+        // Elevated, so a locality grant is not refused by the step-up rule — that rule has its own
+        // tests in the domain crate, and repeating it here would test the domain through a database.
+        granting_assurance: RequiredAssurance::Elevated,
+        rule,
+        scope,
+        reason_ref: "operator approved".to_owned(),
+        single_use,
+        issued_at: UtcTimestamp::parse("2026-01-01T00:00:00Z").expect("valid"),
+        expires_at: UtcTimestamp::parse("2027-01-01T00:00:00Z").expect("valid"),
+    })
+    .expect("a waivable rule with a bounded reason is grantable")
+}
+
+#[tokio::test]
+async fn a_policy_exception_round_trips_with_its_scope_and_assurance() {
+    // The stored scope is re-parsed through the domain type on every read, so this asserts the two
+    // representations are interchangeable. A row this build cannot reinterpret is reported as
+    // corruption rather than passed along, which is the property the parse makes possible.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            provider_id: Some("openai".to_owned()),
+            region: Some(jarvis_domain::model::identity::Region::parse("eu").expect("valid")),
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        true,
+    );
+    repositories
+        .grant_exception(workspace(), exception.clone())
+        .await
+        .expect("the grant is stored");
+
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("the grant reads back");
+    assert_eq!(stored, exception);
+    assert_eq!(stored.scope.provider_id.as_deref(), Some("openai"));
+    assert_eq!(
+        stored.scope.locality,
+        Some(Locality::PrivateNetworkAllowed),
+        "the scope's locality survives the round trip",
+    );
+    assert!(stored.single_use);
+    assert_eq!(stored.required_assurance, RequiredAssurance::Elevated);
+    assert_eq!(
+        stored.state_at(now()),
+        ExceptionState::Issued,
+        "a fresh grant with a future expiry is usable",
+    );
+}
+
+#[tokio::test]
+async fn an_exception_identity_is_write_once() {
+    // An exception is the one record that *relaxes* a rule, so a second write at the same identity
+    // is a conflict rather than a replacement: overwriting would rewrite, after the fact, what a
+    // past decision was permitted by. The assertion reads the ORIGINAL back, because an error alone
+    // does not prove nothing changed.
+    let (_database, repositories) = repository().await;
+    let original = granted_exception(
+        PolicyRuleKey::MaximumProviderRetention,
+        ExceptionScope::default(),
+        false,
+    );
+    repositories
+        .grant_exception(workspace(), original.clone())
+        .await
+        .expect("stored once");
+
+    let mut replacement = original.clone();
+    replacement.rule = PolicyRuleKey::ProviderTrainingUse;
+    let error = repositories
+        .grant_exception(workspace(), replacement)
+        .await
+        .expect_err("an exception is write-once");
+    assert_eq!(error.code(), "storage.conflict");
+
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("the original reads back");
+    assert_eq!(
+        stored.rule,
+        PolicyRuleKey::MaximumProviderRetention,
+        "the refused write must not have replaced the grant",
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_exception_is_a_state_rather_than_a_removal() {
+    // The contract requires an exception to remain explainable after it stops being usable, so a
+    // revocation is an instant rather than a delete. Reading it back and observing a non-null
+    // `revoked_at` is what proves the record survived — asserting only that the operation
+    // succeeded would pass against a store that deleted the row.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        false,
+    );
+    repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("stored");
+
+    let revoked_at = now();
+    repositories
+        .revoke_exception(workspace(), exception_id(), revoked_at)
+        .await
+        .expect("revocation succeeds");
+
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("the revoked grant is still readable");
+    assert_eq!(stored.revoked_at, Some(revoked_at));
+    assert_eq!(stored.state_at(now()), ExceptionState::Revoked);
+    assert!(
+        !stored.is_usable_at(now()),
+        "a revoked exception permits nothing",
+    );
+
+    // Re-revoking is idempotent and keeps the FIRST instant, because the second would rewrite when
+    // the decision was actually taken.
+    let later = UtcTimestamp::parse("2026-06-01T00:00:00Z").expect("valid");
+    repositories
+        .revoke_exception(workspace(), exception_id(), later)
+        .await
+        .expect("re-revoking is not an error");
+    let again = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("readable");
+    assert_eq!(
+        again.revoked_at,
+        Some(revoked_at),
+        "the first revocation instant is kept",
+    );
+}
+
+#[tokio::test]
+async fn a_single_use_exception_can_be_consumed_only_once() {
+    // The conditional `UPDATE` is the guard, so this proves the store refuses a second consumption
+    // rather than merely the domain refusing a second *check*. Both halves are asserted: the first
+    // consumption succeeds and the second is a conflict, because a store that refused both would
+    // also pass a test that only checked the refusal.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        true,
+    );
+    repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("stored");
+
+    let consumed_at = now();
+    repositories
+        .consume_exception(workspace(), exception_id(), consumed_at)
+        .await
+        .expect("the first consumption succeeds");
+
+    let error = repositories
+        .consume_exception(workspace(), exception_id(), consumed_at)
+        .await
+        .expect_err("a single-use grant is consumed at most once");
+    assert_eq!(error.code(), "storage.conflict");
+
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("readable");
+    assert_eq!(stored.consumed_at, Some(consumed_at));
+    assert_eq!(stored.state_at(now()), ExceptionState::Consumed);
+    assert!(!stored.is_usable_at(now()));
+}
+
+#[tokio::test]
+async fn a_consumed_exception_cannot_then_be_revoked() {
+    // The two are different decisions, and accepting both would record a revocation that prevented
+    // nothing — a grant already spent cannot be un-spent. The conflict is reported rather than
+    // silently succeeding, so a caller that revoked a spent grant is told its action had no effect.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        true,
+    );
+    repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("stored");
+    repositories
+        .consume_exception(workspace(), exception_id(), now())
+        .await
+        .expect("consumed");
+
+    let error = repositories
+        .revoke_exception(workspace(), exception_id(), now())
+        .await
+        .expect_err("a spent grant cannot be revoked");
+    assert_eq!(error.code(), "storage.conflict");
+
+    // And the record is still reported as consumed rather than revoked, so the reason it is
+    // unusable is not overwritten by the refused call.
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("readable");
+    assert_eq!(stored.state_at(now()), ExceptionState::Consumed);
+    assert!(stored.revoked_at.is_none());
+}
+
+#[tokio::test]
+async fn a_repeatable_exception_is_left_untouched_by_a_consume() {
+    // The `single_use = 1` predicate in the guard, and the half a store that stamped
+    // `consumed_at` unconditionally would get wrong. Consuming a repeatable grant is a **no-op
+    // reported as success**, not a conflict: the caller's grant is intact and still usable, and
+    // recording a consumption instant on it would make a later reader report a grant that is in
+    // force as spent.
+    //
+    // The success half matters as much as the timestamp half. Returning `Conflict` here would tell
+    // a caller its standing grant was gone when nothing had happened to it, which is the false
+    // refusal direction — the same class as reporting a stale view when the write never landed.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        false,
+    );
+    repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("stored");
+
+    repositories
+        .consume_exception(workspace(), exception_id(), now())
+        .await
+        .expect("consuming a repeatable grant is a no-op, not a failure");
+
+    let stored = repositories
+        .load_exception(workspace(), exception_id())
+        .await
+        .expect("readable");
+    assert!(
+        stored.consumed_at.is_none(),
+        "a repeatable grant must not be stamped consumed",
+    );
+    assert_eq!(
+        stored.state_at(now()),
+        ExceptionState::Issued,
+        "and it stays usable",
+    );
+    // Idempotent for the same reason: the second consume finds the same non-single-use row.
+    repositories
+        .consume_exception(workspace(), exception_id(), now())
+        .await
+        .expect("and remains a no-op however often it is asked");
+}
+
+#[tokio::test]
+async fn a_revoked_exception_cannot_be_consumed() {
+    // The mirror of the case above, and the one that would waste a call: consuming a revoked grant
+    // would report a use that was never permitted.
+    let (_database, repositories) = repository().await;
+    let exception = granted_exception(
+        PolicyRuleKey::Locality,
+        ExceptionScope {
+            locality: Some(Locality::PrivateNetworkAllowed),
+            ..ExceptionScope::default()
+        },
+        true,
+    );
+    repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("stored");
+    repositories
+        .revoke_exception(workspace(), exception_id(), now())
+        .await
+        .expect("revoked");
+
+    let error = repositories
+        .consume_exception(workspace(), exception_id(), now())
+        .await
+        .expect_err("a revoked grant cannot be consumed");
+    assert_eq!(error.code(), "storage.conflict");
+}
+
+#[tokio::test]
+async fn listing_exceptions_is_scoped_and_bounded() {
+    // The scope is a query predicate rather than a post-filter, so another workspace's grant must
+    // be indistinguishable from an absent one — the same rule every other store follows. The bound
+    // is asserted because `list_exceptions` is read on the route path, and a workspace with enough
+    // grants to exceed it must be told rather than handed a silently shortened list.
+    let (_database, repositories) = repository().await;
+
+    // One grant in this workspace.
+    repositories
+        .grant_exception(
+            workspace(),
+            granted_exception(
+                PolicyRuleKey::Locality,
+                ExceptionScope {
+                    locality: Some(Locality::PrivateNetworkAllowed),
+                    ..ExceptionScope::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("stored");
+
+    let listed = repositories
+        .list_exceptions(workspace())
+        .await
+        .expect("the workspace's grants are listed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, exception_id());
+
+    // A second workspace sees none of them.
+    let other_workspace = WorkspaceId::from_uuid(id(712));
+    let foreign = repositories
+        .list_exceptions(other_workspace)
+        .await
+        .expect("a workspace with no grants lists none");
+    assert!(
+        foreign.is_empty(),
+        "another workspace's grants must be invisible",
+    );
+    assert_eq!(
+        repositories
+            .load_exception(other_workspace, exception_id())
+            .await
+            .expect_err("a foreign grant is not readable"),
+        RepositoryError::NotFound,
+    );
 }

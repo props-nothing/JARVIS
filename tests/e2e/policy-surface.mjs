@@ -569,7 +569,78 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
-    // 11. The daemon is still healthy after the policy surface ran.
+    // 11. A real run is governed by the policy in force, not only the probe.
+    //
+    // This is the check this section exists for, and it is here rather than in a unit test
+    // because the defect it closes was a **composition** gap: the daemon built its run ports
+    // with `policies: None`, so every handler test passed and the diagnostic probe answered
+    // correctly while a real run recorded no policy and routed to `models().first()`.
+    //
+    // Version 2 in force from section 6 carries `maximum_sensitivity: "confidential"`, which is
+    // above the objective's own `internal` label — so a create must **succeed** and the daemon
+    // must have selected and recorded a route. The narrowing direction is then proven by the
+    // version-3 write below, whose `public` ceiling must refuse the same create with `403`.
+    // ---------------------------------------------------------------------
+    const governed = await request(
+      record,
+      credential,
+      "POST",
+      "/api/v1/runs",
+      {
+        input: { type: "text", text: "does a real run see the policy" },
+        runtime: "jarvis-native",
+      },
+      { "Idempotency-Key": idempotencyKey("run-1") },
+    );
+    if (governed.status !== 202) {
+      fail(`a run under a permitting policy must be accepted, got ${governed.status}`, governed.text);
+    } else if (typeof governed.json?.run_id !== "string") {
+      fail("the accepted run must name its identifier", governed.text);
+    } else {
+      pass("a run is created under the active policy and answers 202");
+    }
+
+    // Narrow the ceiling to `public`, below the objective's `internal` label, so the same create
+    // can only be carried out by a route no candidate satisfies. Written as version 3 because
+    // version 2 is in force.
+    const narrowing = await request(
+      record,
+      credential,
+      "PUT",
+      "/api/v1/model-data-policy",
+      { ...policyBody(2, "local_only"), rules: { ...policyBody(2, "local_only").rules, maximum_sensitivity: "public" } },
+      { "Idempotency-Key": idempotencyKey("policy-5") },
+    );
+    if (narrowing.status !== 200 || narrowing.json?.version !== 3) {
+      fail(`the narrowing write must create version 3, got ${narrowing.status}`, narrowing.text);
+    } else {
+      pass("the ceiling was narrowed to public as version 3");
+    }
+
+    const refused = await request(
+      record,
+      credential,
+      "POST",
+      "/api/v1/runs",
+      {
+        input: { type: "text", text: "this objective is internal" },
+        runtime: "jarvis-native",
+      },
+      { "Idempotency-Key": idempotencyKey("run-2") },
+    );
+    if (refused.status !== 403) {
+      fail(
+        `a policy that admits no compliant route must refuse the create, got ${refused.status}`,
+        refused.text,
+      );
+    } else if (refused.json?.error?.code !== "model.policy_unsatisfied") {
+      fail("the refusal must carry the contract's model.policy_unsatisfied code", refused.text);
+    } else {
+      pass("a create above the ceiling is refused with 403 model.policy_unsatisfied");
+    }
+
+    // ---------------------------------------------------------------------
+    // 12. The daemon is still healthy after the policy surface ran.
     //
     // Cheap, but it is the check that catches a handler that panics in a way the router
     // converted into a response: the process would still be alive and the next probe would

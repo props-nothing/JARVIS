@@ -37,10 +37,11 @@ use jarvis_application::repository::run::{
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
-    ConversationId, MessageId, ModelCallId, PrincipalId, RunActivityEventId, RunId, WorkspaceId,
+    ConversationId, MessageId, ModelCallId, ModelRouteDecisionId, PrincipalId, RunActivityEventId,
+    RunId, WorkspaceId,
 };
 use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
-use jarvis_domain::model::stream::Role;
+use jarvis_domain::model::stream::{FinishReason, Role};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::{RunState, RunVersion};
 use jarvis_domain::time::UtcTimestamp;
@@ -1219,6 +1220,30 @@ fn stored_model_call(row: &sqlx::sqlite::SqliteRow) -> Result<StoredModelCall, R
                 })
             })
             .transpose()?,
+        route_decision: opt_text(row, "route_decision_id")?
+            .map(|value| {
+                ModelRouteDecisionId::parse(&value).map_err(|_| RepositoryError::Corrupted {
+                    column: "route_decision_id",
+                })
+            })
+            .transpose()?,
+        // The finish reason is stored as the domain type's own JSON, and a value this build
+        // cannot reinterpret is `Corrupted` rather than absent: reporting it absent would say the
+        // provider reported nothing, when the truth is that JARVIS wrote something it can no
+        // longer read. That is the same rule the policy rules column follows.
+        // The finish reason is stored as the domain type's own JSON, and a value this build
+        // cannot reinterpret is `Corrupted` rather than absent: reporting it absent would say the
+        // provider reported nothing, when the truth is that JARVIS wrote something it can no
+        // longer read. That is the same rule the policy rules column follows.
+        finish_reason: opt_text(row, "finish_reason")?
+            .map(|value| {
+                serde_json::from_str::<FinishReason>(&value).map_err(|_| {
+                    RepositoryError::Corrupted {
+                        column: "finish_reason",
+                    }
+                })
+            })
+            .transpose()?,
         state: jarvis_application::repository::model_call::ModelCallState::parse(&text(
             row, "state",
         )?)?,
@@ -1238,7 +1263,7 @@ impl ModelCallRepository for SqliteRepositories {
                      id, workspace_id, run_id, step_id, logical_call_id, attempt, \
                      provider_id, model_id, model_revision, route_decision_id, state, \
                      request_fingerprint, started_at\
-                 ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, 'pending', ?, ?)",
+                 ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             )
             .bind(call.id.to_string())
             .bind(call.workspace_id.to_string())
@@ -1248,6 +1273,11 @@ impl ModelCallRepository for SqliteRepositories {
             .bind(call.model.provider_id.to_string())
             .bind(call.model.model_id.to_string())
             .bind(call.model.revision.as_ref().map(ToString::to_string))
+            // The route decision this call was authorized under, or `NULL` when no policy was in
+            // force. Bound rather than left as the literal `NULL` it used to be: the column
+            // existed and had no writer, so a call permitted by a decision and one made with no
+            // policy were indistinguishable.
+            .bind(call.route_decision.map(|decision| decision.to_string()))
             .bind(call.request_fingerprint.as_deref())
             .bind(call.started_at.to_string())
             .execute(&self.pool)
@@ -1276,7 +1306,8 @@ impl ModelCallRepository for SqliteRepositories {
         Box::pin(async move {
             let row = sqlx::query(
                 "SELECT id, run_id, logical_call_id, attempt, provider_id, model_id, \
-                        model_revision, state, provider_request_id, started_at, completed_at \
+                        model_revision, route_decision_id, finish_reason, state, \
+                        provider_request_id, started_at, completed_at \
                  FROM model_calls WHERE workspace_id = ? AND id = ?",
             )
             .bind(workspace.to_string())
@@ -1378,7 +1409,8 @@ impl ModelCallRepository for SqliteRepositories {
         Box::pin(async move {
             let rows = sqlx::query(
                 "SELECT id, run_id, logical_call_id, attempt, provider_id, model_id, \
-                        model_revision, state, provider_request_id, started_at, completed_at \
+                        model_revision, route_decision_id, finish_reason, state, \
+                        provider_request_id, started_at, completed_at \
                  FROM model_calls WHERE workspace_id = ? AND logical_call_id = ? \
                  ORDER BY attempt ASC",
             )
@@ -1413,6 +1445,9 @@ mod tests;
 
 #[path = "repositories/policy.rs"]
 mod policy_store;
+
+#[path = "repositories/exception.rs"]
+mod exception_store;
 
 /// Rebuilds a [`ModelRef`] from its stored parts.
 ///

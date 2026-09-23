@@ -17,7 +17,7 @@ pub use policy::{
     PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
 };
 pub use run::{
-    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_RUN_INPUT_BYTES, ModelPolicyRef,
-    NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame, RunInput, RunLinks, RunView, SseEvent,
-    event_type,
+    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
+    MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame,
+    RunInput, RunLinks, RunView, SseEvent, event_type,
 };

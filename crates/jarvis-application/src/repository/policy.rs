@@ -192,4 +192,116 @@ pub trait ModelDataPolicyRepository: Send + Sync {
         workspace: WorkspaceId,
         decision_id: jarvis_domain::ids::ModelRouteDecisionId,
     ) -> RepositoryFuture<'_, ModelRouteDecision>;
+
+    /// Grants a durable exception.
+    ///
+    /// The write is a plain `INSERT` behind the primary key, so a duplicate identity is a
+    /// conflict rather than a replacement. That matters because an exception is the one record
+    /// that *relaxes* a rule: rewriting one in place would change, after the fact, what a past
+    /// decision was permitted by — the same reason a policy version and a route decision are
+    /// both insert-only here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Conflict`] when the identity already exists, and
+    /// [`RepositoryError::Query`] for a driver failure. The record's own rules — a waivable rule,
+    /// a bounded reason, a step-up requirement that was met — are enforced by
+    /// [`PolicyException::grant`], so this method cannot be handed an invalid one; a record read
+    /// from a database written by another build is re-validated on the way out instead.
+    fn grant_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception: JarvisPolicyException,
+    ) -> RepositoryFuture<'_, ()>;
+
+    /// Reads one exception, scoped to `workspace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] when it is absent or owned by another workspace —
+    /// indistinguishable by design — and [`RepositoryError::Corrupted`] when the stored scope or
+    /// rule key cannot be read back as the domain type. The second is deliberately not
+    /// `NotFound`: reporting an unreadable row as absent would let a caller grant a second
+    /// exception for a rule that already has one.
+    fn load_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+    ) -> RepositoryFuture<'_, JarvisPolicyException>;
+
+    /// Reads every exception a workspace holds, whether or not it is still usable.
+    ///
+    /// All of them rather than only the usable ones, because usability is a question about an
+    /// *instant* and the caller is the one that knows it — this selection happens at the decision
+    /// instant, and recovery or a diagnostics read may ask about a different one. The store's job
+    /// is to return what was written, and [`JarvisPolicyException::is_usable_at`] is the single
+    /// predicate that answers the other question.
+    ///
+    /// Bounded by [`MAX_EXCEPTIONS_PER_WORKSPACE`], because a caller reads this list on the route
+    /// path and an unbounded read would let a workspace accumulate enough grants to make every
+    /// selection expensive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Corrupted`] when a stored scope or rule key cannot be read back,
+    /// and [`RepositoryError::Query`] for a driver failure.
+    fn list_exceptions(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<JarvisPolicyException>>;
+
+    /// Records that an exception was revoked at `at`.
+    ///
+    /// A state change rather than a delete, so the record survives to explain why a past call was
+    /// permitted. Re-revoking is idempotent: the first instant is kept, because the second would
+    /// rewrite when the decision was actually taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] when it is absent or foreign, and
+    /// [`RepositoryError::Conflict`] when it was already **consumed** — a used single-use grant
+    /// cannot also be revoked, because the two are different decisions and accepting both would
+    /// record a revocation that did not prevent anything.
+    fn revoke_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()>;
+
+    /// Records that a single-use exception was consumed at `at`.
+    ///
+    /// The **conditional** update is the guard: `consumed_at IS NULL AND revoked_at IS NULL` is
+    /// part of the statement rather than a pre-read, so two concurrent calls cannot both consume
+    /// one grant. A pre-read followed by an unconditional write is the shape that lets both
+    /// succeed and reports a single-use exception as used twice.
+    ///
+    /// **Only a single-use grant is affected.** `single_use = 1` is part of the same predicate, so
+    /// consuming a repeatable grant is a no-op reported as success rather than an error or a
+    /// stamp: the caller's grant is intact and still usable, and recording a consumption instant
+    /// on it would make a later reader report a grant in force as spent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] when it is absent or foreign, and
+    /// [`RepositoryError::Conflict`] when it was already consumed or revoked — the caller's
+    /// grant is gone, which is a fact it must not be told succeeded.
+    fn consume_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: jarvis_domain::ids::PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()>;
 }
+
+/// The most exceptions one workspace read may return.
+///
+/// Bounded because [`ModelDataPolicyRepository::list_exceptions`] is read on the route path: an
+/// unbounded list would let a workspace accumulate enough grants to make every selection
+/// expensive, and a real workspace holds a handful. Exceeding it is reported as
+/// [`RepositoryError::Conflict`] rather than truncating, because a silently shortened list would
+/// drop a grant that an operator believes is in force.
+pub const MAX_EXCEPTIONS_PER_WORKSPACE: usize = 256;
+
+/// The domain exception type, under a local alias that keeps the port's signatures readable.
+pub use jarvis_domain::model::exception::PolicyException as JarvisPolicyException;

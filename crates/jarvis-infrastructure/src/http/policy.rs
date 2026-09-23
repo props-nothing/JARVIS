@@ -359,7 +359,15 @@ pub async fn read_effective_route(
             // No required capabilities: nothing measures them yet (`BRN-011`), and requiring one
             // would refuse every candidate on an evidence gap rather than on a policy decision.
             required_capabilities: std::collections::BTreeSet::new(),
-            locality: active.rules.locality,
+            // **No locality floor**, deliberately, even though the policy's own locality is right
+            // here. The requirement and the rule are different quantities: `rules.locality` is a
+            // *ceiling* over what a route may use, while `requirements.locality` is a *floor* the
+            // call must not go below. Setting the floor from the ceiling makes the two the same
+            // value and the floor redundant — and it defeats a locality exception, because the
+            // selector relaxes the ceiling and cannot relax a floor the caller stated. The policy
+            // is what should constrain a diagnostic probe, so the floor is left at the most
+            // permissive value and `evaluate` refuses on the rule.
+            locality: Locality::ApprovedCloudAllowed,
         },
         today,
         decided_at,
@@ -453,6 +461,7 @@ fn rejection_reason_of(reason: jarvis_domain::model::policy::RejectionReason) ->
         RejectionReason::CapabilityUnattested => "capability_unattested",
         RejectionReason::EvidenceStale => "evidence_stale",
         RejectionReason::EvidenceMissing => "evidence_missing",
+        RejectionReason::SensitivityExceedsPolicy => "sensitivity_exceeds_policy",
     }
 }
 
@@ -651,8 +660,9 @@ fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response 
 /// day and the instant describe different moments.
 #[must_use]
 pub fn evaluation_instant(now: UtcTimestamp) -> (IsoDate, UtcTimestamp) {
-    let day = now.as_timestamp().to_zoned(jiff::tz::TimeZone::UTC).date();
-    (IsoDate::from_date(day), now)
+    // The conversion lives in the domain, because deriving a date needs `jiff`'s zone handling and
+    // this crate's callers should not each reach for it.
+    (now.utc_date(), now)
 }
 
 #[cfg(test)]
@@ -793,6 +803,10 @@ mod tests {
             ),
             (RejectionReason::EvidenceStale, "evidence_stale"),
             (RejectionReason::EvidenceMissing, "evidence_missing"),
+            (
+                RejectionReason::SensitivityExceedsPolicy,
+                "sensitivity_exceeds_policy",
+            ),
         ] {
             let code = rejection_reason_of(value);
             assert_eq!(code, expected);

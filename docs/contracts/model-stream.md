@@ -10,6 +10,10 @@ Lifecycle: DRAFT
 {
   "call_id": "019...",
   "run_id": "019...",
+  "model": {
+    "provider_id": "local.ollama",
+    "model_id": "llama3.1"
+  },
   "route_requirements": {
     "modalities": ["text"],
     "required_capabilities": ["tool_calling"],
@@ -26,6 +30,15 @@ Lifecycle: DRAFT
   }
 }
 ```
+
+`model` is **required**, and it is a routed selection rather than a preference: the model data
+policy's selector chose it, so an adapter asked to serve a different one must refuse rather than
+substitute. A request that named no model would leave the policy constraining the *record* and not
+the call — the adapter would answer with whatever it defaults to, and the `model_calls` row would
+name the routed model while a different one served it. `route_requirements.locality` is the
+**floor** the call must not go below; it is not a second way to ask for a model, and a policy
+exception can relax the policy's own ceiling without relaxing this. An optional revision pins an
+immutable version when the provider publishes one.
 
 `route_requirements` names **the same vocabulary the capability inventory attests**:
 `required_capabilities` holds `Capability` values and `locality` holds the `Locality` the
@@ -213,6 +226,13 @@ not a struct, so an adapter in another crate can implement it.
 | late frames reach the state machine | the transport does not swallow frames after a terminal | `frames_after_a_terminal_are_still_delivered_to_the_state_machine` |
 | a replayed sequence and a foreign call are refused | `ScriptStep::Raw` reproduces a frame the provider itself could not produce | `a_scripted_duplicate_sequence_is_refused_by_the_state_machine`, `a_scripted_frame_for_another_call_is_refused_by_the_state_machine` |
 | the trusted request identity reaches the adapter | the start frame's provider metadata echoes the server-derived request id | `the_trusted_request_identity_reaches_the_adapter` |
+| the call names the model it must be served by | `ModelCallRequest::model` is a required `ModelRef` and the contract's own example carries it | `the_contracts_request_example_parses_as_the_normalized_request`, `the_contract_requires_the_call_to_name_its_model` |
+| an adapter cannot substitute its own default model | the provider port refuses any model it does not serve with `model.provider_no_route` | `a_request_naming_a_model_the_provider_does_not_serve_is_refused`; removing the check lets `fixture-withdrawn` serve the call |
+| the stream reports the model that was asked for | the start frame echoes `request.model` rather than the provider's first served model | `the_start_frame_names_the_requested_model_rather_than_the_first_served_one` |
+| the routed model is what the controller sends | `RunController::build_request` sets it from the run's stored route | `the_request_names_the_routed_model_so_the_provider_cannot_substitute` |
+| the finish reason the provider reported is recorded on the call | the terminal frame's reason is captured on the drained turn and written with the outcome, then read back | `the_finish_reason_the_provider_reported_is_recorded_on_the_call`, `a_call_records_the_finish_reason_it_was_completed_with`; removing the capture records `None` for a `Length` stop, and removing the adapter's parse makes the column unreadable |
+| an unmodelled provider reason stays visible | `FinishReason::Other` retains the raw provider value rather than mapping it to `Stop` | `an_unmodelled_finish_reason_is_recorded_rather_than_flattened` |
+| usage and a finish reason on one terminal are both recorded | one `call.completed` arm captures both, because two arms would let the first match win | `the_usage_on_a_terminal_frame_and_its_finish_reason_are_both_recorded` |
 | a failure is retryable in exactly one place | `ProviderError::retryable` is the only decider | `only_transient_failures_are_retryable` |
 | an adapter outside this crate can implement the port | the returned stream is a trait, and the test defines one without module internals | `an_adapter_can_implement_the_port_without_this_modules_internals` |
 

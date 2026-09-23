@@ -14,7 +14,7 @@ use jarvis_domain::clock::ManualClock;
 use jarvis_domain::ids::{
     ConversationId, CorrelationId, PrincipalId, RequestId, RunId, WorkspaceId,
 };
-use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
+use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
@@ -514,6 +514,126 @@ async fn a_repeated_cancel_is_idempotent_and_signals_nothing_extra() {
 }
 
 #[tokio::test]
+async fn two_cancels_whose_reasons_differ_are_different_requests() {
+    // The defect: the cancel digest was `format!("cancel:{}", reason.len())`, which folds only the
+    // reason's **length**. Two reasons of equal length were therefore the *same* request, so a
+    // caller reusing an idempotency key across two runs with `"user_requested"` and
+    // `"timeout_detected"` (both 14 bytes) was told its second cancel was a replay of the first —
+    // and because a replayed cancel is a no-op by design, the second run was **never signalled**.
+    //
+    // A digest that cannot distinguish the inputs it claims to identify is worse than none: the
+    // caller receives a confident and wrong answer, and the run it asked to stop keeps going.
+    let fixture = fixture();
+    let first = create(&fixture, "hello", "key-1").await;
+    let second = create(&fixture, "hello again", "key-2").await;
+
+    // Deliberately the same length and different content.
+    let one = "user_requested";
+    let other = "timeout_reason";
+    assert_eq!(
+        one.len(),
+        other.len(),
+        "the fixture is only meaningful if the lengths match",
+    );
+
+    let key = "shared-cancel-key";
+    let reported = fixture
+        .service
+        .cancel(&context(), first.run_id, one, key)
+        .await
+        .expect("the first cancel is accepted");
+    assert_eq!(reported, RunState::Received);
+
+    // The second is a *different* request, so it must be accepted and signalled rather than being
+    // reported as a replay of the first.
+    let error = fixture
+        .service
+        .cancel(&context(), second.run_id, other, key)
+        .await
+        .expect_err("a different reason under one key is a conflict, not a replay");
+    assert_eq!(
+        error,
+        RunServiceError::IdempotencyConflict,
+        "the digest must distinguish the two reasons, which it cannot by length alone",
+    );
+
+    // And with its own key it is accepted and the second run really is cancelled.
+    fixture
+        .service
+        .cancel(&context(), second.run_id, other, "second-key")
+        .await
+        .expect("accepted under its own key");
+    fixture.spawner.run_all().await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), second.run_id)
+        .await
+        .expect("loads");
+    assert_eq!(
+        stored.state,
+        RunState::Cancelled,
+        "the run whose cancel was refused must still be cancellable",
+    );
+}
+
+#[tokio::test]
+async fn the_scope_records_the_reason_it_was_cancelled_with() {
+    // The reason travels on the **scope**, because that is the value the controller already holds.
+    // A reason kept in a registry beside the signal would need a second lookup keyed by run, could
+    // disagree with the signal, and would be invisible to a caller holding only the scope.
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    fixture
+        .service
+        .cancel(&context(), created.run_id, "user_requested", "cancel-key")
+        .await
+        .expect("accepted");
+
+    let scope = fixture
+        .cancellations
+        .scope_of(created.run_id)
+        .expect("the run is registered");
+    assert!(scope.is_cancelled(), "the cancel signalled it");
+    assert_eq!(
+        scope.cancel_reason().as_deref(),
+        Some("user_requested"),
+        "the reason must be readable from the scope that was signalled",
+    );
+}
+
+#[tokio::test]
+async fn a_child_scope_reports_the_reason_its_parent_was_cancelled_with() {
+    // A child shares the reason rather than copying it, because the cancellation reaches it later
+    // than the parent: a controller working on a child scope must still be able to report why.
+    let parent = crate::cancellation::CancellationScope::new();
+    let child = parent.child();
+    parent.cancel_with_reason(Some("user_requested"));
+
+    assert!(child.is_cancelled(), "the parent cancels its descendants");
+    assert_eq!(
+        child.cancel_reason().as_deref(),
+        Some("user_requested"),
+        "a child must report the reason its parent was cancelled with",
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_without_a_reason_does_not_erase_one_already_recorded() {
+    // An internal signaller that names no reason must not clear the operator's stated reason for a
+    // cancellation already signalled: the run was cancelled for that reason, and a later
+    // reason-less signal is not a correction of it.
+    let scope = crate::cancellation::CancellationScope::new();
+    scope.cancel_with_reason(Some("user_requested"));
+    scope.cancel();
+
+    assert_eq!(
+        scope.cancel_reason().as_deref(),
+        Some("user_requested"),
+        "a reason-less cancel must leave the recorded reason intact",
+    );
+}
+
+#[tokio::test]
 async fn a_cancel_for_a_foreign_run_is_not_found_rather_than_a_silent_success() {
     // A cancel that stopped nothing must not report success: a caller would conclude
     // the run was stopped.
@@ -819,4 +939,473 @@ async fn a_run_in_a_workspace_with_no_policy_records_none() {
         "a run with no policy must record that fact rather than a default",
     );
     assert!(stored.budget.context_sensitivity_ceiling().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Route selection at creation
+//
+// The defect class this closes: the selector, the decision store, and the policy reader all
+// existed, so the diagnostic `GET /model-data-policy/effective` answered correctly while a real
+// run called `provider.models().first()`. The route is therefore resolved **at creation**, and
+// these tests are about what the created run's own record says.
+// ---------------------------------------------------------------------------
+
+/// Inserts one `Active` policy version for the fixture's workspace.
+async fn insert_policy(
+    fixture: &Fixture,
+    policy_id: jarvis_domain::ids::ModelDataPolicyId,
+    rules: jarvis_domain::model::policy::PolicyRules,
+) {
+    use crate::repository::policy::NewPolicyVersion;
+    use jarvis_domain::model::policy::ModelDataPolicyStatus;
+
+    fixture
+        .repositories
+        .insert_version(NewPolicyVersion {
+            policy_id,
+            version: 1,
+            workspace_id: workspace(),
+            name: "active".to_owned(),
+            status: ModelDataPolicyStatus::Active,
+            rules,
+            created_at: now(),
+        })
+        .await
+        .expect("the policy inserts");
+}
+
+/// A policy that permits only `public` content.
+///
+/// The objective the fixture stores is labelled `internal`, so this policy refuses it. Used to
+/// drive the route selector to a refusal without needing a provider whose endpoint class is
+/// excluded, because that would also need the candidate to be built by `route_candidates` — and
+/// the ceiling is checked before any candidate exists.
+fn public_only() -> jarvis_domain::model::policy::PolicyRules {
+    jarvis_domain::model::policy::PolicyRules {
+        maximum_sensitivity: jarvis_domain::model::policy::Sensitivity::Public,
+        ..jarvis_domain::model::policy::PolicyRules::permissive()
+    }
+}
+
+#[tokio::test]
+async fn a_run_created_under_a_policy_records_the_route_and_its_decision() {
+    // The whole point of resolving at creation: the created run's **own** record names the model
+    // it may call and the decision that authorized it, so the controller has something to read
+    // rather than re-deriving a selection (or, as it did, ignoring one).
+    let fixture = fixture_policied();
+    insert_policy(
+        &fixture,
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(90)),
+        jarvis_domain::model::policy::PolicyRules::permissive(),
+    )
+    .await;
+
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+
+    let route = stored
+        .budget
+        .route
+        .as_ref()
+        .expect("a run under a policy records the route it may call");
+    assert_eq!(
+        route.model,
+        model(),
+        "the fixture's only candidate is the model a compliant route selects",
+    );
+    assert!(
+        route.exception_ref.is_none(),
+        "a permissive policy needs no grant",
+    );
+
+    // The decision is **stored**, not merely referenced: a decision that existed only as an
+    // identifier on the budget could not explain the choice, which is the half the contract
+    // requires ("the considered candidates and their rejection reasons").
+    let decisions = fixture
+        .repositories
+        .recorded_decisions()
+        .expect("decisions are readable");
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0].effective.model, model());
+}
+
+/// Inserts a grant of `rule` with `scope`, and returns its identifier.
+///
+/// The grant is `single_use` when asked, which is what the consumption tests vary. It is issued
+/// and expiring around the fixture's instant so it is usable when the run is created.
+async fn insert_exception(
+    fixture: &Fixture,
+    rule: jarvis_domain::model::exception::PolicyRuleKey,
+    scope: jarvis_domain::model::exception::ExceptionScope,
+    single_use: bool,
+) -> jarvis_domain::ids::PolicyExceptionId {
+    use jarvis_domain::model::exception::{NewPolicyException, PolicyException, RequiredAssurance};
+
+    let exception_id = jarvis_domain::ids::PolicyExceptionId::from_uuid(id(95));
+    let exception = PolicyException::grant(NewPolicyException {
+        id: exception_id,
+        workspace_id: workspace(),
+        policy: jarvis_domain::model::policy::PolicyVersionRef {
+            policy_id: jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(96)),
+            version: 1,
+        },
+        granting_principal_id: principal(),
+        // Elevated, because a locality grant requires step-up. The step-up rule itself is covered
+        // by the exception module's tests; here the grant must exist so consumption can be tested.
+        granting_assurance: RequiredAssurance::Elevated,
+        rule,
+        scope,
+        reason_ref: "operator approved".to_owned(),
+        single_use,
+        issued_at: UtcTimestamp::parse("2026-09-01T00:00:00Z").expect("valid"),
+        expires_at: UtcTimestamp::parse("2026-12-01T00:00:00Z").expect("valid"),
+    })
+    .expect("the fixture grant is valid");
+    fixture
+        .repositories
+        .grant_exception(workspace(), exception)
+        .await
+        .expect("the grant is stored");
+    exception_id
+}
+
+/// Inserts a **local-only** policy plus a cloud-serving provider and a locality grant, and
+/// returns the grant's identifier.
+///
+/// This is the one shape in which a stored grant changes a route outcome here, and the reason is
+/// a rule rather than convenience: the sensitivity ceiling is checked *before any candidate is
+/// examined*, so no grant can rescue content above it, while locality is evaluated per candidate
+/// and is therefore exactly what a grant can relax. The policy is `LocalOnly` and the provider
+/// serves an `ApprovedCloud` model, so the candidate is refused without the grant and admitted
+/// with it.
+///
+/// `PolicyRules::permissive()` is used as the base so the *ceiling* admits the fixture's
+/// `internal` objective; a `public` ceiling would refuse the run before the candidate was
+/// considered and the grant could not be observed at all.
+async fn fixture_local_only_with_locality_grant(
+    single_use: bool,
+) -> (Fixture, jarvis_domain::ids::PolicyExceptionId) {
+    use jarvis_domain::model::policy::Locality;
+
+    let provider: Arc<dyn crate::model::ModelProvider> = Arc::new(
+        ScriptedProvider::new(model())
+            .with_endpoint_class(EndpointClass::ApprovedCloud)
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    );
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let cancellations = Arc::new(RunCancellationRegistry::new());
+    let service = RunService::new(
+        RunPorts {
+            runs: Arc::clone(&repositories) as Arc<dyn crate::repository::run::RunRepository>,
+            conversations: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::conversation::ConversationRepository>,
+            model_calls: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::model_call::ModelCallRepository>,
+            deltas: Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+            provider,
+            clock: Arc::new(ManualClock::new(now())),
+            policies: Some(Arc::clone(&repositories)
+                as Arc<dyn crate::repository::policy::ModelDataPolicyRepository>),
+        },
+        Arc::clone(&cancellations),
+    );
+    let fixture = Fixture {
+        service,
+        repositories,
+        cancellations,
+        spawner: RecordingSpawner::new(),
+    };
+
+    insert_policy(
+        &fixture,
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(97)),
+        jarvis_domain::model::policy::PolicyRules {
+            locality: Locality::LocalOnly,
+            ..jarvis_domain::model::policy::PolicyRules::permissive()
+        },
+    )
+    .await;
+    // `ApprovedCloudAllowed` is the permissive end of the ladder, so the grant admits the cloud
+    // candidate the policy refuses. The narrowing direction is `relax_one`'s `max`, which is why
+    // the granted value must be *more* permissive than the policy's own.
+    let exception_id = insert_exception(
+        &fixture,
+        jarvis_domain::model::exception::PolicyRuleKey::Locality,
+        jarvis_domain::model::exception::ExceptionScope {
+            locality: Some(Locality::ApprovedCloudAllowed),
+            ..jarvis_domain::model::exception::ExceptionScope::default()
+        },
+        single_use,
+    )
+    .await;
+    (fixture, exception_id)
+}
+
+/// A run that complies on its own leaves every grant untouched, even one that is offered.
+///
+/// The baseline the consumption tests are measured against. A store that consumed every grant it
+/// was *shown* rather than the one a call *relied on* would spend this one and leave the workspace
+/// with nothing for the call that actually needs it.
+#[tokio::test]
+async fn a_run_that_needs_no_grant_spends_none() {
+    // A permissive policy with a cloud-serving provider, so the candidate complies unaided, plus
+    // a single-use grant that is read on the route path and must not be touched.
+    let fixture = fixture_policied();
+    insert_policy(
+        &fixture,
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(98)),
+        jarvis_domain::model::policy::PolicyRules::permissive(),
+    )
+    .await;
+    let exception_id = insert_exception(
+        &fixture,
+        jarvis_domain::model::exception::PolicyRuleKey::Locality,
+        jarvis_domain::model::exception::ExceptionScope {
+            locality: Some(jarvis_domain::model::policy::Locality::ApprovedCloudAllowed),
+            ..jarvis_domain::model::exception::ExceptionScope::default()
+        },
+        true,
+    )
+    .await;
+
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+    let route = stored.budget.route.as_ref().expect("a route was selected");
+    assert!(
+        route.exception_ref.is_none(),
+        "a compliant candidate must not record a grant it did not use",
+    );
+
+    let exception = fixture
+        .repositories
+        .load_exception(workspace(), exception_id)
+        .await
+        .expect("the grant loads");
+    assert!(
+        exception.consumed_at.is_none(),
+        "an unused single-use grant must remain unspent, not merely unused",
+    );
+}
+
+#[tokio::test]
+async fn a_single_use_grant_is_consumed_when_a_run_relies_on_it() {
+    // The defect this closes: `consume_exception` had a port, an adapter, a double, and tests, and
+    // **no production caller** — so a grant an operator marked single-use permitted unlimited
+    // runs. The permissive direction of "a field nothing enforces", and the same shape as the
+    // dead `route_decision_id` column: correct in every test beside it, absent from the path a
+    // client takes.
+    let (fixture, exception_id) = fixture_local_only_with_locality_grant(true).await;
+
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+    let route = stored.budget.route.as_ref().expect("a route was selected");
+    assert_eq!(
+        route.exception_ref.as_deref(),
+        Some(exception_id.to_string().as_str()),
+        "the run's route must name the grant it relied on",
+    );
+
+    let exception = fixture
+        .repositories
+        .load_exception(workspace(), exception_id)
+        .await
+        .expect("the grant loads");
+    assert!(
+        exception.consumed_at.is_some(),
+        "a single-use grant a run relied on must be spent",
+    );
+}
+
+#[tokio::test]
+async fn a_spent_single_use_grant_no_longer_admits_a_second_run() {
+    // The consequence, asserted rather than inferred from the timestamp: the second create must be
+    // **refused**, because a spent grant is not a grant. This is the whole point of single-use, and
+    // a test that only checked `consumed_at` would pass against an implementation that consumed
+    // the record and then ignored its state.
+    let (fixture, exception_id) = fixture_local_only_with_locality_grant(true).await;
+
+    // The first run is admitted by the grant.
+    create_with_policy(&fixture, "hello", "key-1", None).await;
+
+    // The second is not: the grant is spent, so no candidate complies.
+    let error = fixture
+        .service
+        .create(
+            &context(),
+            None,
+            "hello again",
+            "key-2",
+            None,
+            &fixture.spawner,
+        )
+        .await
+        .expect_err("a spent grant must not permit a second run");
+    assert_eq!(error.code(), "model.policy_unsatisfied");
+    assert_eq!(
+        fixture.repositories.run_count().expect("reads"),
+        1,
+        "the refused create must not have created a run",
+    );
+
+    let exception = fixture
+        .repositories
+        .load_exception(workspace(), exception_id)
+        .await
+        .expect("the grant loads");
+    assert!(
+        exception.consumed_at.is_some(),
+        "and the grant stays spent rather than being reissued by the refusal",
+    );
+}
+
+#[tokio::test]
+async fn a_repeatable_grant_is_not_consumed_by_a_run_that_relies_on_it() {
+    // The other direction, and the one a store that consumed every grant it touched would fail:
+    // `single_use: false` means the grant is a standing relaxation, so relying on it must leave it
+    // usable. Stamping it spent would show a workspace's in-force grant as exhausted.
+    let (fixture, exception_id) = fixture_local_only_with_locality_grant(false).await;
+
+    create_with_policy(&fixture, "hello", "key-1", None).await;
+    // And a second run, so "not consumed" is shown by the grant still admitting work rather than
+    // only by an absent timestamp.
+    let second = create_with_policy(&fixture, "again", "key-2", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), second.run_id)
+        .await
+        .expect("loads");
+    assert!(
+        stored
+            .budget
+            .route
+            .as_ref()
+            .and_then(|route| route.exception_ref.as_deref())
+            .is_some(),
+        "a repeatable grant still admits the second run",
+    );
+
+    let exception = fixture
+        .repositories
+        .load_exception(workspace(), exception_id)
+        .await
+        .expect("the grant loads");
+    assert!(
+        exception.consumed_at.is_none(),
+        "a repeatable grant must not be stamped consumed",
+    );
+}
+
+#[tokio::test]
+async fn a_policy_that_admits_no_compliant_route_refuses_creation_and_creates_no_run() {
+    // A refusal must not create a run that is immediately failed. A created run has to be
+    // governed by *something*, and the contract's `model.policy_unsatisfied` is expressly "not
+    // permission to silently relax policy" — so the request is refused where nothing exists yet.
+    let fixture = fixture_policied();
+    insert_policy(
+        &fixture,
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(91)),
+        public_only(),
+    )
+    .await;
+
+    let error = fixture
+        .service
+        .create(&context(), None, "hello", "key-1", None, &fixture.spawner)
+        .await
+        .expect_err("content above the ceiling has no compliant route");
+
+    assert_eq!(error.code(), "model.policy_unsatisfied");
+    assert!(
+        !error.retryable(),
+        "resending the same objective cannot help",
+    );
+    // Nothing was created, so no run's record has to be corrected and no conversation is left
+    // orphaned by the refusal.
+    assert_eq!(fixture.repositories.run_count().expect("reads"), 0);
+    assert!(
+        fixture
+            .repositories
+            .recorded_decisions()
+            .expect("decisions are readable")
+            .is_empty(),
+        "a refused selection stores no decision, because none was taken",
+    );
+}
+
+#[tokio::test]
+async fn a_run_with_no_policy_records_no_route_and_still_creates() {
+    // The unconstrained case. A workspace with no policy is a real state, and refusing to create
+    // a run in it would make an unconfigured daemon unusable — while inventing a route would
+    // attribute a decision to nobody.
+    let fixture = fixture_policied();
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+
+    assert!(
+        stored.budget.route.is_none(),
+        "no policy means no route, which the controller reads as the unconstrained case",
+    );
+    assert!(
+        fixture
+            .repositories
+            .recorded_decisions()
+            .expect("decisions are readable")
+            .is_empty(),
+        "no policy means no decision was taken",
+    );
+}
+
+#[tokio::test]
+async fn the_recorded_decision_is_the_one_the_run_route_names() {
+    // The two halves must be the *same* decision: the budget carries an identifier and the store
+    // holds the record. A mismatch would make the run's own reference unanswerable, which is
+    // exactly the shape of the dead column this work exists to replace.
+    let fixture = fixture_policied();
+    insert_policy(
+        &fixture,
+        jarvis_domain::ids::ModelDataPolicyId::from_uuid(id(92)),
+        jarvis_domain::model::policy::PolicyRules::permissive(),
+    )
+    .await;
+
+    let created = create_with_policy(&fixture, "hello", "key-1", None).await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+    let route = stored.budget.route.as_ref().expect("a route was selected");
+
+    let decisions = fixture
+        .repositories
+        .recorded_decisions()
+        .expect("decisions are readable");
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    // The stored decision carries the same instant the run recorded, so the two cannot describe
+    // different moments — the reason the instant is derived once and passed into the request.
+    assert_eq!(
+        decisions[0].policy,
+        stored.budget.policy.expect("the policy is recorded"),
+    );
+    assert_eq!(decisions[0].effective.model, route.model);
 }

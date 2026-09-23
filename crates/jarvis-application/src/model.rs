@@ -729,6 +729,15 @@ impl ModelProvider for ScriptedProvider {
                 // stream would be read downstream as an interrupted call.
                 return Err(ProviderError::Cancelled);
             }
+            // The requested model must be one this provider actually serves. A provider asked
+            // for a model it does not have cannot serve it, and answering with its own first
+            // model instead is the exact substitution the data policy exists to prevent: the
+            // run would be recorded as answered by the routed model while a different one
+            // produced the text. `NoRoute` rather than `InvalidRequest`, because the request is
+            // well-formed and the provider simply has no route to that model.
+            if !self.models.iter().any(|served| served == &request.model) {
+                return Err(ProviderError::NoRoute);
+            }
             // The counted failure is evaluated after the cancellation check, so a caller
             // that cancelled is always told so rather than being shown a provider fault
             // this double was configured to produce. Counting every open — including the
@@ -746,9 +755,14 @@ impl ModelProvider for ScriptedProvider {
             // only the provider knows. The frame is prepended rather than left to
             // the script, so a script cannot omit the start of its own stream and
             // produce output frames with no `call.started` to belong to.
+            //
+            // It reports the **requested** model, which the check above has already shown to be
+            // one this provider serves. Echoing `models.first()` instead would let a run's start
+            // frame name a model the policy never selected — and a frame is what an operator and
+            // an audit read, so the record would describe a call that did not happen.
             let mut frames = vec![stamper.stamp(
                 ModelStreamEventKind::CallStarted {
-                    model: self.models.first().cloned(),
+                    model: Some(request.model.clone()),
                 },
                 Some(ProviderMetadata {
                     // A provider request id correlates a provider-side record with

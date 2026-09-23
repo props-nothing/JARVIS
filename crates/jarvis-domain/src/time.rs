@@ -55,6 +55,23 @@ impl UtcTimestamp {
         let timestamp: Timestamp = value.parse().map_err(|_| DomainError::InvalidTimestamp)?;
         Ok(Self(timestamp))
     }
+
+    /// Returns this instant's calendar date in UTC.
+    ///
+    /// Lives here rather than at each caller because deriving a date needs `jiff`'s time-zone
+    /// conversion, and the layers above the domain deliberately do not depend on it: a caller that
+    /// reached for `to_zoned` would have to add a dependency the evidence note does not cover,
+    /// which is how a clock concern leaks into a crate that only needed a day. The conversion is
+    /// UTC-only, because evidence freshness is evaluated against the same instant for every reader
+    /// and a local-zone date would make it depend on where the daemon happens to run.
+    ///
+    /// Infallible: `Timestamp` is already an absolute instant, so projecting it into UTC cannot
+    /// fail. It returns a value rather than an `Option` for that reason — an `Option` here would
+    /// push an unreachable branch onto every caller.
+    #[must_use]
+    pub fn utc_date(&self) -> IsoDate {
+        IsoDate(self.0.to_zoned(jiff::tz::TimeZone::UTC).date())
+    }
 }
 
 impl fmt::Display for UtcTimestamp {

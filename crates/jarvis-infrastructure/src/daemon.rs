@@ -377,13 +377,21 @@ pub async fn start(
         return Err(StartupError::Bind);
     }
 
+    // One repository value, shared deliberately. The run service resolves a run's policy through
+    // `RunPorts::policies` and evaluates its route against it, while the policy surface reads and
+    // writes the same rows through `PolicyService`. Building these from two separately-constructed
+    // adapters would still share the pool, but it would let the two drift if one later gained a
+    // cache or a transaction of its own — and the diagnostic probe would then report on rules the
+    // run path did not use. This is the single value both are derived from.
+    let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+
     // 4. Settle runs the previous daemon left mid-flight, **before** anything is
     // published or reported ready. The local control API requires a non-terminal run
     // found at restart to be recovered to an explicit resumable or failed state, and
     // readiness must stay false until that classification completes — so this cannot
     // follow the discovery publication, or a client could reach a daemon that has not
     // yet settled the runs it is about to serve.
-    let ports = run_ports(database.pool().clone());
+    let ports = run_ports(Arc::clone(&repositories));
     let recovery = jarvis_application::recovery::reconcile(
         &ports.runs,
         crate::time::SystemClock::new()
@@ -433,10 +441,12 @@ pub async fn start(
     ));
 
     // The policy surface reads the same pool the run service writes, so the rules a route is
-    // evaluated against are the ones this daemon stores.
-    let repositories = Arc::new(SqliteRepositories::new(database.pool().clone()));
+    // evaluated against are the ones this daemon stores. `repositories` here is the *same* value
+    // the run ports were built from, cloned rather than re-constructed: a run created through the
+    // API and a diagnostic probe of the same policy must not be able to observe different stores.
     let policies = Arc::new(jarvis_application::policy_service::PolicyService::new(
-        repositories as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
+        Arc::clone(&repositories)
+            as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
     ));
 
     Ok(RunningDaemon {
@@ -465,20 +475,23 @@ pub async fn start(
 /// It is not a fake of something that exists: it is the deterministic provider the
 /// plan requires, and its model identifier says `scripted.local` so an operator can
 /// see which source served a run.
-fn run_ports(pool: sqlx::SqlitePool) -> jarvis_application::run_service::RunPorts {
+///
+/// The repository is passed in rather than built here, and it is the same value the
+/// daemon's policy surface uses, so the policy a run's route is selected from is the
+/// policy the API reads back.
+fn run_ports(repositories: Arc<SqliteRepositories>) -> jarvis_application::run_service::RunPorts {
     use jarvis_application::model::{ModelProvider, ScriptedProvider};
     use jarvis_application::run_service::RunPorts;
     use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
     use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
 
-    let repositories = Arc::new(SqliteRepositories::new(pool));
-    // The identifiers are literals this build controls, so a failure here would be a
-    // programming error rather than a runtime condition. They are validated once and
-    // fall back rather than being unwrapped, so a future edit that mistypes one degrades
-    // to a provider that serves no model — which makes every run fail with
-    // `run.no_model_served`, a state an operator can see — instead of panicking on the
-    // startup path.
     let provider: Arc<dyn ModelProvider> = match (
+        // The identifiers are literals this build controls, so a failure here would be a
+        // programming error rather than a runtime condition. They are validated once and
+        // fall back rather than being unwrapped, so a future edit that mistypes one degrades
+        // to a provider that serves no model — which makes every run fail with
+        // `run.no_model_served`, a state an operator can see — instead of panicking on the
+        // startup path.
         ProviderId::from_literal("scripted.local"),
         ModelId::from_literal("scripted-echo"),
     ) {
@@ -512,10 +525,19 @@ fn run_ports(pool: sqlx::SqlitePool) -> jarvis_application::run_service::RunPort
             as Arc<dyn jarvis_application::repository::conversation::ConversationRepository>,
         model_calls: Arc::clone(&repositories)
             as Arc<dyn jarvis_application::repository::model_call::ModelCallRepository>,
-        deltas: repositories as Arc<dyn jarvis_application::live_events::StreamDeltaSink>,
+        deltas: Arc::clone(&repositories)
+            as Arc<dyn jarvis_application::live_events::StreamDeltaSink>,
         provider,
         clock: Arc::new(crate::time::SystemClock::new()),
-        policies: None,
+        // The same repository the policy surface reads. `None` here was the hole: a diagnostic
+        // probe was governed by the stored policy while a real run recorded none, so the
+        // sensitivity ceiling and the route decision existed on the test path and not on the
+        // path a client actually takes. Proven by restoring it: the end-to-end journey then
+        // answers `202` to a create the policy must refuse, and only this composition changed.
+        policies: Some(
+            repositories
+                as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
+        ),
     }
 }
 

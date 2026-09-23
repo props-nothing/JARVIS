@@ -8,7 +8,7 @@
 //! silently overwriting the recorded outcome of the first one.
 
 use crate::repository::{RepositoryError, RepositoryFuture};
-use jarvis_domain::ids::{ModelCallId, RunId, WorkspaceId};
+use jarvis_domain::ids::{ModelCallId, ModelRouteDecisionId, RunId, WorkspaceId};
 use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, Usage};
 use jarvis_domain::time::UtcTimestamp;
@@ -96,6 +96,14 @@ pub struct NewModelCall {
     pub attempt: u32,
     /// The provider and model that served it.
     pub model: ModelRef,
+    /// The route decision that authorized this call, when a policy selected one.
+    ///
+    /// `None` when no policy was in force, which is a different fact from "a decision selected
+    /// this same model": the column answers *which authorization permitted this call*, and a
+    /// call made with none is exactly the state an operator needs to be able to see. Every
+    /// attempt of one logical call names the same decision, because the route is a property of
+    /// the run rather than of an attempt.
+    pub route_decision: Option<ModelRouteDecisionId>,
     /// The requested output schema fingerprint, when structured output was used.
     pub request_fingerprint: Option<String>,
     /// The instant the attempt started.
@@ -203,6 +211,21 @@ pub struct StoredModelCall {
     pub model_id: ModelId,
     /// The model revision, when pinned.
     pub revision: Option<ModelRevision>,
+    /// The route decision this attempt was authorized under, when a policy was in force.
+    ///
+    /// Read back rather than write-only: the column existed and had no writer, and a guarantee
+    /// that a call carries its authorization is only checkable if the same port that stores it
+    /// can return it. `None` means no policy governed the run, which is a different fact from
+    /// "a decision permitted this".
+    pub route_decision: Option<ModelRouteDecisionId>,
+    /// Why the provider stopped, when it reached a terminal.
+    ///
+    /// Read back rather than write-only. The column was in the schema, was bound by the write,
+    /// and was named by **no** `SELECT` while `StoredModelCall` had no field for it — so "the
+    /// model was cut off by its own token limit" and "the model finished" were one value on every
+    /// read. A reconciliation pass or an operator asking why a completed answer looks truncated has
+    /// no other place to learn it.
+    pub finish_reason: Option<FinishReason>,
     /// How the attempt ended.
     pub state: ModelCallState,
     /// The provider's request identifier, when recorded.
@@ -295,6 +318,9 @@ mod tests {
             logical_call_id: ModelCallId::from_uuid(id(4)),
             attempt,
             model: model(),
+            // No policy governed this fixture, which is the ordinary case the port must express:
+            // a call made with no decision is a different fact from one a policy permitted.
+            route_decision: None,
             request_fingerprint: None,
             started_at: now(),
         }

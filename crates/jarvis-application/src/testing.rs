@@ -22,11 +22,11 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use jarvis_domain::ids::{
-    ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId, RunId,
-    WorkspaceId,
+    ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId,
+    PolicyExceptionId, RunId, WorkspaceId,
 };
 use jarvis_domain::model::policy::{ModelRouteDecision, PolicyVersionRef};
-use jarvis_domain::model::stream::Usage;
+use jarvis_domain::model::stream::{FinishReason, Usage};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunLifecycle;
 use jarvis_domain::run::state::RunState;
@@ -81,7 +81,7 @@ impl RunRow {
             completed_at: self.lifecycle.terminal_at(),
             error_code: self.error_code.clone(),
             deadline_at: self.deadline_at,
-            budget: self.budget,
+            budget: self.budget.clone(),
         }
     }
 }
@@ -110,8 +110,12 @@ struct CallRow {
     call: NewModelCall,
     state: ModelCallState,
     provider_request_id: Option<String>,
+    /// Why the provider stopped, recorded with the outcome so the read and the write agree.
+    finish_reason: Option<FinishReason>,
     started_at: UtcTimestamp,
     completed_at: Option<UtcTimestamp>,
+    /// When the first output arrived, recorded with the outcome for the same reason.
+    first_output_at: Option<UtcTimestamp>,
     usage: Option<Usage>,
     estimated_cost_microunits: Option<u64>,
 }
@@ -139,6 +143,12 @@ struct Store {
     policies: BTreeMap<(ModelDataPolicyId, u32), crate::repository::policy::StoredPolicyVersion>,
     /// Recorded route decisions, keyed by identity.
     decisions: BTreeMap<ModelRouteDecisionId, ModelRouteDecision>,
+    /// Granted policy exceptions, keyed by identity.
+    ///
+    /// A map for the same reason the policies are: the identity is the key, so a duplicate is a
+    /// conflict rather than a silent replacement — and an exception is the one record that
+    /// relaxes a rule, so replacing it would rewrite what a past decision was permitted by.
+    exceptions: BTreeMap<PolicyExceptionId, crate::repository::policy::JarvisPolicyException>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -219,6 +229,26 @@ impl InMemoryRepositories {
         })
     }
 
+    /// Returns every policy exception the store holds, oldest first.
+    ///
+    /// Exposed so a test can assert that a refused grant stored nothing — the half of the "a
+    /// non-waivable rule cannot be granted" rule that a returned error alone does not prove — and
+    /// so a lifecycle test can read a grant back after revoking or consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] if the lock is poisoned.
+    pub fn exceptions(
+        &self,
+    ) -> Result<Vec<crate::repository::policy::JarvisPolicyException>, RepositoryError> {
+        self.with(|store| {
+            let mut exceptions: Vec<crate::repository::policy::JarvisPolicyException> =
+                store.exceptions.values().cloned().collect();
+            exceptions.sort_by_key(|exception| exception.issued_at);
+            Ok(exceptions)
+        })
+    }
+
     /// Returns every output-text delta published, in order, as `(item_id, delta)`.
     ///
     /// # Errors
@@ -265,6 +295,7 @@ impl InMemoryRepositories {
                 .map(|call| RecordedUsage {
                     usage: call.usage.clone(),
                     estimated_cost_microunits: call.estimated_cost_microunits,
+                    finish_reason: call.finish_reason.clone(),
                 })
                 .collect())
         })
@@ -304,6 +335,12 @@ pub struct RecordedUsage {
     pub usage: Option<Usage>,
     /// The cost lifted from that block into its own column.
     pub estimated_cost_microunits: Option<u64>,
+    /// Why the provider stopped, as recorded with the outcome.
+    ///
+    /// Read through this accessor rather than through `recorded_calls`, which returns the
+    /// *creation* request: the finish reason is part of the attempt's outcome, so a test that
+    /// asserted it on the new-call record would be asserting a field that cannot exist there.
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl RunRepository for InMemoryRepositories {
@@ -848,8 +885,12 @@ impl ModelCallRepository for InMemoryRepositories {
                         call: call.clone(),
                         state: ModelCallState::Pending,
                         provider_request_id: None,
+                        // Populated only by `record_outcome`, so a pending attempt reports no
+                        // finish reason rather than an inherited one.
+                        finish_reason: None,
                         started_at: call.started_at,
                         completed_at: None,
+                        first_output_at: None,
                         usage: None,
                         estimated_cost_microunits: None,
                     },
@@ -905,6 +946,11 @@ impl ModelCallRepository for InMemoryRepositories {
                 // same call.
                 row.usage.clone_from(&outcome.usage);
                 row.estimated_cost_microunits = outcome.estimated_cost_microunits;
+                // The finish reason is recorded with the state for the same reason: it is part of
+                // the outcome, and a double that dropped it would let a test assert a rule the
+                // adapter does not keep.
+                row.finish_reason.clone_from(&outcome.finish_reason);
+                row.first_output_at = outcome.first_output_at;
                 Ok(())
             })
         })
@@ -992,6 +1038,8 @@ fn stored_call(row: &CallRow) -> StoredModelCall {
         provider_id: row.call.model.provider_id.clone(),
         model_id: row.call.model.model_id.clone(),
         revision: row.call.model.revision.clone(),
+        route_decision: row.call.route_decision,
+        finish_reason: row.finish_reason.clone(),
         state: row.state,
         provider_request_id: row.provider_request_id.clone(),
         started_at: row.started_at,
@@ -1116,6 +1164,144 @@ impl crate::repository::policy::ModelDataPolicyRepository for InMemoryRepositori
                     .get(&decision_id)
                     .cloned()
                     .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    fn grant_exception(
+        &self,
+        _workspace: WorkspaceId,
+        exception: crate::repository::policy::JarvisPolicyException,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.with(|store| {
+                // A duplicate identity is a conflict, matching the adapter's primary-key
+                // constraint. Replacing the row would change, after the fact, what a past
+                // decision was permitted by — the same reason a policy version is insert-only.
+                if store.exceptions.contains_key(&exception.id) {
+                    return Err(RepositoryError::Conflict {
+                        what: "policy_exception",
+                    });
+                }
+                store.exceptions.insert(exception.id, exception);
+                Ok(())
+            })
+        })
+    }
+
+    fn load_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+    ) -> RepositoryFuture<'_, crate::repository::policy::JarvisPolicyException> {
+        Box::pin(async move {
+            self.with(|store| {
+                store
+                    .exceptions
+                    .get(&exception_id)
+                    // Scope is a query predicate, not a post-filter: another workspace's row must
+                    // be indistinguishable from an absent one, exactly as in the adapter.
+                    .filter(|exception| exception.workspace_id == workspace)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    fn list_exceptions(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<crate::repository::policy::JarvisPolicyException>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut found: Vec<_> = store
+                    .exceptions
+                    .values()
+                    .filter(|exception| exception.workspace_id == workspace)
+                    .cloned()
+                    .collect();
+                // Ordered by `issued_at` like the adapter's `ORDER BY`, so the two agree about the
+                // order a caller reads. A difference between them would be invisible to a test that
+                // exercised either one alone.
+                found.sort_by_key(|exception| exception.issued_at);
+                // The bound is enforced here too, and reported as the same conflict: a double that
+                // truncated or silently returned everything would let a test pass against a store
+                // the production adapter refuses.
+                if found.len() > crate::repository::policy::MAX_EXCEPTIONS_PER_WORKSPACE {
+                    return Err(RepositoryError::Conflict {
+                        what: "too_many_policy_exceptions",
+                    });
+                }
+                Ok(found)
+            })
+        })
+    }
+
+    fn revoke_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.with(|store| {
+                let Some(exception) = store.exceptions.get_mut(&exception_id) else {
+                    return Err(RepositoryError::NotFound);
+                };
+                if exception.workspace_id != workspace {
+                    return Err(RepositoryError::NotFound);
+                }
+                // A consumed grant cannot also be revoked, matching the adapter's statement.
+                if exception.consumed_at.is_some() {
+                    return Err(RepositoryError::Conflict {
+                        what: "exception_already_consumed",
+                    });
+                }
+                // Idempotent: re-revoking keeps the first instant, because the second would
+                // rewrite when the decision was actually taken.
+                if exception.revoked_at.is_none() {
+                    exception.revoked_at = Some(at);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    fn consume_exception(
+        &self,
+        workspace: WorkspaceId,
+        exception_id: PolicyExceptionId,
+        at: UtcTimestamp,
+    ) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.with(|store| {
+                let Some(exception) = store.exceptions.get_mut(&exception_id) else {
+                    return Err(RepositoryError::NotFound);
+                };
+                if exception.workspace_id != workspace {
+                    return Err(RepositoryError::NotFound);
+                }
+                // Both guards, matching the adapter's conditional `UPDATE`, so the double cannot
+                // report a single-use grant as consumable twice.
+                if exception.consumed_at.is_some() {
+                    return Err(RepositoryError::Conflict {
+                        what: "exception_already_consumed",
+                    });
+                }
+                if exception.revoked_at.is_some() {
+                    return Err(RepositoryError::Conflict {
+                        what: "exception_revoked",
+                    });
+                }
+                // A repeatable grant has nothing to spend, and reporting that as success is the
+                // half of the adapter's `single_use = 1` predicate a double that always stamped
+                // `consumed_at` would get wrong — making a workspace's repeatable grant appear
+                // spent to a later reader while it is still in force.
+                if !exception.single_use {
+                    return Ok(());
+                }
+                exception.consumed_at = Some(at);
+                Ok(())
             })
         })
     }
@@ -1363,6 +1549,7 @@ mod tests {
                     logical_call_id: logical,
                     attempt,
                     model: model.clone(),
+                    route_decision: None,
                     request_fingerprint: None,
                     started_at: now(),
                 })
@@ -1384,6 +1571,7 @@ mod tests {
                 logical_call_id: logical,
                 attempt: 1,
                 model,
+                route_decision: None,
                 request_fingerprint: None,
                 started_at: now(),
             })
