@@ -101,6 +101,22 @@ const OBJECTIVE_SENSITIVITY: Sensitivity = Sensitivity::Internal;
 /// Why a run command could not be carried out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunServiceError {
+    /// A durable precondition no longer holds, so the caller must re-read before resubmitting.
+    ///
+    /// **A stale precondition is not an internal failure, and reporting it as one was a real
+    /// defect.** Every transition supplies the version it read, so a concurrent advance is refused
+    /// by the adapter with [`RepositoryError::VersionConflict`](crate::repository::RepositoryError)
+    /// — the same conflict the policy surface meets its own `expected_version` with. Arriving
+    /// through the storage variant, it was mapped to `500` with the code `storage.version_conflict`,
+    /// which is not a code this surface documents: the contract lists `resource.version_conflict`
+    /// for a precondition (`409`) and `internal.failure` for a `500`. So a conflict a client can act
+    /// on was presented as a server fault carrying an undocumented code, while the identical
+    /// conflict on the policy route was presented as a `409` the client could retry.
+    ///
+    /// It is a distinct variant rather than a field on `Storage` because the *status* differs: the
+    /// surface must be able to tell a conflict from a fault, and pattern-matching a nested
+    /// repository error to find that out would put a storage taxonomy on the API's decision path.
+    Conflict,
     /// The request was invalid before any durable effect.
     Invalid {
         /// The stable, namespaced error code.
@@ -153,6 +169,7 @@ impl RunServiceError {
             // rather than by coincidence — a second arm would read as two different answers.
             Self::Invalid { code, .. } | Self::PolicyUnsatisfied { code, .. } => code,
             Self::NotFound => "resource.not_found",
+            Self::Conflict => "resource.version_conflict",
             Self::IdempotencyConflict => "idempotency.conflict",
             Self::Storage(error) => error.code(),
             Self::Controller(error) => error.code(),
@@ -172,6 +189,13 @@ impl RunServiceError {
             | Self::IdempotencyConflict
             | Self::PolicyNotFound
             | Self::PolicyUnsatisfied { .. } => false,
+            // **A stale precondition answers `true`, matching the policy surface.** The code is
+            // `resource.version_conflict`, and the contract marks that code retryable — for the same
+            // reason `PolicyServiceError::VersionConflict` does: the remedy is a re-read and a
+            // resubmit, so a client that sees this may retry *after* refreshing its view. This is a
+            // client-facing claim and is deliberately not `RepositoryError::retryable`, which answers
+            // a different question ("may this be resent unchanged?") and says no.
+            Self::Conflict => true,
             Self::Storage(error) => error.retryable(),
             Self::Controller(error) => error.retryable(),
         }
@@ -185,6 +209,7 @@ impl RunServiceError {
             // the variant is what says which kind of refusal this is.
             Self::Invalid { message, .. } | Self::PolicyUnsatisfied { message, .. } => message,
             Self::NotFound => "No such resource.",
+            Self::Conflict => "The run changed since it was read; re-read and resubmit.",
             Self::IdempotencyConflict => {
                 "The idempotency key was already used for another request."
             }
@@ -199,6 +224,12 @@ impl From<RepositoryError> for RunServiceError {
     fn from(error: RepositoryError) -> Self {
         match error {
             RepositoryError::NotFound => Self::NotFound,
+            // A version conflict is a **durable precondition**, not a storage fault, so it is
+            // separated here rather than left to be recognized from the variant's payload. Leaving
+            // it wrapped made the API surface ask a storage question to choose a status code, and it
+            // chose `500` with an undocumented code for a conflict the policy route answers with
+            // `409 resource.version_conflict`.
+            RepositoryError::VersionConflict { .. } => Self::Conflict,
             other => Self::Storage(other),
         }
     }

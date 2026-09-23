@@ -2629,6 +2629,47 @@ Foundation TODO remains incomplete.
   - Two more `RunRepository` doubles (`StallingWrites`, `Unreadable`) needed the new method, which the
     compiler reported both times rather than letting one silently diverge.
   1001 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-041` Answer a stale durable precondition with `409 resource.version_conflict`, and hold the
+  table's `Retryable` column to what the surface actually sends. Found by sweeping the **third column**
+  of the contract's minimum-code table — the one column no test had ever read.
+  - **The defect.** Every run transition supplies the version it read, so a concurrent advance is
+    refused by the adapter with `RepositoryError::VersionConflict`. That arrived at the API wrapped in
+    `RunServiceError::Storage(_)`, so `service_error_response` sent it to **`500`** with the code
+    `storage.version_conflict` — and `Retryable: false`. The contract lists `resource.version_conflict`
+    for a precondition (`409`) and `internal.failure` for a `500`, so a client was told the server had
+    faulted, under a code this surface does not document, when its own view was merely stale — the one
+    case where a retry after a re-read succeeds. **The identical conflict on the policy route was
+    already a `409`**, which is what made it a contradiction rather than merely a rough edge: one
+    concept, two answers, depending on which route met it.
+  - Fix: a `RunServiceError::Conflict` variant (a variant rather than a mapping tweak, because the
+    *status* differs and the surface must not pattern-match a nested storage error to find that out),
+    `From<RepositoryError>` mapping `VersionConflict` to it, and a `409` arm. Code, message, and
+    retryable all become the policy surface's.
+  - **A flag that had to stay different, and the reason is worth keeping.** `RepositoryError::retryable`
+    returns **false** for a version conflict, with a doc comment explaining that a retry is "only
+    meaningful with new information, so it is reported as **not** blindly retryable" — while
+    `PolicyServiceError::VersionConflict` returns **true**. These are not in conflict: they answer
+    different questions (the repository's "may this be resent unchanged?" versus the client's "may I
+    retry after refreshing?"). My first framing treated them as contradictory and was wrong; the
+    assertion now pins both answers *and* the fact that they differ by design.
+  - **`the_tables_retryable_column_is_what_the_surface_actually_sends`** asserts the column against the
+    real answers: `resource.version_conflict` is `yes` and the surface's own `Conflict.retryable()` is
+    true, `service.not_ready` is `yes`, and the non-retryable rows are checked so an edit that flipped
+    one without touching the table fails in the build rather than at a client. **Falsified:** flipping
+    the table cell to `no` fails with "the contract marks a stale precondition retryable after a
+    re-read"; and each half of the fix is falsified separately — sending `Conflict` back to `500`
+    fails the status assertion, and collapsing the `From` arm back into `Storage` fails with "the
+    adapter's version conflict must map to the conflict variant", which a test constructing the
+    variant directly could not have caught.
+  - **A second finding, recorded rather than papered over.** The table test's scan comment claimed the
+    namespace list includes "`model.` and `run.`, which reach the envelope through the service error
+    types this surface maps" — **neither is on the list.** `RunServiceError::Controller(e) => e.code()`
+    yields `run.*` and `Self::Storage(e) => e.code()` yields `storage.*`, so those families reach the
+    envelope while being invisible to a source scan here. The comment now says what the list is (the
+    literals written *in* this surface, nothing more), the contract states the limit of the
+    completeness check, and the scan and the retryable-column reader are extracted helpers so the test
+    reads as an assertion rather than as a scanner.
+  1003 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

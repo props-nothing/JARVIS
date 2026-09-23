@@ -682,6 +682,17 @@ fn created_response(request_id: Option<&str>, created: &CreatedRun) -> Response 
 }
 
 /// Maps a service error to its contract status and envelope.
+///
+/// Exposed to the crate as `service_error_response_for_test` so a test can drive the mapping
+/// directly. A route-level test would have to win a race against the controller to produce a
+/// version conflict at all, and a test that cannot reliably reach its subject proves nothing about
+/// it — this is the function that decides the status, so it is the function to assert.
+#[cfg(test)]
+pub(crate) fn service_error_response_for_test(error: &RunServiceError) -> Response {
+    service_error_response(None, error)
+}
+
+/// Maps a service error to its contract status and envelope.
 fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> Response {
     let status = match error {
         RunServiceError::Invalid { .. } => StatusCode::BAD_REQUEST,
@@ -698,7 +709,14 @@ fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> 
         // `200` because the probe *asked* what would comply, while here the caller asked for work
         // to be done and the answer is that this policy forbids it.
         RunServiceError::PolicyUnsatisfied { .. } => StatusCode::FORBIDDEN,
-        RunServiceError::IdempotencyConflict => StatusCode::CONFLICT,
+        RunServiceError::IdempotencyConflict | RunServiceError::Conflict => StatusCode::CONFLICT,
+        // A durable precondition that no longer holds is a conflict, and it is the **same** conflict
+        // the policy route answers with `409 resource.version_conflict` — one concept, one status.
+        // It used to arrive through `Storage(_)` and be reported as a `500` carrying
+        // `storage.version_conflict`, a code this surface does not document: the contract lists
+        // `resource.version_conflict` for a precondition and `internal.failure` for a `500`. So a
+        // client was told the server had faulted when its own view was merely stale, which is the one
+        // case where retrying after a re-read succeeds.
         RunServiceError::Storage(_) | RunServiceError::Controller(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }

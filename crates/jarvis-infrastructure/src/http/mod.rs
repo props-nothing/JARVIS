@@ -2973,46 +2973,7 @@ mod tests {
         //
         // Scanned over this surface's own source, from `CARGO_MANIFEST_DIR`, so a moved file fails
         // loudly rather than quietly checking nothing.
-        let surface = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/http");
-        let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut modules = 0;
-        for entry in std::fs::read_dir(&surface).expect("the module directory reads") {
-            let path = entry.expect("a directory entry reads").path();
-            if path.extension().is_none_or(|extension| extension != "rs") {
-                continue;
-            }
-            modules += 1;
-            let text = std::fs::read_to_string(&path).expect("a module reads");
-            // Only the production half: a test may legitimately name a code it does not produce,
-            // and counting a test's own assertions would make this test assert itself.
-            let production = match text.find("#[cfg(test)]") {
-                Some(at) => &text[..at],
-                None => &text[..],
-            };
-            for found in production.match_indices('"') {
-                let rest = &production[found.0 + 1..];
-                let Some(end) = rest.find('"') else { continue };
-                let candidate = &rest[..end];
-                // The envelope's own namespaces, plus `model.` and `run.`, which reach the envelope
-                // through the service error types this surface maps.
-                let namespaced = candidate.split_once('.').is_some_and(|(namespace, _)| {
-                    matches!(
-                        namespace,
-                        "request"
-                            | "api"
-                            | "auth"
-                            | "resource"
-                            | "idempotency"
-                            | "stream"
-                            | "service"
-                            | "internal"
-                    )
-                });
-                if namespaced {
-                    produced.insert(candidate.to_owned());
-                }
-            }
-        }
+        let (mut produced, modules) = production_codes();
         // A scan that found no modules would pass vacuously, which is the failure a fixture test
         // exists to prevent.
         assert!(
@@ -3057,6 +3018,66 @@ mod tests {
             "the table must have been parsed: {listed:?}",
         );
 
+        // **The `Retryable` column, which nothing read.** The rest of this test compares the *codes*
+        // in the table against the codes the surface produces, so a row could name a code correctly
+        // and state the opposite of what the daemon sends without anything failing. That is not
+        // hypothetical: `resource.version_conflict` is marked retryable and the runs surface sent it
+        // as `500 retryable:false` while the policy surface sent `409 retryable:true`, and only the
+        // *status* disagreement was reachable by any existing assertion.
+        //
+        // Parsed by position rather than by shape here, because the third cell is free text
+        // (`yes`, `no`, `yes, after declared delay`, `conditionally`) and a shape check would have to
+        // enumerate spellings. The two codes whose flag is decided in code are asserted below; the
+        // rest are checked for presence so a row cannot lose its column silently.
+        let retryable_column = retryable_cells(&document);
+        assert!(
+            retryable_column.len() >= 14,
+            "the retryable column must have been parsed: {retryable_column:?}",
+        );
+        for (code, value) in &retryable_column {
+            assert!(
+                !value.is_empty(),
+                "row {code} has an empty retryable cell, which reads as a statement and is not one",
+            );
+        }
+
+        // The two codes whose flag the surface decides, asserted against the real answers rather
+        // than against the table alone: a table that agreed with a wrong implementation would be two
+        // documents agreeing.
+        assert_eq!(
+            retryable_column
+                .get("resource.version_conflict")
+                .map(String::as_str),
+            Some("yes"),
+            "the contract marks a stale precondition retryable after a re-read",
+        );
+        assert!(
+            jarvis_application::run_service::RunServiceError::Conflict.retryable(),
+            "and the surface must agree, which it did not: it reached a client as retryable:false \
+             on a 500",
+        );
+        assert_eq!(
+            retryable_column
+                .get("service.not_ready")
+                .map(String::as_str),
+            Some("yes"),
+            "readiness is the one refusal whose whole point is to be retried",
+        );
+        // The codes the surface sends as non-retryable, so a later edit that flipped one without
+        // touching the table fails here rather than at a client.
+        for (code, flag) in [
+            ("request.invalid", false),
+            ("idempotency.conflict", false),
+            ("stream.replay_unavailable", false),
+            ("request.too_large", false),
+        ] {
+            assert_eq!(
+                retryable_column.get(code).map(String::as_str),
+                Some(if flag { "yes" } else { "no" }),
+                "{code} must be documented as retryable={flag}",
+            );
+        }
+
         // A code this surface can return and the table does not name is a client that cannot know
         // it exists.
         let unlisted: Vec<&String> = produced.difference(&listed).collect();
@@ -3081,6 +3102,236 @@ mod tests {
                 "{code} must not be a listed code: {why}",
             );
         }
+    }
+
+    /// Collects every namespaced code literal in this surface's production half.
+    ///
+    /// Extracted so the table test reads as an assertion rather than as a scanner.
+    ///
+    /// **The namespace list is a deliberate restriction, and the comment here used to misstate it.**
+    /// It said "plus `model.` and `run.`, which reach the envelope through the service error types
+    /// this surface maps" — but neither is on the list, and the surface genuinely can send both:
+    /// `RunServiceError::Controller(error) => error.code()` yields `run.*` and
+    /// `Self::Storage(error) => error.code()` yields `storage.*`, neither of which this scan sees.
+    /// Those families travel on **error types**, so they are invisible to a source scan here for the
+    /// same reason `idempotency.conflict` was — and `CODES_CARRIED_BY_ERROR_TYPES` names the two the
+    /// table must list. The others are a real gap in coverage rather than a claim, so the list now
+    /// says what it is: the literals written *in* this surface, and nothing more.
+    fn production_codes() -> (std::collections::BTreeSet<String>, usize) {
+        let surface = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/http");
+        let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut modules = 0;
+        for entry in std::fs::read_dir(&surface).expect("the module directory reads") {
+            let path = entry.expect("a directory entry reads").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            modules += 1;
+            let text = std::fs::read_to_string(&path).expect("a module reads");
+            // Only the production half: a test may legitimately name a code it does not produce,
+            // and counting a test's own assertions would make this test assert itself.
+            let production = match text.find("#[cfg(test)]") {
+                Some(at) => &text[..at],
+                None => &text[..],
+            };
+            for found in production.match_indices('"') {
+                let rest = &production[found.0 + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let candidate = &rest[..end];
+                let namespaced = candidate.split_once('.').is_some_and(|(namespace, _)| {
+                    matches!(
+                        namespace,
+                        "request"
+                            | "api"
+                            | "auth"
+                            | "resource"
+                            | "idempotency"
+                            | "stream"
+                            | "service"
+                            | "internal"
+                    )
+                });
+                if namespaced {
+                    produced.insert(candidate.to_owned());
+                }
+            }
+        }
+        (produced, modules)
+    }
+
+    /// Reads the table's third cell — the `Retryable` column — for each listed code.
+    ///
+    /// Extracted from the table test so the code comparison and the flag comparison are separate
+    /// tests with separate subjects. Parsed by **position** rather than by shape: the third cell is
+    /// free text (`yes`, `no`, `yes, after declared delay`, `conditionally`), so a shape check would
+    /// have to enumerate spellings and would reject a legitimate new one.
+    fn retryable_cells(document: &str) -> std::collections::BTreeMap<String, String> {
+        document
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| ")?.trim_start();
+                let (status, rest) = rest.split_once(" | ")?;
+                if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let (_, after) = rest.split_once('`')?;
+                let (code, rest) = after.split_once('`')?;
+                let (_, value) = rest.split_once(" | ")?;
+                let value = value.trim().trim_end_matches(" |").trim();
+                Some((code.to_owned(), value.to_owned()))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_tables_retryable_column_is_what_the_surface_actually_sends() {
+        // **The `Retryable` column, which nothing read.** The code comparison in
+        // `the_minimum_code_table_names_every_code_this_surface_produces` checks *which codes* the
+        // table lists, so a row could name a code correctly and state the opposite of what the daemon
+        // sends without anything failing. That was not hypothetical:
+        // `resource.version_conflict` is marked retryable, and the runs surface sent it as
+        // `500 retryable:false` — reachable, and the only thing any assertion could have seen was
+        // the status, which is why the status was the whole of the defect's visible half.
+        //
+        // A column nothing reads is the same failure as a constant nothing enforces: it reads as a
+        // statement about the daemon while being a statement about the document.
+        let document = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("the crate lives two levels under the repository root")
+                .join("docs/contracts/local-control-api.md"),
+        )
+        .expect("the contract reads");
+
+        let column = retryable_cells(&document);
+        assert!(
+            column.len() >= 14,
+            "the retryable column must have been parsed: {column:?}",
+        );
+        for (code, value) in &column {
+            assert!(
+                !value.is_empty(),
+                "row {code} has an empty retryable cell, which reads as a statement and is not one",
+            );
+        }
+
+        // The rows whose flag the surface decides in code, asserted against the **real answers**
+        // rather than against the table alone: a table agreeing with a wrong implementation would be
+        // two documents agreeing, which is the shape this project keeps finding.
+        assert_eq!(
+            column.get("resource.version_conflict").map(String::as_str),
+            Some("yes"),
+            "the contract marks a stale precondition retryable after a re-read",
+        );
+        assert!(
+            jarvis_application::run_service::RunServiceError::Conflict.retryable(),
+            "and the surface must agree, which it did not: a stale precondition reached a client as \
+             retryable:false on a 500",
+        );
+        assert_eq!(
+            column.get("service.not_ready").map(String::as_str),
+            Some("yes"),
+            "readiness is the one refusal whose whole purpose is to be retried",
+        );
+
+        // The non-retryable rows, so an edit that flipped one without touching the table fails here
+        // rather than at a client. Each is a refusal where resending the same request cannot help.
+        for code in [
+            "request.invalid",
+            "idempotency.conflict",
+            "stream.replay_unavailable",
+            "request.too_large",
+            "resource.not_found",
+            "auth.credential_rejected",
+        ] {
+            assert_eq!(
+                column.get(code).map(String::as_str),
+                Some("no"),
+                "{code} must be documented as not retryable",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_durable_precondition_is_a_conflict_and_not_an_internal_failure() {
+        // **A reachable defect, and the reason the fix is a variant rather than a mapping tweak.**
+        // Every run transition supplies the version it read, so a concurrent advance is refused by
+        // the adapter with `RepositoryError::VersionConflict` — and that arrived at the surface
+        // wrapped in `RunServiceError::Storage(_)`, so the mapping sent it to `500` with the code
+        // `storage.version_conflict`. The contract lists `resource.version_conflict` for a
+        // precondition (`409`) and `internal.failure` for a `500`, so a client was told the server
+        // had faulted, under a code this surface does not document, when its own view was merely
+        // stale — the one case where retrying after a re-read succeeds. The identical conflict on
+        // the policy route was already a `409`, so one concept had two answers depending on which
+        // route met it.
+        //
+        // Asserted through `service_error_response`, which is the function that decides, because a
+        // route-level test would have to win a race to produce the conflict at all — and a test that
+        // cannot reliably reach its subject proves nothing about it.
+        let response = crate::http::runs::service_error_response_for_test(
+            &jarvis_application::run_service::RunServiceError::Conflict,
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "a stale precondition is a conflict, not a fault",
+        );
+
+        // The conflict the adapter actually produces must become that variant, and this is the half
+        // a status assertion cannot see: a `From` impl that still collapsed it into `Storage` would
+        // pass any test that constructed the variant directly.
+        let mapped: jarvis_application::run_service::RunServiceError =
+            jarvis_application::repository::RepositoryError::VersionConflict {
+                expected: 1,
+                actual: 2,
+            }
+            .into();
+        assert_eq!(
+            mapped,
+            jarvis_application::run_service::RunServiceError::Conflict,
+            "the adapter's version conflict must map to the conflict variant, not to Storage",
+        );
+        assert_eq!(mapped.code(), "resource.version_conflict");
+        assert_eq!(
+            mapped.code(),
+            jarvis_application::policy_service::PolicyServiceError::VersionConflict {
+                expected: 1,
+                actual: 2,
+            }
+            .code(),
+            "one concept must carry one code whichever route meets it",
+        );
+        // **And the retryable flag, which is the part nothing checked.** The contract marks
+        // `resource.version_conflict` retryable, and it answers a *client-facing* question ("may I
+        // retry after refreshing?") rather than `RepositoryError::retryable`'s ("may this be resent
+        // unchanged?"). Those disagree by design on this variant, so the surface must report the
+        // client-facing one, and the table row is what a client reads.
+        assert!(mapped.retryable());
+        assert!(
+            !jarvis_application::repository::RepositoryError::VersionConflict {
+                expected: 1,
+                actual: 2,
+            }
+            .retryable(),
+            "the repository's answer stays no: the two flags answer different questions",
+        );
+        let body = read_body_text(response).await;
+        assert!(body.contains(r#""retryable":true"#), "{body}");
+        assert!(
+            body.contains(r#""code":"resource.version_conflict""#),
+            "{body}",
+        );
+    }
+
+    /// Reads a response's body as text, for a test that drives a mapping function directly.
+    async fn read_body_text(response: axum::response::Response) -> String {
+        use axum::body::to_bytes;
+
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body reads");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
     }
 
     #[tokio::test]

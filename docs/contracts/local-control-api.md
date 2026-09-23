@@ -428,11 +428,29 @@ Minimum codes:
 | 500 | `internal.failure` | conditionally |
 
 Every code above except one is produced by a control on this surface, and every code the surface
-produces is listed above — a property a test holds, not a claim this document makes about itself.
-The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
+produces is listed above — a property a test holds, not a claim this document makes about itself.The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
 surface, and the connector platform (`CON-004`) owns rate limiting for provider and MCP traffic.
 It stays listed so the `429` shape is fixed before a limiter is added, but a client must not
 treat "handled" as "will occur".
+
+**`409 resource.version_conflict` covers a stale durable precondition, on every route that has one.**
+The run routes supply the version they read on every transition, so a concurrent advance is refused as
+a conflict — and it is the *same* conflict the policy route meets its own `expected_version` with.
+This is stated because the two routes disagreed: arriving through the storage layer, the run-side
+conflict was reported as a `500` carrying `storage.version_conflict`, a code this table does not
+list, while the policy-side conflict was a `409`. A client was told the server had faulted when its
+own view was merely stale — the one case where a retry after a re-read succeeds. The row's
+`Retryable` marker is a **client-facing** decision ("may I retry after refreshing?") and is
+deliberately not the repository's own answer for the same condition, which asks whether the identical
+write may be resent unchanged and says no.
+
+**Codes reaching the envelope from an error type are not visible to a scan of this surface.** A code
+carried by a variant's `code()` — `idempotency.conflict`, `run.*` from the controller, `storage.*`
+from the repository, `model.*` from the provider — is produced here without appearing as a literal in
+this surface's source, so the test that holds "every produced code is listed" names the ones it knows
+about explicitly. The named set is `CODES_CARRIED_BY_ERROR_TYPES` plus the literals written here; the
+`run.*` and `storage.*` families are covered by their own surfaces' mapping tests rather than by this
+table's completeness check, which is a real limit of that check rather than a claim it is total.
 
 `auth.invalid` and `auth.scope_denied` were listed here and are **deliberately absent**. The first
 is redundant with `auth.credential_rejected`, which this document's own layer-order paragraph
