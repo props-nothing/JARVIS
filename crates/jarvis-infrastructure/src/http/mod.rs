@@ -305,7 +305,9 @@ struct StorageStatus {
 /// 2. the local-authority check, because a request addressed elsewhere should not
 ///    reach a credential comparison at all;
 /// 3. the browser-`Origin` check;
-/// 4. version negotiation and authentication, per route;
+/// 4. version negotiation and authentication, per route, with the media-type check
+///    immediately inside authentication so a request with no credential is told that
+///    first;
 /// 5. routing, with the envelope-returning fallback.
 pub fn router(state: Arc<ApiState>) -> Router {
     // Every `/api/v1` route needs the same authentication layer, so it is applied by
@@ -313,10 +315,17 @@ pub fn router(state: Arc<ApiState>) -> Router {
     // without a credential, which is why the wrapping is a function and not a
     // copy-paste at each call site.
     let authenticated = |route: MethodRouter<Arc<ApiState>>| {
-        route.layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_authentication,
-        ))
+        route
+            // The media-type check is inside authentication, so a request with no credential is
+            // told that first: authentication is the more fundamental refusal and is what the
+            // contract puts before body handling. The order between the two is otherwise
+            // unobservable, because a request that fails one and passes the other receives the
+            // same envelope either way.
+            .layer(middleware::from_fn(require_json_content_type))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_authentication,
+            ))
     };
     Router::new()
         .route("/health/live", get(liveness))
@@ -358,6 +367,93 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // default does not bound raw body consumption, so this is the only bound.
         .layer(middleware::from_fn(limit_request_body))
         .with_state(state)
+}
+
+/// Refuses a command whose `Content-Type` is not a JSON media type, in the shared envelope.
+///
+/// The contract's minimum-code table requires `415 request.media_type_unsupported`, and until this
+/// existed **no handler returned it**. The two halves of the problem were different, and the second
+/// is the one that mattered:
+///
+/// - `runs::create_run` and `runs::cancel_run` read the body as `axum::body::Bytes` and parse it by
+///   hand, which is deliberate — it is what lets a malformed body answer the shared envelope rather
+///   than the framework's plain-text rejection. But `Bytes` applies **no** media-type rule, so a
+///   perfectly valid JSON command sent as `text/plain` was accepted. Verified live against a real
+///   daemon: `POST /api/v1/runs` answered `202` for `text/plain`,
+///   `application/x-www-form-urlencoded`, and a request with no `Content-Type` at all.
+/// - `policy::put_active_policy` takes `axum::Json<PutPolicyRequest>`, so the framework *does*
+///   refuse the same request — with a bare `415` whose body is the plain text
+///   ``Expected request with `Content-Type: application/json` ``. That is exactly the shape this
+///   surface already fixes twice elsewhere (round 5's empty-body `404` fallback and
+///   `tower_http`'s plain-text `413`): a status a client can see and nothing it can parse, in
+///   violation of "every refusal on this surface uses this envelope".
+///
+/// So one check at the router answers both: it produces the contract's code *and* it is outermost
+/// with respect to the extractor, so the framework never gets the chance to emit its own text.
+///
+/// The predicate is axum's own, read from the pinned `axum 0.8.9` (`src/json.rs::json_content_type`)
+/// rather than guessed: `application/json`, or an `application/…+json` suffix such as
+/// `application/merge-patch+json`. It is **restated rather than delegated** because the framework's
+/// version is only reachable through a `Json` extractor, and using one would mean reading and
+/// discarding the body just to obtain a rejection — while silently reverting the shared-envelope
+/// behaviour the hand-parsed routes were written for. A contract test holds the two to the same
+/// rule, so the restatement cannot drift unnoticed.
+///
+/// It applies to every authenticated route, including `GET`s. An unconditional rule is one rule to
+/// test, and a `GET` that declares `text/plain` is malformed whatever it does with the body — there
+/// is no request this surface accepts whose `Content-Type` is neither absent nor JSON. A client that
+/// sends one is fixed by sending none, which RFC 9110 permits for a bodyless request.
+async fn require_json_content_type(request: Request, next: Next) -> Response {
+    let Some(value) = request.headers().get(header::CONTENT_TYPE) else {
+        // An absent `Content-Type` is inside the rule rather than refused by it. RFC 9110
+        // deliberately does not define a default, so it is the client's decision what an unlabelled
+        // body means; refusing it would break every plain JSON client that omits the header while
+        // catching nothing, because a body with no label claims no format to be wrong about. A
+        // `Content-Length: 0` body is already accepted without one today.
+        //
+        // The check applies to `GET`s too — an unconditional rule is one rule to test — and this
+        // branch is what makes that coherent: a `GET` sends no `Content-Type`, so a rule that
+        // refused its absence would refuse every read on the surface. Falsified: returning a `415`
+        // here fails 14 tests, every one of them a read.
+        return next.run(request).await;
+    };
+    if value.to_str().is_ok_and(is_json_media_type) {
+        return next.run(request).await;
+    }
+    error_response(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "request.media_type_unsupported",
+        "This endpoint accepts a JSON request body.",
+        false,
+    )
+}
+
+/// Reports whether a `Content-Type` value is a JSON media type.
+///
+/// Split out so the rule is a pure function a test can drive with any spelling, and so the
+/// `application/…+json` suffix case is exercised without a request that carries one.
+///
+/// Parameters are ignored deliberately: `application/json; charset=utf-8` is the same media type as
+/// `application/json`, and treating a parameter as a different type would refuse the most ordinary
+/// client. An unparseable value is not JSON.
+#[must_use]
+fn is_json_media_type(value: &str) -> bool {
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let Some((kind, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    if kind != "application" {
+        return false;
+    }
+    subtype == "json"
+        || subtype
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix == "json")
 }
 
 /// Refuses a request whose declared body exceeds the bound, in the shared envelope.
@@ -1736,6 +1832,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_event_stream_request_that_excludes_event_stream_is_refused() {
+        // The contract states the events route "requires `Accept: text/event-stream`", and until
+        // this the handler took the header map and read only `Last-Event-ID`, so the requirement
+        // was decoration. A **present** header that excludes the only representation this route can
+        // produce is the case worth catching: a client that asked for JSON was served an event
+        // stream it cannot parse, and the mismatch surfaced in the client rather than here.
+        let (app, token) = runs_fixture("runs-accept").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        for (label, accept) in [
+            ("a JSON-only client", "application/json"),
+            ("an HTML-only client", "text/html"),
+            (
+                "a JSON list that excludes it",
+                "application/json, text/html",
+            ),
+            ("a malformed media range", "not-a-media-range"),
+        ] {
+            let mut headers = run_headers(&token);
+            headers.push(("accept", accept.to_owned()));
+            let (status, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &headers,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+            assert!(
+                body.contains(r#""code":"request.invalid""#),
+                "{label} must use the contract's code: {body}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_request_is_served_when_accept_permits_it() {
+        // The other half of the rule, and the half a `require`-style check gets wrong. An absent
+        // `Accept` states no preference, so the one representation available is served — the same
+        // rule this surface applies to an absent `Content-Type`. And a range the client may not
+        // have thought about (`*/*`, `text/*`, or a list ending in one) permits it too, because
+        // refusing a caller that said "anything" is the wrong direction for a check whose purpose
+        // is to catch a caller that said "JSON".
+        let (app, token) = runs_fixture("runs-accept-ok").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        for (label, accept) in [
+            ("no preference", None),
+            ("the only representation", Some("text/event-stream")),
+            ("a whole-range wildcard", Some("*/*")),
+            ("a type wildcard", Some("text/*")),
+            ("a bare wildcard", Some("*")),
+            (
+                "a list ending in the wildcard",
+                Some("application/json, */*"),
+            ),
+            (
+                "the type spelled first",
+                Some("text/event-stream, application/json"),
+            ),
+            ("with parameters", Some("text/event-stream; charset=utf-8")),
+            ("in a different case", Some("TEXT/EVENT-STREAM")),
+        ] {
+            let mut headers = run_headers(&token);
+            if let Some(value) = accept {
+                headers.push(("accept", value.to_owned()));
+            }
+            let (status, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &headers,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            assert!(body.contains("event: run.received"), "{label}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_accept_rule_is_decided_before_the_resume_position() {
+        // Ordering, and it is observable here because the two refusals use **different** codes: an
+        // `Accept` mismatch is about the request, while an unknown `Last-Event-ID` is about the
+        // retained events. A request that fails both must report the request defect, because the
+        // resume position is only meaningful to a client that is going to receive a stream.
+        let (app, token) = runs_fixture("runs-accept-order").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let mut headers = run_headers(&token);
+        headers.push(("accept", "application/json".to_owned()));
+        headers.push((
+            "last-event-id",
+            "0195f4f1-0475-7613-a92c-edf01183e909".to_owned(),
+        ));
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}/events"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains(r#""code":"request.invalid""#),
+            "the request defect must be reported before the resume position: {body}",
+        );
+    }
+
+    #[tokio::test]
     async fn the_event_stream_uses_sse_framing_and_one_terminal_event() {
         let (app, token) = runs_fixture("runs-stream").await;
         let run_id = create_run(&app, &token, "hello").await;
@@ -1959,6 +2164,153 @@ mod tests {
                 "the hand-built payload and the protocol's builder must agree on the shape",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_with_a_non_json_media_type_is_refused_in_the_shared_envelope() {
+        // The contract's minimum-code table lists `415 request.media_type_unsupported`, and before
+        // this no handler returned it. Two different halves had to be fixed, and the split is the
+        // interesting part: `runs::create_run` reads the body as raw `Bytes` (deliberately, so a
+        // malformed body answers the shared envelope), which applies **no** media-type rule at
+        // all — so a valid JSON command sent as `text/plain` was accepted with `202`. The policy
+        // write took `axum::Json`, so the framework refused it with a **plain-text** body, which
+        // is the same defect this surface fixes twice elsewhere (the empty-body `404` fallback and
+        // `tower_http`'s plain-text `413`). Both are asserted here because one check now answers
+        // both, and a check that covered only the hand-parsed route would leave the framework's
+        // own text reachable.
+        let (app, token) = runs_fixture("media-type-runs").await;
+        for (label, content_type) in [
+            ("a plain-text command", Some("text/plain")),
+            (
+                "a form-encoded command",
+                Some("application/x-www-form-urlencoded"),
+            ),
+            ("a malformed media type", Some("not-a-media-type")),
+            ("a non-application kind", Some("text/json")),
+        ] {
+            let mut headers = run_headers(&token);
+            headers.retain(|(name, _)| *name != "content-type");
+            if let Some(value) = content_type {
+                headers.push(("content-type", value.to_owned()));
+            }
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/api/v1/runs",
+                &headers,
+                &create_body("hello"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{label}: {body}"
+            );
+            // The envelope, not the framework's text. Asserting the code is what distinguishes a
+            // JSON refusal from `Expected request with \`Content-Type: application/json\``.
+            assert!(
+                body.contains(r#""code":"request.media_type_unsupported""#),
+                "{label} must use the contract's code: {body}",
+            );
+            assert!(
+                body.contains(r#""retryable":false"#),
+                "{label} must use the shared envelope: {body}",
+            );
+        }
+
+        // The policy write is the route that reached the media-type code by the wrong path, so it
+        // is asserted separately: an `axum::Json` extractor there would answer a `415` with no
+        // parseable body, and a status-only assertion would not notice.
+        let (policy_app, policy_token, _policy_repositories) =
+            policy_fixture("media-type-policy").await;
+        let mut headers = policy_headers(&policy_token);
+        headers.retain(|(name, _)| *name != "content-type");
+        headers.push(("content-type", "text/plain".to_owned()));
+        let (status, body) = send(
+            &policy_app,
+            "PUT",
+            "/api/v1/model-data-policy",
+            &headers,
+            r#"{"expected_version":0,"rules":{"locality":"local_only","maximum_sensitivity":"public","require_documented_training_use":false,"require_documented_retention":false,"allow_fallback":false}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+        assert!(
+            body.contains(r#""code":"request.media_type_unsupported""#),
+            "the policy write must not answer the framework's plain text: {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_omits_the_content_type_is_still_accepted() {
+        // The refused direction above is only half a rule; this is the other half. RFC 9110 does
+        // not define a default `Content-Type`, so an unlabelled body is the client's statement
+        // that it has no format to declare — and refusing it would break every plain JSON client
+        // that omits the header while catching nothing, since a body with no label cannot be wrong
+        // about its own format. A `Content-Length: 0` request already met this path.
+        let (app, token) = runs_fixture("media-type-absent").await;
+        let mut headers = run_headers(&token);
+        headers.retain(|(name, _)| *name != "content-type");
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &headers,
+            &create_body("hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_json_media_type_rule_matches_the_frameworks_own() {
+        // The predicate is **restated** rather than delegated: the framework's version is only
+        // reachable through a `Json` extractor, and using one would mean reading and discarding a
+        // body just to obtain a rejection — reverting the shared-envelope behaviour the
+        // hand-parsed routes exist for. A restated contract is exactly what this workspace
+        // cross-checks, so the two are held to the same rule here. The cases come from axum
+        // 0.8.9's own `json_content_type`: `application/json`, or an `application/…+json` suffix.
+        for (value, expected) in [
+            ("application/json", true),
+            ("application/json; charset=utf-8", true),
+            ("APPLICATION/JSON", true),
+            ("application/merge-patch+json", true),
+            ("application/problem+json", true),
+            (" application/json ", true),
+            ("text/json", false),
+            ("application/xml", false),
+            ("application/json-seq", false),
+            ("application/", false),
+            ("application", false),
+            ("", false),
+            ("not-a-media-type", false),
+        ] {
+            assert_eq!(
+                super::is_json_media_type(value),
+                expected,
+                "{value} must be {expected}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_media_type_is_not_the_credential_error() {
+        // The media-type check sits *inside* authentication, so an unauthenticated request is told
+        // about its credential rather than its body. The contract puts authentication before body
+        // handling, and the order is otherwise unobservable — both refusals use the same envelope,
+        // so only the code tells them apart.
+        let (app, _token) = runs_fixture("media-type-auth").await;
+        let headers = vec![
+            ("host", TEST_AUTHORITY.to_owned()),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "text/plain".to_owned()),
+        ];
+        let (status, body) = send(&app, "POST", "/api/v1/runs", &headers, &create_body("hi")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(
+            body.contains(r#""code":"auth.credential_rejected""#),
+            "authentication must be reported before the media type: {body}",
+        );
     }
 
     #[tokio::test]
@@ -2458,6 +2810,56 @@ mod tests {
         let (read_status, _) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
         assert_eq!(read_status, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(temp_dir("policy-put-nokey"));
+    }
+
+    #[tokio::test]
+    async fn a_put_with_an_unparseable_or_unknown_field_body_answers_the_shared_envelope() {
+        // The policy write is the one route that previously took `axum::Json`, whose rejections are
+        // its **own** responses rather than the shared envelope this contract promises for every
+        // refusal. `deny_unknown_fields` on `PutPolicyRequest` made an unknown field a parse
+        // failure, so a client that mistyped a rule name received a status it could see and nothing
+        // it could parse. The media type is now checked once for every route by
+        // `require_json_content_type`, and the body is parsed by hand here — so both halves of the
+        // rejection are the contract's.
+        //
+        // Asserted with a **valid** media type, because the media-type half is covered by
+        // `a_command_with_a_non_json_media_type_is_refused_in_the_shared_envelope`; this is the
+        // parse half, which no other test reaches.
+        let (app, token, _) = policy_fixture("policy-put-unparseable").await;
+
+        for (label, body) in [
+            (
+                "a truncated body",
+                r#"{"expected_version":0,"rules":{"locality":"#,
+            ),
+            (
+                "an unknown field",
+                r#"{"expected_version":0,"locality":"local_only"}"#,
+            ),
+            (
+                "a mistyped rule name",
+                r#"{"expected_version":0,"rules":{"localityy":"local_only"}}"#,
+            ),
+            ("a non-object body", r#""just-a-string""#),
+        ] {
+            let (status, response) = policy_put(&app, &token, body, Some("key-1")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {response}");
+            assert!(
+                response.contains(r#""code":"request.invalid""#),
+                "{label} must use the contract's code: {response}",
+            );
+            // The framework's own rejection is plain text beginning `Failed to deserialize`, so
+            // this is what distinguishes a shared-envelope refusal from it.
+            assert!(
+                response.contains(r#""retryable":false"#),
+                "{label} must use the shared envelope: {response}",
+            );
+        }
+
+        // Nothing was written by any of the refusals.
+        let (read_status, _) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(read_status, StatusCode::NOT_FOUND, "nothing was stored");
+        let _ = std::fs::remove_dir_all(temp_dir("policy-put-unparseable"));
     }
 
     #[tokio::test]

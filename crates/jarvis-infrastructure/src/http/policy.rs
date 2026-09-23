@@ -26,8 +26,9 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jarvis_application::policy_service::{EvaluationRequest, PolicyServiceError};
 use jarvis_application::repository::policy::StoredPolicyVersion;
@@ -84,14 +85,37 @@ pub async fn read_active_policy(
 /// into typed values and refuses an unsupported spelling rather than passing the body along: the
 /// merge can only narrow a rule it understands, so a value this build did not parse would be a
 /// rule the write silently dropped — the one edit direction that widens a policy.
+///
+/// The body arrives as raw `Bytes` and is parsed by hand, for the same reason `runs::create_run`
+/// does: `axum::Json` rejects a parse failure with its **own** response. That response is not the
+/// shared envelope, so a client submitting a mistyped rule would receive a status it can see and
+/// nothing it can parse — the one thing this surface promises never to do. The framework's
+/// rejection is also plain text, so it is not the contract's envelope either. It was, before this,
+/// the only route on the surface that reached `request.media_type_unsupported` at all, and by the
+/// wrong path. The media type is now checked once for every route by
+/// `http::require_json_content_type`, so this handler needs no rule of its own.
 pub async fn put_active_policy(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
-    headers: axum::http::HeaderMap,
-    body: axum::Json<PutPolicyRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let Some(service) = state.policies.as_ref() else {
         return not_ready();
+    };
+
+    let request: PutPolicyRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        // A malformed or unknown-field body is the caller's error. The rejected value is not
+        // echoed, because it is caller-supplied text.
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "request.invalid",
+                "The request body is not valid for this endpoint.",
+                false,
+            );
+        }
     };
 
     // `Idempotency-Key` is required by the contract. Without it a client that retries a timed-out
@@ -109,7 +133,7 @@ pub async fn put_active_policy(
         );
     }
 
-    let rules = match submitted_rules(&body.rules) {
+    let rules = match submitted_rules(&request.rules) {
         Ok(rules) => rules,
         Err(code) => {
             return error_response(
@@ -138,8 +162,8 @@ pub async fn put_active_policy(
     match service
         .put(
             &context,
-            body.expected_version,
-            &body.name,
+            request.expected_version,
+            &request.name,
             rules,
             now,
             // A workspace holds one logical policy that accumulates versions, so the identifier

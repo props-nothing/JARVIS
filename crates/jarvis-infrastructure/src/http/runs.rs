@@ -394,6 +394,19 @@ pub async fn run_events(
     let Some(service) = state.runs.as_ref() else {
         return not_ready();
     };
+    // This endpoint serves `text/event-stream` and nothing else, so a caller that states it will
+    // accept something else is asking for a representation this route cannot produce. Refused
+    // before the run is read, because the refusal is about the request rather than the resource:
+    // answering `404` for a well-formed `Accept` mismatch would send a client looking for a run
+    // that is right there.
+    if !accepts_event_stream(&headers) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "request.invalid",
+            "This endpoint serves `text/event-stream`.",
+            false,
+        );
+    }
     let Ok(run) = RunId::parse(&run_id) else {
         return not_found();
     };
@@ -460,6 +473,63 @@ pub async fn run_events(
         }
         Err(error) => service_error_response(&error),
     }
+}
+
+/// Returns whether a request's `Accept` permits an event stream.
+///
+/// The contract states that `GET /api/v1/runs/{run_id}/events` "requires
+/// `Accept: text/event-stream`", and until this nothing checked it — the handler took the header
+/// map and read only `Last-Event-ID`. The requirement was decoration, and it is worth saying why
+/// that mattered: the CLI, which is the reference client for this surface, did **not send the
+/// header either**, so the two defects hid each other. A conforming client and a permissive server
+/// look identical from every test that drives one against the other, which is why the client half
+/// is fixed in the same change.
+///
+/// **An absent `Accept` is inside the rule**, matching how this surface treats an absent
+/// `Content-Type`: a request that states no preference can be served the only representation there
+/// is. A **present** header that excludes `text/event-stream` is refused, which is the case worth
+/// catching — a client that asked for JSON gets an error it can read rather than an event stream it
+/// cannot parse.
+///
+/// The refusal is `400 request.invalid` rather than a `406`, because the contract's minimum-code
+/// table has no `406` and inventing a status/code pair is a protocol change. `request.invalid` is
+/// what this surface already uses for a malformed request header (a missing idempotency key, an
+/// over-long cancel reason), so this stays inside the published envelope.
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(header::ACCEPT) else {
+        return true;
+    };
+    value.to_str().is_ok_and(accepts_event_stream_value)
+}
+
+/// Reports whether one `Accept` header value admits `text/event-stream`.
+///
+/// Split out so the rule is a pure function a test can drive with any spelling. The parsing is
+/// deliberately the small honest subset of RFC 9110 this needs: a comma-separated list of media
+/// ranges, each an optional type and subtype that may be `*`. A range's parameters are ignored,
+/// because `text/event-stream; charset=utf-8` names the same type, and treating a parameter as a
+/// different one would refuse the most ordinary client.
+///
+/// `*/*` and `text/*` both permit it. So does a bare `*`, which is not valid but is unambiguous —
+/// and refusing a caller that said "anything" would be the wrong direction, since the refusal exists
+/// to catch a caller that said "JSON".
+#[must_use]
+fn accepts_event_stream_value(value: &str) -> bool {
+    value.split(',').any(|range| {
+        let essence = range
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match essence.split_once('/') {
+            Some((kind, subtype)) => {
+                (kind == "text" || kind == "*") && (subtype == "event-stream" || subtype == "*")
+            }
+            // A bare `*` is a whole-range wildcard.
+            None => essence == "*",
+        }
+    })
 }
 
 /// Resolves a `Last-Event-ID` value to the sequence after it.

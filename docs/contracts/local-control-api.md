@@ -286,7 +286,13 @@ its code, because every value there comes from a closed set.
 ## Run Event Stream
 
 `GET /api/v1/runs/{run_id}/events` requires
-`Accept: text/event-stream`. Events use standard SSE framing:
+`Accept: text/event-stream`. A **present** `Accept` that excludes that media type is refused with
+`400 request.invalid`; an **absent** `Accept` is inside the rule and is served, because a request
+that states no preference can be given the only representation this route has. The refusal is
+`400` rather than `406` because the minimum-code table above has no `406`, and inventing a
+status/code pair is a protocol change rather than an implementation detail.
+
+Events use standard SSE framing:
 
 ```text
 id: 0195f4f1-0475-7613-a92c-edf01183e909
@@ -390,6 +396,14 @@ produced by a route handler:
 - a **body over the limit** returns `413` with `request.too_large` as
   `application/json`. A limiter's own plain-text `413` would satisfy "the body is
   bounded" while breaking both this rule and the JSON requirement above;
+- a **non-JSON `Content-Type`** on a command returns `415` with
+  `request.media_type_unsupported`. A body reader's own rejection would satisfy
+  "the body is typed" while breaking this rule the same way — and it did, on the one
+  route that took the framework's typed extractor while the others read raw bytes and
+  applied no media-type rule at all;
+- an **absent `Content-Type`** is accepted. RFC 9110 defines no default, so an
+  unlabelled body declares no format to be wrong about; refusing it would break every
+  plain JSON client that omits the header while catching nothing;
 - a **`Host` refusal** returns `400` with `api.host_not_allowed`, a **browser
   `Origin`** or a **forwarding header** returns `403`, and all three are JSON.
 
@@ -403,6 +417,13 @@ authentication — that is, it is checked first — so an oversized body is repo
 after authentication would make the same oversized request report
 `api.version_unsupported` or `auth.credential_rejected` instead, which is true but
 answers the wrong question.
+
+The media-type check is the opposite case and is applied **inside** authentication: a
+caller with no credential learns that before it learns about its body, because
+authentication is the more fundamental refusal and this document puts it before body
+handling. The order between the two is otherwise unobservable, since a request that
+fails one and passes the other receives the same envelope either way — only the `code`
+tells them apart, which is why both directions are asserted.
 
 ## Crash and Recovery Semantics
 

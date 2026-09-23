@@ -1726,6 +1726,106 @@ Foundation TODO remains incomplete.
   on the exception and step tables. The sweep is cheap (`grep` each column name across `crates/`) and
   has now found four defects, so it should continue.
   963 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-021` Enforce the media type on every command, in the contract's own envelope. Found by
+  grepping the contract's **minimum-code table** against the code — the sweep that found `BRN-019`
+  one table over, and the first time this list has been read as a checklist.
+  **The gap was two defects wearing one code's name**, and the split is the whole finding:
+  - **`runs::create_run` and `runs::cancel_run` read the body as raw `Bytes`** and parse it by hand.
+    That is deliberate and correct — it is what lets a malformed body answer the shared envelope
+    instead of the framework's plain text — but `Bytes` applies **no media-type rule at all**, so a
+    perfectly valid JSON command sent as `text/plain` was **accepted with `202`**. Verified live
+    against a real daemon for `text/plain`, `application/x-www-form-urlencoded`, and a request with
+    no `Content-Type` at all: all three created runs.
+  - **`policy::put_active_policy` took `axum::Json`**, so the framework *did* refuse the same
+    request — with a bare `415` whose body was the plain text
+    ``Expected request with `Content-Type: application/json` ``. That violates "every refusal on
+    this surface uses this envelope" and is the **third instance of one class**: round 5 fixed the
+    empty-body `404` fallback and `tower_http`'s plain-text `413`, both for this same rule.
+  - So `415 request.media_type_unsupported` was listed in the contract and returned by **no route**,
+    for two different reasons. **A code that no code produces is invisible in both directions.**
+  - **One check answers both:** `require_json_content_type` at the router, which produces the
+    contract's code *and* is outermost with respect to the extractor — so the framework never gets
+    the chance to emit its own text. The policy handler also moved to the hand-parsed shape the run
+    handlers use, so a **malformed or unknown-field** body answers the envelope too; that half was
+    untested before and is now covered by a test that drives four unparseable bodies.
+  - **The predicate is axum's own, restated, not guessed.** `axum 0.8.9`'s
+    `src/json.rs::json_content_type` accepts `application/json` or an `application/…+json` suffix, so
+    `application/merge-patch+json` works and `text/json` does not. Restated rather than delegated
+    because the framework's version is only reachable through a `Json` extractor, and using one
+    would mean reading and discarding a body just to obtain a rejection. A contract test holds the
+    two to the same rule over 13 spellings.
+  - **Absence is inside the rule, not outside it.** RFC 9110 defines no default `Content-Type`, so
+    an unlabelled body declares no format to be wrong about; refusing it would break every plain
+    JSON client that omits the header while catching nothing. This also required the rule to be
+    applied to `GET`s at all — a `GET` sends no `Content-Type`, so a rule that refused its absence
+    would refuse every read on the surface.
+  - **Ordering is inside authentication**, so an unauthenticated request is told about its
+    credential first. The contract puts authentication before body handling, and the order is
+    otherwise unobservable because both refusals share the envelope — only the `code` distinguishes
+    them, so both directions are asserted.
+  **Falsified four ways, each compiling:** moving the check outside authentication fails the
+  ordering test; `|| true` in the predicate fails the refusal test with the exact defect in the
+  failure body (**a `202` and a created run**); removing the layer entirely fails it too *and* makes
+  the function dead, which clippy denies; reverting the policy handler to `Json` fails the envelope
+  test with `Failed to parse the request body as JSON: …` — the framework's text. And a fifth: making
+  the absent-header branch refuse fails **14** tests, every one a read, which is what settled the
+  absence rule.
+  **Verified on the real daemon and the real client:** the journey asserts all three refusals and
+  the absent-header direction, and `jarvis ask` on a fresh profile still answers with exit `0` — the
+  new layer is the first thing a real client meets.
+  **Still open in this class:** `auth.invalid` and `auth.scope_denied` are in the same table and are
+  returned by no route either. The daemon uses `auth.credential_rejected` for every authentication
+  failure, which is a deliberate privacy decision (unknown, malformed, and revoked credentials must
+  be indistinguishable), and `auth.scope_denied` has no consumer because no route authorizes at a
+  scope finer than the workspace yet. Both need an owner decision: either the table's entries change
+  or the code grows a route that can produce them. `request.rate_limited` is the fourth unreferenced
+  code and is correctly absent — no rate limiter exists and `CON-004` owns connectors.
+  968 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-022` Enforce the event stream's `Accept` requirement, and make the reference client send
+  it. Found by reading the contract's **Required Contract Tests** list as a checklist and then
+  following a sentence in the endpoint description that nothing implemented.
+  **The gap was two defects that hid each other, which is why neither was visible:**
+  - `run_events` took the header map and read **only** `Last-Event-ID`, so the contract's
+    "requires `Accept: text/event-stream`" was decoration. A client that sent
+    `Accept: application/json` was served an event stream it cannot parse, and the mismatch
+    surfaced in the client rather than at the boundary that could name it.
+  - The CLI — which is the **reference client** for this surface — sent no `Accept` header at
+    all. It worked solely because the daemon did not check. A permissive server and a
+    non-conforming client are indistinguishable when driven against each other, so every test
+    that exercised one against the other passed while both were wrong. **Fixing only one half
+    would have broken the CLI against the other.**
+  - And the CLI built these headers in **two** places (`runs events` and the follow loop
+    `jarvis ask` uses), so a fix at one call site would have left `ask` silently non-conforming.
+    Both now go through `event_stream_headers`.
+  - **The predicate is a pure function** (`accepts_event_stream_value`) so the rule is testable
+    over any spelling: a comma-separated media-range list, parameters ignored, `*/*`, `text/*`,
+    and a bare `*` all permit; `application/json`, `text/html`, and a malformed range do not. The
+    subset of RFC 9110 is small on purpose — a full content-negotiation implementation is not
+    needed to answer "does this client permit the one representation this route has".
+  - **Absence is inside the rule**, matching how this surface already treats an absent
+    `Content-Type`: a request stating no preference can be served the only representation there
+    is. **Falsified: refusing absence breaks 4 existing tests, every one a read of the stream.**
+  - **Ordering: the media type is decided before the resume position**, and that is observable
+    because the two refusals use different codes (`request.invalid` vs `stream.replay_unavailable`).
+    A request that fails both must hear about the request, because a resume position is only
+    meaningful to a client that is about to receive a stream.
+  - **The refusal is `400 request.invalid`, not `406`.** The contract's minimum-code table has no
+    `406`, and inventing a status/code pair is a protocol change rather than an implementation
+    detail; `request.invalid` is what this surface already uses for a bad request header.
+  **Falsified three ways, each compiling:** disabling the check fails the refusal test *and* the
+  ordering test, the second showing the resume refusal reported first; refusing absence fails 4
+  reads; removing the CLI's header line fails the client test — and the client half needed its own
+  assertion because **what a client sends cannot be observed from the daemon**, which is exactly
+  why this pair survived.
+  **Verified on the real daemon and the real client:** the disconnect journey asserts the server
+  half in both directions, and `jarvis ask` — which follows a run by polling this route — still
+  answers with exit `0` against the enforcing daemon.
+  **Still open:** `auth.invalid` and `auth.scope_denied` remain in the minimum-code table and are
+  produced by no route (from `BRN-021`), and `MAX_SOURCE_BYTES` in `diagnostics` documents "the
+  maximum number of bytes this process reads from a discovered JSON file" while `std::fs::read`
+  allocates the whole file — a declared bound with no enforcement point, which is the class
+  `BRN-018` and `BRN-021` both belong to.
+  972 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

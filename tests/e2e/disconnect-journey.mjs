@@ -535,6 +535,67 @@ async function main() {
     } else {
       pass("a terminal run is stable across reads");
     }
+
+    // ---------------------------------------------------------------------
+    // 5. The event stream requires the media type the contract names.
+    //
+    // The contract states the route "requires `Accept: text/event-stream`", and until this
+    // **nothing checked it** — the handler took the header map and read only `Last-Event-ID`.
+    // Checked here against a real daemon because the defect had two halves that hid each other:
+    // the CLI, which is the reference client, sent no `Accept` header either, so a permissive
+    // server and a conforming client looked identical from every test that drove one against the
+    // other. This is the server half; the client half is asserted in `jarvis-cli`'s own tests,
+    // because what a client *sends* cannot be observed from the daemon.
+    // ---------------------------------------------------------------------
+    const wrongMediaType = await request(
+      record,
+      credential,
+      "GET",
+      `/api/v1/runs/${abandoned.run_id}/events`,
+      undefined,
+      { Accept: "application/json" },
+    );
+    if (wrongMediaType.status !== 400) {
+      fail(
+        `a client that will not accept an event stream must be refused, got ${wrongMediaType.status}`,
+        wrongMediaType.text,
+      );
+    } else if (wrongMediaType.json?.error?.code !== "request.invalid") {
+      fail("the media-type mismatch must carry the contract's request.invalid code", wrongMediaType.text);
+    } else {
+      pass("an event-stream request that excludes the media type is refused with request.invalid");
+    }
+
+    // And the absence of the header still works, so the check did not turn into a requirement
+    // every plain client fails. Asserted as a comparison against the same request *with* the
+    // header, so the rule being tested is that the header does not change the outcome — a literal
+    // status would pin this to whatever the run's state happens to be.
+    const withHeader = await request(
+      record,
+      credential,
+      "GET",
+      `/api/v1/runs/${abandoned.run_id}/events`,
+      undefined,
+      { Accept: "text/event-stream" },
+    );
+    const withoutHeader = await request(
+      record,
+      credential,
+      "GET",
+      `/api/v1/runs/${abandoned.run_id}/events`,
+    );
+    if (withHeader.status !== 200) {
+      fail(`the control request must be served, got ${withHeader.status}`, withHeader.text);
+    } else if (withoutHeader.status !== withHeader.status) {
+      fail(
+        `an absent Accept must reach the same decision as a permitting one: ${withoutHeader.status} vs ${withHeader.status}`,
+        withoutHeader.text,
+      );
+    } else if (withoutHeader.json?.error?.code === "request.invalid") {
+      fail("an absent Accept must not be refused as a media-type mismatch", withoutHeader.text);
+    } else {
+      pass("an absent Accept is served the only representation this route has");
+    }
   } finally {
     if (running) {
       await stop(running);

@@ -215,7 +215,15 @@ function request(record, credential, method, path, body, extraHeaders = {}) {
     let payload;
     if (body !== undefined) {
       payload = JSON.stringify(body);
-      headers["Content-Type"] = "application/json";
+      // `Content-Type` is set unless the caller named one, and `null` is how a caller asks for the
+      // header to be **absent** rather than JSON — the two are different requests and only the real
+      // daemon can tell them apart.
+      if (!("Content-Type" in extraHeaders)) {
+        headers["Content-Type"] = "application/json";
+      } else if (extraHeaders["Content-Type"] === null) {
+        delete headers["Content-Type"];
+        headers["Content-Length"] = Buffer.byteLength(payload);
+      }
       headers["Content-Length"] = Buffer.byteLength(payload);
     }
     const call = http.request(
@@ -697,7 +705,70 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
-    // 12. The daemon is still healthy after the policy surface ran.
+    // 12. A non-JSON media type is refused in the contract's envelope, on every route.
+    //
+    // The contract's minimum-code table requires `415 request.media_type_unsupported`, and until
+    // this no handler returned it — the check did not exist at all. Two different paths had to be
+    // covered, and the split is why this is checked against a **real** daemon: the run routes read
+    // the body as raw bytes (so they applied no media-type rule and accepted a JSON command sent as
+    // `text/plain` with `202`), while the policy write took the framework's `Json` extractor (so it
+    // refused the same request with a **plain-text** body, violating "every refusal on this surface
+    // uses this envelope"). A status-only assertion passes against both defects; the body is what
+    // distinguishes them.
+    // ---------------------------------------------------------------------
+    for (const [label, path, body, contentType] of [
+      ["a plain-text run command", "/api/v1/runs", { input: { type: "text", text: "hi" }, runtime: "jarvis-native" }, "text/plain"],
+      ["a form-encoded run command", "/api/v1/runs", { input: { type: "text", text: "hi" }, runtime: "jarvis-native" }, "application/x-www-form-urlencoded"],
+      ["a plain-text policy write", "/api/v1/model-data-policy", { expected_version: 3, rules: { locality: "local_only", maximum_sensitivity: "public", require_documented_training_use: false, require_documented_retention: false, allow_fallback: false } }, "text/plain"],
+    ]) {
+      const refused = await request(record, credential, path === "/api/v1/runs" ? "POST" : "PUT", path, body, {
+        "Content-Type": contentType,
+        "Idempotency-Key": idempotencyKey(`media-${label}`),
+      });
+      if (refused.status !== 415) {
+        fail(`${label} must be refused with 415, got ${refused.status}`, refused.text);
+      } else if (refused.json?.error?.code !== "request.media_type_unsupported") {
+        fail(`${label} must carry the contract's media-type code`, refused.text);
+      } else if (typeof refused.json?.error?.message !== "string") {
+        fail(`${label} must answer the shared envelope, not the framework's text`, refused.text);
+      } else {
+        pass(`${label} is refused with 415 in the shared envelope`);
+      }
+    }
+
+    // And the absence of the header is inside the rule, not outside it: RFC 9110 defines no default
+    // `Content-Type`, so a body with no label declares no format to be wrong about — and refusing it
+    // would break every plain JSON client that omits the header.
+    //
+    // Asserted as a **comparison** rather than against a literal status, because by this point the
+    // policy has been narrowed to `public` and a create is legitimately refused with
+    // `403 model.policy_unsatisfied`. That 403 is stronger evidence than a 202 would be: it proves
+    // the request reached the policy decision, which is *deeper* than the media-type layer. The rule
+    // being tested is that the header's presence does not change the outcome, so the two requests
+    // must agree — a literal would pin this check to the state of the journey around it.
+    const unlabelledBody = { input: { type: "text", text: "an unlabelled body" }, runtime: "jarvis-native" };
+    const labelled = await request(record, credential, "POST", "/api/v1/runs", unlabelledBody, {
+      "Idempotency-Key": idempotencyKey("media-labelled"),
+    });
+    const unlabelled = await request(record, credential, "POST", "/api/v1/runs", unlabelledBody, {
+      "Content-Type": null,
+      "Idempotency-Key": idempotencyKey("media-absent"),
+    });
+    if (labelled.status === 415) {
+      fail("the control request was itself refused on its media type, so this proves nothing", labelled.text);
+    } else if (unlabelled.status !== labelled.status) {
+      fail(
+        `a body with no Content-Type must reach the same decision as a JSON one: ${unlabelled.status} vs ${labelled.status}`,
+        unlabelled.text,
+      );
+    } else if (unlabelled.json?.error?.code === "request.media_type_unsupported") {
+      fail("an unlabelled body must not be refused on its media type", unlabelled.text);
+    } else {
+      pass(`a command with no Content-Type reaches the same decision as one with it (${labelled.status})`);
+    }
+
+    // ---------------------------------------------------------------------
+    // 13. The daemon is still healthy after the policy surface ran.
     //
     // Cheap, but it is the check that catches a handler that panics in a way the router
     // converted into a response: the process would still be alive and the next probe would

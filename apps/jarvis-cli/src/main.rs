@@ -40,10 +40,36 @@ use jarvis_infrastructure::service::{
 /// The API major version this client speaks.
 const API_MAJOR: u32 = 1;
 
+/// The media type the run event stream is served as.
+///
+/// The contract states that the events route "requires `Accept: text/event-stream`", so this
+/// client states it. A client that relies on the server not checking the header works until the
+/// server starts doing so — and then fails for a reason that names the daemon rather than the
+/// client.
+const EVENT_STREAM_MEDIA_TYPE: &str = "text/event-stream";
+
 /// Exit code for a successful command.
 const EXIT_OK: u8 = 0;
 /// Exit code for a usage or environment problem the operator must fix.
 const EXIT_ATTENTION: u8 = 1;
+
+/// Builds the extra headers the event-stream route takes.
+///
+/// The contract states that `GET /api/v1/runs/{run_id}/events` "requires
+/// `Accept: text/event-stream`", and this is the reference client for that surface — so it states
+/// what it accepts rather than relying on the daemon's tolerance. Until this it sent only the
+/// resume header, which worked **solely** because the daemon did not check: a permissive server and
+/// a conforming client are indistinguishable when driven against each other, so both halves were
+/// wrong together and neither showed it.
+///
+/// A named function rather than an inline `format!` so the client's conformance is assertable
+/// without a running daemon. A header this client is required to send is exactly the kind of thing
+/// that disappears in a refactor while every test still passes.
+#[must_use]
+fn event_stream_headers(last_event_id: Option<&str>) -> String {
+    let resume = last_event_id.map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+    format!("Accept: {EVENT_STREAM_MEDIA_TYPE}\r\n{resume}")
+}
 
 /// The `jarvis` command-line client.
 #[derive(Debug, Parser)]
@@ -357,9 +383,10 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
     let mut last_event_id: Option<String> = None;
     let mut streamed = false;
     for _ in 0..600 {
-        let extra = last_event_id
-            .as_ref()
-            .map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+        // The same function the `runs events` command uses, because this route's headers were
+        // built in **two** places — and that is how the missing media type hid: a fix in one call
+        // site would have left the other wrong, and `jarvis ask` is the command that uses this one.
+        let extra = event_stream_headers(last_event_id.as_deref());
         let (status, body) = match get_with_status(
             &state.discovered,
             &state.credential,
@@ -446,8 +473,7 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
             run_id,
             last_event_id,
         } => {
-            let extra =
-                last_event_id.map_or_else(String::new, |id| format!("Last-Event-ID: {id}\r\n"));
+            let extra = event_stream_headers(last_event_id.as_deref());
             let (status, body) = match get_with_status(
                 &state.discovered,
                 &state.credential,
@@ -1417,10 +1443,54 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, InstallAction, StatusBody, idempotency_key, json_string, parse_sse,
-        parse_status,
+        Cli, Command, InstallAction, StatusBody, event_stream_headers, idempotency_key,
+        json_string, parse_sse, parse_status,
     };
     use clap::Parser as _;
+
+    #[test]
+    fn the_event_stream_request_states_the_media_type_the_contract_requires() {
+        // The contract requires `Accept: text/event-stream` on the events route, and this client is
+        // the reference implementation of that surface. It sent **no** `Accept` header at all until
+        // this, which worked only because the daemon did not check — the two defects hid each other,
+        // so no test driving one against the other could see either.
+        //
+        // Asserted on the string this client builds rather than through a server, because the rule
+        // is about what the client *sends*: a test that went over the wire would pass as soon as the
+        // server started tolerating the omission, which is exactly the state this leaves behind.
+        let bare = event_stream_headers(None);
+        assert!(
+            bare.contains(&format!("Accept: {}\r\n", super::EVENT_STREAM_MEDIA_TYPE)),
+            "{bare}",
+        );
+        assert!(
+            !bare.contains("Last-Event-ID"),
+            "no resume was asked for: {bare}"
+        );
+
+        // And the resume header is still sent when one is asked for, so adding the media type did
+        // not replace the header that was already there.
+        let resumed = event_stream_headers(Some("0195f4f1-0475-7613-a92c-edf01183e909"));
+        assert!(
+            resumed.contains("Accept: text/event-stream\r\n"),
+            "{resumed}",
+        );
+        assert!(
+            resumed.contains("Last-Event-ID: 0195f4f1-0475-7613-a92c-edf01183e909\r\n"),
+            "{resumed}",
+        );
+
+        // Every header line ends in CRLF and none is empty, because this string is spliced directly
+        // into the request the client writes — a missing terminator would merge two headers into
+        // one and send a header nobody wrote.
+        for line in bare.lines() {
+            assert!(!line.is_empty(), "{bare}");
+            assert!(
+                bare.contains(&format!("{line}\r\n")),
+                "every line must be terminated: {bare}",
+            );
+        }
+    }
 
     #[test]
     fn every_documented_command_parses() {
