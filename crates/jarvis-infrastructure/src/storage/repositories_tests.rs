@@ -1419,6 +1419,88 @@ async fn an_uninterpretable_stored_state_is_corruption_not_absence() {
 }
 
 #[tokio::test]
+async fn a_run_records_the_runtime_that_executed_it() {
+    // `agent_runs.runtime_id` and `runtime_version` were referenced by **no code at all** before
+    // this: `CreateRunRequest.runtime` was required, validated by the handler, and then discarded,
+    // so every row carried `NULL` for both while the schema, the contract, and
+    // `agent-runtime.md`'s "validate runtime identity/version" resume step all expected a value.
+    //
+    // The assertion is on the *stored* run rather than on the request, because the defect was
+    // exactly that the value stopped at the request. It is also on a non-native runtime, so
+    // "some runtime" cannot satisfy it — a hardcoded `jarvis-native` in the reader would pass a
+    // native-only assertion and fail this one.
+    let (_database, repositories) = repository().await;
+    seed_conversation_only(&repositories).await;
+
+    let runtime = jarvis_application::repository::run::RunRuntime::new("external-runtime", "9.9.9")
+        .expect("valid");
+    let run = NewRun::new(
+        run_id(),
+        workspace(),
+        conversation_id(),
+        principal(),
+        Some("objective-1".to_owned()),
+        now(),
+    )
+    .expect("valid")
+    .with_runtime(runtime.clone());
+    repositories
+        .create(run, run_received_event(run_id(), now()))
+        .await
+        .expect("the run is created");
+
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("the run loads");
+    assert_eq!(stored.runtime, Some(runtime));
+}
+
+#[tokio::test]
+async fn a_run_with_half_a_runtime_identity_is_corruption_not_absence() {
+    // Half a pair is what a partial write or a hand-edited row produces, and the two values are
+    // only meaningful together: an id with no version cannot tell a compatible runtime from a
+    // changed one, which is the whole reason `agent-runtime.md` requires both on resume. Reporting
+    // `None` would make corruption look like "recorded before this feature existed".
+    let (database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    sqlx::query("UPDATE agent_runs SET runtime_version = NULL WHERE id = ?")
+        .bind(run_id().to_string())
+        .execute(database.pool())
+        .await
+        .expect("the row is rewritten");
+
+    let error = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect_err("half an identity must be reported");
+    assert_eq!(error.code(), "storage.row_corrupted");
+}
+
+#[tokio::test]
+async fn a_run_predating_the_runtime_columns_reads_back_without_one() {
+    // The mirror of the corruption case, and the reason the stored field is an `Option`: a row
+    // written before these columns had a writer carries `NULL` for both, and that is a *complete*
+    // pair of absences rather than a half one. Reporting corruption here would fail every existing
+    // database on upgrade.
+    let (database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    sqlx::query("UPDATE agent_runs SET runtime_id = NULL, runtime_version = NULL WHERE id = ?")
+        .bind(run_id().to_string())
+        .execute(database.pool())
+        .await
+        .expect("the row is rewritten");
+
+    let stored = repositories
+        .load(workspace(), run_id())
+        .await
+        .expect("an old row still loads");
+    assert_eq!(stored.runtime, None);
+}
+
+#[tokio::test]
 async fn the_transition_and_event_survive_a_reopen() {
     // Durability rather than in-process visibility: the state and its event are
     // read back through a fresh pool over the same file.

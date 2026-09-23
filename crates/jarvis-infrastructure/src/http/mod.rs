@@ -718,6 +718,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use jarvis_application::policy_service::PolicyService;
     use jarvis_application::repository::policy::ModelDataPolicyRepository;
+    use jarvis_application::repository::run::RunRepository as _;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -1289,6 +1290,20 @@ mod tests {
     /// HTTP boundary and a double at both layers would let a serialization or scope
     /// defect survive. The database is in-memory so the fixture stays fast.
     async fn runs_fixture(tag: &str) -> (axum::Router, String) {
+        let (app, token, _repositories) = runs_fixture_with(tag, FixtureProvider::Answers).await;
+        (app, token)
+    }
+
+    /// The same fixture, but also handing back the repositories.
+    ///
+    /// A separate accessor rather than a wider return type on [`runs_fixture`], because most of
+    /// these tests are about the HTTP surface and never look at storage; forcing each of them to
+    /// destructure a handle they ignore would be noise. This one exists so a test can assert what
+    /// a *real* create wrote — the difference between "the handler accepted the field" and "the
+    /// field reached a row", which is exactly the defect this fixture is used for.
+    async fn runs_fixture_with_storage(
+        tag: &str,
+    ) -> (axum::Router, String, Arc<SqliteRepositories>) {
         runs_fixture_with(tag, FixtureProvider::Answers).await
     }
 
@@ -1306,7 +1321,10 @@ mod tests {
         Refuses,
     }
 
-    async fn runs_fixture_with(tag: &str, kind: FixtureProvider) -> (axum::Router, String) {
+    async fn runs_fixture_with(
+        tag: &str,
+        kind: FixtureProvider,
+    ) -> (axum::Router, String, Arc<SqliteRepositories>) {
         use crate::storage::repositories::SqliteRepositories;
         use crate::storage::{Database, migrate};
         use jarvis_application::live_events::StreamDeltaSink;
@@ -1379,7 +1397,11 @@ mod tests {
             .with_runs(service)
             .with_spawner(Arc::new(TokioSpawner)),
         );
-        (router(state), credential.to_presentation_text())
+        (
+            router(state),
+            credential.to_presentation_text(),
+            repositories,
+        )
     }
 
     /// Authenticated headers for a run request.
@@ -1547,6 +1569,61 @@ mod tests {
         assert!(
             response.contains(r#""code":"request.semantic_invalid""#),
             "{response}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_created_run_records_the_runtime_that_executed_it() {
+        // The runtime named in a create request was validated by the handler and then **discarded**:
+        // `agent_runs.runtime_id` and `runtime_version` appeared in the schema and were referenced
+        // by no code at all, so every row carried `NULL` while
+        // `agent-runtime.md`'s resume step required "validate runtime identity/version".
+        //
+        // Asserted at the handler rather than only at the adapter, because the defect was in the
+        // handoff: the service could store a runtime correctly while the handler never told it one.
+        // Reading the row back through the repository is what makes that falsifiable — a handler
+        // that accepted the field and dropped it again would pass any assertion on the response.
+        let (app, token, repositories) = runs_fixture_with_storage("runs-runtime-recorded").await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        let stored = repositories
+            .load(
+                jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::from_u128(
+                    crate::http::runs::DEFAULT_WORKSPACE_UUID,
+                )),
+                jarvis_domain::ids::RunId::parse(&run_id).expect("the response carries an id"),
+            )
+            .await
+            .expect("the created run loads");
+
+        let runtime = stored.runtime.expect("the row records a runtime");
+        assert_eq!(
+            runtime.id,
+            jarvis_application::repository::run::NATIVE_RUNTIME_ID,
+            "the row must name the runtime that executed it",
+        );
+        // Asserted against the build's own version rather than merely non-empty. An earlier
+        // version of this assertion was `!runtime.version.is_empty()`, and a mutation that read
+        // the `runtime_id` column twice — so the version silently became the id — passed it. The
+        // version is what a resume compares, so the check has to name the value.
+        assert_eq!(
+            runtime.version,
+            env!("CARGO_PKG_VERSION"),
+            "the version is the executing build's, which is what a resume compares",
+        );
+    }
+
+    #[test]
+    fn the_native_runtime_literal_matches_the_protocols() {
+        // `jarvis-application` cannot depend on `jarvis-protocol` — the flow runs protocol ->
+        // nothing app-side — so the identifier `jarvis-native` exists twice. This is the cross-check
+        // the workspace applies to every such duplicated contract string, and it is asserted here
+        // because this is a crate that can name both. Without it, editing one literal would leave
+        // the app recording a runtime id no client recognises as the native one.
+        assert_eq!(
+            jarvis_application::repository::run::NATIVE_RUNTIME_ID,
+            jarvis_protocol::run::NATIVE_RUNTIME,
+            "the recorded runtime id and the contract's must be one value",
         );
     }
 
@@ -1810,7 +1887,7 @@ mod tests {
         // Asserted on the **stored events** rather than on the wire, because the handler renders
         // whatever the repository holds: a payload that never reached the row could not be
         // delivered however the handler rendered it.
-        let (app, token) =
+        let (app, token, _repositories) =
             runs_fixture_with("runs-terminal-payload", FixtureProvider::Refuses).await;
         // A provider that always refuses fails the run before acceptance, which is the path that
         // reaches `Step::failed` with a code.

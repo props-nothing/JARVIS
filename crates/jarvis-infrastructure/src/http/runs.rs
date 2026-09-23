@@ -27,6 +27,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use jarvis_application::repository::run::RunRuntime;
 use jarvis_application::request_context::RequestContext;
 use jarvis_application::run_service::{CreatedRun, RunService, RunServiceError};
 use jarvis_domain::ids::{
@@ -45,6 +46,14 @@ use crate::http::{ApiState, AuthenticatedClient, error_response};
 
 /// The header carrying a client's idempotency key.
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+
+/// The runtime version this build records on every run it creates.
+///
+/// The package version rather than the wire contract version, because the two answer different
+/// questions: the contract version says which *protocol* an event frame speaks, while this says
+/// which build executed the run — and a resume needs the second, since a runtime's behaviour can
+/// change without the wire shape changing.
+const BUILD_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The header a client uses to resume a stream.
 pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
@@ -161,6 +170,22 @@ pub async fn create_run(
             "The requested runtime is not supported by this build.",
             false,
         );
+    }
+    // The runtime the caller named is **validated**, and the recorded runtime comes from the build
+    // rather than from the request: the check above refuses what this build cannot serve, so the
+    // only runtime that can reach a row is this one. The version is this build's own, because the
+    // version that matters for a resume is the one that actually executed the run — a client cannot
+    // claim a runtime version it is not running.
+    match RunRuntime::new(command.runtime.as_str(), BUILD_RUNTIME_VERSION) {
+        Ok(_) => {}
+        Err(_) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "request.semantic_invalid",
+                "The requested runtime identity is not usable.",
+                false,
+            );
+        }
     }
     let input = command.input.text_value();
     if input.is_empty() || input.len() > MAX_RUN_INPUT_BYTES {

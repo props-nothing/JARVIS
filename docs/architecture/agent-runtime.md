@@ -592,6 +592,15 @@ Runtime-native checkpoint IDs are opaque references. On resume:
 5. Ask the runtime to resume from its checkpoint.
 6. Reject duplicate completion or tool-intent events by stable event/call ID.
 
+Step 2's first half is now **satisfiable**: a run records the runtime that executed it and that
+build's version, written by the create path into `agent_runs.runtime_id`/`runtime_version` and read
+back by the same port. Before that, both columns were referenced by no code at all —
+`CreateRunRequest.runtime` was required and validated and then discarded — so a resume had nothing
+to compare a runtime against. The second half (checkpoint ownership) is not implemented, because
+there are no runtime-native checkpoints yet; `BRN-011` owns that. The columns are nullable so a row
+written before they had a writer stays presentable, and a row carrying only one of the pair is
+reported as corruption rather than as an absent identity.
+
 If a runtime claims completion but required artifacts or tool outcomes are
 missing, the JARVIS run enters a reconciliation error, not `Completed`.
 

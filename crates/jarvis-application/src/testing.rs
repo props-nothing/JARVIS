@@ -62,6 +62,8 @@ struct RunRow {
     waiting_kind: Option<String>,
     waiting_ref: Option<String>,
     deadline_at: Option<UtcTimestamp>,
+    /// The runtime that executed the run, mirroring the adapter's nullable columns.
+    runtime: Option<crate::repository::run::RunRuntime>,
     budget: RunBudget,
 }
 
@@ -81,6 +83,7 @@ impl RunRow {
             completed_at: self.lifecycle.terminal_at(),
             error_code: self.error_code.clone(),
             deadline_at: self.deadline_at,
+            runtime: self.runtime.clone(),
             budget: self.budget.clone(),
         }
     }
@@ -376,6 +379,7 @@ impl RunRepository for InMemoryRepositories {
                         waiting_kind: None,
                         waiting_ref: None,
                         deadline_at: run.deadline_at,
+                        runtime: Some(run.runtime.clone()),
                         budget: run.budget,
                     },
                 );
@@ -742,6 +746,7 @@ impl RunRepository for InMemoryRepositories {
                         waiting_kind: None,
                         waiting_ref: None,
                         deadline_at: run.deadline_at,
+                        runtime: Some(run.runtime.clone()),
                         budget: run.budget,
                     },
                 );

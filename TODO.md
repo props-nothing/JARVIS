@@ -1676,6 +1676,56 @@ Foundation TODO remains incomplete.
   the real-daemon journey asserts both directions — an event naming its call when one is published,
   and **no** event for the scripted provider that reports no usage.
   955 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-020` Record which runtime executed a run. The schema sweep that found `BRN-017` and the
+  same shape again, one table over: `agent_runs.runtime_id` and `runtime_version` were named by
+  `docs/data/schema.md` and by **no code at all**.
+  **The gap:** `CreateRunRequest.runtime` is a **required** field, and the create handler did check
+  it — an unsupported runtime is `422 request.semantic_invalid`, with a test asserting exactly that.
+  What the handler never did was *record* it: the validated value was dropped and both columns stayed
+  `NULL` on every row. So the check was real and the record was absent, which reads as coverage: the
+  refusal test passes, the field is documented, the columns exist, and the architecture's resume step
+  ("validate runtime identity/version") has nothing to validate against. Same class as the dead
+  `route_decision_id` column and the unenforced `MAX_CANCEL_REASON_BYTES`: a value that stops at the
+  boundary it was named for.
+  - **A new `RunRuntime { id, version }` on the application's run repository**, with a validating
+    `new` and a `native()` helper. Both fields are bounded, non-empty, and NUL-free, because both
+    reach a `TEXT` column and SQLite cannot bound one — so the rule lives at the single place a run is
+    built rather than in each adapter. Both are checked: a validation that covered only `id` would let
+    an empty *version* through, and an empty version is what made "recorded" indistinguishable from
+    "not recorded" in the first place. Falsified: validating only `id` lets an empty version through.
+  - **The constructors default it to the native runtime** rather than taking it as an argument, and a
+    `with_runtime` override is what a multi-runtime build would use. The default is *true of this
+    build* rather than a convenience: the handler refuses every runtime this build cannot serve, so
+    native is the only one that can reach a row. It also keeps a run from existing in a state where
+    the columns stay `NULL` because a caller forgot.
+  - **The version is the build's own (`env!("CARGO_PKG_VERSION")`), never the caller's.** A client
+    cannot claim to be running a runtime version it is not, and the version a resume compares is the
+    one that actually executed the run. The wire contract version answers a different question —
+    which *protocol* a frame speaks — since a runtime's behaviour can change without its wire shape
+    changing.
+  - **The stored field is an `Option` while the created field is required**, and the asymmetry is the
+    point: a row written before these columns had a writer has no truthful value to give, and
+    reporting corruption for it would fail every existing database on upgrade. A row carrying **one**
+    of the pair is corrupt rather than absent — half an identity cannot be validated against
+    anything.
+  - **The `jarvis-native` literal exists twice** (`jarvis-application` cannot depend on
+    `jarvis-protocol`), so a cross-check test asserts the recorded id and
+    `jarvis_protocol::run::NATIVE_RUNTIME` are one value — the technique used for every duplicated
+    contract string here.
+  - **The handler test reads the row back through the repository**, not just the response. That is
+    what makes "the field reached storage" falsifiable, and it matters because the defect was in the
+    handoff: the service could store a runtime correctly while the handler never told it one.
+  **Falsified three ways, each compiling:** dropping the two `INSERT` binds fails the round-trip and
+  the handler test; reading `runtime_id` twice in the `SELECT` also fails both — and an earlier
+  version of the handler assertion (`!version.is_empty()`) **passed that mutation**, so it was
+  strengthened to name the build version. That near-miss is recorded because a loose assertion beside
+  a correct implementation is the thing that lets the next mutation through.
+  **Still open in this class:** `agent_steps` columns `attempt_count`, `input_fingerprint`,
+  `input_ref`, `output_ref`, `timeout_ms`, `next_attempt_at`; `agent_runs` columns
+  `context_manifest_id`, `plan_summary_ref`, `result_ref`, `error_ref`; and `granted_by`/`scope_ref`
+  on the exception and step tables. The sweep is cheap (`grep` each column name across `crates/`) and
+  has now found four defects, so it should continue.
+  963 workspace tests. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

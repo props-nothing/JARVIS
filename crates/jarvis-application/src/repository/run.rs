@@ -30,6 +30,82 @@ use jarvis_domain::time::UtcTimestamp;
 /// would be the one place large content crept back into a row.
 pub const MAX_REFERENCE_BYTES: usize = 512;
 
+/// The largest accepted runtime identity or version string.
+///
+/// Bounded because both reach persisted columns and both are validated against what the build
+/// supports: an unbounded value would let a caller write a runtime identity no reader can match.
+/// The bound matches `MAX_REFERENCE_BYTES`'s order of magnitude rather than being an arbitrary new
+/// number — a runtime name and its version are identifiers, not content.
+pub const MAX_RUNTIME_ID_BYTES: usize = 128;
+
+/// The runtime a run is executed by, and the version of it.
+///
+/// Recorded on the run rather than kept in the request, because the request is gone the moment it
+/// returns while the run outlives it: `agent-runtime.md` requires a resume to "validate runtime
+/// identity/version", and a run whose row could not say which runtime executed it could not be
+/// validated against anything.
+///
+/// Before this, `agent_runs.runtime_id` and `runtime_version` existed in the schema and were
+/// referenced by **no code at all**: `CreateRunRequest.runtime` was required and validated by the
+/// handler and then discarded, so every row carried `NULL` for both. The handler's check is real
+/// — it refuses a runtime this build does not support — but it recorded nothing, which is the
+/// "validated and then dropped" shape rather than a missing check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRuntime {
+    /// The runtime's stable identifier (`jarvis-native`), which is what a resume matches on.
+    pub id: String,
+    /// The runtime's version, so a resume can tell a compatible runtime from a changed one.
+    pub version: String,
+}
+
+impl RunRuntime {
+    /// The native runtime this build executes runs with.
+    ///
+    /// The literal rather than `jarvis_protocol::NATIVE_RUNTIME`, because this crate cannot depend
+    /// on `jarvis-protocol`; the two are asserted equal by a cross-check test in the crate that can
+    /// name both, which is the technique this workspace uses for every duplicated contract string.
+    ///
+    /// The version is the **package** version rather than the wire contract version: the contract
+    /// version says which protocol an event frame speaks, while this says which build executed the
+    /// run, and a resume needs the second — a runtime's behaviour can change without its wire shape
+    /// changing.
+    #[must_use]
+    pub fn native() -> Self {
+        Self {
+            id: NATIVE_RUNTIME_ID.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    /// Builds a runtime identity, validating both fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Conflict`] when either value is empty, over
+    /// [`MAX_RUNTIME_ID_BYTES`], or contains a NUL byte. Both reach a persisted column, and the
+    /// schema cannot bound a `TEXT` column — so the rule lives here, at the one place a run is
+    /// built, rather than at each adapter.
+    pub fn new(id: &str, version: &str) -> Result<Self, RepositoryError> {
+        for value in [id, version] {
+            if value.is_empty() || value.len() > MAX_RUNTIME_ID_BYTES || value.contains('\0') {
+                return Err(RepositoryError::Conflict {
+                    what: "run_runtime_identity",
+                });
+            }
+        }
+        Ok(Self {
+            id: id.to_owned(),
+            version: version.to_owned(),
+        })
+    }
+}
+
+/// The native runtime's identifier.
+///
+/// Public so the cross-check test can name it rather than restating the literal, which would make
+/// the test agree with a second copy instead of with the value itself.
+pub const NATIVE_RUNTIME_ID: &str = "jarvis-native";
+
 /// The fields needed to create a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRun {
@@ -45,6 +121,14 @@ pub struct NewRun {
     pub objective_ref: Option<String>,
     /// The instant the run was created.
     pub created_at: UtcTimestamp,
+    /// The runtime this run is executed by, and its version.
+    ///
+    /// Required rather than optional: a run is always executed by *something*, and an absent value
+    /// would make "no runtime recorded" and "the native runtime" indistinguishable — which is
+    /// exactly the state every row was in while these columns were unreferenced. The constructors
+    /// default it to [`RunRuntime::native`], so a run records one without every call site naming
+    /// it, and [`with_runtime`](Self::with_runtime) overrides it.
+    pub runtime: RunRuntime,
     /// The per-run wall-clock deadline, which `agent_runs.deadline_at` stores.
     ///
     /// Held separately from [`budget`](Self::budget) because the schema keeps it in its
@@ -87,6 +171,19 @@ impl NewRun {
         )
     }
 
+    /// Returns this request with the runtime that will execute it.
+    ///
+    /// An override rather than a required constructor argument, so a caller that only has the
+    /// native runtime — every caller today — does not have to name it, while a build that serves
+    /// more than one can. The default is [`RunRuntime::native`], which is **true** of this build:
+    /// the create handler refuses any runtime it does not support, so native is the only one that
+    /// can reach here.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: RunRuntime) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
     /// Builds a run creation request under `budget`.
     ///
     /// The deadline is taken from the budget rather than passed separately, so a run
@@ -120,6 +217,9 @@ impl NewRun {
             principal_id,
             objective_ref,
             created_at,
+            // The native runtime is the default because it is the only one this build can serve;
+            // a caller that runs another overrides it through `with_runtime`.
+            runtime: RunRuntime::native(),
             deadline_at: budget.deadline,
             budget,
         })
@@ -163,6 +263,13 @@ pub struct StoredRun {
     /// needs it to decide whether an interrupted run had already run out of time: a
     /// run whose deadline passed is not "interrupted work", it is expired work.
     pub deadline_at: Option<UtcTimestamp>,
+    /// The runtime that executed it, when recorded.
+    ///
+    /// Optional **on the read** while required on the create, and the asymmetry is the schema's:
+    /// the columns are nullable, so a row written before this existed has none. Reading it as
+    /// required would make every pre-existing row unpresentable, which is why the migration is
+    /// additive and the read is tolerant.
+    pub runtime: Option<RunRuntime>,
     /// The run budget this run was created under.
     pub budget: RunBudget,
 }
@@ -731,7 +838,10 @@ pub trait RunRepository: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventVisibility, MAX_REFERENCE_BYTES, NewRun, StoredRun};
+    use super::{
+        EventVisibility, MAX_REFERENCE_BYTES, MAX_RUNTIME_ID_BYTES, NATIVE_RUNTIME_ID, NewRun,
+        RunRuntime, StoredRun,
+    };
     use crate::repository::RepositoryError;
     use jarvis_domain::ids::{ConversationId, PrincipalId, RunId, WorkspaceId};
     use jarvis_domain::run::budget::RunBudget;
@@ -800,6 +910,60 @@ mod tests {
     }
 
     #[test]
+    fn a_new_run_records_the_native_runtime_without_being_told() {
+        // The point is that the caller does **not** pass a runtime: the constructor defaults to
+        // one, so a run cannot be created in a state where the schema's runtime columns stay
+        // `NULL`. Asserting the value rather than "some runtime" is what makes this falsifiable —
+        // `RunRuntime::default()` or an empty pair would satisfy a looser assertion.
+        let run = new_run(Some("objective-1")).expect("valid");
+        assert_eq!(run.runtime.id, NATIVE_RUNTIME_ID);
+        assert_eq!(run.runtime.version, env!("CARGO_PKG_VERSION"));
+        assert!(!run.runtime.version.is_empty());
+    }
+
+    #[test]
+    fn a_run_runtime_can_be_overridden_for_a_non_native_build() {
+        // The default must be an *overridable* default rather than a hardcoded literal, or a build
+        // that serves more than the native runtime cannot record what it served.
+        let override_runtime = RunRuntime::new("external-runtime", "9.9.9").expect("valid");
+        let run = new_run(Some("objective-1"))
+            .expect("valid")
+            .with_runtime(override_runtime.clone());
+        assert_eq!(run.runtime, override_runtime);
+        assert_ne!(run.runtime.id, NATIVE_RUNTIME_ID);
+    }
+
+    #[test]
+    fn a_runtime_identity_is_bounded_and_non_empty_on_both_fields() {
+        assert!(RunRuntime::new("jarvis-native", "0.1.0").is_ok());
+        assert!(
+            RunRuntime::new(&"a".repeat(MAX_RUNTIME_ID_BYTES), "0.1.0").is_ok(),
+            "exactly the bound is inside it",
+        );
+
+        // Both fields reach a persisted column, so both are validated. Checking only `id` would
+        // let an empty version through, and an empty version is the value that made "no runtime
+        // recorded" indistinguishable from "a runtime was recorded" in the first place.
+        for (id, version) in [
+            ("", "0.1.0"),
+            ("jarvis-native", ""),
+            (&"a".repeat(MAX_RUNTIME_ID_BYTES + 1), "0.1.0"),
+            ("jarvis-native", &"1".repeat(MAX_RUNTIME_ID_BYTES + 1)),
+            ("jarvis\0native", "0.1.0"),
+            ("jarvis-native", "0.1\0.0"),
+        ] {
+            let error = RunRuntime::new(id, version)
+                .expect_err("an unusable runtime identity must be refused");
+            assert_eq!(
+                error,
+                RepositoryError::Conflict {
+                    what: "run_runtime_identity"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn a_stored_run_reports_terminality_from_its_state() {
         let run = StoredRun {
             id: run_id(),
@@ -815,6 +979,7 @@ mod tests {
             completed_at: Some(now()),
             error_code: None,
             deadline_at: None,
+            runtime: Some(RunRuntime::native()),
             budget: RunBudget::default(),
         };
         assert!(run.is_terminal());

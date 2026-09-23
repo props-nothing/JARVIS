@@ -158,6 +158,46 @@ function credentialFor(profile) {
   return credential;
 }
 
+/**
+ * Reads a run's recorded runtime out of the profile's own database.
+ *
+ * The run resource does not expose the runtime — its shape is a closed set and adding a field is a
+ * contract change — so the only way to assert that the create path *recorded* it is to read the row.
+ * That is the assertion this journey needs, because the defect was "validated at the boundary and
+ * never stored": every API-level check passed while both columns were `NULL` on every row.
+ *
+ * Node's built-in `node:sqlite` rather than a package, so this harness keeps its dependency-free
+ * property. It is imported dynamically so a Node without the module fails with a sentence naming
+ * the requirement rather than an unhandled module-resolution error at load time. Opened
+ * **read-only** so a check cannot be the thing that changes what it observes, and `null` is returned
+ * rather than thrown for "no row", because a missing row is a failure to report (the check has its
+ * own message) rather than a harness crash.
+ */
+async function readRunRuntime(profile, runId) {
+  if (typeof runId !== "string") {
+    return null;
+  }
+  const path = join(profile, "data", "db", "jarvis.sqlite");
+  if (!existsSync(path)) {
+    throw new Error(`the profile has no database at ${path}`);
+  }
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import("node:sqlite"));
+  } catch (error) {
+    throw new Error(`this journey needs Node's built-in node:sqlite module: ${error.message}`);
+  }
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = database
+      .prepare("SELECT runtime_id, runtime_version FROM agent_runs WHERE id = ?")
+      .get(runId);
+    return row ?? null;
+  } finally {
+    database.close();
+  }
+}
+
 /** One HTTP request to the daemon. */
 function request(record, credential, method, path, body, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
@@ -598,6 +638,23 @@ async function main() {
       fail("the accepted run must name its identifier", governed.text);
     } else {
       pass("a run is created under the active policy and answers 202");
+    }
+
+    // The runtime the create named is **recorded on the row**, not only validated. The handler
+    // refused an unsupported runtime before this round, and a `422` test passed, while
+    // `agent_runs.runtime_id`/`runtime_version` stayed `NULL` on every row because the validated
+    // value was discarded — so the columns the resume path needs were referenced by no code at
+    // all. Read straight out of the profile's database here: an assertion through the API could
+    // not see this, since the run resource deliberately does not expose the runtime.
+    const recorded = await readRunRuntime(profile, governed.json.run_id);
+    if (recorded === null) {
+      fail("the created run must be readable from the profile database", profile);
+    } else if (recorded.runtime_id !== "jarvis-native") {
+      fail(`the row must name the runtime that executed it, got ${recorded.runtime_id}`);
+    } else if (typeof recorded.runtime_version !== "string" || recorded.runtime_version === "") {
+      fail(`the row must record the executing build's version, got ${recorded.runtime_version}`);
+    } else {
+      pass(`the run records the runtime that executed it: ${recorded.runtime_id} ${recorded.runtime_version}`);
     }
 
     // Narrow the ceiling to `public`, below the objective's `internal` label, so the same create

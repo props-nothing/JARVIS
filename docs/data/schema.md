@@ -161,6 +161,16 @@ created_at, started_at, updated_at, completed_at
 ```
 
 State and waiting fields have constraints preventing incompatible combinations.
+
+`runtime_id` and `runtime_version` name the runtime that *executed* the run and the build version it
+was, so a resume can validate both against the runtime it is about to use
+(`docs/architecture/agent-runtime.md`). They are written by the create path and read back by the
+same port: before that, the `CreateRunRequest.runtime` field was required and validated and then
+discarded, so both columns were referenced by no code at all and every row carried `NULL` while the
+contract expected a value. Both are nullable because a row written before they had a writer has no
+truthful value to give, and a row carrying **one** of the pair is reported as corruption rather than
+as absent — half an identity cannot be validated against anything.
+
 ### `agent_steps`
 
 ```text

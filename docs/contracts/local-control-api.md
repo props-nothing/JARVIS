@@ -515,6 +515,23 @@ Three further facts are worth recording because each was a defect first:
   produces `stream.replay_unavailable` instead of delivering a gap as if it were
   complete.
 
+The `runtime` a create request names is now **recorded** on the run, into
+`agent_runs.runtime_id`/`runtime_version`, and read back by the same port. The field was
+required and the unsupported-runtime refusal was real, but the validated value was then
+discarded and both columns stayed `NULL` on every row — a check that reads as coverage
+while the durable record it exists for was absent, and one that left
+`agent-runtime.md`'s resume step ("validate runtime identity/version") with nothing to
+validate against. The recorded version is this build's own, not the caller's: a client
+cannot claim a runtime version it is not running.
+
+**Not exposed on the wire, deliberately.** `RunView` (and therefore the create response
+above) carries no `runtime` field. The run resource's documented shape is a closed set
+and `Unknown JSON fields are rejected on commands`, so adding one is a contract change
+with a versioning decision attached, not a free addition — and a client currently has no
+use for the value, since it cannot request a runtime other than the native one. The
+consumer that does need it is a resume, which reads the row server-side. Recorded here
+so the next person does not read "the runtime is stored" as "a client can see it".
+
 **Not implemented, and deliberately not claimed:** the event stream delivers the
 retained public events and closes rather than following the run live. A client
 therefore reconnects with `Last-Event-ID` until it receives a terminal event, which is

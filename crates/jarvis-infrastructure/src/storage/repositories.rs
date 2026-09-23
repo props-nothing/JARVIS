@@ -33,7 +33,7 @@ use jarvis_application::repository::model_call::{
 use jarvis_application::repository::run::{
     EventVisibility, IdempotencyClaim, IncompleteRun, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
     NewActivityEvent, NewIdempotencyRecord, NewRun, RunEventPage, RunRepository, RunResumeState,
-    RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
+    RunRuntime, RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
@@ -290,6 +290,23 @@ fn stored_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, RepositoryErro
             }
             None => RunBudget::default(),
         },
+        // Read back so a resume can satisfy the architecture's "validate runtime identity/version".
+        // Both columns are nullable because a row written before this existed has none — reading
+        // them as required would make every pre-existing row unpresentable. A row that has **one**
+        // of the pair is reported as corruption rather than as absent, because a half-written
+        // identity cannot be validated against anything.
+        runtime: match (
+            opt_text(row, "runtime_id")?,
+            opt_text(row, "runtime_version")?,
+        ) {
+            (Some(id), Some(version)) => Some(RunRuntime { id, version }),
+            (None, None) => None,
+            _ => {
+                return Err(RepositoryError::Corrupted {
+                    column: "runtime_id",
+                });
+            }
+        },
     })
 }
 
@@ -306,7 +323,8 @@ macro_rules! run_columns {
     () => {
         "id, workspace_id, conversation_id, principal_id, state, version, \
          objective_ref, created_at, started_at, updated_at, completed_at, \
-         error_code, waiting_kind, waiting_ref, deadline_at, budget_json"
+         error_code, waiting_kind, waiting_ref, deadline_at, budget_json, \
+         runtime_id, runtime_version"
     };
 }
 
@@ -369,8 +387,8 @@ async fn insert_run(
         "INSERT INTO agent_runs (\
              id, workspace_id, conversation_id, parent_run_id, principal_id, \
              objective_ref, state, version, deadline_at, budget_json, \
-             created_at, updated_at\
-         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?, ?, ?)",
+             runtime_id, runtime_version, created_at, updated_at\
+         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run.id.to_string())
     .bind(run.workspace_id.to_string())
@@ -386,6 +404,11 @@ async fn insert_run(
         serde_json::to_string(&run.budget)
             .map_err(|_| RepositoryError::Conflict { what: "run_budget" })?,
     )
+    // The runtime that will execute the run. Before this the columns existed and were
+    // referenced by no code, so a resume could not validate the runtime identity the
+    // architecture requires it to check.
+    .bind(&run.runtime.id)
+    .bind(&run.runtime.version)
     .bind(run.created_at.to_string())
     .bind(run.created_at.to_string())
     .execute(&mut **tx)
