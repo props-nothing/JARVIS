@@ -13,7 +13,7 @@
 //! period, remove the discovery file only if it is still ours, flush logs, exit.
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -366,10 +366,20 @@ pub async fn start(
         .map_err(StartupError::Storage)?;
 
     // 3. Loopback only. A wildcard bind is never attempted.
-    let requested = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let listener = TcpListener::bind(requested)
-        .await
-        .map_err(|_| StartupError::Bind)?;
+    //
+    // **Every loopback address is tried, because the client accepts both families and this used to
+    // bind only IPv4.** `format_base_url` renders a bracketed IPv6 authority, `authority_of` builds
+    // a bracketed `Host` for one, `validate_loopback_url` admits `[::1]` and has a test for it, and
+    // the client dials whatever the record publishes — so the stack intends to support IPv6
+    // loopback at every layer except the one that chooses the socket. Binding only
+    // `Ipv4Addr::LOCALHOST` meant a host without IPv4 (IPv6-only kernel configuration, an
+    // IPv4-disabled network namespace) could not start the daemon at all.
+    //
+    // Ordering is deliberate: IPv4 first, so the address published on a dual-stack host is the
+    // same `127.0.0.1` it has always been and nothing about the common path changes. The first
+    // family that binds wins, and every candidate is loopback — this is not a fallback to a
+    // broader bind, and the `is_loopback` check below still refuses anything else.
+    let listener = bind_loopback().await?;
     let bound = listener.local_addr().map_err(|_| StartupError::Bind)?;
     if !bound.ip().is_loopback() {
         // Defense in depth: the request was loopback, so a non-loopback bound
@@ -559,6 +569,30 @@ fn format_base_url(address: SocketAddr) -> String {
     }
 }
 
+/// Binds the first loopback address that is available.
+///
+/// IPv4 loopback is attempted first so the published authority on a dual-stack host is the
+/// `127.0.0.1` every existing client already expects; IPv6 loopback is the fallback for a host
+/// where IPv4 loopback is unavailable, which used to make the daemon exit with a bind failure that
+/// named nothing an operator could act on.
+///
+/// # Errors
+///
+/// Returns [`StartupError::Bind`] when neither loopback address can be bound.
+async fn bind_loopback() -> Result<TcpListener, StartupError> {
+    let mut last = StartupError::Bind;
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        match TcpListener::bind(SocketAddr::new(ip, 0)).await {
+            Ok(listener) => return Ok(listener),
+            Err(_) => last = StartupError::Bind,
+        }
+    }
+    Err(last)
+}
+
 /// Builds API state for a running daemon.
 ///
 /// Prefer [`RunningDaemon::api_state`], which shares the daemon's own clients
@@ -631,6 +665,42 @@ mod tests {
         let record = jarvis_protocol::DiscoveryFile::parse(&bytes).expect("valid discovery");
         assert_eq!(record.instance_id, daemon.instance_id());
         assert_eq!(record.base_url, daemon.base_url().expect("base url"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_published_base_url_is_one_the_client_can_dial() {
+        // The daemon and the client were written to different rules: this side rendered a bracketed
+        // IPv6 authority and the client was able to produce one, but the client's dial was
+        // hardcoded to IPv4, so a record naming `[::1]` was accepted by every validator and then
+        // connected elsewhere. Asserting the two ends agree — that the authority this daemon
+        // publishes round-trips through the client's own validator and dial helper — is what keeps
+        // them from drifting again, and it is checked on the real bound address rather than on a
+        // literal.
+        let root = temp_root("dialable");
+        let daemon = start_daemon(&root).await;
+
+        let base_url = daemon.base_url().expect("base url");
+        assert!(
+            jarvis_protocol::discovery::validate_loopback_url(&base_url),
+            "the daemon must publish an authority the record validator admits: {base_url}",
+        );
+
+        // And the part the validator cannot check: that the published host is one the client will
+        // actually connect to. `dial_host` is the same function `request` uses, so this is the
+        // end-to-end agreement rather than a copy of the rule.
+        let authority = base_url
+            .strip_prefix("http://")
+            .expect("the published scheme is http");
+        let (host, port) = authority.rsplit_once(':').expect("an authority and a port");
+        let address = crate::client::dial_host(host).expect("the published host is dialable");
+        assert_eq!(
+            address,
+            daemon.local_addr().expect("bound address").ip(),
+            "the address the client would dial must be the address the daemon bound",
+        );
+        assert!(port.parse::<u16>().expect("a port") > 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

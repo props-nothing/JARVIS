@@ -491,6 +491,15 @@ impl RunRepository for StallingWrites {
         self.inner.load_events(workspace, run, from_sequence, limit)
     }
 
+    fn load_event_sequence(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        event_id: &str,
+    ) -> crate::repository::RepositoryFuture<'_, u64> {
+        self.inner.load_event_sequence(workspace, run, event_id)
+    }
+
     fn claim_idempotency(
         &self,
         record: crate::repository::run::NewIdempotencyRecord,
@@ -758,6 +767,11 @@ async fn the_recovery_event_payload_names_the_classification_and_the_state() {
 }
 
 #[tokio::test]
+// The `Unreadable` double below implements an eleven-method trait, each arm returning the same
+// failure, which puts this test past the line bound however it is written. Splitting the double into
+// its own item would not shorten what a reader checks: the point is that *every* read fails, which is
+// confirmed by scanning the arms for one that does not.
+#[allow(clippy::too_many_lines)]
 async fn a_read_failure_is_reported_rather_than_looking_like_a_clean_pass() {
     // A pass that could not read must not report "nothing to do", because a caller would
     // conclude the profile was clean while interrupted runs sat unrecovered.
@@ -814,6 +828,14 @@ async fn a_read_failure_is_reported_rather_than_looking_like_a_clean_pass() {
             _from_sequence: u64,
             _limit: u32,
         ) -> crate::repository::RepositoryFuture<'_, crate::repository::run::RunEventPage> {
+            Box::pin(async { Err(crate::repository::RepositoryError::Query) })
+        }
+        fn load_event_sequence(
+            &self,
+            _workspace: WorkspaceId,
+            _run: RunId,
+            _event_id: &str,
+        ) -> crate::repository::RepositoryFuture<'_, u64> {
             Box::pin(async { Err(crate::repository::RepositoryError::Query) })
         }
         fn claim_idempotency(

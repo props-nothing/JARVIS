@@ -247,24 +247,65 @@ pub async fn probe_liveness(discovered: &Discovered) -> Result<DaemonLiveness, C
     }
 }
 
+/// Returns the loopback IP to dial for a discovery authority, or an error if it is not permitted.
+///
+/// The authority is **parsed as an address** rather than compared as text, and that does two jobs
+/// at once. It makes the value that was validated the value that is dialed, so a published `[::1]`
+/// authority reaches an IPv6 daemon instead of an IPv4 one; and it makes a name unrepresentable,
+/// so no string that could resolve through DNS or a hosts file can reach the socket — a
+/// `TcpStream::connect((name, port))` resolves, which is the one thing "loopback only" must not do.
+///
+/// The permitted set is exactly the two loopback host addresses that `validate_loopback_url` also
+/// admits, so the client's rule and the record validator's rule agree.
+///
+/// The old check was `starts_with("127.0.0.1")`, which is a text prefix rather than an address test:
+/// it admitted `127.0.0.10` and refused `127.0.0.2`, and neither is a fact about loopback. The
+/// record validator refuses both, so that looseness was unreachable in practice — but a rule that is
+/// wrong in both directions is the kind that becomes reachable the moment someone relaxes the other
+/// end.
+///
+/// Crate-visible rather than private so `daemon` can assert that the authority it publishes is one
+/// this client will dial: the cross-module agreement no single-module test can make, and the one
+/// that was missing when this module connected to a hardcoded IPv4 address regardless of what the
+/// daemon had published.
+pub(crate) fn dial_host(authority_host: &str) -> Result<std::net::IpAddr, ClientError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // A bracketed IPv6 authority is what a client sends in `Host`; the port was split off already,
+    // so the closing bracket is the last character. An unbracketed `::1` is also accepted, because
+    // `validate_loopback_url` accepts it.
+    let unbracketed = authority_host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(authority_host);
+    let Ok(address) = unbracketed.parse::<IpAddr>() else {
+        return Err(ClientError::Transport);
+    };
+    let loopback = match address {
+        IpAddr::V4(ip) => ip == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(ip) => ip == Ipv6Addr::LOCALHOST,
+    };
+    if loopback {
+        Ok(address)
+    } else {
+        Err(ClientError::Transport)
+    }
+}
+
 /// Reads the enrolled client credential for this profile.
+///
+/// Delegates to `auth::credential::read_presentation_text`, which owns both the byte bound and the
+/// well-formedness rule. This function used to do its own unbounded `std::fs::read` and repeat the
+/// length-plus-alphabet rule that `auth::load_client_credential` implemented *differently* (length
+/// only), so the two readers of one file could disagree about the same bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ClientError::NoCredential`] when the file is missing or malformed.
+/// Returns [`ClientError::NoCredential`] when the file is missing, unreadable, over the bound, or
+/// malformed.
 pub fn read_credential(credential_path: &Path) -> Result<String, ClientError> {
-    let bytes = std::fs::read(credential_path).map_err(|_| ClientError::NoCredential)?;
-    let text = String::from_utf8(bytes).map_err(|_| ClientError::NoCredential)?;
-    let trimmed = text.trim();
-    // The credential is a fixed-length unpadded base64url string.
-    if trimmed.len() != 43
-        || !trimmed
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return Err(ClientError::NoCredential);
-    }
-    Ok(trimmed.to_owned())
+    crate::auth::credential::read_presentation_text(credential_path)
+        .ok_or(ClientError::NoCredential)
 }
 
 /// Fetches an authenticated endpoint and returns the body.
@@ -412,21 +453,35 @@ async fn request(
 ) -> Result<(u16, String), ClientError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    // Only a numeric loopback authority is ever dialed; the discovery file was
-    // validated at parse time, but the address is re-derived here so a future
-    // caller cannot bypass that.
+    // Only loopback may be dialed, and **the address dialed is the one validated**. The discovery
+    // file is validated at parse time, but the host is re-derived here so a future caller cannot
+    // bypass that — and then it is *used*, rather than only checked.
+    //
+    // **It was only checked.** This read the host, refused anything that was not `127.0.0.1` or
+    // `[::1]`, and then connected to a hardcoded `("127.0.0.1", port)` — so the value that passed
+    // validation was never the value dialed. Three faults followed from that one line. A published
+    // `[::1]` authority, which the whole stack accepts (`format_base_url` renders the bracketed
+    // IPv6 form, `authority_of` builds a bracketed `Host`, `validate_loopback_url` admits it and has
+    // a test for it) could never be dialed, so a dual-stack daemon was unreachable by its own
+    // client. `127.0.0.2`, which the old prefix test *accepted*, was silently redirected to
+    // `127.0.0.1`. And the `Host` header was built from the validated host while the connection went
+    // elsewhere, so the client stated an authority it had not connected to.
     let authority = discovered
         .base_url
         .strip_prefix("http://")
         .ok_or(ClientError::Transport)?;
     let (host, port) = authority.rsplit_once(':').ok_or(ClientError::Transport)?;
-    if !host.starts_with("127.0.0.1") && host != "[::1]" {
-        return Err(ClientError::Transport);
-    }
+    // **`address`, not a shadowed `host`.** The `Host` header below must carry the authority as the
+    // record spelled it — `[::1]:53996` — because the daemon compares it against its own bracketed
+    // `authority_of` and refuses an unbracketed `::1:53996` as `jarvis.host_not_allowed`. Binding
+    // the parsed address to `host` instead rendered the header from `IpAddr`'s `Display`, which
+    // omits the brackets, and the test that drives a real socket caught it immediately: the body
+    // came back but the authority the server saw was wrong.
+    let address = dial_host(host)?;
     let port: u16 = port.parse().map_err(|_| ClientError::Transport)?;
 
     let attempt = async {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        let mut stream = tokio::net::TcpStream::connect((address, port))
             .await
             .map_err(|_| ClientError::Transport)?;
 
@@ -693,6 +748,148 @@ mod tests {
         assert!(authenticated.contains("Authorization: Bearer secret-credential"));
         assert!(super::public_headers().is_empty());
         assert!(!super::public_headers().contains("Authorization"));
+    }
+
+    #[test]
+    fn the_dialed_host_is_the_validated_host_and_never_a_name() {
+        // The property the transport depends on: what was validated is what is connected. Asserted
+        // at the helper because it is the helper that decides, and because the previous version of
+        // this path could not have been caught any other way — it checked the host and then dialed
+        // a hardcoded one, so the *value* never reached the socket.
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        assert_eq!(
+            super::dial_host("127.0.0.1").expect("IPv4 loopback is dialable"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        // A bracketed IPv6 authority is what a client sends in `Host`, and the address is the one
+        // that must reach the socket: the old code connected to `127.0.0.1` for this input, so a
+        // dual-stack daemon publishing `[::1]` was unreachable by its own client.
+        assert_eq!(
+            super::dial_host("[::1]").expect("IPv6 loopback is dialable"),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        );
+        // The unbracketed spelling is admitted by `validate_loopback_url`, so it must be dialable
+        // too rather than accepted by one layer and refused by the next.
+        assert_eq!(
+            super::dial_host("::1").expect("the unbracketed form is dialable"),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        );
+
+        // Everything else is refused, and each for its own reason. The three that matter are the
+        // three a name-based check would let through: a hostname resolves, and this path must not
+        // send anything to DNS.
+        for refused in [
+            "localhost",    // a name, and the one a careless check would accept
+            "jarvis.local", // any other name
+            "0.0.0.0",      // the wildcard, which is not loopback
+            "192.168.1.10", // a routable address
+            "127.0.0.2",    // a 127/8 address that is *not* the loopback host address
+            "127.0.0.10",   // which the old text prefix wrongly admitted
+            "[::]",         // the IPv6 wildcard
+            "[fe80::1]",    // a link-local address
+            "127.0.0.1 ",   // trailing space: parsed, not trimmed
+            "127.0.0.1.0",  // not an address at all
+            "0177.0.0.1",   // octal spelling, refused because this parses rather than resolves
+        ] {
+            assert!(
+                super::dial_host(refused).is_err(),
+                "{refused:?} must not be dialed",
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_reaches_a_listener_on_the_address_the_record_published() {
+        // **The falsifying test: it fails against the hardcoded dial.** `dial_host` above asserts
+        // what should happen; this asserts what does, through `request` and a real socket.
+        //
+        // The published address has to be one the *old* code would have accepted and then
+        // mis-dialed, or the test proves nothing. `127.0.0.2` is that address: the old check was
+        // `starts_with("127.0.0.1")`, which **refused** it — so it is not the case here. Instead the
+        // address is the real IPv4 loopback `127.0.0.1` on a port bound by a listener that is
+        // deliberately *not* the daemon's, and the assertion is that the request arrives at all:
+        // with a hardcoded dial the connection succeeds too, so what makes this falsify is the
+        // `Host` header, which is built from the validated authority and must name the address the
+        // connection actually reached.
+        //
+        // The stronger half is the IPv6 case, which the old code could not pass at any port: a
+        // record publishing `[::1]` was accepted by validation and then connected to `127.0.0.1`.
+        // A listener bound on IPv6 loopback accepts the corrected dial and rejects the old one,
+        // because the old one never opens an IPv6 connection.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            // Serve one request and report the `Host` header it received.
+            async fn serve_once(listener: tokio::net::TcpListener) -> String {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let (mut socket, _) = listener.accept().await.expect("a connection");
+                let mut buffer = vec![0_u8; 2048];
+                let read = socket.read(&mut buffer).await.expect("a request");
+                let head = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let host = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Host: "))
+                    .unwrap_or("<absent>")
+                    .to_owned();
+                // A minimal response so the client's parser has something well formed to read.
+                let body = r#"{"status":"live"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+                host
+            }
+
+            // IPv4, the ordinary case: the request arrives and the `Host` names the authority the
+            // record published.
+            let v4 = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind IPv4 loopback");
+            let v4_port = v4.local_addr().expect("local addr").port();
+            let serving = tokio::spawn(serve_once(v4));
+            let discovered = super::Discovered {
+                base_url: format!("http://127.0.0.1:{v4_port}"),
+                instance_id: "inst-v4".to_owned(),
+                pid: 1,
+            };
+            let body = super::get_public(&discovered, "/health/live")
+                .await
+                .expect("the request reaches the listener");
+            assert_eq!(body, r#"{"status":"live"}"#);
+            assert_eq!(serving.await.expect("join"), format!("127.0.0.1:{v4_port}"));
+
+            // **IPv6, the case the old hardcoded dial could not pass.** The listener is on `[::1]`
+            // and the record publishes `[::1]`; connecting to `127.0.0.1` here would have opened a
+            // connection to whatever else held that port — or, on this port, nothing at all.
+            // A host without IPv6 loopback cannot run this half; the unit test above still covers the
+            // address selection, and skipping is reported here rather than silent.
+            let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+                return;
+            };
+            let v6_port = v6.local_addr().expect("local addr").port();
+            let serving = tokio::spawn(serve_once(v6));
+            let discovered = super::Discovered {
+                base_url: format!("http://[::1]:{v6_port}"),
+                instance_id: "inst-v6".to_owned(),
+                pid: 1,
+            };
+            let body = super::get_public(&discovered, "/health/live")
+                .await
+                .expect("the request reaches the IPv6 listener, which a hardcoded IPv4 dial cannot");
+            assert_eq!(body, r#"{"status":"live"}"#);
+            let seen = serving.await.expect("join");
+            assert_eq!(
+                seen,
+                format!("[::1]:{v6_port}"),
+                "the Host the server saw",
+            );
+        });
     }
 
     #[test]

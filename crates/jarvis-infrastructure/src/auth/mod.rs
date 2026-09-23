@@ -144,18 +144,17 @@ pub fn store_client_credential(
 
 /// Reads a previously stored client credential.
 ///
+/// Delegates to `credential::read_presentation_text`, which owns both the byte bound and the
+/// well-formedness rule. This function used to do its own `std::fs::read` and compare only the
+/// length, so it accepted a 43-byte file of any characters while `client::read_credential` — the
+/// other reader of the same file — refused the same bytes for the alphabet. One rule, one answer.
+///
 /// # Errors
 ///
-/// Returns [`CredentialError::Malformed`] when the file is unreadable or does
+/// Returns [`CredentialError::Malformed`] when the file is unreadable, over the bound, or does
 /// not contain a well-formed credential.
 pub fn load_client_credential(source: &ClientCredentialPath) -> Result<String, CredentialError> {
-    let bytes = std::fs::read(source.path()).map_err(|_| CredentialError::Malformed)?;
-    let text = String::from_utf8(bytes).map_err(|_| CredentialError::Malformed)?;
-    let trimmed = text.trim();
-    if trimmed.len() != credential::CREDENTIAL_TEXT_LEN {
-        return Err(CredentialError::Malformed);
-    }
-    Ok(trimmed.to_owned())
+    credential::read_presentation_text(source.path()).ok_or(CredentialError::Malformed)
 }
 
 /// Writes owner-only bytes, creating the parent directory owner-only on Unix.
@@ -294,6 +293,7 @@ mod tests {
         load_client_credential,
     };
     use crate::auth::credential::GeneratedCredential;
+    use crate::auth::credential::MAX_CREDENTIAL_SOURCE_BYTES;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("jarvis-fnd007-{tag}-{}", std::process::id()));
@@ -505,6 +505,115 @@ mod tests {
         let destination = ClientCredentialPath::in_config_dir(&dir);
         std::fs::write(destination.path(), b"tooshort").expect("write fixture");
         assert!(load_client_credential(&destination).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn both_readers_of_the_credential_file_accept_and_refuse_the_same_bytes() {
+        // **The two readers implemented this rule differently, and both were reachable.** The
+        // daemon's `load_client_credential` compared only the length; the CLI's and doctor's
+        // `client::read_credential` compared the length *and* the base64url alphabet. So a 43-byte
+        // file of any characters was accepted at every daemon start and refused by every other
+        // reader — whether an invalid spelling is acceptable is a property of the *input*, and it
+        // came out differently depending on which function looked at it.
+        //
+        // This asserts the two agree rather than that either is right, because "right" is the
+        // alphabet rule and what matters is that one rule exists. Both directions are given a case,
+        // so a fix that unified them on the *permissive* rule would still fail here.
+        let dir = temp_dir("readers-agree");
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+        let path = destination.path();
+
+        // A generated credential: both must accept it, and the same text must come back.
+        let (_, generated) = enroll_owner_client("owner", "", &destination)
+            .expect("enrollment writes the credential");
+        let created = generated.to_presentation_text();
+        let from_daemon = load_client_credential(&destination).expect("the daemon reads it");
+        let from_client = crate::client::read_credential(path).expect("the client reads it");
+        assert_eq!(from_daemon, created);
+        assert_eq!(
+            from_daemon, from_client,
+            "both readers must return the same credential for one file",
+        );
+
+        // 43 characters that are not base64url. This is the case the daemon used to accept: the
+        // length is right and nothing else is.
+        let length = super::credential::CREDENTIAL_TEXT_LEN;
+        let not_an_alphabet = "!".repeat(length);
+        assert_eq!(not_an_alphabet.len(), length);
+        std::fs::write(path, &not_an_alphabet).expect("write fixture");
+        assert!(
+            load_client_credential(&destination).is_err(),
+            "the daemon must refuse characters a credential cannot contain",
+        );
+        assert!(
+            crate::client::read_credential(path).is_err(),
+            "and the client must refuse them too",
+        );
+
+        // A well-formed 43-character string that is not a valid credential is still *readable*:
+        // being well formed and being correct are different questions, and conflating them would
+        // turn a wrong credential into a missing one.
+        let well_formed = "A".repeat(length);
+        std::fs::write(path, &well_formed).expect("write fixture");
+        assert_eq!(
+            load_client_credential(&destination).expect("43 alphabet characters are readable"),
+            well_formed,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_reader_refuses_a_credential_file_over_its_byte_bound() {
+        // The bound is a property of how much is *read*, so it is asserted on the reader rather
+        // than through a caller: an assertion through a caller passes against the old unbounded
+        // implementation too, because `std::fs::read` returns the bytes and a length check then
+        // rejects them — same observable outcome, different mechanism.
+        //
+        // **And the input has to be chosen so the bound is the only thing that can reject it.** My
+        // first version wrote 257 `'A'`s, and it passed with the unbounded read restored: the
+        // content check refuses that file anyway, so the test measured nothing. The case that
+        // isolates the bound is a file that is *over* it while its **trimmed content is a valid
+        // credential** — a real 43-character credential followed by whitespace. `String::trim`
+        // accepts trailing whitespace, so the unbounded reader returns a perfectly good credential
+        // and only the bound refuses it. Verified: this version fails (`is_err()` is false) with
+        // `std::fs::read` restored and passes with the bounded read in place.
+        let dir = temp_dir("oversized");
+        let destination = ClientCredentialPath::in_config_dir(&dir);
+
+        let valid = "A".repeat(super::credential::CREDENTIAL_TEXT_LEN);
+        let mut over = valid.clone().into_bytes();
+        over.extend(std::iter::repeat_n(
+            b'\n',
+            usize::try_from(MAX_CREDENTIAL_SOURCE_BYTES).expect("fits") + 1 - valid.len(),
+        ));
+        assert!(over.len() as u64 > MAX_CREDENTIAL_SOURCE_BYTES);
+        std::fs::write(destination.path(), &over).expect("write fixture");
+        assert!(
+            load_client_credential(&destination).is_err(),
+            "a file over the bound must be refused even when its trimmed content is valid",
+        );
+        assert!(
+            crate::client::read_credential(destination.path()).is_err(),
+            "and the client must refuse it as well, with the same rule",
+        );
+
+        // At exactly the bound the same bytes are *read* and the credential is returned, which is
+        // what makes the refusal above a bound rather than a guess at one.
+        let mut at_bound = valid.clone().into_bytes();
+        at_bound.extend(std::iter::repeat_n(
+            b'\n',
+            usize::try_from(MAX_CREDENTIAL_SOURCE_BYTES).expect("fits") - valid.len(),
+        ));
+        assert_eq!(at_bound.len() as u64, MAX_CREDENTIAL_SOURCE_BYTES);
+        std::fs::write(destination.path(), &at_bound).expect("write fixture");
+        assert_eq!(
+            load_client_credential(&destination).expect("exactly the bound is inside it"),
+            valid,
+            "the credential inside the padding is what is returned",
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

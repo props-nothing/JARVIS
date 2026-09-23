@@ -838,6 +838,47 @@ impl RunRepository for SqliteRepositories {
         })
     }
 
+    fn load_event_sequence(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        event_id: &str,
+    ) -> RepositoryFuture<'_, u64> {
+        // Owned before the future is built: the returned future borrows `&self`, not the caller's
+        // `&str`, so the identifier must outlive the borrow it arrived with.
+        let event_id = event_id.to_owned();
+        Box::pin(async move {
+            // The run is read first so an absent or foreign run is `NotFound` rather than "no such
+            // event", which the caller maps to a different refusal: a foreign run is indistinguishable
+            // from a missing one, while a missing *event* inside a run the caller can see is a resume
+            // position the daemon no longer retains. Collapsing the two would tell a caller which
+            // identifiers exist, which is what the run check exists to prevent.
+            if read_run(&self.pool, workspace, &run.to_string())
+                .await?
+                .is_none()
+            {
+                return Err(RepositoryError::NotFound);
+            }
+
+            // Visibility is a predicate for the same reason it is on `load_events`: an operator-only
+            // event must not be resumable from, so it must not be *findable* here either.
+            let row = sqlx::query(
+                "SELECT sequence FROM run_activity_events \
+                 WHERE workspace_id = ? AND run_id = ? AND visibility = 'public' AND id = ?",
+            )
+            .bind(workspace.to_string())
+            .bind(run.to_string())
+            .bind(event_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?
+            .ok_or(RepositoryError::NotFound)?;
+
+            u64::try_from(int(&row, "sequence")?)
+                .map_err(|_| RepositoryError::Corrupted { column: "sequence" })
+        })
+    }
+
     fn claim_idempotency(
         &self,
         record: NewIdempotencyRecord,

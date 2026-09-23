@@ -45,6 +45,22 @@ use crate::repository::run::{
 };
 use crate::repository::{RepositoryError, RepositoryFuture};
 
+/// Synthesizes the stable identifier this double gives one event of one run.
+///
+/// Extracted so the **same** id is produced when a read builds it and when a resume looks one up:
+/// `load_events` stamps each event with this value, and `load_event_sequence` has to recognize it,
+/// which requires one formula rather than two copies. Two copies is how a resume would stop
+/// addressing the row a read had handed out — the same class as a double enforcing a different
+/// bound from its adapter.
+///
+/// Unique per event because it mixes the run's own 128-bit identifier with the sequence, and never
+/// nil because `.max(1)` keeps a zero result distinguishable from "no id".
+fn event_id_for(run: RunId, sequence: u64) -> jarvis_domain::ids::RunActivityEventId {
+    jarvis_domain::ids::RunActivityEventId::from_uuid(uuid::Uuid::from_u128(
+        (run.as_uuid().as_u128() ^ u128::from(sequence)).max(1),
+    ))
+}
+
 /// One stored run: its domain lifecycle plus the fields the lifecycle does not own.
 #[derive(Debug, Clone)]
 struct RunRow {
@@ -601,11 +617,7 @@ impl RunRepository for InMemoryRepositories {
                         // The double synthesizes a stable id from the run and
                         // sequence, which is unique per event and stable across
                         // reads, so a `Last-Event-ID` resume addresses the same row.
-                        id: jarvis_domain::ids::RunActivityEventId::from_uuid(
-                            uuid::Uuid::from_u128(
-                                (run.as_uuid().as_u128() ^ u128::from(event.sequence)).max(1),
-                            ),
-                        ),
+                        id: event_id_for(run, event.sequence),
                         run_id: event.run_id,
                         sequence: event.sequence,
                         event_type: event.event_type.clone(),
@@ -621,6 +633,45 @@ impl RunRepository for InMemoryRepositories {
                     events,
                     terminal_state: state.is_terminal().then_some(state),
                 })
+            })
+        })
+    }
+
+    fn load_event_sequence(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        event_id: &str,
+    ) -> RepositoryFuture<'_, u64> {
+        // Owned before the future is built: the returned future is bound to `&self`'s lifetime, not
+        // to the caller's `&str`, so the identifier has to outlive the borrow it arrived with.
+        let event_id = event_id.to_owned();
+        Box::pin(async move {
+            self.with(|store| {
+                // The run is checked first so a foreign run is `NotFound` rather than "no such
+                // event", matching the adapter: a caller cannot tell a run it may not see from one
+                // that does not exist, and neither is the same as an event that is gone.
+                store
+                    .runs
+                    .get(&run)
+                    .filter(|row| row.workspace_id == workspace)
+                    .ok_or(RepositoryError::NotFound)?;
+
+                // The double's synthesized identifiers are the reason this method had to be added
+                // rather than the caller filtering a page: `load_events` builds each id from the run
+                // and sequence, so the only way to find the sequence for an id is to *reverse* that
+                // — and the sequence is what the caller wants. Searching a page for it is what the
+                // handler used to do, and a page is bounded while a stream is not.
+                store
+                    .events
+                    .iter()
+                    .find(|event| {
+                        event.run_id == run
+                            && event.visibility == crate::repository::run::EventVisibility::Public
+                            && event_id_for(run, event.sequence).to_string() == event_id
+                    })
+                    .map(|event| event.sequence)
+                    .ok_or(RepositoryError::NotFound)
             })
         })
     }

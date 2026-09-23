@@ -348,6 +348,12 @@ Rules:
   events. `Last-Event-ID` resumes strictly after that event.
 - A missing, foreign, malformed, or no-longer-retained replay position returns
   HTTP `409` with `stream.replay_unavailable`; it never silently skips a gap.
+  **"No-longer-retained" is a statement about retention, not about a read bound.** Resume positions are
+  resolved against the retained stream, so any event the server still holds is resumable however far
+  into the stream it lies. This is worth stating because the first implementation searched a single
+  page of retained events — a page is bounded while a run's stream is not, and the controller
+  publishes one durable event per streamed output chunk, so a long answer exceeds one page routinely.
+  A client whose last-seen event was past that page was refused as though the event were gone.
 - Keepalives are SSE comments and do not consume sequence numbers.
 - Exactly one terminal event is persisted: `run.completed`, `run.failed`, or
   `run.cancelled`. The server closes after delivering the terminal event.

@@ -574,6 +574,21 @@ fn accepts_event_stream_value(value: &str) -> bool {
 /// Returns the refusal as a `Response` when the identifier is unknown, because "resume
 /// from an event I do not have" must not silently become "start from the beginning" —
 /// that would deliver a gap as if it were complete.
+///
+/// **Resolved by lookup, not by scanning a page, and that distinction was a defect.** This used to
+/// read one page of retained events (`service.events(context, run, 1)`) and search it, while a page
+/// is bounded to `MAX_EVENT_PAGE` (**500**) and a run's stream is not — the controller publishes one
+/// durable event per streamed output chunk, so a long answer passes 500 events as a matter of
+/// course. A client whose last-seen event was sequence 501 was therefore refused with
+/// `stream.replay_unavailable`, a code the contract reserves for a position that is **no longer
+/// retained**, while the event sat in the store. The page bound leaked out of the transport and
+/// became a claim about retention.
+///
+/// The lookup also removes a subtler cost: the scan re-read one page to discover nothing, on a
+/// request a client makes on every reconnect. The comment that stood here claimed scanning was
+/// "the honest way to find it" because "a second lookup path could disagree with the stream about
+/// what is retained" — which is true of *retention* and not of *identity*, and the two questions
+/// are now answered by different things: retention by this row existing, framing by `load_events`.
 async fn resolve_resume(
     request_id: Option<&str>,
     service: &RunService,
@@ -584,20 +599,12 @@ async fn resolve_resume(
     if last_event_id.is_empty() || last_event_id.len() > MAX_EVENT_ID_BYTES {
         return Err(Box::new(replay_unavailable(request_id)));
     }
-    // The identifier only has to match one retained event, and one page is bounded, so
-    // scanning the retained events from the start is the honest way to find it: a
-    // second lookup path could disagree with the stream about what is retained.
-    let page = match service.events(context, run, 1).await {
-        Ok(page) => page,
-        Err(error) => return Err(Box::new(service_error_response(request_id, &error))),
-    };
-    match page
-        .events
-        .iter()
-        .find(|event| event.id.to_string() == last_event_id)
-    {
-        Some(event) => Ok(event.sequence.saturating_add(1)),
-        None => Err(Box::new(replay_unavailable(request_id))),
+    match service.event_sequence(context, run, last_event_id).await {
+        Ok(sequence) => Ok(sequence.saturating_add(1)),
+        // A run the caller cannot see and an event the daemon no longer retains are the same
+        // refusal to a client — `409`, never a silent restart — which is why both arms map here.
+        // The service reports `NotFound` for either, so nothing distinguishes them on the wire.
+        Err(_) => Err(Box::new(replay_unavailable(request_id))),
     }
 }
 

@@ -118,7 +118,18 @@ pub struct DaemonDescriptor<'a> {
     pub instance_id: &'a str,
     /// The daemon process id. Diagnostic only, never authority.
     pub pid: u32,
-    /// The API major version the daemon reported.
+    /// The API major to report.
+    ///
+    /// **Which value this is depends on how the descriptor was built, and that is a wart rather
+    /// than a design.** From a `DiscoveryFile` it is the major *the daemon published*; from the
+    /// client's `Discovered` it is `crate::http::API_MAJOR`, the major *this client speaks*, because
+    /// `Discovered` does not carry the field. The rendered `daemon` finding then says "api major N"
+    /// without distinguishing the two, so on the client path it states the client's major as though
+    /// it were the daemon's. Both are `1` today, so the output is not wrong — but the label claims a
+    /// fact the client path did not observe. The honest fix is for doctor to read the major the
+    /// daemon returns in `Jarvis-API-Version` on a real request; it is recorded as an open item
+    /// rather than approximated, because a diagnostic that reports a defaulted value under the
+    /// daemon's name is the same defect class this project keeps finding.
     pub api_major: u32,
 }
 

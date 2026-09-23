@@ -794,6 +794,31 @@ pub trait RunRepository: Send + Sync {
         limit: u32,
     ) -> RepositoryFuture<'_, RunEventPage>;
 
+    /// Returns the sequence a retained public event carries, by its identifier.
+    ///
+    /// **This exists because a resume position was resolved against a page rather than against the
+    /// stream.** The caller that resolves `Last-Event-ID` needs to know whether the daemon still
+    /// retains *that* event and, if so, what sequence it has — and it cannot learn that from
+    /// [`load_events`](Self::load_events), because a read is bounded to [`MAX_EVENT_PAGE`] while a
+    /// run's stream is not. A client whose last-seen event was sequence 501 was therefore told its
+    /// position was unavailable, and the contract's `stream.replay_unavailable` means *no longer
+    /// retained*, not *past the first page*. A lookup has no page, so it answers the question the
+    /// caller is actually asking.
+    ///
+    /// Scoped by workspace and by public visibility, like every other client-facing read, so an
+    /// operator-only event can neither be resumed from nor confirmed to exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] for an absent or foreign run, and
+    /// [`RepositoryError::Query`] for a driver failure.
+    fn load_event_sequence(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+        event_id: &str,
+    ) -> RepositoryFuture<'_, u64>;
+
     /// Claims an idempotency key for a run-creating command.
     ///
     /// The claim is atomic: two concurrent requests with one key must not both be

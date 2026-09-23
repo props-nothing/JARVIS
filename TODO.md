@@ -2513,6 +2513,122 @@ Foundation TODO remains incomplete.
     because `core.autocrlf=true` and `.gitattributes` normalize the comparison. **Do not "fix" it:**
     rewriting endings would be a whole-file churn with no behavioural change, and it would show up
     as a suspicious diff in review.
+- [x] `BRN-038` Give the credential file **one** reader and one validation rule, and bound what is read.
+  Found by holding the multi-participant file sweep (a file written by one party, read by several)
+  against the credential, and by asking of each rule whether it was implemented once.
+  - **The same rule was implemented twice, and the two disagreed.** The credential file is one input
+    read by two functions that are both reachable: `auth::load_client_credential` (the daemon, on
+    every start) compared only the **length**; `client::read_credential` (the CLI and `doctor`)
+    compared the length **and** the base64url alphabet. So a 43-byte file of arbitrary characters was
+    accepted by the daemon's reader and refused by every other reader — whether an invalid spelling
+    is acceptable is a property of the *input*, and it came out differently depending on which
+    function looked at it. Two readers of one file is how that happens.
+  - **And both allocated the whole file before checking anything.** Each did `std::fs::read` and then
+    compared `len()`, so a `len` check guarded against malformed *content* while doing nothing about
+    *how much was read*. That is the same defect `BRN-023` closed for the discovery file — whose
+    bounded reader sits a few functions away in `client.rs`, and whose test already records the trap
+    this round fell into once.
+  - Fix: `credential::is_presentation_text` is the one rule, `credential::read_presentation_text` is
+    the one reader (metadata check **plus** `take(bound + 1)`, so a file that grows between the two
+    calls is still bounded), and `MAX_CREDENTIAL_SOURCE_BYTES = 256` is the one bound. Both readers
+    now delegate, so their codes differ and their answers cannot.
+  - **My first bound test was vacuous and the mutation said so.** I wrote 257 `'A'`s and asserted a
+    refusal — and it **passed with the unbounded read restored** (`MUTANT_UNBOUNDED=0`), because the
+    content rule rejects that file anyway, so nothing measured the bound. The discriminating input is
+    a file that is over the bound while its **trimmed content is a valid credential**: a real
+    43-character credential followed by whitespace, which `String::trim` accepts. The bounded reader
+    refuses it; the unbounded one returns a perfectly good credential. **Re-falsified: fails with
+    `std::fs::read` restored, passes with the bound.** A bound on a *resource* cannot be proven by an
+    assertion on a *result*, and the input must make the bound the only thing that can reject it.
+  - **The rule's divergence is falsified separately:** restoring the daemon's length-only rule fails
+    the agreement test at "the daemon must refuse characters a credential cannot contain", while the
+    alphabet check's own mutation is caught too. The agreement test asserts the two **agree** rather
+    than that either is right, and gives both directions a case, so unifying them on the permissive
+    rule would fail as well.
+  - **Deliberately not folded together:** `is_presentation_text` could have been
+    `base64_decode_unpadded(...).is_ok()`, but those answer different questions — *is this readable*
+    versus *does this decode* — and merging them would let a future change to decoding silently
+    loosen what is read. Their agreement is asserted by a test instead, so drift is caught rather
+    than prevented by construction.
+  - **A finding recorded rather than papered over:** `DaemonDescriptor.api_major` is documented as
+    "the API major version **the daemon reported**", but its `From<&Discovered>` impl substitutes
+    `crate::http::API_MAJOR` — the major *this client speaks* — because `Discovered` does not carry
+    the field, and doctor then prints it as the daemon's. `DiscoveryFile::validate` never checks
+    `api_major` either, so the published value is neither validated nor read by anything. Both majors
+    are `1` today so the output is not wrong, but the label claims a fact the client path did not
+    observe; the honest fix is for doctor to read `Jarvis-API-Version` off a real request. The doc
+    now says which value it is on each path, and the test that called itself "the same descriptor"
+    was renamed to what it actually checks.
+  997 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-039` Dial the host the record published, and bind the family the client can dial. Found by
+  following the client's transport, where the validated authority and the connected address were
+  **two different values**.
+  - **`request` checked the host and then ignored it.** It read `host`, refused anything that was not
+    `127.0.0.1` or `[::1]`, and connected to a hardcoded `("127.0.0.1", port)` — so the value that
+    passed validation never reached the socket. Three faults followed from one line: a record
+    publishing `[::1]` (which `format_base_url`, `authority_of`, and `validate_loopback_url` **all
+    support and all test**) could never be dialed; the `Host` header was built from the validated
+    authority while the connection went elsewhere, so the client stated an authority it had not
+    connected to; and the check `starts_with("127.0.0.1")` was a text prefix rather than an address
+    test, admitting `127.0.0.10` and refusing `127.0.0.2` — wrong in both directions.
+  - **The daemon bound IPv4 only**, which is what made the IPv6 half unreachable rather than merely
+    broken: the whole stack intended dual-stack loopback except the one line that chose the socket,
+    so a host with IPv4 loopback unavailable could not start at all. `bind_loopback` now tries IPv4
+    first (so the common path publishes the same `127.0.0.1` as before) then IPv6, and still refuses
+    any non-loopback result.
+  - Fix: `client::dial_host` **parses** the authority as an address and dials *that*. Parsing rather
+    than resolving is the security property as much as the correctness one — `TcpStream::connect`
+    with a name goes to DNS and the hosts file, which is the one thing a loopback-only client must
+    never do.
+  - **A real-socket test, because no pure test could catch the original.** `dial_host` asserts what
+    should happen; a test that binds a listener and drives `get_public` asserts what does. The IPv6
+    half is the falsifying one: the old code accepted the record and then connected to `127.0.0.1`,
+    so a listener on `[::1]` rejects it. Verified — the mutation fails with "the request reaches the
+    IPv6 listener, which a hardcoded IPv4 dial cannot: Transport".
+  - **The test immediately caught a bug I introduced fixing it.** Binding the parsed `IpAddr` to
+    `host` made the `Host` header render unbracketed (`::1:53996`), which a real daemon refuses as
+    `jarvis.host_not_allowed` — the body still came back, so only the assertion on the header the
+    *server saw* could have found it. Kept as a separate name (`address`), with the reason recorded.
+  - **A three-way inconsistency, recorded rather than unified.** "Loopback" is defined three times and
+    they disagree: `validate_loopback_url` and `dial_host` admit `127.0.0.1` and `::1` only;
+    `http::authority_of` and the `Host` check take whatever the daemon bound, so `127.0.0.2` would be
+    accepted if the daemon bound it; and `bound.ip().is_loopback()` accepts all of `127.0.0.0/8`.
+    Nothing is exploitable today because the daemon binds `127.0.0.1`, but one rule per concept is the
+    project's own standard and this is three. Recorded as an open item rather than "fixed" by
+    widening or narrowing whichever one I happened to be holding.
+  1000 workspace tests (+3). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-040` Resolve a stream resume position against the **stream**, not against one page of it.
+  Found by following `Last-Event-ID` from the header to the lookup, and asking what the lookup was
+  actually searching.
+  - **A page bound leaked out of the transport and became a claim about retention.**
+    `resolve_resume` read one page of retained events (`service.events(context, run, 1)`) and
+    searched it, while `MAX_EVENT_PAGE` bounds a **page** and a run's stream does not: the controller
+    publishes **one durable event per streamed output chunk**, so a long answer passes 500 events as
+    a matter of course. A client whose last-seen event was past that page got `409
+    stream.replay_unavailable` — a code the contract reserves for a position the daemon *no longer
+    retains* — while the event sat in the store. The comment defending the scan claimed scanning was
+    "the honest way" because "a second lookup path could disagree with the stream about what is
+    retained"; that is true of retention and false of *identity*, and the two questions are now
+    answered by different things.
+  - Fix: a `load_event_sequence` port method (workspace- and visibility-scoped, `NotFound` for a
+    foreign run, `NotFound` for an absent event) plus `RunService::event_sequence`, so the handler
+    asks "what sequence does this event have" instead of "is it in the first 500". The page scan also
+    re-read a page on every reconnect to discover nothing.
+  - **MY FIRST TEST DID NOT FALSIFY AND THE MUTATION SAID SO.** I appended **one** event at sequence
+    510 and resumed from it — and the pre-fix page scan **passed** (`MUTANT=0`), because the page bound
+    is on the number of *rows read*, not on the sequence value: a nine-event run has a first page that
+    includes sequence 510. The test measured nothing. **The trigger is more than a page of events
+    ahead of the target**, so the corrected test appends a full `MAX_EVENT_PAGE` of them and then
+    **asserts the precondition it depends on** — that the target is absent from the first page — so a
+    change to the bound or the fixture cannot silently make the case unreachable again.
+    **Re-falsified: the mutant now returns `409` for a retained event.**
+  - **And my first mutation was invalid.** I added the old scan as a *fallback* in the `Err` arm, but
+    the new lookup **succeeds** for a retained event, so the mutant code never ran — a mutation that
+    cannot execute proves nothing, the same way an unreached branch does not count as covered. Read
+    where the mutant actually is on the path before trusting the result.
+  - Two more `RunRepository` doubles (`StallingWrites`, `Unreadable`) needed the new method, which the
+    compiler reported both times rather than letting one silently diverge.
+  1001 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

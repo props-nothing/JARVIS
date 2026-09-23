@@ -722,6 +722,32 @@ impl RunService {
             .await?)
     }
 
+    /// Reads the sequence a retained public event carries, by identifier.
+    ///
+    /// Exists so a resume position is resolved against the **stream** rather than against one page
+    /// of it. `events` is bounded to [`MAX_EVENT_PAGE`](crate::repository::run::MAX_EVENT_PAGE) and
+    /// a run's stream is not, so a caller that searched a single page concluded that an event past
+    /// that page was no longer retained — and reported `stream.replay_unavailable`, which the
+    /// contract reserves for a position the daemon genuinely no longer has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::NotFound`] for an absent or foreign run, and
+    /// [`RepositoryError::NotFound`](crate::repository::RepositoryError::NotFound) when the event is
+    /// not a retained public event of that run.
+    pub async fn event_sequence(
+        &self,
+        context: &RequestContext,
+        run: RunId,
+        event_id: &str,
+    ) -> Result<u64, RunServiceError> {
+        Ok(self
+            .ports
+            .runs
+            .load_event_sequence(context.workspace_id, run, event_id)
+            .await?)
+    }
+
     /// Resolves the policy this run executes under.
     ///
     /// A named version is honoured exactly, and an absent one means the workspace's active

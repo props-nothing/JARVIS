@@ -21,6 +21,83 @@ pub const CREDENTIAL_BYTES: usize = 32;
 /// The base64url-encoded length of a credential (32 bytes, unpadded).
 pub const CREDENTIAL_TEXT_LEN: usize = 43;
 
+/// The largest credential file this build will read, in bytes.
+///
+/// The stored file holds exactly one credential: 43 bytes of unpadded base64url, plus at most
+/// three whitespace characters (`String::trim` accepts them, so they are inside the rule).
+/// 256 is roughly five times that and still far below anything that matters in memory, which is
+/// what makes it a bound rather than a limit an operator could reach.
+///
+/// **It exists because both credential readers allocated the whole file before checking anything.**
+/// `load_client_credential` and `client::read_credential` each did `std::fs::read`, then compared
+/// `len() != 43` — so a `len` check guarded against malformed *content* while doing nothing about
+/// *how much was read*. That is the same defect `BRN-023` fixed for the discovery file, whose
+/// bounded reader sits a few functions away; the credential file is the other input in a profile a
+/// different process could have written, and the CLI reads it on every command.
+pub const MAX_CREDENTIAL_SOURCE_BYTES: u64 = 256;
+
+/// Returns whether `text` is a well-formed credential presentation string.
+///
+/// **The one definition of this rule, because it had two and they disagreed.** The daemon's
+/// `load_client_credential` compared only the length, and the client's `read_credential` compared
+/// the length *and* the base64url alphabet. Both were reachable: the daemon runs the first on every
+/// start, the CLI and `doctor` run the second. So a file of 43 bytes containing, say, 43 spaces
+/// passed the daemon's check — and only there — while every other reader refused it. Whether an
+/// invalid spelling is accepted is a property of the *input*, not of which reader looked at it, and
+/// two readers of one file implementing one rule is how the answer comes to depend on the caller.
+///
+/// This is deliberately not `base64_decode_unpadded(...).is_ok()`, although that decoder already
+/// rejects padding and every non-alphabet byte: folding the two into one would make a future change
+/// to what decodes acceptable silently loosen what is *readable*, and those are different questions.
+/// The agreement between them is asserted by a test instead, which is what keeps them from drifting
+/// in the direction that matters.
+#[must_use]
+pub fn is_presentation_text(text: &str) -> bool {
+    text.len() == CREDENTIAL_TEXT_LEN
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// Reads a credential file within [`MAX_CREDENTIAL_SOURCE_BYTES`].
+///
+/// The bound is at the read rather than in the parser, for the reason the constant records: a
+/// `&[u8]` is already allocated by the time a length comparison can run.
+///
+/// # Errors
+///
+/// Returns `None` when the file is missing, unreadable, over the bound, not UTF-8, or not a
+/// well-formed credential. The readers map that to their own typed error, which is why this helper
+/// returns a plain `Option` rather than either module's error type: the two callers report the same
+/// fault under different codes (the daemon's enrollment uses `CredentialError::Malformed`, the CLI
+/// uses `ClientError::NoCredential`) and both are correct for their surface.
+#[must_use]
+pub fn read_presentation_text(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_CREDENTIAL_SOURCE_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    // Bounded by `take`, not only by the metadata check: the file could grow between the two calls,
+    // and this is exactly the kind of small file another process writes.
+    let mut source = file.take(MAX_CREDENTIAL_SOURCE_BYTES + 1);
+    if source.read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    if bytes.len() as u64 > MAX_CREDENTIAL_SOURCE_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let trimmed = text.trim();
+    if !is_presentation_text(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
 /// An error raised while handling credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialError {

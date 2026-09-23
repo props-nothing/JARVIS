@@ -2424,6 +2424,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resume_position_beyond_the_first_page_is_still_resumable() {
+        // **The falsifying test for `BRN-040`.** The resume position was resolved by reading one
+        // page of events and searching it, and a page is bounded to `MAX_EVENT_PAGE` while a run's
+        // stream is not: the controller publishes **one durable event per streamed output chunk**, so
+        // a long answer passes 500 events as a matter of course. A client whose last-seen event was
+        // past that page was refused with `stream.replay_unavailable`, a code the contract reserves
+        // for a position that is *no longer retained* — while the event sat in the store.
+        //
+        // The trigger has to be a real run whose stream exceeds one page, because a smaller run
+        // cannot distinguish the two implementations: with fewer than `MAX_EVENT_PAGE` events the
+        // page *is* the stream, and the old scan finds the position correctly. Verified — this test
+        // fails against the page-scanning version with `409`, and passes against the lookup.
+        use jarvis_application::repository::run::{
+            EventVisibility, MAX_EVENT_PAGE, NewActivityEvent,
+        };
+
+        let (app, token, repositories) = runs_fixture_with_storage("runs-resume-beyond-page").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let parsed =
+            jarvis_domain::ids::RunId::parse(&run_id).expect("the create returned a run id");
+        let workspace = jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::from_u128(
+            crate::http::runs::DEFAULT_WORKSPACE_UUID,
+        ));
+
+        // The run is driven to a terminal state first, so no live controller is appending events
+        // while this test writes to the same stream — a race for sequence numbers would make the
+        // assertion about the *read* nondeterministic.
+        let mut body = String::new();
+        for _ in 0..200 {
+            let (_, current) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &run_headers(&token),
+                "",
+            )
+            .await;
+            body = current;
+            if body.contains("event: run.completed") || body.contains("event: run.failed") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(body.contains("event: run.completed"), "{body}");
+
+        // Extend the stream past one page, the way a long answer does. Appended directly because the
+        // subject under test is the *read*: driving a provider to emit >500 chunks would make this a
+        // test of the provider, and the controller's one-event-per-chunk behaviour is already
+        // documented where it is implemented.
+        //
+        // **`MAX_EVENT_PAGE` events, not one event at a high sequence number — my first attempt got
+        // this wrong and the mutation proved it.** The page bound is on the number of *rows read*, not
+        // on the sequence value, so a single event at sequence 510 sits inside the first page of a
+        // nine-event run and the pre-fix scan finds it: the test passed against the old
+        // implementation and measured nothing. What makes the position unreachable by a page scan is
+        // having more than a page of events ahead of it, which is why the whole page is appended.
+        let base = 1000_u64;
+        for offset in 0..u64::from(MAX_EVENT_PAGE) {
+            repositories
+                .append_event(
+                    workspace,
+                    NewActivityEvent {
+                        run_id: parsed,
+                        sequence: base + offset,
+                        event_type: "run.output_text.delta".to_owned(),
+                        payload_json: Some(r#"{"item_id":"i","delta":"x"}"#.to_owned()),
+                        visibility: EventVisibility::Public,
+                        occurred_at: jarvis_domain::time::UtcTimestamp::parse(
+                            "2026-09-23T00:00:00Z",
+                        )
+                        .expect("valid"),
+                    },
+                )
+                .await
+                .expect("the event is appended past the page bound");
+        }
+
+        // Read the id the *last* appended event was stored under, so the resume names a real
+        // retained event whose row is past the first page by construction. A hardcoded id would
+        // exercise the refusal path instead of the lookup.
+        let last_sequence = base + u64::from(MAX_EVENT_PAGE) - 1;
+        let tail = repositories
+            .load_events(workspace, parsed, last_sequence, MAX_EVENT_PAGE)
+            .await
+            .expect("the tail page reads");
+        assert_eq!(
+            tail.events.len(),
+            1,
+            "reading from the last sequence returns the single event at it",
+        );
+        let last_event_id = tail.events[0].id.to_string();
+
+        // The precondition the test depends on, asserted rather than assumed: a page read from this
+        // run does **not** contain the target. Without this, a change to `MAX_EVENT_PAGE` or to the
+        // fixture's event count could silently make the case unreachable again.
+        let first_page = repositories
+            .load_events(workspace, parsed, 1, MAX_EVENT_PAGE)
+            .await
+            .expect("the first page reads");
+        assert_eq!(
+            first_page.events.len(),
+            MAX_EVENT_PAGE as usize,
+            "the first page is full, so more events exist than it can hold",
+        );
+        assert!(
+            !first_page
+                .events
+                .iter()
+                .any(|event| event.id.to_string() == last_event_id),
+            "the target must be outside the first page, or this test cannot distinguish the two \
+             implementations",
+        );
+
+        // **The assertion.** Resuming from an event past the first page must not be reported as
+        // no-longer-retained. `409 stream.replay_unavailable` means the daemon no longer has the
+        // position, and this one it plainly does — the previous implementation searched one page and
+        // concluded the event was gone.
+        let mut headers = run_headers(&token);
+        headers.push(("last-event-id", last_event_id));
+        let (status, resumed) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}/events"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::CONFLICT,
+            "a retained position must not be reported as no-longer-retained: {resumed}",
+        );
+        assert_eq!(status, StatusCode::OK, "{resumed}");
+        // Resuming after the last event leaves nothing to deliver, which is the right answer at the
+        // end of a stream — and it is what distinguishes "resumed" from "silently restarted", the
+        // failure the contract's `409` exists to prevent.
+        assert!(
+            !resumed.contains("event: run.received"),
+            "a resume must not silently restart the stream: {resumed}",
+        );
+        assert!(
+            resumed.trim().is_empty(),
+            "resuming after the final event leaves nothing: {resumed}",
+        );
+    }
+
+    #[tokio::test]
     async fn a_cancel_reason_is_bounded_by_the_constant_declared_for_it() {
         // `MAX_CANCEL_REASON_BYTES` was **declared and never enforced** while `MAX_RUN_INPUT_BYTES`
         // is applied one route above it. A declared bound that nothing checks is the shape where

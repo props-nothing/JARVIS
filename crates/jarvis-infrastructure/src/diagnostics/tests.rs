@@ -1005,7 +1005,28 @@ fn a_client_discovery_value_converts_to_the_same_descriptor() {
     let descriptor = DaemonDescriptor::from(&discovered);
     assert_eq!(descriptor.instance_id, "inst-xyz");
     assert_eq!(descriptor.pid, 99);
+    // **This assertion is weaker than it reads, and the name is now honest about it.** It compares
+    // the client's constant to itself: `Discovered` carries no API major, so the `From` impl
+    // substitutes `crate::http::API_MAJOR`. So this does not check that the client agrees with the
+    // *daemon* — that is what its old name ("the same descriptor") suggested. What it does check is
+    // that the field is populated at all, which is worth keeping; the cross-check that the daemon's
+    // published major and this client's constant agree is a real assertion made on the daemon-side
+    // path above, where the value is read from the file.
     assert_eq!(descriptor.api_major, crate::http::API_MAJOR);
+    let published = jarvis_protocol::DiscoveryFile {
+        schema_version: jarvis_protocol::DISCOVERY_SCHEMA_VERSION,
+        instance_id: "inst-xyz".to_owned(),
+        pid: 99,
+        base_url: "http://127.0.0.1:1".to_owned(),
+        api_major: crate::http::API_MAJOR,
+        started_at: "2026-09-21T00:00:00Z".to_owned(),
+    };
+    assert_eq!(
+        DaemonDescriptor::from(&published).api_major,
+        crate::http::API_MAJOR,
+        "and the daemon-side path publishes that same major today, which is why the client \
+         substituting its own is not yet observable",
+    );
 }
 
 #[test]
