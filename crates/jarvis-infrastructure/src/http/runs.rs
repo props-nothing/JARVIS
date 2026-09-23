@@ -42,7 +42,7 @@ use jarvis_protocol::{
     RunView, SseEvent,
 };
 
-use crate::http::{ApiState, AuthenticatedClient, error_response};
+use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for};
 
 /// The header carrying a client's idempotency key.
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -145,26 +145,34 @@ pub const fn wire_state(state: RunState) -> &'static str {
 pub async fn create_run(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.runs.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
     let Some(key) = idempotency_key(&headers) else {
-        return invalid_request("An idempotency key is required.");
+        return invalid_request(request_id, "An idempotency key is required.");
     };
     let command: CreateRunRequest = match serde_json::from_slice(&body) {
         Ok(command) => command,
         // A malformed body is the caller's error. The rejected value is not echoed,
         // because it is caller-supplied text.
-        Err(_) => return invalid_request("The request body is not valid for this endpoint."),
+        Err(_) => {
+            return invalid_request(
+                request_id,
+                "The request body is not valid for this endpoint.",
+            );
+        }
     };
 
     // Refused rather than defaulted: a client that asked for an external runtime must
     // not silently receive a native one.
     if command.runtime != NATIVE_RUNTIME {
-        return error_response(
+        return error_response_for(
+            request_id,
             StatusCode::UNPROCESSABLE_ENTITY,
             "request.semantic_invalid",
             "The requested runtime is not supported by this build.",
@@ -179,7 +187,8 @@ pub async fn create_run(
     match RunRuntime::new(command.runtime.as_str(), BUILD_RUNTIME_VERSION) {
         Ok(_) => {}
         Err(_) => {
-            return error_response(
+            return error_response_for(
+                request_id,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "request.semantic_invalid",
                 "The requested runtime identity is not usable.",
@@ -189,7 +198,8 @@ pub async fn create_run(
     }
     let input = command.input.text_value();
     if input.is_empty() || input.len() > MAX_RUN_INPUT_BYTES {
-        return error_response(
+        return error_response_for(
+            request_id,
             StatusCode::UNPROCESSABLE_ENTITY,
             "request.semantic_invalid",
             "The run input is empty or over the bounded limit.",
@@ -201,7 +211,8 @@ pub async fn create_run(
         Some(value) => match ConversationId::parse(value) {
             Ok(parsed) => Some(parsed),
             Err(_) => {
-                return error_response(
+                return error_response_for(
+                    request_id,
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "request.semantic_invalid",
                     "The conversation identifier is not a valid identifier.",
@@ -220,7 +231,8 @@ pub async fn create_run(
     let requested_policy = match parse_policy_reference(command.model_policy.as_ref()) {
         Ok(reference) => reference,
         Err(message) => {
-            return error_response(
+            return error_response_for(
+                request_id,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "request.semantic_invalid",
                 message,
@@ -229,7 +241,7 @@ pub async fn create_run(
         }
     };
 
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
     match service
         .create(
             &context,
@@ -241,8 +253,8 @@ pub async fn create_run(
         )
         .await
     {
-        Ok(created) => created_response(&created),
-        Err(error) => service_error_response(&error),
+        Ok(created) => created_response(request_id, &created),
+        Err(error) => service_error_response(request_id, &error),
     }
 }
 
@@ -276,20 +288,23 @@ fn parse_policy_reference(
 pub async fn read_run(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
     Path(run_id): Path<String>,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.runs.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
     // A value that cannot be an identifier cannot denote a resource, and reporting it as
     // `not_found` keeps a foreign run and a malformed one indistinguishable, which the
     // contract requires.
     let Ok(run) = RunId::parse(&run_id) else {
-        return not_found();
+        return not_found(request_id);
     };
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
     match service.read(&context, run).await {
         Ok(stored) => json_response(
+            request_id,
             StatusCode::OK,
             &RunView {
                 run_id: stored.id.to_string(),
@@ -303,7 +318,7 @@ pub async fn read_run(
                 error_code: stored.error_code,
             },
         ),
-        Err(error) => service_error_response(&error),
+        Err(error) => service_error_response(request_id, &error),
     }
 }
 
@@ -311,18 +326,20 @@ pub async fn read_run(
 pub async fn cancel_run(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
     headers: HeaderMap,
     Path(run_id): Path<String>,
     body: Bytes,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.runs.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
     let Some(key) = idempotency_key(&headers) else {
-        return invalid_request("An idempotency key is required.");
+        return invalid_request(request_id, "An idempotency key is required.");
     };
     let Ok(run) = RunId::parse(&run_id) else {
-        return not_found();
+        return not_found(request_id);
     };
     // An empty body is accepted because the contract's example supplies only a reason,
     // and requiring a body would refuse a legitimate minimal cancel.
@@ -331,7 +348,12 @@ pub async fn cancel_run(
     } else {
         match serde_json::from_slice::<CancelRunRequest>(&body) {
             Ok(command) => command.reason,
-            Err(_) => return invalid_request("The request body is not valid for this endpoint."),
+            Err(_) => {
+                return invalid_request(
+                    request_id,
+                    "The request body is not valid for this endpoint.",
+                );
+            }
         }
     };
     // The contract bounds the reason, and `MAX_CANCEL_REASON_BYTES` was declared for exactly
@@ -343,10 +365,13 @@ pub async fn cancel_run(
     // stored on a durable event, and a value that truncates at a NUL would be persisted
     // differently from how it was validated.
     if reason.is_empty() || reason.len() > MAX_CANCEL_REASON_BYTES || reason.contains('\0') {
-        return invalid_request("The cancellation reason is empty or over the bounded limit.");
+        return invalid_request(
+            request_id,
+            "The cancellation reason is empty or over the bounded limit.",
+        );
     }
 
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
     // The status is derived from the state the **service** returns, not from a separate
     // pre-read. That is the same read that decides whether to signal the run, so there is
     // no window between the two in which the run can finish.
@@ -359,6 +384,7 @@ pub async fn cancel_run(
     // was caught by a real-daemon journey, not by a unit test.
     match service.cancel(&context, run, &reason, &key).await {
         Ok(current) => json_response(
+            request_id,
             if current.is_terminal() {
                 StatusCode::OK
             } else {
@@ -366,7 +392,7 @@ pub async fn cancel_run(
             },
             &serde_json::json!({ "state": wire_state(current) }),
         ),
-        Err(error) => service_error_response(&error),
+        Err(error) => service_error_response(request_id, &error),
     }
 }
 
@@ -388,11 +414,13 @@ pub async fn cancel_run(
 pub async fn run_events(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
     headers: HeaderMap,
     Path(run_id): Path<String>,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.runs.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
     // This endpoint serves `text/event-stream` and nothing else, so a caller that states it will
     // accept something else is asking for a representation this route cannot produce. Refused
@@ -400,7 +428,8 @@ pub async fn run_events(
     // answering `404` for a well-formed `Accept` mismatch would send a client looking for a run
     // that is right there.
     if !accepts_event_stream(&headers) {
-        return error_response(
+        return error_response_for(
+            request_id,
             StatusCode::BAD_REQUEST,
             "request.invalid",
             "This endpoint serves `text/event-stream`.",
@@ -408,9 +437,9 @@ pub async fn run_events(
         );
     }
     let Ok(run) = RunId::parse(&run_id) else {
-        return not_found();
+        return not_found(request_id);
     };
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
 
     // The resume position is resolved against the retained events rather than trusted as
     // a number, so a position for an event this daemon no longer has is a `409` instead
@@ -420,7 +449,7 @@ pub async fn run_events(
         .and_then(|value| value.to_str().ok())
     {
         None => 1,
-        Some(value) => match resolve_resume(service, &context, run, value).await {
+        Some(value) => match resolve_resume(request_id, service, &context, run, value).await {
             Ok(sequence) => sequence,
             Err(response) => return *response,
         },
@@ -448,7 +477,7 @@ pub async fn run_events(
                     payload,
                 };
                 let Ok(data) = serde_json::to_string(&frame) else {
-                    return internal_failure();
+                    return internal_failure(request_id);
                 };
                 body.push_str(
                     &SseEvent {
@@ -471,7 +500,7 @@ pub async fn run_events(
             )
                 .into_response()
         }
-        Err(error) => service_error_response(&error),
+        Err(error) => service_error_response(request_id, &error),
     }
 }
 
@@ -538,20 +567,21 @@ fn accepts_event_stream_value(value: &str) -> bool {
 /// from an event I do not have" must not silently become "start from the beginning" —
 /// that would deliver a gap as if it were complete.
 async fn resolve_resume(
+    request_id: Option<&str>,
     service: &RunService,
     context: &RequestContext,
     run: RunId,
     last_event_id: &str,
 ) -> Result<u64, Box<Response>> {
     if last_event_id.is_empty() || last_event_id.len() > MAX_EVENT_ID_BYTES {
-        return Err(Box::new(replay_unavailable()));
+        return Err(Box::new(replay_unavailable(request_id)));
     }
     // The identifier only has to match one retained event, and one page is bounded, so
     // scanning the retained events from the start is the honest way to find it: a
     // second lookup path could disagree with the stream about what is retained.
     let page = match service.events(context, run, 1).await {
         Ok(page) => page,
-        Err(error) => return Err(Box::new(service_error_response(&error))),
+        Err(error) => return Err(Box::new(service_error_response(request_id, &error))),
     };
     match page
         .events
@@ -559,7 +589,7 @@ async fn resolve_resume(
         .find(|event| event.id.to_string() == last_event_id)
     {
         Some(event) => Ok(event.sequence.saturating_add(1)),
-        None => Err(Box::new(replay_unavailable())),
+        None => Err(Box::new(replay_unavailable(request_id))),
     }
 }
 
@@ -580,10 +610,22 @@ pub fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 ///
 /// The identifiers are generated here rather than accepted from the caller: a
 /// caller-supplied correlation id would let one client forge another's trace.
-fn context_for(client: &AuthenticatedClient) -> RequestContext {
+///
+/// The request identifier, though, is the one the middleware already derived — passed in rather
+/// than minted again, because a refusal's envelope names a `request_id` and the daemon's own
+/// diagnostics record a `request_id`, and two ids for one request would make the correlation the
+/// contract asks for impossible. The correlation id stays independently minted: it groups a flow
+/// across requests, while this identifies one.
+pub(crate) fn context_for(
+    client: &AuthenticatedClient,
+    request_id: Option<&str>,
+) -> RequestContext {
     let scope = resolve_scope(client);
+    let request_id = request_id
+        .and_then(|value| RequestId::parse(value).ok())
+        .unwrap_or_else(|| RequestId::from_uuid(uuid::Uuid::now_v7()));
     RequestContext::new(
-        RequestId::from_uuid(uuid::Uuid::now_v7()),
+        request_id,
         CorrelationId::from_uuid(uuid::Uuid::now_v7()),
         scope.principal_id,
         client.assurance,
@@ -593,7 +635,7 @@ fn context_for(client: &AuthenticatedClient) -> RequestContext {
 }
 
 /// Renders a created run as the contract's `202` response.
-fn created_response(created: &CreatedRun) -> Response {
+fn created_response(request_id: Option<&str>, created: &CreatedRun) -> Response {
     let body = CreateRunResponse {
         run_id: created.run_id.to_string(),
         conversation_id: created.conversation_id.to_string(),
@@ -603,11 +645,11 @@ fn created_response(created: &CreatedRun) -> Response {
         created_at: created.created_at.to_string(),
         links: run_links(&created.run_id.to_string()),
     };
-    json_response(StatusCode::ACCEPTED, &body)
+    json_response(request_id, StatusCode::ACCEPTED, &body)
 }
 
 /// Maps a service error to its contract status and envelope.
-fn service_error_response(error: &RunServiceError) -> Response {
+fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> Response {
     let status = match error {
         RunServiceError::Invalid { .. } => StatusCode::BAD_REQUEST,
         // A named policy that does not exist is a 404 like any other absent resource, and it is
@@ -628,17 +670,30 @@ fn service_error_response(error: &RunServiceError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    error_response(status, error.code(), error.message(), error.retryable())
+    error_response_for(
+        request_id,
+        status,
+        error.code(),
+        error.message(),
+        error.retryable(),
+    )
 }
 
 /// The refusal for a caller's invalid request.
-fn invalid_request(message: &str) -> Response {
-    error_response(StatusCode::BAD_REQUEST, "request.invalid", message, false)
+fn invalid_request(request_id: Option<&str>, message: &str) -> Response {
+    error_response_for(
+        request_id,
+        StatusCode::BAD_REQUEST,
+        "request.invalid",
+        message,
+        false,
+    )
 }
 
 /// The refusal for a stream whose resume position is unavailable.
-fn replay_unavailable() -> Response {
-    error_response(
+fn replay_unavailable(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::CONFLICT,
         "stream.replay_unavailable",
         "The requested stream position is not available.",
@@ -647,8 +702,9 @@ fn replay_unavailable() -> Response {
 }
 
 /// The refusal for a missing resource, which a malformed identifier also produces.
-fn not_found() -> Response {
-    error_response(
+fn not_found(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::NOT_FOUND,
         "resource.not_found",
         "No such resource.",
@@ -657,8 +713,9 @@ fn not_found() -> Response {
 }
 
 /// The refusal for a run surface that is not configured.
-fn not_ready() -> Response {
-    error_response(
+fn not_ready(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::SERVICE_UNAVAILABLE,
         "service.not_ready",
         "The run surface is not available yet.",
@@ -667,8 +724,14 @@ fn not_ready() -> Response {
 }
 
 /// The refusal for a response this daemon could not render.
-fn internal_failure() -> Response {
-    error_response(
+///
+/// Carries the request identifier, because this is the refusal the contract names specifically:
+/// "internal failures return a request ID and generic message while preserving structured
+/// diagnostics in redacted local logs". A client reporting this has no other handle to quote, and
+/// the identifier is also returned as a response header so it can be read without parsing the body.
+fn internal_failure(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal.failure",
         "The response could not be rendered.",
@@ -677,9 +740,13 @@ fn internal_failure() -> Response {
 }
 
 /// Serializes a value into an `application/json` response.
-fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response {
+fn json_response(
+    request_id: Option<&str>,
+    status: StatusCode,
+    value: &impl serde::Serialize,
+) -> Response {
     match serde_json::to_vec(value) {
         Ok(bytes) => (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-        Err(_) => internal_failure(),
+        Err(_) => internal_failure(request_id),
     }
 }

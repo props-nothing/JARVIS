@@ -1780,6 +1780,9 @@ Foundation TODO remains incomplete.
   scope finer than the workspace yet. Both need an owner decision: either the table's entries change
   or the code grows a route that can produce them. `request.rate_limited` is the fourth unreferenced
   code and is correctly absent — no rate limiter exists and `CON-004` owns connectors.
+  **RESOLVED by `BRN-027`**, which took the owner decision in the only direction the facts allow:
+  the two rows are gone, `auth.credential_rejected` and `resource.version_conflict` are in, and a
+  parity test now holds the table and the surface to the same set.
   968 workspace tests. **DO NOT COMMIT.**
 - [x] `BRN-022` Enforce the event stream's `Accept` requirement, and make the reference client send
   it. Found by reading the contract's **Required Contract Tests** list as a checklist and then
@@ -1821,7 +1824,7 @@ Foundation TODO remains incomplete.
   half in both directions, and `jarvis ask` — which follows a run by polling this route — still
   answers with exit `0` against the enforcing daemon.
   **Still open:** `auth.invalid` and `auth.scope_denied` remain in the minimum-code table and are
-  produced by no route (from `BRN-021`), and `MAX_SOURCE_BYTES` in `diagnostics` documents "the
+  produced by no route (from `BRN-021`) — **closed by `BRN-027`** — and `MAX_SOURCE_BYTES` in `diagnostics` documents "the
   maximum number of bytes this process reads from a discovered JSON file" while `std::fs::read`
   allocates the whole file — a declared bound with no enforcement point, which is the class
   `BRN-018` and `BRN-021` both belong to.
@@ -1864,11 +1867,13 @@ Foundation TODO remains incomplete.
   tests including the offset one; and reverting each discovery reader to `std::fs::read` fails its
   own test. Verified on the real daemon: both E2E journeys pass and `jarvis ask` answers, so the
   bounded reads did not change any observable behaviour.
-  **Still open:** `auth.invalid` and `auth.scope_denied` remain produced by no route (`BRN-021`), and
-  the unreferenced-column list from `BRN-020` is unchanged — `agent_steps` (`attempt_count`,
-  `input_fingerprint`, `input_ref`, `output_ref`, `timeout_ms`, `next_attempt_at`) and `agent_runs`
-  (`context_manifest_id`, `plan_summary_ref`, `result_ref`, `error_ref`). Those are tables with no
-  port at all, so they belong to the tool-fabric milestone rather than to a bound sweep.
+  **Still open:** `auth.invalid` and `auth.scope_denied` remain produced by no route (`BRN-021`) —
+  **closed by `BRN-027`**, which removed both rows and added the two produced codes the table was
+  missing — and the unreferenced-column list from `BRN-020` is unchanged — `agent_steps`
+  (`attempt_count`, `input_fingerprint`, `input_ref`, `output_ref`, `timeout_ms`, `next_attempt_at`)
+  and `agent_runs` (`context_manifest_id`, `plan_summary_ref`, `result_ref`, `error_ref`). Those are
+  tables with no port at all, so they belong to the tool-fabric milestone rather than to a bound
+  sweep.
   976 workspace tests. **DO NOT COMMIT.**
 - [x] `BRN-024` Decide the step-up rule from the assurance the caller **proved**, not one it was
   told. Found by following the two "recorded gap" doc comments the exception module carries, and
@@ -1944,6 +1949,91 @@ Foundation TODO remains incomplete.
   invisible to the compiler, to clippy, and to the docs gate, which checks links and IDs rather than
   whether a sentence is still true.
   979 workspace tests. **DO NOT COMMIT.**
+- [x] `BRN-026` Make the error envelope's `request_id` real. Found by counting references:
+  `ErrorEnvelope::with_request_id` had exactly **two** — its definition and one unit test — so
+  **no production caller existed** and every refusal on the run and policy surfaces shipped
+  `request_id` as absent, while `common-conventions.md` promised the field and
+  `local-control-api.md` named it a requirement for internal failures specifically. The
+  contract's own example is a `tool.permission_denied` refusal, which says the field is not
+  reserved for 500s: a refusal is the case a client most often needs a handle to report.
+  - **Fix.** `require_authentication` mints one server-derived id per authenticated request,
+    stores it as the `RequestIdValue` request extension, and returns it as the
+    `jarvis-request-id` response header. `RequestIdOf` is the infallible extractor over it;
+    `error_response_for(request_id, …)` is the shared builder, and plain `error_response`
+    delegates with `None` so the two remain distinguishable. Every handler on both surfaces
+    threads the id into its refusals **and** into `context_for`. The media-type layer, which
+    runs inside authentication but ahead of the handler, now attaches the id it can already
+    see rather than ignoring it — found by writing a test for a claim I had just put in the
+    contract.
+  - **Second defect, found while wiring it.** Both `context_for`s minted their **own** UUIDv7
+    instead of using the request's, so even once a response carried an id the daemon's
+    diagnostics were filed under a different one — the correlation the contract promises would
+    silently return nothing. The context id is readable: `ScriptedProvider` stamps it into
+    `ProviderMetadata.request_id` on the `call.started` frame, so it reaches an adapter.
+  - **Layer order is now specified, not implied.** The identifier's presence is evidence the
+    request authenticated, so it is minted *after* the credential check. Six refusals precede
+    it and carry none, with the field absent rather than invented: the `413` body limit, the
+    browser-`Origin` and forwarded-header `403`s, the `400` authority refusal, the `426`
+    version negotiation (inside the middleware but ahead of the credential), and the `401`
+    itself. Both the contract and `the_id_is_present_exactly_where_a_credential_was_verified`
+    now state this, and the test asserts the inside cases *and* the outside ones.
+  - **Falsified five ways, each compiling:** ignoring the id in `error_response_for` fails 5
+    tests; a constant id fails 2 (including "identifiers must not repeat"); `context_for`
+    ignoring its argument fails 1; the header minted from a fresh id rather than the stored one
+    fails 2; and trusting a caller-supplied `jarvis-request-id` header fails
+    `a_caller_cannot_name_the_request_it_is_answering` — the id must be server-derived, or a
+    caller can aim an operator's search.
+  - **Two pre-existing checks asserted byte-equality and were corrected, not deleted.**
+    `an_unknown_run_is_not_found_and_a_malformed_id_is_indistinguishable` and step 4 of the
+    policy-surface journey both compared whole bodies. The property they guard — a caller
+    cannot tell which identifiers exist — is carried by the code and message, so both now
+    compare apart from `request_id` **and** assert the two ids differ, which keeps the
+    exemption from absorbing a genuine per-request difference.
+  985 workspace tests, both E2E journeys green. **DO NOT COMMIT.**
+- [x] `BRN-027` Make the minimum-code table and the surface name the same set. Found by inverting the
+  sweep four earlier rounds had run in one direction. `BRN-021` counted each code in the table
+  against production code and found four produced by nothing, then **recorded** the two it could not
+  justify as needing an owner decision; `BRN-022` and `BRN-023` inherited the note and left it open.
+  Running the sweep **the other way** — every code the surface returns, against the table — shows
+  the table was wrong in *both* directions at once.
+  - **A document that contradicted itself.** The table's `401` row said `auth.invalid`. Two
+    paragraphs below, the same document's layer-order section names `auth.credential_rejected` as
+    the `401` this surface returns — and that is what the daemon produces. So a client writing
+    handling for a failed credential would key on a code it can never receive, and every test the
+    daemon does have asserted the code the table omits. **`auth.invalid` was a name for a response
+    nobody sends, sitting beside the name of the response everybody receives.**
+  - **And the reverse omission, which the one-directional sweep could not have seen:**
+    `resource.version_conflict` is produced on this surface (`PUT` with a stale `expected_version`,
+    and the run's idempotency conflict) and was **not in the table at all**. A client could not know
+    the status is `409`/retryable from the contract, only from a test.
+  - **The decision `BRN-021` deferred, taken in the only direction the facts allow.** `auth.scope_denied`
+    stays unproducible and its row is gone: no route authorizes at a scope finer than the workspace,
+    so authentication answers "is this the owner" and nothing narrows what an owner may do. Adding a
+    route to satisfy a table row would be building a control to fit a document. `auth.invalid` is
+    deleted as **redundant**, not unproducible — one name for one response.
+  - **`request.rate_limited` is kept and labelled `reserved`**, which is a correction to my own
+    first draft: I wrote "every code in the table is produced", which was the very overclaim this
+    round exists to fix. It has no limiter (the connector platform, `CON-004`, owns rate limiting),
+    so the `429` row states its shape before a limiter exists while the prose says a client must not
+    read "documented" as "will occur".
+  - **Two of the produced codes are invisible to a source scan** — `idempotency.conflict` and
+    `resource.version_conflict` travel on an error type's `code()` rather than as a literal here —
+    so `CODES_CARRIED_BY_ERROR_TYPES` names them and says why the scan was not widened to other
+    crates (that would find every code in the workspace and stop describing *this* surface).
+  - **The test scans the surface's own source from `CARGO_MANIFEST_DIR`** and takes only the
+    production half of each module, because a test may legitimately name a code it does not produce
+    and counting its own assertions would make the test assert itself. It asserts it scanned at
+    least three modules and parsed at least fourteen rows, so a broken scan fails rather than
+    passing vacuously — the failure mode a fixture test exists to prevent.
+  - **The table parser needed a second attempt, and the first failure was informative:** scanning the
+    whole document for "must not list `auth.invalid`" **failed against my own corrected contract**,
+    because the prose explaining the removal names the code. Rows are now extracted by shape
+    (`| 401 | `code` | no |`) so a reworded paragraph cannot pass as a table.
+  - **Falsified three ways, each compiling:** deleting the `resource.version_conflict` row fails with
+    `["resource.version_conflict"]`; restoring `auth.invalid` in the table fails with
+    `auth.credential_rejected` unlisted; and isolating the other direction, a table row for
+    `auth.invalid` fails with `auth.invalid must not be a listed code`.
+  986 workspace tests. Both doc gates green. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

@@ -76,6 +76,15 @@ channel/origin
 Public APIs may accept a requested workspace selector, but the server resolves
 and authorizes it before constructing trusted context.
 
+`request_id` is minted server-side, once per authenticated request, by the
+authentication middleware. It is recorded on the request extensions, returned to
+the client in the `jarvis-request-id` response header, and used as the
+`RequestContext`'s own identifier, so an error envelope, the response header,
+and the daemon's structured diagnostics all name the same request. A
+caller-supplied `jarvis-request-id` request header is ignored rather than
+echoed: a correlation identifier a caller can choose is one a caller can use to
+aim an operator's search, or to collide with another request's.
+
 ## Error Envelope
 
 ```json
@@ -95,6 +104,11 @@ Requirements:
 
 - `code` is stable and namespaced.
 - `message` is safe for the requesting principal.
+- `request_id` is populated on every refusal a handler can produce, not only on
+  internal failures, and matches the `jarvis-request-id` response header. The
+  example above is a permission denial for that reason: the field is what lets a
+  client quote one request, and a refusal is the case a client most often needs
+  to report.
 - `details` is schema-defined per code and contains no secret/internal stack.
 - Retryability describes this operation, not the error class in every context.
 - Internal/source error and provider IDs are stored in protected diagnostics.

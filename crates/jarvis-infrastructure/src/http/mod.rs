@@ -420,7 +420,18 @@ async fn require_json_content_type(request: Request, next: Next) -> Response {
     if value.to_str().is_ok_and(is_json_media_type) {
         return next.run(request).await;
     }
-    error_response(
+    // The identifier is attached here even though this is not a handler, because this layer runs
+    // **inside** authentication: the middleware has already minted one and stored it on the request
+    // extensions, so the value is available and the contract's rule — every refusal a handler can
+    // produce carries one — extends naturally to a layer the handler sits behind. Reading it from
+    // the extension rather than minting a second one is what keeps it the *same* identifier the
+    // request would have been answered under.
+    let request_id = request
+        .extensions()
+        .get::<RequestIdValue>()
+        .map(|value| value.0.clone());
+    error_response_for(
+        request_id.as_deref(),
         StatusCode::UNSUPPORTED_MEDIA_TYPE,
         "request.media_type_unsupported",
         "This endpoint accepts a JSON request body.",
@@ -686,6 +697,21 @@ where
 #[derive(Debug, Clone)]
 pub struct AuthenticatedClientId(String);
 
+/// The identifier the authentication middleware derived for one request.
+///
+/// A newtype rather than a bare `String` in the extension map, because an untyped extension key is
+/// one an unrelated middleware could shadow, and the value carries a security-relevant property: it
+/// is **server-derived**, so a handler that finds one knows the request was authenticated.
+#[derive(Debug, Clone)]
+pub struct RequestIdValue(
+    /// The canonical identifier, already a string because it reaches a header and a JSON field.
+    pub String,
+);
+
+/// The header and response-extension key carrying a request's identifier.
+///
+pub const REQUEST_ID_HEADER: &str = "jarvis-request-id";
+
 /// Requires a valid local credential and a supported API version.
 async fn require_authentication(
     State(state): State<Arc<ApiState>>,
@@ -724,7 +750,33 @@ async fn require_authentication(
         .extensions_mut()
         .insert(AuthenticatedClientId(client.client_id.clone()));
 
+    // Every authenticated request is given a server-derived identifier here, before the handler
+    // runs, for two reasons the contract states and nothing implemented.
+    //
+    // The first is `common-conventions.md`: an error envelope's `request_id` is what lets an operator
+    // correlate a refusal with the diagnostics it was logged in — "internal failures return a
+    // request ID and generic message while preserving structured diagnostics in redacted local
+    // logs". That field existed and **nothing ever populated it**: `ErrorEnvelope::with_request_id`
+    // had no caller outside its own unit test, so every refusal shipped `request_id` as absent while
+    // the contract promised the opposite, and a client reporting a 500 had no handle to quote.
+    //
+    // The second is that the identifier has to be **server-derived**. A client-supplied request id
+    // is untrusted input, and echoing it would reflect caller text into every message the way the
+    // refused authority is deliberately not echoed. Minting it here also makes it available to the
+    // handler *before* it can fail.
+    //
+    // It is inserted as a request extension and returned as a response header. The extension is what
+    // the extractor and the error builder read; the header is what a client or an intermediary can
+    // record without parsing the body.
+    let request_id = uuid::Uuid::now_v7().to_string();
+    request
+        .extensions_mut()
+        .insert(RequestIdValue(request_id.clone()));
+
     let mut response = next.run(request).await;
+    if let Ok(value) = header::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
     if let Ok(value) = header::HeaderValue::from_str(&API_MAJOR.to_string()) {
         response.headers_mut().insert(API_VERSION_HEADER, value);
     }
@@ -782,9 +834,58 @@ async fn system_status(State(state): State<Arc<ApiState>>) -> Json<SystemStatus>
     })
 }
 
+/// The request identifier, as an extractor.
+///
+/// `Option`-like rather than mandatory: the middleware only runs on authenticated routes, so a
+/// handler reached without one is a composition error rather than a caller error — and a refusal
+/// that cannot name its request id is still a refusal. Reporting `None` rather than panicking keeps
+/// a missing extension from turning into a 500 that hides the original reason.
+#[derive(Debug, Clone)]
+pub struct RequestIdOf(pub Option<String>);
+
+impl<S> FromRequestParts<S> for RequestIdOf
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // The extension is already present, so there is nothing to wait for. `FromRequestParts`
+        // requires an `async` signature, so this yields once rather than pretending to do
+        // asynchronous work — the alternative is an `allow` for `unused_async`, which would hide a
+        // genuinely unnecessary `async` if one were introduced later. The same shape as
+        // `AuthenticatedClient`'s extraction, for the same reason.
+        std::future::ready(()).await;
+        Ok(Self(
+            parts
+                .extensions
+                .get::<RequestIdValue>()
+                .map(|value| value.0.clone()),
+        ))
+    }
+}
+
 /// Builds an error response from the shared envelope.
 fn error_response(status: StatusCode, code: &str, message: &str, retryable: bool) -> Response {
-    let envelope = ErrorEnvelope::new(code, message, retryable);
+    error_response_for(None, status, code, message, retryable)
+}
+
+/// Builds an error response that names the request it answers.
+///
+/// Every refusal that can reach a handler should use this rather than [`error_response`], because
+/// the contract states that an error envelope carries a `request_id` so a client reporting a fault
+/// can be correlated with the daemon's own diagnostics.
+fn error_response_for(
+    request_id: Option<&str>,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    retryable: bool,
+) -> Response {
+    let mut envelope = ErrorEnvelope::new(code, message, retryable);
+    if let Some(request_id) = request_id {
+        envelope = envelope.with_request_id(request_id);
+    }
     match envelope.to_bytes() {
         Ok(bytes) => (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
         Err(_) => (
@@ -805,16 +906,36 @@ pub fn credential_status(error: CredentialError) -> StatusCode {
     }
 }
 
+/// The codes this surface produces that do not appear as a literal in its own source.
+///
+/// Every envelope this module and its children build names its code inline, which is what the
+/// parity test scans for — but two codes travel on an **error type's `code()`** instead of
+/// appearing as a literal here: `idempotency.conflict` on `RunServiceError` and
+/// `resource.version_conflict` on `RepositoryError`. Both reach the envelope through
+/// `service_error_response`/`policy_error_response`, so they are produced by this surface while
+/// being invisible to a scan of it.
+///
+/// Naming them rather than widening the scan: a scan that also read other crates would find every
+/// code in the workspace and stop describing *this* surface, which is the thing the test is about.
+#[cfg(test)]
+const CODES_CARRIED_BY_ERROR_TYPES: [&str; 2] =
+    ["idempotency.conflict", "resource.version_conflict"];
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiState, ProviderInventory, Readiness, authority_of, router};
+    use super::{
+        ApiState, AuthenticatedClient, ProviderInventory, REQUEST_ID_HEADER, Readiness,
+        authority_of, router,
+    };
     use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
+    use crate::http::runs::context_for;
     use crate::storage::repositories::SqliteRepositories;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use jarvis_application::policy_service::PolicyService;
     use jarvis_application::repository::policy::ModelDataPolicyRepository;
     use jarvis_application::repository::run::RunRepository as _;
+    use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt as _;
@@ -1559,6 +1680,37 @@ mod tests {
         )
     }
 
+    /// The identifier an error envelope names, or the empty string when it names none.
+    ///
+    /// Read as a field rather than by string-splitting, because a body compared after having its
+    /// identifier removed needs the identifier's *position* to be found by the JSON parser, not by
+    /// a pattern that would silently stop matching if the envelope's field order changed — and a
+    /// pattern that stops matching would make two responses look identical again.
+    fn request_id_of(body: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|parsed| parsed["error"]["request_id"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// An error envelope's body with its `request_id` removed.
+    ///
+    /// Used where the property under test is that two refusals are indistinguishable to a caller,
+    /// which is a claim about the code and the message. The identifier is deliberately **excluded**
+    /// rather than asserted equal: it must differ between two requests, and a comparison that
+    /// included it would either fail (as it did) or, if the identifier were a constant, pass while
+    /// correlating nothing.
+    fn without_request_id(body: &str) -> serde_json::Value {
+        let mut parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        if let Some(error) = parsed
+            .get_mut("error")
+            .and_then(|value| value.as_object_mut())
+        {
+            error.remove("request_id");
+        }
+        parsed
+    }
+
     /// Creates a run and returns its identifier.
     async fn create_run(app: &axum::Router, token: &str, text: &str) -> String {
         let (status, body) = send(
@@ -1783,7 +1935,20 @@ mod tests {
         .await;
         assert_eq!(unknown_status, StatusCode::NOT_FOUND);
         assert_eq!(malformed_status, StatusCode::NOT_FOUND);
-        assert_eq!(unknown_body, malformed_body);
+        // Compared apart from the request identifier, which must differ: these are two requests,
+        // and the middleware gives each its own id — two byte-identical bodies here would mean the
+        // identifier was a constant, which correlates nothing. The property being asserted is that
+        // a caller cannot tell **which identifiers exist**, and that is carried by the code and the
+        // message, not by the field that exists to correlate a single request with its diagnostics.
+        assert_eq!(
+            without_request_id(&unknown_body),
+            without_request_id(&malformed_body),
+        );
+        assert_ne!(
+            request_id_of(&unknown_body),
+            request_id_of(&malformed_body),
+            "each request must name itself: {unknown_body} / {malformed_body}",
+        );
         assert!(
             unknown_body.contains(r#""code":"resource.not_found""#),
             "{unknown_body}"
@@ -2311,6 +2476,448 @@ mod tests {
             body.contains(r#""code":"auth.credential_rejected""#),
             "authentication must be reported before the media type: {body}",
         );
+    }
+
+    #[tokio::test]
+    async fn every_refusal_names_the_request_it_answers() {
+        // `common-conventions.md` states the error envelope carries a `request_id`, and
+        // `local-control-api.md` makes it a requirement for internal failures specifically:
+        // "internal failures return a request ID and generic message while preserving structured
+        // diagnostics in redacted local logs".
+        //
+        // **Nothing populated it.** `ErrorEnvelope::with_request_id` had exactly two references —
+        // its own definition and one unit test — so every refusal on the surface shipped the field
+        // absent while the contract promised the opposite, and a client reporting a 500 had no
+        // handle to quote. A field that exists, is documented, and is filled in by nobody is the
+        // same shape as a column with no writer.
+        //
+        // Asserted on the envelope **and** the header, because they serve different consumers: the
+        // body field is what a client parses, and the header is what an intermediary can record
+        // without reading the body at all. They must also be the *same* value, or the two would
+        // correlate to different requests.
+        let (app, token) = runs_fixture("request-id").await;
+        let mut headers = run_headers(&token);
+        headers.push(("accept", "application/json".to_owned()));
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/runs/0195f4f0-0000-7000-8000-000000000000",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("the envelope is JSON");
+        let named = parsed["error"]["request_id"]
+            .as_str()
+            .unwrap_or_else(|| unreachable!("the envelope must name its request: {body}"));
+        assert_eq!(
+            named.len(),
+            36,
+            "the identifier is a canonical UUID: {named}",
+        );
+
+        // The same identifier on the header, so an operator quoting either one lands on the same
+        // request.
+        let (status, _) = send(
+            &app,
+            "GET",
+            "/api/v1/runs/0195f4f0-0000-7000-8000-000000000000",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn two_requests_are_given_different_identifiers() {
+        // The identifier has to be **per request**, not per daemon: a constant would satisfy "the
+        // envelope carries a request_id" while correlating nothing, since every refusal an operator
+        // looked up would return the same row.
+        let (app, token) = runs_fixture("request-id-unique").await;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (_, body) = send(
+                &app,
+                "GET",
+                "/api/v1/runs/0195f4f0-0000-7000-8000-000000000000",
+                &run_headers(&token),
+                "",
+            )
+            .await;
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            seen.push(
+                parsed["error"]["request_id"]
+                    .as_str()
+                    .expect("named")
+                    .to_owned(),
+            );
+        }
+        let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "identifiers must not repeat: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_minimum_code_table_names_every_code_this_surface_produces() {
+        // The contract's minimum-code table listed `auth.invalid` for `401` while **this
+        // document's own prose, two paragraphs above the table, cites `auth.credential_rejected`**
+        // as the code a failed credential receives — and that is what the daemon returns. So one
+        // document named a code no control produces and omitted the one a client actually meets,
+        // which is worse than an empty table: a client writing handling for a `401` would key on
+        // `auth.invalid` and never match.
+        //
+        // `auth.scope_denied` was the same, with a different cause: no route authorizes at a scope
+        // finer than the workspace, so nothing can produce it.
+        //
+        // **This is the mirror of the sweep that found `BRN-021`.** That round counted each code
+        // in the table against production code and found four produced by nothing; this counts the
+        // other direction and finds two codes produced and not listed. Both directions are one
+        // property — the table and the surface must name the same set — and the check belongs in a
+        // test because the docs validator cannot see it: it verifies links, ids, and evidence
+        // notes, never whether a sentence or a row is still true.
+        //
+        // Scanned over this surface's own source, from `CARGO_MANIFEST_DIR`, so a moved file fails
+        // loudly rather than quietly checking nothing.
+        let surface = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/http");
+        let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut modules = 0;
+        for entry in std::fs::read_dir(&surface).expect("the module directory reads") {
+            let path = entry.expect("a directory entry reads").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            modules += 1;
+            let text = std::fs::read_to_string(&path).expect("a module reads");
+            // Only the production half: a test may legitimately name a code it does not produce,
+            // and counting a test's own assertions would make this test assert itself.
+            let production = match text.find("#[cfg(test)]") {
+                Some(at) => &text[..at],
+                None => &text[..],
+            };
+            for found in production.match_indices('"') {
+                let rest = &production[found.0 + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let candidate = &rest[..end];
+                // The envelope's own namespaces, plus `model.` and `run.`, which reach the envelope
+                // through the service error types this surface maps.
+                let namespaced = candidate.split_once('.').is_some_and(|(namespace, _)| {
+                    matches!(
+                        namespace,
+                        "request"
+                            | "api"
+                            | "auth"
+                            | "resource"
+                            | "idempotency"
+                            | "stream"
+                            | "service"
+                            | "internal"
+                    )
+                });
+                if namespaced {
+                    produced.insert(candidate.to_owned());
+                }
+            }
+        }
+        // A scan that found no modules would pass vacuously, which is the failure a fixture test
+        // exists to prevent.
+        assert!(
+            modules >= 3,
+            "the surface must have been scanned: {modules} modules",
+        );
+        for carried in super::CODES_CARRIED_BY_ERROR_TYPES {
+            produced.insert(carried.to_owned());
+        }
+
+        let document = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("the crate lives two levels under the repository root")
+                .join("docs/contracts/local-control-api.md"),
+        )
+        .expect("the contract reads");
+
+        // The **table rows** only, not the whole document. A code named in prose is not a listed
+        // code — the paragraph above the table has to be able to say that `auth.invalid` was
+        // removed, and a scan over the whole file cannot tell that sentence from a row. Extracted
+        // by shape (`| 401 | `code` | no |`) so a reworded paragraph cannot pass as a table.
+        let listed: std::collections::BTreeSet<String> = document
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| ")?.trim_start();
+                // A status cell is exactly three digits, and the next cell is the code in
+                // backticks. Anything else on the line is a different table.
+                let (status, rest) = rest.split_once(" | ")?;
+                if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                // The code sits between the first pair of backticks.
+                let (_, after) = rest.split_once('`')?;
+                let (code, _) = after.split_once('`')?;
+                code.contains('.').then(|| code.to_owned())
+            })
+            .collect();
+        assert!(
+            listed.len() >= 14,
+            "the table must have been parsed: {listed:?}",
+        );
+
+        // A code this surface can return and the table does not name is a client that cannot know
+        // it exists.
+        let unlisted: Vec<&String> = produced.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "every produced code must be in the contract's table: {unlisted:?}",
+        );
+
+        // And the direction the table had wrong: a row naming a code no control returns.
+        for (code, why) in [
+            (
+                "auth.invalid",
+                "the surface returns `auth.credential_rejected` for every failed credential",
+            ),
+            (
+                "auth.scope_denied",
+                "no route authorizes at a scope finer than the workspace",
+            ),
+        ] {
+            assert!(
+                !listed.contains(code),
+                "{code} must not be a listed code: {why}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_id_is_present_exactly_where_a_credential_was_verified() {
+        // The contract states that the identifier is minted in the authentication middleware, and
+        // that five refusals are produced before it and therefore carry none. That is a claim about
+        // **layer order**, and layer order is invisible from any single refusal — the same envelope
+        // is used either way, so only the presence of the field distinguishes them.
+        //
+        // This is also what makes the identifier evidence of authentication: a handler that finds
+        // one knows a credential was verified. Minting it earlier would break that for every later
+        // reader, so which refusals carry one is a security-relevant fact rather than a detail.
+        let (app, token) = runs_fixture("request-id-layers").await;
+
+        // Inside the middleware: authenticated, so named.
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/runs/not-an-identifier",
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            !request_id_of(&body).is_empty(),
+            "a handler refusal is named: {body}"
+        );
+
+        // A media type refusal is inside authentication but ahead of the handler, so it is named
+        // too — the identifier exists before the route is reached.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &[
+                ("authorization", format!("Bearer {token}")),
+                ("jarvis-api-version", "1".to_owned()),
+                ("content-type", "text/plain".to_owned()),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+        assert!(
+            !request_id_of(&body).is_empty(),
+            "a media-type refusal is named: {body}"
+        );
+
+        // Ahead of the middleware: a forwarded header is refused by an outer layer, and there is
+        // no verified credential yet, so no identifier is minted and the field is absent rather
+        // than invented.
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/system/status",
+            &[
+                ("authorization", format!("Bearer {token}")),
+                ("jarvis-api-version", "1".to_owned()),
+                ("x-forwarded-host", "elsewhere.example".to_owned()),
+            ],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            request_id_of(&body),
+            "",
+            "an outer refusal names no request: {body}",
+        );
+
+        // And the credential refusal itself, whose subject never authenticated. The version header
+        // is sent so the `426` negotiation does not pre-empt the `401` — they are different layers
+        // and the test is about the credential one.
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/system/status",
+            &[("jarvis-api-version", "1".to_owned())],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(
+            request_id_of(&body),
+            "",
+            "an unauthenticated refusal names no request: {body}",
+        );
+
+        // The version negotiation runs inside the middleware but **ahead of the credential check**,
+        // so it is the one refusal where the id is deliberately not yet minted even though a
+        // handler-layer middleware is answering. Asserted because the contract states it, and
+        // because this is the case that proves the identifier is ordered after the credential
+        // rather than after the middleware.
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/system/status",
+            &[("authorization", format!("Bearer {token}"))],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{body}");
+        assert_eq!(
+            request_id_of(&body),
+            "",
+            "a version refusal precedes the identifier: {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_response_header_names_the_same_request_as_the_envelope() {
+        // Both are produced from one server-derived value: the body field and the header must be the
+        // same identifier, or a client quoting one and an operator grepping the other are looking at
+        // different requests — which is worse than having neither.
+        let (app, token) = runs_fixture("request-id-header").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/runs/0195f4f0-0000-7000-8000-000000000000")
+                    .header("host", TEST_AUTHORITY)
+                    .header("jarvis-api-version", "1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let header = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("the response names the request")
+            .to_str()
+            .expect("header is text")
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body reads");
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            body.contains(&format!(r#""request_id":"{header}""#)),
+            "the header and the envelope must name one request: {header} vs {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_name_the_request_it_is_answering() {
+        // The identifier must be **server-derived**. A client-supplied value is untrusted input,
+        // and echoing it would reflect caller text into every envelope and every response header
+        // the way the refused authority is deliberately not echoed — the caller would control what
+        // an operator greps for, which is the one property a correlation identifier cannot have.
+        //
+        // Both channels are asserted, because a fix that validated the body field but copied the
+        // header (or the reverse) would leave the other reflecting caller text.
+        let chosen = "0195f4f0-0000-7000-8000-0000000000ff";
+        let (app, token) = runs_fixture("request-id-hostile").await;
+        let mut headers = run_headers(&token);
+        headers.push((REQUEST_ID_HEADER, chosen.to_owned()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/runs/not-an-identifier")
+                    .header("host", TEST_AUTHORITY)
+                    .header("jarvis-api-version", "1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header(REQUEST_ID_HEADER, chosen)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router answers");
+        let header = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("a response names its own request")
+            .to_str()
+            .expect("text")
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body reads");
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert_ne!(header, chosen, "the caller's value must not be echoed");
+        assert_eq!(
+            request_id_of(&body),
+            header,
+            "one request, one identifier: {body}",
+        );
+        assert!(
+            !body.contains(chosen),
+            "the caller's value must not reach the envelope: {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_context_is_evaluated_under_the_id_the_response_names() {
+        // The response id and the request context must be the **same** identifier. Before this,
+        // `context_for` minted its own UUIDv7 while the refusal named a different one, so an
+        // operator who quoted the id from an error envelope could not find the diagnostics the
+        // handler produced — the correlation the contract promises would silently return nothing.
+        //
+        // Asserted on `context_for` directly, because the context id is otherwise observable only
+        // several layers away: the scripted provider stamps it into `ProviderMetadata.request_id`
+        // on the `call.started` frame, so a run created and then read back would show the
+        // agreement. That path is real but indirect, and a test that reads a frame cannot say
+        // *which* of the two identifiers drifted.
+        let client = AuthenticatedClient {
+            client_id: "owner".to_owned(),
+            assurance: AuthenticationAssurance::Standard,
+            channel: RequestChannel::Api,
+        };
+        let named = "0195f4f0-4c13-7bf4-89fb-f067adac13ee";
+        assert_eq!(
+            context_for(&client, Some(named)).request_id.to_string(),
+            named,
+            "the context must be evaluated under the id the response names",
+        );
+        // Absent, it still produces a usable identifier rather than failing: a handler reached
+        // without the middleware's extension is a composition error, and refusing the request over
+        // it would hide the caller's actual reason.
+        assert!(!context_for(&client, None).request_id.to_string().is_empty());
     }
 
     #[tokio::test]

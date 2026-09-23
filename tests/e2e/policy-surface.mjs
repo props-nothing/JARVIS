@@ -53,6 +53,32 @@ function pass(message) {
   console.log(`ok    ${message}`);
 }
 
+/**
+ * An error envelope's body with its `request_id` removed, as a comparable string.
+ *
+ * Used where the property under test is that two refusals are the *same* answer, which is a
+ * claim about the code and the message. The identifier is deliberately excluded rather than
+ * asserted equal: it is minted per request, so it must differ between two requests, and a
+ * comparison that included it would either fail or — if the identifier were a constant —
+ * pass while correlating nothing. Callers that use this must assert the identifiers differ,
+ * or the exemption would absorb a genuine per-request difference.
+ *
+ * Parsed rather than pattern-matched, so a change to the envelope's field order makes this
+ * fail loudly instead of silently comparing two bodies that both match nothing.
+ */
+function withoutRequestId(text) {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed?.error && typeof parsed.error === "object") {
+      delete parsed.error.request_id;
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    // Not JSON: returned unchanged so the caller's equality check still compares everything.
+    return text;
+  }
+}
+
 /** Paths to the two binaries, resolved from a build directory. */
 function resolveBinaries() {
   const directory = process.argv[2];
@@ -337,6 +363,12 @@ async function main() {
 
     // And it must refuse an unauthenticated call, so the surface is not open on loopback.
     // A loopback bind is not authorization: another local user can reach the port.
+    //
+    // The **code** is asserted, not only the status, because the contract's minimum-code table
+    // named `auth.invalid` for `401` while the daemon returns `auth.credential_rejected` — so a
+    // client keyed on the documented code would never match. Asserting the status alone is
+    // satisfied by both codes and would not have caught the disagreement; asserting the code
+    // against the contract is what makes the table's row mean something.
     const unauthenticated = await request(
       record,
       "not-a-real-credential-that-is-long-enough-to-look-plausible",
@@ -345,8 +377,13 @@ async function main() {
     );
     if (unauthenticated.status !== 401) {
       fail(`the policy surface accepted a bad credential: ${unauthenticated.status}`);
+    } else if (unauthenticated.json?.error?.code !== "auth.credential_rejected") {
+      fail(
+        "a refused credential must carry the code the contract's table lists for 401",
+        unauthenticated.text,
+      );
     } else {
-      pass("the policy surface refuses a bad credential with 401");
+      pass("the policy surface refuses a bad credential with the contract's 401 code");
     }
 
     // ---------------------------------------------------------------------
@@ -416,7 +453,16 @@ async function main() {
     // A policy answer that changed between two identical requests would mean a per-request
     // clock or a re-read of the store inside the response, either of which would make two
     // probes of one daemon disagree. The daemon reads its clock once, at composition, so the
-    // two bodies must be byte-identical.
+    // two bodies must be identical.
+    //
+    // Compared **apart from `request_id`**, which must differ: the identifier is minted per
+    // request by the authentication middleware and is returned in the `jarvis-request-id`
+    // header and used as the request context's own id, so an operator quoting it from a
+    // refusal can find the daemon's diagnostics for that request. Including it in the
+    // comparison would either fail — as it did — or, if it were a constant, pass while
+    // correlating nothing. The second assertion is what keeps this exemption honest: the two
+    // reads must name *different* requests, so the exemption cannot hide a per-request
+    // difference by absorbing every request through one field.
     // ---------------------------------------------------------------------
     const firstRead = await request(record, credential, "GET", "/api/v1/model-data-policy/effective");
     const secondRead = await request(
@@ -425,13 +471,20 @@ async function main() {
       "GET",
       "/api/v1/model-data-policy/effective",
     );
-    if (firstRead.text !== secondRead.text) {
+    const firstId = firstRead.json?.error?.request_id;
+    const secondId = secondRead.json?.error?.request_id;
+    if (withoutRequestId(firstRead.text) !== withoutRequestId(secondRead.text)) {
       fail(
         "two identical policy probes answered differently, so something is read per request",
         `${firstRead.text}\n${secondRead.text}`,
       );
+    } else if (!firstId || !secondId || firstId === secondId) {
+      fail(
+        "two probes must name two different requests, or the field correlates nothing",
+        `${firstRead.text}\n${secondRead.text}`,
+      );
     } else {
-      pass("two identical probes answer byte-identically");
+      pass("two identical probes answer identically, apart from the request they each name");
     }
 
     // ---------------------------------------------------------------------

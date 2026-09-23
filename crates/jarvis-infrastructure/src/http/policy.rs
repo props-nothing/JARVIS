@@ -49,7 +49,7 @@ use jarvis_protocol::{
     PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
 };
 
-use crate::http::{ApiState, AuthenticatedClient, error_response, runs};
+use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for, runs};
 
 /// The sensitivity an effective-route probe evaluates at.
 ///
@@ -67,14 +67,16 @@ const PROBE_SENSITIVITY: Sensitivity = Sensitivity::Confidential;
 pub async fn read_active_policy(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.policies.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
     match service.active(&context).await {
-        Ok(stored) => json_response(StatusCode::OK, &active_view(&stored)),
-        Err(error) => policy_error_response(&error),
+        Ok(stored) => json_response(request_id, StatusCode::OK, &active_view(&stored)),
+        Err(error) => policy_error_response(request_id, &error),
     }
 }
 
@@ -97,11 +99,13 @@ pub async fn read_active_policy(
 pub async fn put_active_policy(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.policies.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
 
     let request: PutPolicyRequest = match serde_json::from_slice(&body) {
@@ -109,7 +113,8 @@ pub async fn put_active_policy(
         // A malformed or unknown-field body is the caller's error. The rejected value is not
         // echoed, because it is caller-supplied text.
         Err(_) => {
-            return error_response(
+            return error_response_for(
+                request_id,
                 StatusCode::BAD_REQUEST,
                 "request.invalid",
                 "The request body is not valid for this endpoint.",
@@ -125,7 +130,8 @@ pub async fn put_active_policy(
     // `expected_version` precondition is what actually prevents a duplicate, so recording the key
     // would be a second mechanism for the same guarantee.
     if !headers.contains_key("idempotency-key") {
-        return error_response(
+        return error_response_for(
+            request_id,
             StatusCode::BAD_REQUEST,
             "request.invalid",
             "An idempotency key is required.",
@@ -136,7 +142,8 @@ pub async fn put_active_policy(
     let rules = match submitted_rules(&request.rules) {
         Ok(rules) => rules,
         Err(code) => {
-            return error_response(
+            return error_response_for(
+                request_id,
                 StatusCode::BAD_REQUEST,
                 code,
                 "The submitted rules contain a value this build does not support.",
@@ -145,7 +152,7 @@ pub async fn put_active_policy(
         }
     };
 
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
     // The instant comes from the inventory's build time when the daemon recorded one, so the
     // version's `created_at` matches the instant the rest of the surface evaluates against. A
     // clock failure is a 500 rather than a defaulted timestamp: a policy row whose creation
@@ -156,7 +163,7 @@ pub async fn put_active_policy(
         .and_then(|inventory| inventory.built_at())
         .map_or_else(|| crate::time::SystemClock::new().now(), Ok)
     else {
-        return internal_failure();
+        return internal_failure(request_id);
     };
 
     match service
@@ -175,6 +182,7 @@ pub async fn put_active_policy(
         .await
     {
         Ok(stored) => json_response(
+            request_id,
             StatusCode::OK,
             &PutPolicyResponse {
                 policy_id: stored.policy_id.to_string(),
@@ -184,7 +192,7 @@ pub async fn put_active_policy(
                 rules: full_rules_view(&stored.rules),
             },
         ),
-        Err(error) => policy_error_response(&error),
+        Err(error) => policy_error_response(request_id, &error),
     }
 }
 
@@ -340,18 +348,20 @@ fn fallback_of(value: FallbackPermission) -> &'static str {
 pub async fn read_effective_route(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
 ) -> Response {
+    let request_id = request_id.as_deref();
     let Some(service) = state.policies.as_ref() else {
-        return not_ready();
+        return not_ready(request_id);
     };
-    let context = context_for(&client);
+    let context = context_for(&client, request_id);
 
     // The active policy is read once and its reference reused, so the response's policy
     // version and the version the evaluation ran under cannot disagree — a second read could
     // see a policy updated in between and report a version that did not apply.
     let active = match service.active(&context).await {
         Ok(active) => active,
-        Err(error) => return policy_error_response(&error),
+        Err(error) => return policy_error_response(request_id, &error),
     };
     let reference = active.reference();
 
@@ -359,7 +369,7 @@ pub async fn read_effective_route(
         // A daemon with no provider configured has no candidates to evaluate, which is a
         // readiness fact rather than a policy refusal: reporting it as `model.policy_unsatisfied`
         // would say the policy rejected something when nothing was offered.
-        return not_ready();
+        return not_ready(request_id);
     };
 
     // The evaluation instant comes from the inventory's own build time when the daemon
@@ -371,7 +381,7 @@ pub async fn read_effective_route(
         Some(built_at) => built_at,
         None => match crate::time::SystemClock::new().now() {
             Ok(now) => now,
-            Err(_) => return internal_failure(),
+            Err(_) => return internal_failure(request_id),
         },
     };
     let (today, decided_at) = evaluation_instant(now);
@@ -398,14 +408,15 @@ pub async fn read_effective_route(
     };
 
     match service.evaluate(&context, reference, &request).await {
-        Ok(decision) => json_response(StatusCode::OK, &compliant_view(&decision)),
+        Ok(decision) => json_response(request_id, StatusCode::OK, &compliant_view(&decision)),
         // A refusal is `200` with a body, because the evaluation succeeded and the answer is
         // that nothing complies. The rejected candidates are the actionable half.
         Err(PolicyServiceError::Unsatisfied(refusal)) => json_response(
+            request_id,
             StatusCode::OK,
             &refusal_view(reference, &refusal.requested, &refusal.rejected),
         ),
-        Err(error) => policy_error_response(&error),
+        Err(error) => policy_error_response(request_id, &error),
     }
 }
 
@@ -594,10 +605,19 @@ fn residency_of(value: EffectiveResidency) -> &'static str {
 }
 
 /// Builds the request context for an authenticated client.
-fn context_for(client: &AuthenticatedClient) -> RequestContext {
+///
+/// The request id is the one the authentication middleware minted for this request, so a refusal's
+/// envelope and the context this handler was authorized under name the same request. Minting a
+/// second identifier here — which this did — left the two disagreeing: an operator quoted the id
+/// from an error envelope and the matching row could not be found, because the diagnostics the
+/// context produced were filed under a different one.
+fn context_for(client: &AuthenticatedClient, request_id: Option<&str>) -> RequestContext {
     let scope = runs::resolve_scope(client);
+    let request_id = request_id
+        .and_then(|value| RequestId::parse(value).ok())
+        .unwrap_or_else(|| RequestId::from_uuid(uuid::Uuid::now_v7()));
     RequestContext::new(
-        RequestId::from_uuid(uuid::Uuid::now_v7()),
+        request_id,
         CorrelationId::from_uuid(uuid::Uuid::now_v7()),
         scope.principal_id,
         AuthenticationAssurance::Standard,
@@ -611,7 +631,7 @@ fn context_for(client: &AuthenticatedClient) -> RequestContext {
 /// A refusal is deliberately absent from this mapping: an unsatisfied policy is a `200` with a
 /// body, handled by the caller, and routing it here would give a client a status that says the
 /// request failed.
-fn policy_error_response(error: &PolicyServiceError) -> Response {
+fn policy_error_response(request_id: Option<&str>, error: &PolicyServiceError) -> Response {
     let status = match error {
         PolicyServiceError::NoActivePolicy | PolicyServiceError::PolicyNotFound => {
             StatusCode::NOT_FOUND
@@ -636,7 +656,13 @@ fn policy_error_response(error: &PolicyServiceError) -> Response {
         PolicyServiceError::InsufficientAssurance => StatusCode::FORBIDDEN,
         PolicyServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    error_response(status, error.code(), message_for(error), error.retryable())
+    error_response_for(
+        request_id,
+        status,
+        error.code(),
+        message_for(error),
+        error.retryable(),
+    )
 }
 
 /// Returns a message safe for the requesting principal.
@@ -662,8 +688,9 @@ fn message_for(error: &PolicyServiceError) -> &'static str {
 }
 
 /// The refusal for a policy surface that is not configured.
-fn not_ready() -> Response {
-    error_response(
+fn not_ready(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::SERVICE_UNAVAILABLE,
         "service.not_ready",
         "The model data policy surface is not available yet.",
@@ -672,8 +699,9 @@ fn not_ready() -> Response {
 }
 
 /// The refusal for a response this daemon could not render.
-fn internal_failure() -> Response {
-    error_response(
+fn internal_failure(request_id: Option<&str>) -> Response {
+    error_response_for(
+        request_id,
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal.failure",
         "The response could not be rendered.",
@@ -682,10 +710,14 @@ fn internal_failure() -> Response {
 }
 
 /// Serializes a value into an `application/json` response.
-fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response {
+fn json_response(
+    request_id: Option<&str>,
+    status: StatusCode,
+    value: &impl serde::Serialize,
+) -> Response {
     match serde_json::to_vec(value) {
         Ok(bytes) => (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-        Err(_) => internal_failure(),
+        Err(_) => internal_failure(request_id),
     }
 }
 
@@ -751,7 +783,7 @@ mod tests {
                 "model.exception_required",
             ),
         ] {
-            let response = policy_error_response(&error);
+            let response = policy_error_response(None, &error);
             assert_eq!(response.status(), status, "{label}");
             let body = body_of(response).await;
             assert!(

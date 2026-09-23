@@ -368,12 +368,12 @@ Minimum codes:
 | --- | --- | --- |
 | 400 | `request.invalid` | no |
 | 400 | `api.host_not_allowed` | no |
-| 401 | `auth.invalid` | no |
-| 403 | `auth.scope_denied` | no |
+| 401 | `auth.credential_rejected` | no |
 | 403 | `api.origin_not_allowed` | no |
 | 403 | `api.forwarded_header_not_allowed` | no |
 | 404 | `resource.not_found` | no |
 | 409 | `idempotency.conflict` | no |
+| 409 | `resource.version_conflict` | yes |
 | 409 | `stream.replay_unavailable` | no |
 | 413 | `request.too_large` | no |
 | 415 | `request.media_type_unsupported` | no |
@@ -383,9 +383,33 @@ Minimum codes:
 | 503 | `service.not_ready` | yes |
 | 500 | `internal.failure` | conditionally |
 
+Every code above except one is produced by a control on this surface, and every code the surface
+produces is listed above — a property a test holds, not a claim this document makes about itself.
+The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
+surface, and the connector platform (`CON-004`) owns rate limiting for provider and MCP traffic.
+It stays listed so the `429` shape is fixed before a limiter is added, but a client must not
+treat "handled" as "will occur".
+
+`auth.invalid` and `auth.scope_denied` were listed here and are **deliberately absent**. The first
+is redundant with `auth.credential_rejected`, which this document's own layer-order paragraph
+already cites as the `401` this surface returns. The second has no producer because no route yet
+authorizes at a scope finer than the workspace: authentication answers whether a caller is the
+owner, and nothing downstream narrows what that owner may do. Naming a code no control returns
+invites a client to write handling for a response it will never receive while omitting the one it
+will — the same defect as a table entry with no producer, seen from the client's side.
+
 Malformed authentication must be rejected before body parsing or resource
 lookup where the HTTP stack permits. Internal failures return a request ID and
 generic message while preserving structured diagnostics in redacted local logs.
+
+`request_id` is populated on every refusal a handler can produce — not only on
+`internal.failure` — and is minted server-side, once per authenticated request,
+by the authentication middleware. The same value is returned in the
+`jarvis-request-id` response header, so a client can record it without parsing
+the body, and is used as the `RequestContext`'s identifier, so quoting it from an
+envelope finds the daemon's own diagnostics for that request. A caller-supplied
+`jarvis-request-id` request header is **ignored**: an identifier a caller can
+choose is one a caller can aim an operator's search with.
 
 Every refusal on this surface uses this envelope, including the ones that are not
 produced by a route handler:
@@ -424,6 +448,29 @@ authentication is the more fundamental refusal and this document puts it before 
 handling. The order between the two is otherwise unobservable, since a request that
 fails one and passes the other receives the same envelope either way — only the `code`
 tells them apart, which is why both directions are asserted.
+
+`request_id` is the exception to the rule that a refusal produced outside a handler
+carries no handler-derived detail. The identifier is minted in the authentication
+middleware, before the handler runs and before any route-level refusal, and is
+attached to the response after the handler returns. A `404` from the unknown-route
+fallback and a `415` from the media-type layer therefore carry one, because those
+layers run **inside** the middleware.
+
+Six refusals are produced before the identifier exists and carry none, with the field
+absent rather than invented: the `413` body-limit rejection (`request.too_large`, the
+outermost layer), the browser-`Origin` `403` (`api.origin_not_allowed`) and the
+forwarding-header `403` (`api.forwarded_header_not_allowed`), the `400` authority
+refusal (`api.host_not_allowed`), the `426` version-negotiation refusal
+(`api.version_unsupported`) — from within the middleware, but ahead of the credential
+check — and the `401` for a failed credential (`auth.credential_rejected`).
+
+That ordering is deliberate and is not merely an implementation accident. The
+presence of the identifier is itself evidence that the request authenticated: a
+handler that finds one knows a credential was verified. Minting it before the
+credential check would let a refusal name a request that was never authenticated,
+and would destroy that property for every later reader. The `401` is the sharpest
+case — it is the one refusal whose subject never completed authentication, so it
+names no request.
 
 ## Crash and Recovery Semantics
 
