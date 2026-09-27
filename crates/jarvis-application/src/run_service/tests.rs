@@ -222,6 +222,85 @@ fn fixture_with(provider: Arc<ScriptedProvider>) -> Fixture {
     }
 }
 
+/// A fixture over an arbitrary provider port, so a test can capture what the daemon sends.
+///
+/// Separate from [`fixture_with`] because that one takes a concrete `ScriptedProvider` and most
+/// tests need nothing more; this exists for the one test that must observe the assembled request
+/// through the real spawned path.
+fn fixture_with_provider(provider: Arc<dyn crate::model::ModelProvider>) -> Fixture {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let cancellations = Arc::new(RunCancellationRegistry::new());
+    let service = RunService::new(
+        RunPorts {
+            runs: Arc::clone(&repositories) as Arc<dyn crate::repository::run::RunRepository>,
+            conversations: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::conversation::ConversationRepository>,
+            model_calls: Arc::clone(&repositories)
+                as Arc<dyn crate::repository::model_call::ModelCallRepository>,
+            deltas: Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+            provider,
+            clock: Arc::new(ManualClock::new(now())),
+            policies: None,
+        },
+        Arc::clone(&cancellations),
+    );
+    Fixture {
+        service,
+        repositories,
+        cancellations,
+        spawner: RecordingSpawner::new(),
+    }
+}
+
+/// A provider that records every request it is handed and then behaves as its inner provider.
+///
+/// The assembled prompt goes to the provider and nowhere else — it is deliberately not persisted —
+/// so a test that wants to assert what the model was given has to stand where the model does.
+struct RecordingProvider {
+    inner: ScriptedProvider,
+    requests: Mutex<Vec<jarvis_domain::model::stream::ModelCallRequest>>,
+}
+
+impl RecordingProvider {
+    fn new(inner: ScriptedProvider) -> Self {
+        Self {
+            inner,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns the requests seen, oldest first.
+    fn requests(&self) -> Vec<jarvis_domain::model::stream::ModelCallRequest> {
+        self.requests
+            .lock()
+            .expect("the lock is not poisoned")
+            .clone()
+    }
+}
+
+impl crate::model::ModelProvider for RecordingProvider {
+    fn models(&self) -> &[ModelRef] {
+        self.inner.models()
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        self.inner.endpoint_class()
+    }
+
+    fn open<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        request: &'a jarvis_domain::model::stream::ModelCallRequest,
+        cancel: &'a crate::cancellation::CancellationScope,
+    ) -> crate::model::OpenResult<'a> {
+        self.requests
+            .lock()
+            .expect("the lock is not poisoned")
+            .push(request.clone());
+        self.inner.open(context, request, cancel)
+    }
+}
+
 async fn create(fixture: &Fixture, text: &str, key: &str) -> CreatedRun {
     fixture
         .service
@@ -294,6 +373,72 @@ async fn a_created_run_carries_a_bounded_deadline_so_it_cannot_hang_forever() {
         deadline > stored.created_at,
         "{deadline} {0}",
         stored.created_at
+    );
+}
+
+/// The composition that prevents a duplicated objective: `create` tells the controller which
+/// stored message is the objective.
+///
+/// The controller-side test proves the *assembler* removes the right message; this proves the
+/// **wiring** — that `append_objective` returns the id it stored and `spawn_run` passes it through.
+/// Without this, the assembler is correct and the daemon still sends the question twice, which is
+/// exactly the composition-root defect a component test cannot see. Asserted through the real
+/// `create` path and the real spawned task, so the whole chain is exercised.
+#[tokio::test]
+async fn a_created_run_drops_the_objectives_stored_message_when_it_builds_the_prompt() {
+    // The recording provider captures the request the daemon would send; wrapping the scripted
+    // provider keeps the stream identical, so the only addition is the recording.
+    let provider = Arc::new(RecordingProvider::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "the answer")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    let fixture = fixture_with_provider(Arc::clone(&provider) as Arc<dyn super::ModelProvider>);
+    let created = create(&fixture, "what is the deadline", "key-1").await;
+    fixture.spawner.run_all().await;
+
+    let requests = provider.requests();
+    let request = requests.first().expect("the spawned run made one call");
+    let occurrences = request
+        .input
+        .as_slice()
+        .iter()
+        .filter(|item| match item {
+            jarvis_domain::model::stream::InputItem::Message { blocks, .. } => {
+                blocks.iter().any(|block| match block {
+                    jarvis_domain::model::stream::ContentBlock::Text { text } => {
+                        text.as_str() == "what is the deadline"
+                    }
+                    jarvis_domain::model::stream::ContentBlock::ArtifactRef { .. } => false,
+                })
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "create must hand the controller the objective's message id, or the daemon sends the \
+         question twice: once as the stored turn and once as the run's task",
+    );
+    // And the stored message is still on the transcript, so removing it from the *prompt* did not
+    // remove it from the conversation a client reads back.
+    let transcript = fixture
+        .repositories
+        .load_messages(workspace(), created.conversation_id, None, 10)
+        .await
+        .expect("messages are readable");
+    assert!(
+        transcript
+            .iter()
+            .any(|message| message.content == "what is the deadline"),
+        "the objective must remain a durable conversation turn: {transcript:?}",
     );
 }
 

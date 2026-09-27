@@ -52,6 +52,7 @@ fn assemble_permissive(
     assemble(
         transcript,
         objective,
+        None,
         ceiling,
         Sensitivity::Restricted,
         now(),
@@ -123,6 +124,51 @@ fn the_request_is_bounded_by_the_budget_and_not_by_the_message_count() {
             assert_eq!(item.text(), source.content);
         }
     }
+}
+
+#[test]
+fn the_objectives_own_message_is_removed_by_identity_and_an_identical_turn_is_kept() {
+    // The objective is stored as a conversation turn **and** passed as the run's task, so the
+    // assembler removes the stored copy or the model is asked the same question twice. The removal
+    // is by **identity**, and this is the case that proves it: an earlier turn with the *same text*
+    // must survive, because a conversation may hold two runs that asked the same question, and
+    // losing that turn would be a silent context loss. A content-matching implementation drops the
+    // wrong one and this test fails.
+    let earlier = message(1, "hello", Role::User, "internal");
+    let objective_message = message(2, "hello", Role::User, "internal");
+
+    let assembled = assemble(
+        &[earlier.clone(), objective_message.clone()],
+        "hello",
+        Some(objective_message.id),
+        1_000,
+        Sensitivity::Restricted,
+        now(),
+    )
+    .expect("assembles");
+
+    // Exactly one transcript turn survives, and it is the *earlier* one.
+    let retained: Vec<&RetainedItem> = assembled
+        .items
+        .iter()
+        .filter(|item| item.kind() == RetainedKind::Message)
+        .collect();
+    assert_eq!(
+        retained.len(),
+        1,
+        "only the objective's own message is removed: {retained:?}",
+    );
+    assert_eq!(retained[0].text(), "hello");
+    // And the objective itself is present exactly once, so the total occurrences of the text are
+    // two: the surviving earlier turn plus the task statement. A content-matching implementation
+    // would have removed the earlier turn instead — the count would still be two, so the *identity*
+    // of the survivor is what this asserts.
+    let objective_items = assembled
+        .items
+        .iter()
+        .filter(|item| item.kind() == RetainedKind::Objective)
+        .count();
+    assert_eq!(objective_items, 1);
 }
 
 #[test]
@@ -217,6 +263,7 @@ fn the_policy_ceiling_refuses_an_item_above_it_before_ranking() {
     let assembled = assemble(
         &transcript,
         "objective",
+        None,
         1_000,
         Sensitivity::Internal,
         now(),

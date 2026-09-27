@@ -486,14 +486,7 @@ impl RunService {
             // conversation is an output of the first request, and a caller replaying
             // the same command sends the same objective.
             if digest == objective_digest(objective) {
-                let stored = self.ports.runs.load(context.workspace_id, original).await?;
-                return Ok(CreatedRun {
-                    run_id: stored.id,
-                    conversation_id: stored.conversation_id,
-                    state: stored.state,
-                    created_at: stored.created_at,
-                    replayed: true,
-                });
+                return self.replayed_run(context, original).await;
             }
             return Err(RunServiceError::IdempotencyConflict);
         }
@@ -544,24 +537,25 @@ impl RunService {
                 if conversation_id.is_none() {
                     self.discard_conversation(context, conversation.id).await;
                 }
-                let stored = self.ports.runs.load(context.workspace_id, original).await?;
-                return Ok(CreatedRun {
-                    run_id: stored.id,
-                    conversation_id: stored.conversation_id,
-                    state: stored.state,
-                    created_at: stored.created_at,
-                    replayed: true,
-                });
+                return self.replayed_run(context, original).await;
             }
             IdempotencyClaim::Conflict => return Err(RunServiceError::IdempotencyConflict),
         }
 
-        self.append_objective(context, conversation.id, objective, created_at)
+        let objective_message = self
+            .append_objective(context, conversation.id, objective, created_at)
             .await?;
 
         // The run is driven in the background, so a client can stream it while the
         // request that created it has already returned.
-        self.spawn_run(context, run_id, conversation.id, objective, spawn);
+        self.spawn_run(
+            context,
+            run_id,
+            conversation.id,
+            objective,
+            objective_message,
+            spawn,
+        );
 
         Ok(CreatedRun {
             run_id,
@@ -572,23 +566,50 @@ impl RunService {
         })
     }
 
+    /// Loads the run a replayed command refers to and reports it as replayed.
+    ///
+    /// One helper rather than the same three reads and five fields at both replay sites — the
+    /// advisory check that precedes any work and the claim that a concurrent request won — because
+    /// the two must return the **same** shape. A replayed `201`-vs-`202` distinction decided in two
+    /// places is how a client comes to observe two different outcomes for one replayed request.
+    async fn replayed_run(
+        &self,
+        context: &RequestContext,
+        original: RunId,
+    ) -> Result<CreatedRun, RunServiceError> {
+        let stored = self.ports.runs.load(context.workspace_id, original).await?;
+        Ok(CreatedRun {
+            run_id: stored.id,
+            conversation_id: stored.conversation_id,
+            state: stored.state,
+            created_at: stored.created_at,
+            replayed: true,
+        })
+    }
+
     /// Stores the objective as the user's message in the conversation.
     ///
     /// The controller reads the transcript to build the model request, so without
     /// this the model would be asked to answer a question it cannot see.
+    ///
+    /// Returns the stored message's identifier, because the objective is now the transcript's turn
+    /// **and** the run's own task statement, so the controller has to know which message to drop
+    /// when it assembles the prompt. Without it the model receives the question twice — which is
+    /// what happened until this returned the id.
     async fn append_objective(
         &self,
         context: &RequestContext,
         conversation: ConversationId,
         objective: &str,
         created_at: jarvis_domain::time::UtcTimestamp,
-    ) -> Result<(), RunServiceError> {
+    ) -> Result<MessageId, RunServiceError> {
+        let message_id = MessageId::from_uuid(uuid::Uuid::now_v7());
         self.ports
             .conversations
             .append_message(
                 context.workspace_id,
                 NewMessage {
-                    id: MessageId::from_uuid(uuid::Uuid::now_v7()),
+                    id: message_id,
                     conversation_id: conversation,
                     role: Role::User,
                     content: objective.to_owned(),
@@ -600,7 +621,7 @@ impl RunService {
                 .validated()?,
             )
             .await?;
-        Ok(())
+        Ok(message_id)
     }
 
     /// Registers the run's cancellation scope and schedules its execution.
@@ -614,6 +635,7 @@ impl RunService {
         run_id: RunId,
         conversation: ConversationId,
         objective: &str,
+        objective_message: MessageId,
         spawn: &dyn RunSpawner,
     ) {
         let scope = context.cancellation().child();
@@ -642,6 +664,7 @@ impl RunService {
                     run_id,
                     conversation,
                     &objective,
+                    Some(objective_message),
                     request_context.cancellation(),
                 )
                 .await;
@@ -764,8 +787,7 @@ impl RunService {
     /// # Errors
     ///
     /// Returns [`RunServiceError::NotFound`] for an absent or foreign run, and
-    /// [`RepositoryError::NotFound`](crate::repository::RepositoryError::NotFound) when the event is
-    /// not a retained public event of that run.
+    /// [`RepositoryError::NotFound`] when the event is not a retained public event of that run.
     pub async fn event_sequence(
         &self,
         context: &RequestContext,

@@ -129,6 +129,18 @@ pub enum ControllerError {
     },
     /// The model stream ended without a terminal event.
     StreamInterrupted,
+    /// The provider's own terminal frame reported the call as failed.
+    ///
+    /// Distinct from [`Provider`](Self::Provider), which is a *port* failure — an error from
+    /// `open`, before any stream existed. This is a well-formed `call.failed` frame the provider
+    /// chose to send **inside** a stream it had already opened, so the request is ambiguous
+    /// (post-acceptance) and is never retried.
+    ///
+    /// **Before this existed the controller treated every terminal as success.** `finish_attempt`
+    /// recorded `ModelCallState::Completed` and drove the run to `Completed` without ever reading
+    /// the finish reason, so a call the provider reported as failed produced a **successful** run
+    /// whose answer was the partial output the provider had abandoned.
+    ModelCallFailed,
     /// The model stream carried a frame the state machine refused.
     StreamRejected {
         /// The stable, namespaced domain error code.
@@ -188,6 +200,7 @@ impl ControllerError {
             Self::NoModelServed => "No model is available to serve this run.",
             Self::ToolsNotImplemented { .. } => "Tool execution is not available yet.",
             Self::StreamInterrupted => "The model stream ended before it finished.",
+            Self::ModelCallFailed => "The model call did not complete.",
             Self::StreamRejected { .. } => "The model stream was refused.",
             Self::OutputNotPersisted => "Produced output could not be recorded.",
             Self::ClockUnavailable => "The clock could not provide an instant.",
@@ -214,6 +227,7 @@ impl ControllerError {
             Self::NoModelServed
             | Self::ToolsNotImplemented { .. }
             | Self::StreamInterrupted
+            | Self::ModelCallFailed
             | Self::StreamRejected { .. }
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
@@ -233,6 +247,7 @@ impl ControllerError {
             Self::NoModelServed => "run.no_model_served",
             Self::ToolsNotImplemented { .. } => "run.tools_not_implemented",
             Self::StreamInterrupted => "run.stream_interrupted",
+            Self::ModelCallFailed => "run.model_call_failed",
             Self::StreamRejected { .. } => "run.stream_rejected",
             Self::OutputNotPersisted => "run.output_not_persisted",
             Self::ClockUnavailable => "run.clock_unavailable",
@@ -258,6 +273,7 @@ impl ControllerError {
             | Self::NoModelServed
             | Self::ToolsNotImplemented { .. }
             | Self::StreamInterrupted
+            | Self::ModelCallFailed
             | Self::StreamRejected { .. }
             | Self::OutputNotPersisted
             | Self::ClockUnavailable
@@ -287,6 +303,7 @@ impl fmt::Display for ControllerError {
             Self::NoModelServed => "the provider serves no model",
             Self::ToolsNotImplemented { .. } => "tool execution is not implemented yet",
             Self::StreamInterrupted => "the model stream ended without a terminal event",
+            Self::ModelCallFailed => "the model call did not complete",
             Self::StreamRejected { .. } => "the model stream was refused",
             Self::OutputNotPersisted => "produced output could not be recorded",
             Self::ClockUnavailable => "the clock reported no usable instant",
@@ -604,6 +621,7 @@ impl RunController {
         run_id: RunId,
         conversation_id: ConversationId,
         objective: &str,
+        objective_message: Option<MessageId>,
         cancel: &CancellationScope,
     ) -> Result<RunOutcome, ControllerError> {
         let run = RunRef {
@@ -665,7 +683,9 @@ impl RunController {
         )
         .await?;
 
-        let (budget, assembled) = self.build_context(run, conversation_id, objective).await?;
+        let (budget, assembled) = self
+            .build_context(run, conversation_id, objective, objective_message)
+            .await?;
 
         // ContextBuilding -> Planning. There is no persisted plan artifact yet, which
         // the architecture permits: "Planning is a strategy, not a mandatory extra
@@ -768,6 +788,7 @@ impl RunController {
         run: RunRef,
         conversation_id: ConversationId,
         objective: &str,
+        objective_message: Option<MessageId>,
     ) -> Result<(RunBudget, context_assembly::AssembledInput), ControllerError> {
         let budget = self.load(run).await?.budget;
 
@@ -791,6 +812,10 @@ impl RunController {
         let assembled = match context_assembly::assemble(
             &transcript,
             objective,
+            // The objective is also a stored message, so the assembler drops that one by identity
+            // and keeps the objective candidate below. Without this the model received the question
+            // twice: once as a transcript turn and once as the run's task.
+            objective_message,
             effective_context_ceiling(&budget),
             // The ceiling the run was created under, resolved from the stored policy and carried
             // in the budget. An absent ceiling means **no policy was in force**, and only then is
@@ -1202,6 +1227,71 @@ impl RunController {
         self.finish_attempt(run, turn, call_id, drained).await
     }
 
+    /// Settles a run whose provider ended its stream with a terminal other than `call.completed`.
+    ///
+    /// The contract says adapters emit exactly one of `call.completed`, `call.failed`, or
+    /// `call.cancelled`; the first is an answer and the other two are not. This maps the two
+    /// non-answer terminals onto their matching run states rather than treating "the stream ended"
+    /// as "the model answered", which is what the controller did before this existed.
+    ///
+    /// The two are settled differently because they are different facts. A `call.failed` terminal is
+    /// the provider abandoning an accepted call: the request is ambiguous, so the run **fails** and
+    /// is never retried, the same rule [`fail_after_acceptance`] encodes. A `call.cancelled` terminal
+    /// is the provider saying *it* stopped the call — a content policy, a provider-side timeout, an
+    /// operator action on the provider's side — so the run is **cancelled**, not failed: reporting a
+    /// provider's cancellation as a fault would make it indistinguishable from a genuine failure.
+    ///
+    /// Returns `Ok(())` for a completion (or an absent terminal), so the caller can carry on to the
+    /// completion path; returns the matching typed error once the run and its call are settled.
+    async fn settle_provider_terminal(
+        &self,
+        run: RunRef,
+        call_id: ModelCallId,
+        usage: Option<&Usage>,
+        drained: &DrainedTurn,
+    ) -> Result<(), ControllerError> {
+        let (outcome, transition, error) = match drained.finish_reason {
+            Some(FinishReason::ProviderError) => (
+                ModelCallState::Failed,
+                Step::failed(
+                    RunState::AwaitingModel,
+                    "run.failed",
+                    "provider_reported_call_failed",
+                    ControllerError::ModelCallFailed.code(),
+                ),
+                ControllerError::ModelCallFailed,
+            ),
+            Some(FinishReason::Cancelled) => (
+                ModelCallState::Cancelled,
+                Step::new(
+                    RunState::AwaitingModel,
+                    RunState::Cancelled,
+                    "run.cancelled",
+                    "provider_reported_call_cancelled",
+                ),
+                ControllerError::Cancelled,
+            ),
+            _ => return Ok(()),
+        };
+
+        self.finish(run, transition).await?;
+        // The call is closed with the same terminal the run was: a row reading `Completed` beside a
+        // run reading `Cancelled` would disagree about the one fact both records exist to state.
+        self.record_call_outcome_with(
+            run,
+            call_id,
+            outcome,
+            RecordedOutcome {
+                usage: usage.cloned(),
+                finish_reason: drained.finish_reason.clone(),
+                first_output_at: drained.first_output_at,
+                provider_request_id: drained.provider_request_id.clone(),
+            },
+        )
+        .await?;
+        Err(error)
+    }
+
     /// Judges a drained stream: a tool intent, a breached ceiling, or a completion.
     async fn finish_attempt(
         &self,
@@ -1268,6 +1358,16 @@ impl RunController {
             return Err(ControllerError::BudgetExceeded { limit });
         }
 
+        // The provider's own terminal said the call did not succeed, so neither did the run. This
+        // check must come **before** the completion below, because everything after it treats the
+        // stream's terminal as an answer: the call is recorded `Completed`, the usage is published,
+        // and the partial output is stored as the delivered answer. Before this existed, none of
+        // that looked at the finish reason at all, so a provider that ended its stream with
+        // `call.failed` produced a **successful** run whose answer was the text it had abandoned —
+        // and a caller reading `state: "completed"` had no way to learn the call failed.
+        self.settle_provider_terminal(run, call_id, usage.as_ref(), &drained)
+            .await?;
+
         // The call's outcome is recorded before the run moves on, so a completed run
         // never leaves a model call open. The finish reason travels with it, because "why the
         // provider stopped" is part of the recorded outcome rather than a detail: a run cut off
@@ -1318,7 +1418,11 @@ impl RunController {
         .map(AttemptOutcome::Completed)
     }
 
-    /// Drives a successful run through `Responding` to `Completed` and stores the answer.
+    /// Drives a successful run through `Responding` to `Completed`, storing the answer first.
+    ///
+    /// The order is the guarantee: the answer is persisted **before** the run reaches `Completed`,
+    /// so a storage failure leaves a run that never claims to have delivered anything. See the body
+    /// for why the reverse order was a defect.
     async fn complete_run(
         &self,
         run: RunRef,
@@ -1362,6 +1466,32 @@ impl RunController {
             return Err(ControllerError::Cancelled);
         }
 
+        // The answer is stored **before** the run reaches `Completed`, and this ordering is the
+        // guarantee rather than a detail. It used to be the other way round, which meant a run whose
+        // answer storage failed was already durably `Completed`: the transcript was never written
+        // and the run's own `run.completed` event claimed a delivered answer that existed nowhere.
+        // `store_answer` can fail on a real input — a provider that emits more than
+        // `MAX_CONTENT_BYTES` produces a content value the message port refuses — so the failure is
+        // reachable, not theoretical. Persisting first makes "the run is completed" mean "its answer
+        // is durable", because the durable transition is what a client reads.
+        let answer = drained.answer;
+        if let Err(error) = self.store_answer(run, conversation_id, &answer, at).await {
+            // `Responding -> Failed` is the edge the diagram already carries (added for the
+            // provider-failure-during-the-answer case), so a run that cannot deliver its answer has
+            // a legal terminal exit rather than being abandoned mid-state.
+            self.finish(
+                run,
+                Step::failed(
+                    RunState::Responding,
+                    "run.failed",
+                    "answer_not_stored",
+                    error.code(),
+                ),
+            )
+            .await?;
+            return Err(error);
+        }
+
         self.step(
             run,
             Step::new(
@@ -1372,13 +1502,6 @@ impl RunController {
             ),
         )
         .await?;
-
-        // The answer is persisted as the assistant's message so the transcript
-        // survives the run, and its content is stored here rather than in an event
-        // payload: the contract bounds public payloads and forbids prompt content in
-        // them.
-        let answer = drained.answer;
-        self.store_answer(run, conversation_id, &answer, at).await?;
 
         Ok(RunOutcome {
             run_id: run.run_id,
@@ -2123,6 +2246,28 @@ fn capture(drained: &mut DrainedTurn, event: &ModelStreamEvent) {
                 drained.usage = Some(usage.clone());
                 drained.usage_reported = true;
             }
+        }
+        // A `call.failed` terminal means the provider reported the call as failed, and this arm is
+        // what makes that fact reachable: without it the finish reason stayed `None`, so
+        // `finish_attempt` could not tell a failed call from a completed one and drove the run to
+        // `Completed`. The reason is `FinishReason::ProviderError` — the domain's own name for
+        // "the provider reported an error after the stream opened" — so the run's failure and the
+        // recorded finish reason are one fact rather than two spellings.
+        //
+        // The provider's `code` is deliberately **not** carried on `drained`: it is
+        // provider-supplied text, and the run's own error code is a JARVIS vocabulary. The
+        // provider's value stays in the frame, where an adapter can log it, rather than becoming
+        // a client-visible code.
+        ModelStreamEventKind::CallFailed { .. } => {
+            drained.finish_reason = Some(FinishReason::ProviderError);
+        }
+        // A `call.cancelled` terminal means **the provider** stopped the call — a content policy, a
+        // provider-side timeout, an operator action — which is a different fact from the caller
+        // cancelling, and the controller detects the latter on its own signal. Recording the reason
+        // lets `finish_attempt` settle the run `Cancelled` rather than treating the terminal as a
+        // delivered answer, which is what it did while this arm was absent.
+        ModelStreamEventKind::CallCancelled { .. } => {
+            drained.finish_reason = Some(FinishReason::Cancelled);
         }
         // Output text is published as it arrives, and every other frame is either metadata this
         // turn does not need or a kind the state machine has already refused.

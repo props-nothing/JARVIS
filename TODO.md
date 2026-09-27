@@ -2757,6 +2757,105 @@ Foundation TODO remains incomplete.
     done. Recorded rather than implied, because a produced instant reads like the measurement it is
     only the first half of.
   1006 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-044` Stop sending the model its own question twice, which was a silent prompt defect rather
+  than a missing feature. Found by reading the objective's path from `RunService::create` into the
+  assembler and asking what the provider actually receives.
+  - **The defect.** `RunService::create` appends the objective as the conversation's first user turn
+    (`append_objective`) so the durable transcript holds the question, and passes the same text to
+    `RunController::execute` as the run's task. The controller then assembles the transcript **and**
+    an `ActiveTask` objective candidate — so the same question was a candidate twice and reached the
+    provider **twice**. Nothing failed on it, which is what made it silent: the prompt was doubled, a
+    long objective could push real conversation out of the budget, and the same tokens were billed
+    twice against the ceiling. It is the inverse of the empty-objective defect round 21 found (that
+    one sent nothing; this one sent everything twice), and like it the type system was satisfied.
+  - Fix, in two halves, because either alone is a correct component with a broken product. The
+    assembler now drops the transcript copy, and the removal is **by identity**: `append_objective`
+    returns the `MessageId` it stored, `spawn_run` threads it to `execute`, which passes it through
+    `build_context` to `context_assembly::assemble`, which skips exactly that message. Text matching
+    was the first attempt and was rejected on a real case — a conversation where two runs asked the
+    **same** question would have had the wrong turn dropped, turning a silent duplication into a
+    silent **context loss**. The signature change carries an `Option<MessageId>`, where `None` means
+    the objective was never stored as a message (the controller can be driven from a seeded
+    transcript) and then nothing is removed.
+  - **Falsified at both sites, each compiling.** Removing the skip in `assemble` fails
+    `the_objective_is_sent_to_the_provider_only_once` with `left: 2, right: 1`. Passing `None` at the
+    composition root fails
+    `a_created_run_drops_the_objectives_stored_message_when_it_builds_the_prompt` the same way —
+    which is the half a component test cannot see: the assembler stays correct and the daemon still
+    sends the question twice. That second test drives the real `create` path and the real spawned
+    task through a recording provider, and also asserts the objective **remains** a durable
+    conversation turn, so "removed from the prompt" did not become "removed from the record".
+  - A third test pins the identity rule directly: two messages with the **same text**, where the
+    earlier one must survive. A content-matching implementation drops the wrong one and fails.
+  - `create` crossed `clippy::too_many_lines` (104/100) with the added call, fixed by extracting
+    `replayed_run`, which removes a genuinely duplicated five-field `CreatedRun` construction from
+    the two replay sites — the extraction clippy was pointing at.
+  1009 workspace tests (+3). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-045` Stop reporting a run `Completed` when its answer was never stored. Found by reading
+  `complete_run`'s order and asking what a client sees when the step after the transition fails.
+  - **The defect (an ordering defect, invisible from either operation alone).** `complete_run` moved
+    the run `Responding -> Completed` and *then* stored the answer as the assistant's message. Both
+    operations are correct on their own; the **order** is not. `store_answer` can fail on a real
+    input — a provider that emits more than `MAX_CONTENT_BYTES` produces a content value the message
+    port refuses — and when it did, the run was **already durably `Completed`**: its `run.completed`
+    event claimed a delivered answer, the transcript held no assistant turn, and
+    `GET /api/v1/runs/{id}` reported a successful run whose answer existed nowhere. The caller got an
+    error while the durable record said success, so a polling client and a streaming client were told
+    opposite things about the same run.
+  - Fix: persist the answer **before** the transition, so "the run is completed" means "its answer is
+    durable" — the durable transition is what a client reads. A storage failure now fails the run from
+    `Responding` with `answer_not_stored`, using an edge the diagram already carries (added in
+    `BRN-005`'s follow-up for the provider-failure-during-the-answer case), so the run neither claims
+    success nor is abandoned mid-state. This is the storage architecture's own rule — persist the fact
+    before publishing the claim — applied to the answer the completion claims.
+  - **Falsified (compiling):** restoring the old order fails
+    `a_run_whose_answer_cannot_be_stored_is_not_left_reported_as_completed` with
+    `left: Completed, right: Failed`. The test drives a genuinely oversized provider output rather
+    than a mocking of the port, so the failure is one a real provider can cause, and it asserts three
+    things: the run is not `Completed`, its stored `error_code` equals the code its caller received,
+    and **no assistant turn exists** for a run that delivered nothing.
+  - The lesson is the one this project keeps re-learning from the other direction: the previous three
+    rounds were about a value nobody produced, and this one is about a **sequencing** guarantee
+    between two operations that each looked right. "Persist before publish" is stated for state and
+    events; it is equally a rule for the answer the state claims.
+  1010 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-046` Stop recording a provider's own terminal as a successful run. Found by asking what
+  the third terminal the contract names does to a run, after `BRN-017` and `BRN-042` had each taught
+  that a frame field is only real once something reads it.
+  - **The defect (a reader with no writer, twice over).** `docs/contracts/model-stream.md` says an
+    adapter emits exactly one of `call.completed`, `call.failed`, or `call.cancelled`. The controller's
+    frame fold (`capture`) had arms for output, tool calls, usage, and `call.completed` — and **no arm
+    for either non-answer terminal**. So `call.failed` and `call.cancelled` left
+    `drained.finish_reason` as `None`, and `finish_attempt` never read the finish reason anyway: it
+    judged the stream by tool intent, ceilings, and completion only. A provider that ended its stream
+    with `call.failed` produced a run `state: "completed"` whose stored answer was the very text the
+    call had abandoned, with the call recorded `Completed` and the usage published — three durable
+    records agreeing on a success that never happened. This is the same class as `BRN-042`
+    (`provider_request_id` had no producer) and `BRN-017` (`finish_reason` had a writer and no
+    reader), which is why the standing sweep now greps every contract-named terminal back to an arm
+    that handles it.
+  - Fix, in two parts. `capture` maps `call.failed` → `FinishReason::ProviderError` and
+    `call.cancelled` → `FinishReason::Cancelled`, so the terminal is no longer discarded; and
+    `finish_attempt` calls a new `settle_provider_terminal` **before** the completion path records the
+    call, publishes usage, or stores the answer, because every one of those treats the stream's
+    terminal as an answer. The two settle differently on purpose: `call.failed` fails the run and is
+    never retried (the post-acceptance rule `fail_after_acceptance` encodes), while `call.cancelled`
+    cancels it — the contract maps three terminals onto three outcomes, and reporting a provider's own
+    cancellation as a fault would make it indistinguishable from a genuine failure. The call's outcome
+    is closed with the same terminal the run got, so the row and the run cannot disagree about the one
+    fact both exist to state.
+  - **Falsified (compiling), one arm at a time.** Removing the `call.failed` capture arm fails
+    `a_call_that_ends_failed_does_not_complete_the_run` with
+    `Ok(RunOutcome { state: Completed, answer: Some("partial"), .. })`. Removing the `call.cancelled`
+    arm fails `a_call_the_provider_reports_cancelled_does_not_complete_the_run` the same way. The two
+    tests are deliberately not interchangeable: the cancelled test asserts the **exact** settled state
+    (`RunState::Cancelled`) rather than "the run returned an error", so it also detects collapsing the
+    two arms into one — the failed run's own test does not, which a mutation confirmed before the
+    table row was written.
+  - Extracting the settle into `settle_provider_terminal` also kept `finish_attempt` under the
+    `too_many_lines` budget, which is what surfaced the size of what the completion path was doing
+    unconditionally.
+  1012 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

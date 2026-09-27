@@ -168,7 +168,7 @@ async fn execute(
 ) -> Result<super::RunOutcome, ControllerError> {
     fixture
         .controller
-        .execute(&context(), run(), conversation(), "hello", cancel)
+        .execute(&context(), run(), conversation(), "hello", None, cancel)
         .await
 }
 
@@ -208,6 +208,56 @@ async fn a_plain_question_is_answered_and_the_run_completes() {
             .iter()
             .any(|message| message.content == "Hello there" && message.role == Role::Assistant),
         "the answer must be persisted as an assistant message",
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_answer_cannot_be_stored_is_not_left_reported_as_completed() {
+    // ORDERING. `complete_run` transitions the run to `Completed` and *then* stores the answer as
+    // the assistant's message, and `store_answer` can fail: a provider may emit more than
+    // `MAX_CONTENT_BYTES` of output, which the message port refuses as an out-of-bound content
+    // value. When that happens the run is already durably `Completed`, so a client reads a
+    // **successful** run whose answer exists nowhere — the transcript was never written, and the
+    // run's `Completed` event claimed a delivered answer. This asserts the run is not reported
+    // successful when its answer was not persisted. The answer is the run's *outcome*, so a run
+    // that could not deliver it did not complete.
+    let oversized = "x".repeat(crate::repository::conversation::MAX_CONTENT_BYTES + 1);
+    let fixture = fixture(answering(&oversized));
+    seed(&fixture).await;
+
+    let result = execute(&fixture, &CancellationScope::new()).await;
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert!(
+        result.is_err(),
+        "a run whose answer could not be stored must not be reported success: {result:?}",
+    );
+    assert_eq!(
+        stored.state,
+        RunState::Failed,
+        "a run must not read as completed when its answer was never persisted",
+    );
+    // The failure is truthful rather than merely non-terminal: the run's own row carries the code
+    // its caller received, so a client that only polls the run learns why it failed.
+    assert_eq!(
+        stored.error_code.as_deref(),
+        Some(result.unwrap_err().code())
+    );
+    // And no assistant turn exists for a run that delivered nothing.
+    let messages = fixture
+        .repositories
+        .load_messages(context().workspace_id, conversation(), None, 10)
+        .await
+        .expect("messages are readable");
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.role == Role::Assistant),
+        "an unpersisted answer must leave no assistant turn: {messages:?}",
     );
 }
 
@@ -325,7 +375,7 @@ async fn a_cancel_arriving_during_delivery_ends_the_run_cancelled() {
 
     let error = fixture
         .controller
-        .execute(&context(), run(), conversation(), "hello", &cancel)
+        .execute(&context(), run(), conversation(), "hello", None, &cancel)
         .await
         .expect_err("a cancelled run cannot complete");
     assert_eq!(error, ControllerError::Cancelled);
@@ -369,7 +419,7 @@ async fn a_cancel_arriving_during_delivery_publishes_exactly_one_terminal_event(
 
     let _ = fixture
         .controller
-        .execute(&context(), run(), conversation(), "hello", &cancel)
+        .execute(&context(), run(), conversation(), "hello", None, &cancel)
         .await;
 
     let events = fixture
@@ -2172,6 +2222,88 @@ async fn an_objective_that_does_not_fit_the_context_ceiling_fails_the_run() {
     );
 }
 
+/// The objective is sent **once**, not once as a transcript turn and again as the task.
+///
+/// `RunService::create` stores the objective as the conversation's first user message and also
+/// passes the same text to `execute` as the run's objective. The controller reads the transcript
+/// **and** assembles the objective as a separate `ActiveTask` item, so the same text was a candidate
+/// twice. This test asserts what actually reaches the provider, because that is the only place the
+/// duplication is observable: nothing fails, the prompt is merely doubled — the model is asked its
+/// question twice, one copy of a long objective can push real conversation out of the budget, and
+/// the objective is billed twice against the token ceiling.
+///
+/// The conversation holds exactly the objective, which is the state `create` produces, and the
+/// request is captured at the provider. The id passed here is the one the message was stored with,
+/// which is how the assembler removes it — by identity rather than by comparing text.
+const OBJECTIVE_MESSAGE: u128 = 500;
+
+#[tokio::test]
+async fn the_objective_is_sent_to_the_provider_only_once() {
+    let provider = Arc::new(RecordingProvider::new(scripted_answering("done")));
+    let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
+    // `seed` creates the run and the conversation but no messages, so the transcript below is the
+    // objective alone — the exact conversation `RunService::create` leaves behind.
+    seed(&fixture).await;
+    let objective_message = jarvis_domain::ids::MessageId::from_uuid(id(OBJECTIVE_MESSAGE));
+    fixture
+        .repositories
+        .append_message(
+            context().workspace_id,
+            NewMessage {
+                id: objective_message,
+                conversation_id: conversation(),
+                role: Role::User,
+                content: "hello".to_owned(),
+                content_schema_version: 1,
+                sensitivity: "internal".to_owned(),
+                source: "api".to_owned(),
+                created_at: now(),
+            }
+            .validated()
+            .expect("the fixture is valid"),
+        )
+        .await
+        .expect("the objective message is stored");
+
+    // The controller is driven with the objective **and** the id it was stored under, which is what
+    // `RunService` supplies.
+    fixture
+        .controller
+        .execute(
+            &context(),
+            run(),
+            conversation(),
+            "hello",
+            Some(objective_message),
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the run completes");
+
+    let requests = provider.requests();
+    let request = requests.first().expect("one call was made");
+    let occurrences = request
+        .input
+        .as_slice()
+        .iter()
+        .filter(|item| match item {
+            InputItem::Message { blocks, .. } => blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => text.as_str() == "hello",
+                ContentBlock::ArtifactRef { .. } => false,
+            }),
+            InputItem::SystemPolicyRef { .. }
+            | InputItem::ToolCall { .. }
+            | InputItem::ToolResult { .. }
+            | InputItem::ReasoningSummary { .. } => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "the objective reaches the model once, not twice: a duplicated question costs tokens twice \
+         and can displace real conversation",
+    );
+}
+
 /// A message whose sensitivity label cannot be read fails the run.
 ///
 /// Refusing is the only direction of error that cannot leak: assuming the label is
@@ -2906,6 +3038,115 @@ async fn the_finish_reason_the_provider_reported_is_recorded_on_the_call() {
         .await
         .expect("the attempt loads");
     assert_eq!(stored.finish_reason, Some(FinishReason::Length));
+}
+
+/// A provider whose stream ends with a terminal `call.failed` frame.
+///
+/// The contract lists three terminal frames — `call.completed`, `call.failed`, and
+/// `call.cancelled` — and a provider that reports a failure *through* its stream is using the one
+/// that means "the call did not succeed". Distinct from `ProviderError`, which is how a transport
+/// failure reaches the port: this is a well-formed frame the provider chose to send.
+fn answering_then_failing(code: &str) -> Arc<dyn ModelProvider> {
+    Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "partial")
+            .emit(ModelStreamEventKind::CallFailed {
+                code: code.to_owned(),
+                retryable: false,
+            }),
+    )
+}
+
+#[tokio::test]
+async fn a_call_that_ends_failed_does_not_complete_the_run() {
+    // The contract's terminal set is three-way, and the run's outcome has to follow it: a provider
+    // that ends its stream with `call.failed` is stating the call did **not** succeed. The
+    // controller treated *every* terminal as success — `finish_attempt` recorded
+    // `ModelCallState::Completed` and drove the run to `Completed` without ever looking at the
+    // finish reason — so a failed call produced a successful run. A caller would read
+    // `state: "completed"` for a call the provider had just reported as failed, and the partial
+    // output would be stored as the delivered answer.
+    let fixture = fixture(answering_then_failing("model.provider_failed"));
+    seed(&fixture).await;
+
+    let result = execute(&fixture, &CancellationScope::new()).await;
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert!(
+        result.is_err(),
+        "a call that ended failed must not report success: {result:?}",
+    );
+    assert_eq!(
+        stored.state,
+        RunState::Failed,
+        "a call.failed terminal must fail the run, not complete it",
+    );
+    // The call's own row says the same thing, so a caller reading either learns the truth.
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    assert_eq!(
+        calls[0].1,
+        ModelCallState::Failed,
+        "the attempt that ended call.failed must be recorded as failed",
+    );
+    // And the partial output was not stored as the delivered answer.
+    let messages = fixture
+        .repositories
+        .load_messages(context().workspace_id, conversation(), None, 10)
+        .await
+        .expect("messages are readable");
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.role == Role::Assistant && message.content == "partial"),
+        "a failed call's partial output must not become the run's answer: {messages:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_call_the_provider_reports_cancelled_does_not_complete_the_run() {
+    // The third terminal, and the symmetric half of the check above: `call.cancelled` is a frame
+    // a provider may send when *it* stopped the call — a content policy, a provider-side
+    // timeout, an operator action on the provider's side. That is a different fact from the
+    // caller cancelling, which the controller detects on its own signal. Treating a provider-sent
+    // `call.cancelled` as success would record a run the provider stopped as a delivered answer.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "partial")
+            .emit(ModelStreamEventKind::CallCancelled {
+                late_frames_ignored: 0,
+            }),
+    ));
+    seed(&fixture).await;
+
+    let result = execute(&fixture, &CancellationScope::new()).await;
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("the run loads");
+    assert!(
+        result.is_err(),
+        "a provider-cancelled call must not report success: {result:?}",
+    );
+    assert_eq!(
+        stored.state,
+        RunState::Cancelled,
+        "a provider-cancelled call settles the run cancelled, not completed",
+    );
 }
 
 #[tokio::test]

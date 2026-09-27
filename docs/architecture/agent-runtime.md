@@ -490,6 +490,53 @@ the context-selection ledger are `MEM-008` — and the token counts are document
 byte division, since counting tokens is a model-specific job no adapter provides yet. Every ceiling
 this milestone *enforces* is still checked against the provider's reported usage, not this estimate.
 
+**The objective was reaching the model twice (`BRN-044`).** `RunService::create` appends the
+objective as the conversation's first user turn *and* passes the same text to the controller as the
+run's task, and the controller assembles the transcript **and** an `ActiveTask` item — so the same
+question was a candidate twice and the provider received it two times. Nothing failed on it, which is
+what made it silent: the prompt was merely doubled, one copy of a long objective could push real
+conversation out of the budget, and the tokens were billed twice against the ceiling. The transcript
+copy is now removed, and the removal is **by identity** rather than by comparing text: the service
+returns the `MessageId` it stored (`append_objective`) and `execute`/`build_context` pass it to
+`context_assembly::assemble`, which skips exactly that message. Content matching would have dropped
+the wrong turn in a conversation where two runs asked the same question — a silent context loss in
+place of a silent duplication. Falsified in both places it can break, each compiling: removing the
+skip in the assembler brings the count back to two, and passing `None` at the composition root leaves
+the assembler correct while the daemon still sends the question twice — which is why the second test
+drives the real `create` path and the real spawned task rather than the assembler alone.
+
+**A run could be `Completed` with no answer (`BRN-045`).** `complete_run` transitioned the run
+`Responding -> Completed` and *then* stored the answer as the assistant's message. `store_answer` can
+fail on a real input — a provider that emits more than `MAX_CONTENT_BYTES` produces a content value
+the message port refuses — and when it did, the run was **already durably `Completed`**: its
+`run.completed` event claimed a delivered answer, the transcript held no assistant turn, and
+`GET /api/v1/runs/{id}` reported a successful run whose answer existed nowhere. The order is now the
+other way round — the answer is persisted first, so "the run is completed" means "its answer is
+durable", because the durable transition is what a client reads. A storage failure
+fails the run from `Responding` (an edge the diagram already carries, added for the
+provider-failure-during-the-answer case) with `answer_not_stored`, so the run neither claims success
+nor is abandoned mid-state. This is the same ordering rule the storage architecture states for state
+and events — persist the fact before publishing the claim — applied to the answer the completion
+claims.
+
+**Every terminal the provider sent was recorded as success (`BRN-046`).** The model-stream contract says
+an adapter emits exactly one of `call.completed`, `call.failed`, or `call.cancelled`. The controller's
+frame fold had arms for output, tool calls, usage, and `call.completed` — and **no arm for either
+non-answer terminal**, so `call.failed` and `call.cancelled` left `drained.finish_reason` as `None`.
+`finish_attempt` then judged the drained stream by tool intent, ceilings, and completion, and never
+looked at the finish reason at all. The result: a provider that ended its stream with `call.failed`
+produced a run `state: "completed"` whose stored answer was the very text the call had abandoned, the
+call recorded `Completed`, and the usage published — three durable records agreeing on a success that
+never happened. A caller reading the run had no way to learn the call failed. Both terminals are now
+captured onto the finish reason and settled by `settle_provider_terminal` **before** the completion path
+records anything: `call.failed` fails the run (never retried — the same post-acceptance rule
+`fail_after_acceptance` encodes) and `call.cancelled` cancels it, because reporting a provider's own
+cancellation as a fault would make it indistinguishable from a genuine failure. Falsified by removing
+each frame-fold arm in turn, each compiling: without the failed arm the failed run reads `Completed`
+with `answer: Some("partial")`, and without the cancelled arm the cancelled run does the same. The
+cancelled test asserts the exact settled state rather than "the run returned an error", which is what
+makes it detect a collapse of the two arms into one — the failed run's own test does not.
+
 ## Durable Run Record
 
 A run minimally tracks:

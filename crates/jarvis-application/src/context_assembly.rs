@@ -41,6 +41,7 @@
 use jarvis_domain::context::budget::{AssembledContext, ContextBudget, IncludedItem};
 use jarvis_domain::context::manifest::ContextManifest;
 use jarvis_domain::context::source::{CandidateSource, ContextCandidate, InclusionReason};
+use jarvis_domain::ids::MessageId;
 use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::model::stream::{ContentBlock, InputItem, Role};
 use jarvis_domain::time::UtcTimestamp;
@@ -289,6 +290,13 @@ pub fn parse_sensitivity(label: &str) -> Option<Sensitivity> {
 
 /// Assembles the model input from `transcript` and `objective` under `ceiling_tokens`.
 ///
+/// `objective_message` is the id of the transcript message that **is** the objective, when the
+/// caller stored one. It is removed from the candidates so the model receives the question once
+/// rather than twice, and it is an identity rather than a comparison of text because content
+/// matching cannot tell this run's objective from an earlier turn that happens to read the same.
+/// `None` means the objective was never stored as a message, which is a real state — the controller
+/// can be driven from a seeded transcript — and then nothing is removed.
+///
 /// `data_policy_ceiling` is the merged policy's `maximum_sensitivity`. It is a required
 /// parameter rather than a default because this module has no basis on which to choose one: a
 /// default would be an invented policy that reads exactly like a real one. The controller
@@ -308,14 +316,31 @@ pub fn parse_sensitivity(label: &str) -> Option<Sensitivity> {
 pub fn assemble(
     transcript: &[StoredMessage],
     objective: &str,
+    objective_message: Option<MessageId>,
     ceiling_tokens: u64,
     data_policy_ceiling: Sensitivity,
     now: UtcTimestamp,
 ) -> Result<AssembledInput, AssemblyError> {
     let ceiling = ContextBudget::new(ceiling_tokens).map_err(|_| AssemblyError::BudgetUnusable)?;
 
+    // The objective is **also** a stored conversation message: `RunService::create` appends it as
+    // the user's turn so the durable transcript holds the question, and then passes the same text
+    // here. Offering both would send the model the question **twice** — one copy as a transcript
+    // turn and one as the run's task — which nothing fails on, so it was a silent defect: the prompt
+    // is doubled, a long objective can push real conversation out of the budget, and the tokens are
+    // billed twice against the ceiling. The transcript copy is therefore skipped and the objective
+    // candidate below represents it.
+    //
+    // The duplicate is removed **by identity**, not by comparing text. Matching on content would also
+    // collapse an *earlier* turn that happened to read the same — which is a real case, since a
+    // conversation may hold two runs that asked the same question — and losing that turn would be a
+    // silent context loss. `objective_message` is the id the service stored, so it names exactly the
+    // one message to drop.
     let mut candidates: Vec<ContextCandidate> = Vec::with_capacity(transcript.len() + 1);
     for message in transcript {
+        if Some(message.id) == objective_message {
+            continue;
+        }
         let Some(label) = parse_sensitivity(&message.sensitivity) else {
             return Err(AssemblyError::UnlabelledMessage);
         };
