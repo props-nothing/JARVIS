@@ -289,10 +289,11 @@ than an implicit one.
 | `usage { prompt_tokens, completion_tokens, total_tokens, prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens }` | `Usage { input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, provider_reported: true }` | `total_tokens` is dropped: `Usage` has no total, and computing one from the parts would be a JARVIS assertion rather than a provider fact |
 | `id`, `system_fingerprint`, `service_tier` | `ProviderMetadata::request_id` / `provider_finish_reason` | `id` maps to `request_id`. `system_fingerprint` and `service_tier` have no field and are **dropped**, not stuffed into a string |
 | `obfuscation` | (ignored) | A padding field; ignoring it is required, and treating it as content would corrupt the answer |
+| `delta.reasoning` | **counted, never translated** | **Not in the documented field set**; observed on most frames of a real capture. It is the raw model-internal thinking text, which the memory rules forbid persisting — so it is deliberately **not** mapped onto `reasoning.summary.delta`, which carries a *user-visible summary* the contract permits. The count makes the drop a decision rather than an omission |
 | `choices` empty with a populated `usage` | `usage.updated` | The documented final chunk shape |
 | `n > 1` | refused | `InvalidRequest`. JARVIS models one answer, so a second choice is a request JARVIS must not make rather than one it must model |
 | `logprobs` | dropped | Not modelled and not requested |
-| SSE `data: [DONE]` | ignored sentinel | Accepted and skipped; never the terminal |
+| SSE `data: [DONE]` | ignored sentinel | **OBSERVED 2026-09-27**: the real capture ends `data: [DONE]\n\n`, so the sentinel exists and its presence is no longer assumed. It is accepted and skipped and is **never** the terminal — the terminal is the first non-null `finish_reason` |
 | HTTP status + `error.type`/`error.code` | `ProviderError` | See the errors table. The provider's message is retained as bounded text, never as the JARVIS code |
 
 Do not expose provider SDK types in JARVIS domain contracts.
@@ -304,7 +305,7 @@ Do not expose provider SDK types in JARVIS domain contracts.
 | `OC-C001` | A refusal arrives as HTTP 200 with `delta.refusal` populated, so a status-only reader records a refusal as a finished answer | DOCUMENTED | Streaming-events `ChatCompletionStreamResponse.delta.refusal`; `FinishReason::Refusal` exists for exactly this reason | A captured refusal stream returns a non-2xx status, or a passing test still shows `finish_reason: Stop` with `refused: false` |
 | `OC-C002` | `usage` is `null` on every chunk except the last, and only when `stream_options.include_usage` is true | DOCUMENTED | Streaming-events `usage` field description | A captured stream omits the final usage chunk after `include_usage: true`, or carries usage mid-stream |
 | `OC-C003` | `choices` can be empty on the final chunk | DOCUMENTED | Streaming-events `choices` description | Every captured final chunk carries one choice, making the empty-choice branch dead and its test vacuous |
-| `OC-C004` | The stream terminates at the first non-null `finish_reason` or at end-of-body, and `[DONE]` is an ignorable sentinel | UNVERIFIED for `[DONE]`; DOCUMENTED for `finish_reason` | Streaming-events page documents `finish_reason`; it does **not** document `[DONE]` | A captured stream ends **without** any non-null `finish_reason` (terminal would then be reachable only via `[DONE]`), or `[DONE]` never appears in any capture |
+| `OC-C004` | The stream terminates at the first non-null `finish_reason` or at end-of-body, and `[DONE]` is an ignorable sentinel | **`[DONE]`: OBSERVED 2026-09-27**; `finish_reason` DOCUMENTED | A live capture from the operator-configured endpoint ends `data: [DONE]\n\n`, confirming the sentinel exists; the streaming-events page documents `finish_reason` but not `[DONE]` | A captured stream ends **without** any non-null `finish_reason` (terminal would then be reachable only via `[DONE]`), or `[DONE]` never appears in any capture |
 | `OC-C005` | New chunk properties and new stream event types may be added without a version bump, so the parser must ignore unknowns | DOCUMENTED | API overview, "Backwards-compatible API changes" | A capture contains a field whose presence breaks parsing, or a release note declares a breaking frame change |
 | `OC-C006` | Abuse-monitoring retention is 30 days and is not client-side disablable, so `none_documented` retention is false for a cloud endpoint of this contract | DOCUMENTED | Data-controls per-endpoint table and prose | The published terms change, or a ZDR-approved project is used and the inventory reflects that project specifically |
 | `OC-C007` | `finish_reason` has more values than the five named | DOCUMENTED | The page renders the type as five literals followed by "or 2 more" | A capture shows only the five named values and the docs stop saying "or more" |
@@ -485,6 +486,34 @@ exactly one this adapter serves; the mapping changes only how it is spelled on t
 Neither was visible from the contract or from a fixture. Both surfaced the moment a real server
 answered — which is the argument for this test existing at all.
 
+### A third thing the capture settled, and one it found that no fixture could
+
+**`[DONE]` exists.** The Open Questions list asked whether this contract emits the sentinel at all, and
+whether it is ever the *only* terminal. The first half is now answered: a real capture ends
+`data: [DONE]\n\n`. The second half is answered too, and the answer is the reassuring one — the stream
+also carries `finish_reason: "stop"` **before** the sentinel, so a provider that omitted `[DONE]` would
+still terminate correctly. That is what the adapter's design assumed, and it is now observed rather
+than inferred from the absence of a sentence on a documentation page.
+
+**`delta.reasoning` is not in the documented field set, and it is on most frames.** The capture's shape
+is: five frames carrying `reasoning` text with an empty `content`, then one frame carrying the answer in
+`content`, then a `finish_reason: "stop"` frame, then a usage chunk with empty `choices`, then `[DONE]`.
+So on this endpoint the *majority* of the stream is model-internal thinking that must never be
+persisted — which makes "what happens to that text" a load-bearing question rather than a curiosity.
+
+The adapter already discarded it, by the accident of reading only `content`, `tool_calls`, and
+`refusal`. That accident is the defect: a field no code names is indistinguishable from a field the
+translator forgot, and the two have opposite remedies — one is a security decision to preserve, the
+other is a bug to fix. It is now **counted** (`reasoning_chunks_ignored`) and never translated, and the
+distinction is explicit in the code: the normalized stream *does* have a `reasoning.summary.delta` event
+for user-visible summaries, and mapping raw thinking onto it would be the violation with an event type
+making it look legitimate.
+
+**The generalisable rule, and it is the third time this evidence note has taught it:** a documented
+field set is a claim about a *page*, not about an endpoint. Every mapping row here was built from the
+documentation, and two of the three things a real server forced were things the documentation does not
+contain. Capture, then reconcile the table against the bytes.
+
 ## Operational Readiness
 
 - [ ] Health probe: a cheap authenticated request, or reporting the last call's
@@ -515,22 +544,16 @@ answered — which is the argument for this test existing at all.
 
 ## Open Questions
 
-- Does this contract emit a `[DONE]` sentinel, and is it ever the *only* terminal?
-  (`OC-C004`). The adapter is designed not to depend on the answer, and the
-  fixture capture settles it.
-- Which specific OpenAI-compatible server will the gated smoke test target, and does
-  that server conform? **Answered for one server.** The smoke test targets **Ollama** on
-  loopback, because it is the endpoint this build can reach and it needs no credential. Its
-  OpenAI-compatible route is `/v1/chat/completions`, and it names models with a tag
-  (`glm-5.3-flash:cloud`) that a JARVIS model id cannot express — which is why the adapter gained
-  a base path and a name mapping. A **different** server remains its own contract question: it is an
-  external product, so a server that deviates needs its own note, and the smoke test taking its
-  host, port, path, and model from the environment is what makes pointing it at another server a
-  configuration rather than a code change.
-- The **`[DONE]` question is now observed for this server.** Ollama's stream terminated on a
-  non-null `finish_reason`, which is the case the adapter relies on — so `OC-C004`'s
-  `finish_reason` half is `OBSERVED` for Ollama while its `[DONE]` half stays open, because the
-  harness does not inspect the sentinel and a capture would.
+- The **`[DONE]` half of `OC-C004` is now OBSERVED, and the first bullet above is closed.** A raw
+  capture of one stream from the operator-configured endpoint ends `data: [DONE]\n\n`, and it carries a
+  non-null `finish_reason: "stop"` **before** that sentinel — so the sentinel exists *and* the adapter's
+  choice not to depend on it is vindicated for this server. What remains open is whether a *different*
+  conforming server could omit `finish_reason` and rely on `[DONE]` alone; the adapter would then fail
+  to terminate, which is why the sentinel is recognized and skipped rather than treated as the terminal.
+- Does `delta.reasoning` ever carry a **user-visible** summary, as opposed to raw thinking? The capture
+  shows raw thinking (planning text about what the user wants), which is never persistable. If some
+  server used the same field for a summary the user is meant to read, the adapter would be discarding
+  something permitted — and the counter is what would make that visible rather than silent.
 - When the cloud path is enabled, which TLS stack is reviewed, and does the
   adapter then need to distinguish residency domains from ordinary hostnames?
 
@@ -543,3 +566,4 @@ answered — which is the argument for this test existing at all.
 | 2026-09-27 | The adapter is **composed into the daemon**. `jarvis_infrastructure::model_providers::resolve` maps a configuration document plus a secret resolver to the provider a daemon calls; `jarvisd` composes it before startup and refuses a configuration it cannot serve rather than falling back to the scripted provider. Config schema 1 → 2 for the optional `[model.provider]` table (version 1 still readable). Proven end to end at `tests/daemon_provider_composition.rs` — a real daemon, a real socket, a local fake server, and a run through the real control API — and confirmed by mutation. Adds the "Composed into the daemon" section; corrects the Operational Readiness items for setup, disable/unload, migration, and credential rotation, which the composition changes | The composition module and its tests; the daemon-level composition test; the config loader tests for both supported versions |
 | 2026-09-27 | **A real provider run is verified end to end — Milestone 2's exit gate.** `tests/e2e/provider-smoke.mjs` drives a daemon configured for **Ollama on loopback** and asserts the model's own text is durable in the run's events and that `jarvis ask` prints it and exits 0. The gate is a reachable endpoint rather than a secret, and a skip is **reported** as "nothing was proved" rather than as a pass. The real endpoint forced two additions that no fixture could reveal: `[model.provider].base_path` (Ollama serves `/v1/chat/completions`, not `/chat/completions`) and `[model.provider].model_names` (a JARVIS model id cannot contain the `:` in `glm-5.3-flash:cloud`, so without a mapping the adapter cannot name an Ollama cloud model at all). Both are validated where they are used and both leave the default configuration byte-identical | A live `jarvis ask` against `127.0.0.1:11434` returning `JARVIS OLLAMA OK` with exit 0; the smoke harness run twice (live and gated); the adapter's path and model-name validation tests |
 | 2026-09-27 | **Tool calls are translated, reversing a decision that was wrong in the dangerous direction.** The Security Analysis above claimed "tool calls appear as `tool.call.*` events and remain subject to the canonical tool pipeline" while `translate.rs` recognized `tool_calls` and emitted nothing — so the note described behaviour the adapter did not have, and the omission produced a **silent success** rather than a refusal: the controller's typed `run.tools_not_implemented` terminal was reachable only through the scripted provider, so a real model that asked to call a tool yielded a stream with no delta and no tool event and the run could reach `completed` with an empty answer. Now emits `tool.call.added`, `tool.call.arguments.delta`, and `tool.call.completed` (the last carrying the accumulated arguments, because a fragment is not parseable JSON), keyed by the protocol's `index` because later fragments carry neither the id nor the name. Emitting is not a grant: the events are proposals the deterministic layer judges | Five translator tests, falsified by restoring the silent drop; the controller's existing tool-intent tests; the adapter's own code against its security section |
+| 2026-09-27 | **A raw capture of one real stream, taken while answering the open `[DONE]` question — and it closed that question while finding a field the documented schema does not have.** The capture ends `data: [DONE]\n\n` (**so the sentinel exists**, `OC-C004`'s `[DONE]` half moves from UNVERIFIED to OBSERVED) and carries `finish_reason: "stop"` before it, so the adapter's refusal to depend on the sentinel is vindicated. It also carries **`delta.reasoning` on the majority of its frames** — the raw model-internal thinking text, **absent from the Chat Completions documented field set** the mapping table above was built from. The adapter already discarded it, and that is exactly the defect: a field no code names is indistinguishable from a field the translator forgot, and the two have opposite remedies. It is now **counted** and explicitly never translated, with the code stating why it is *not* mapped onto `reasoning.summary.delta` (which carries a user-visible summary the contract permits). Falsified by removing the increment, which fails both new tests | The live capture; `model_internal_reasoning_is_counted_and_never_becomes_output` and `the_shape_of_a_captured_stream_from_a_real_endpoint_is_handled`, the latter built from the captured frames; `Cargo.lock` still has no TLS crate |

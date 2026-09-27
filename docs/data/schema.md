@@ -122,6 +122,32 @@ same transaction as the acknowledged mutation. Reuse with different material
 input is a conflict. Completed and ambiguous outcomes remain long enough to
 cover client retries and downstream reconciliation.
 
+**The implemented table is narrower than the sketch above, and the sketch is aspirational.** The local
+control API creates `idempotency_records` (`000003`, rescoped by `000007`) with:
+
+```text
+id, idempotency_key, workspace_id, principal_id, client_credential, operation,
+api_major, request_digest, run_id, created_at
+UNIQUE INDEX on (principal_id, workspace_id, client_credential, operation,
+  api_major, idempotency_key)
+```
+
+Two differences from the sketch are deliberate rather than pending. There is one resource type, a run,
+so `resource_type`/`resource_id` collapse to a foreign-keyed `run_id`. And the outcome is always
+`202 Accepted` with a completed mutation, because the record commits in the **same transaction** as the
+run — so the `state`, `http_status`, `response_ref`, and `error_code` columns the sketch reserves for
+in-flight and ambiguous outcomes have nothing to hold. They become necessary when a command with an
+externally visible side effect is acknowledged before it completes; nothing on this surface is.
+
+`000007` narrowed the uniqueness key from three dimensions to the contract's five. The first version
+keyed on workspace, operation, and API major while its own comment claimed the full scope, and because
+a local profile shares **one** workspace between every enrolled client that let two clients' keys
+collide — with the replay path resolving the run by workspace alone, so the second client received the
+first client's `run_id` and `conversation_id`. `client_credential` holds a **digest**; the credential
+itself is never stored. A row written before `000007` is attributed from its run's `principal_id` and
+carries the `unknown` credential sentinel, so it never matches on that dimension — the fail-closed
+direction, since nothing recorded which credential created it.
+
 ## Conversations and Agent Runs
 
 ### `conversations`

@@ -111,7 +111,16 @@ aim an operator's search, or to collide with another request's.
 
 Requirements:
 
-- `code` is stable and namespaced.
+- `code` is stable and namespaced. The namespaces JARVIS owns are `jarvis`, `tool`,
+  `approval`, `model`, `run`, `stream`, `storage`, `event`, and `session`; the first
+  segment must be one of them and must be followed by a non-empty name, because a
+  family name alone names no error. A code outside that set is replaced by
+  `jarvis.internal` at the emission boundary rather than forwarded, so a provider or
+  runtime cannot name a code a client would read as JARVIS's own. **This list is
+  normative**: the tool contract defines sixteen `tool.*` codes and the approval
+  contract twelve `approval.*` codes, and a boundary that recognized only the `jarvis.`
+  prefix would have rewritten every one of them to `jarvis.internal`, collapsing codes a
+  client is told to branch on into a single value.
 - `message` is safe for the requesting principal.
 - `request_id` is populated on every refusal a handler can produce, not only on
   internal failures, and matches the `jarvis-request-id` response header. The

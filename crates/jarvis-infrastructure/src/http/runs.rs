@@ -1033,6 +1033,12 @@ pub(crate) fn context_for(
         scope.workspace_id,
         client.channel,
     )
+    // The credential's digest, which the idempotency scope records. Absent rather than empty when the
+    // extractor could not find one, because "no credential" and "a credential whose digest is empty"
+    // are different facts and the run service distinguishes them.
+    .with_client_credential(
+        (!client.credential_digest.is_empty()).then(|| client.credential_digest.clone()),
+    )
 }
 
 /// Renders a created run as the contract's `202` response.

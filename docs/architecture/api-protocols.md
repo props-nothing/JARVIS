@@ -261,6 +261,31 @@ worth recording, because both were absent while the endpoint replayed and closed
   one case that is not retried at all is an overrun that arrived **before any event did**: there is no
   position to resume from, and no number of retries reaches an event that never arrived, so the client
   says so rather than asking again.
+- **A sequence gap ends the follow, and the client is where the contract puts that obligation.** "Clients
+  ignore unknown additive event types but never ignore a sequence gap" is a rule about the *reader*, and
+  the reference client satisfied it by not looking: it parsed `event_id`, `event` and the payload, and
+  never read `sequence` at all — so a gap could not be noticed because the value was never read. That is
+  the same failure the rule names, arrived at by omission rather than by decision, and it is the worst
+  version of it: the client keeps printing across the gap and delivers two halves of an output that were
+  never adjacent, as a complete answer.
+  - **The gap is fatal rather than resumable, and the reason is that it is unrepairable.** The client
+    cannot know which events it missed or whether they are still retained, and its one recovery
+    mechanism — `Last-Event-ID` — re-reads from the position it already reached, which leaves the gap
+    exactly where it was. So the honest response is to stop and say so, and the check therefore
+    **outranks the retry decision**: a gap consulted through the retry path would be answered as a
+    dropped connection and reconnected.
+  - **Two boundaries keep the check from refusing healthy streams.** A resumed stream's first frame is
+    exempt, because `Last-Event-ID` resumes *strictly after* the named event — requiring contiguity
+    across a reconnect would refuse the client's own recovery path. And a frame with no readable
+    `sequence` is not a gap: the contract bounds what a reader concludes from a frame, and inventing a
+    gap from an absent field would refuse a stream the daemon is sending correctly.
+  - **The rule is checked against a real socket, not only as a function.** The watcher is pure and
+    unit-tested, but a correct function nothing calls is the exact shape of the original defect — so a
+    stub listener on an ephemeral loopback port serves a stream with a gap in it, and the follow is
+    asserted to fail *while the stream still carries a terminal event*. That last clause is load-bearing:
+    the first version of the test ended the body after the gapped frames, and the mutation disabling the
+    whole check **passed**, because a stream with no terminal fails the follow anyway. A gap-ignoring
+    client has to be able to succeed for the assertion to be about the gap.
 
 ## Generated Contracts
 

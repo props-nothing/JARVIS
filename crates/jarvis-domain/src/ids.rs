@@ -207,6 +207,39 @@ identifier!(
     "Identifies one durable run activity event, which is globally unique because \
      a client resumes an event stream by echoing this value as `Last-Event-ID`."
 );
+identifier!(
+    ToolId,
+    "tool",
+    "Identifies one **canonical tool**, which is the stable identity authorization \
+     binds to. It is deliberately separate from `ToolCallId`: a call is one \
+     invocation, while this names the capability that was invoked, and the \
+     distinction is what lets an approval record name a tool that has since been \
+     replaced without re-authorizing the replacement — a call id would identify \
+     the invocation, which is exactly the thing that must *not* be reused across \
+     an implementation change."
+);
+identifier!(
+    ToolCallId,
+    "tool_call",
+    "Identifies one tool invocation. Provider-supplied call identifiers are \
+     validated with this parser at the adapter boundary, so a malformed or \
+     non-canonical provider string is refused rather than persisted, and an \
+     approval or ledger row can reference a call without carrying a foreign \
+     string straight into storage."
+);
+identifier!(
+    ToolCallRecordId,
+    "tool_call_record",
+    "Identifies one durable tool-call row in the execution ledger."
+);
+identifier!(
+    ApprovalId,
+    "approval",
+    "Identifies one durable approval record. An approval is separately revocable and, when \
+     one-shot, consumed once, so it needs an identity of its own rather than being named by the \
+     call it authorizes — the call is what the approval *permits*, and a record keyed by it could \
+     not express an approval that was requested before its call existed."
+);
 
 /// Generates identifiers for domain records.
 ///

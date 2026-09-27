@@ -68,6 +68,18 @@ pub struct RequestContext {
     pub assurance: AuthenticationAssurance,
     /// The resolved, authorized active workspace.
     pub workspace_id: WorkspaceId,
+    /// A digest of the credential this request authenticated with, when one was presented.
+    ///
+    /// **A digest and never the credential**, because this value reaches durable rows: the contract
+    /// scopes an idempotency key to the client credential as well as to the principal, and recording
+    /// that scope is what makes a rotation observable. Storing the credential itself would put a secret
+    /// in a table on a path this workspace otherwise keeps secret-free.
+    ///
+    /// `None` means the request arrived on a channel that authenticated by other means — an in-process
+    /// caller — which is a different fact from "authenticated with an empty credential", and the
+    /// distinction is what keeps the scope honest.
+    #[serde(skip)]
+    pub client_credential: Option<String>,
     /// The interface the request arrived on.
     pub channel: RequestChannel,
     /// The absolute instant after which the request must not start new work.
@@ -78,6 +90,17 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// Attaches the digest of the credential this request authenticated with.
+    ///
+    /// A builder rather than a `new` argument, so every existing construction site keeps working and
+    /// the field is absent for a caller that has no credential to describe. Absent is the honest value
+    /// for an in-process caller, and it is distinguishable from an empty digest.
+    #[must_use]
+    pub fn with_client_credential(mut self, digest: Option<String>) -> Self {
+        self.client_credential = digest;
+        self
+    }
+
     /// Builds context from already-trusted, server-resolved values.
     ///
     /// Callers must have authenticated the principal and resolved/authorized
@@ -99,6 +122,7 @@ impl RequestContext {
             principal_id,
             assurance,
             workspace_id,
+            client_credential: None,
             channel,
             deadline: None,
             cancellation: CancellationScope::new(),

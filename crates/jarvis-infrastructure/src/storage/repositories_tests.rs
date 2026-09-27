@@ -94,6 +94,39 @@ fn principal() -> PrincipalId {
     PrincipalId::from_uuid(id(4))
 }
 
+/// A **second** principal, for the idempotency scope tests.
+///
+/// Two clients on one machine resolve to one workspace with different principals, so this pair is what
+/// makes "one client's key cannot reach another client's run" assertable at all — with a single
+/// principal the defect is invisible because every record belongs to the same one.
+fn other_principal() -> PrincipalId {
+    PrincipalId::from_uuid(id(40))
+}
+
+/// A digest standing in for a client credential.
+fn credential(label: &str) -> String {
+    format!("credential-digest-{label}")
+}
+
+/// An idempotency record with every field at its default, so a test names only what it varies.
+///
+/// A helper rather than a literal at each site because this struct gains a **scope** dimension
+/// whenever the contract's scope does — it went from three to five in one round — and a literal at
+/// eight sites is eight places to forget. With a base value, a test that does not care about the
+/// principal cannot accidentally omit it.
+fn idempotency_record() -> NewIdempotencyRecord {
+    NewIdempotencyRecord {
+        key: "0195f4f0-18dc-729b-bb34-07e8c7627f21".to_owned(),
+        workspace_id: workspace(),
+        principal_id: principal(),
+        client_credential: credential("owner"),
+        operation: "runs.create".to_owned(),
+        request_digest: "digest-a".to_owned(),
+        run_id: run_id(),
+        created_at: now(),
+    }
+}
+
 fn run_id() -> RunId {
     RunId::from_uuid(id(5))
 }
@@ -2023,12 +2056,7 @@ async fn a_first_claim_succeeds_and_an_identical_repeat_replays() {
     let (_database, repositories) = repository().await;
     seed(&repositories).await;
     let record = || NewIdempotencyRecord {
-        key: "0195f4f0-18dc-729b-bb34-07e8c7627f21".to_owned(),
-        workspace_id: workspace(),
-        operation: "runs.create".to_owned(),
-        request_digest: "digest-a".to_owned(),
-        run_id: run_id(),
-        created_at: now(),
+        ..idempotency_record()
     };
     assert_eq!(
         repositories
@@ -2056,11 +2084,7 @@ async fn a_reused_key_with_different_input_is_a_conflict() {
     repositories
         .claim_idempotency(NewIdempotencyRecord {
             key: "key-1".to_owned(),
-            workspace_id: workspace(),
-            operation: "runs.create".to_owned(),
-            request_digest: "digest-a".to_owned(),
-            run_id: run_id(),
-            created_at: now(),
+            ..idempotency_record()
         })
         .await
         .expect("claims");
@@ -2069,15 +2093,109 @@ async fn a_reused_key_with_different_input_is_a_conflict() {
         repositories
             .claim_idempotency(NewIdempotencyRecord {
                 key: "key-1".to_owned(),
-                workspace_id: workspace(),
-                operation: "runs.create".to_owned(),
                 request_digest: "digest-b".to_owned(),
                 run_id: other_run_id(),
-                created_at: now(),
+                ..idempotency_record()
             })
             .await
             .expect("answers"),
         IdempotencyClaim::Conflict,
+    );
+}
+
+#[tokio::test]
+async fn a_shared_key_used_by_two_principals_in_one_workspace_does_not_replay() {
+    // **The defect this migration closes, and it is a disclosure rather than a scoping nicety.** A
+    // local profile has exactly ONE workspace shared by every enrolled client, while each client
+    // resolves to its own principal — so `workspace_id` alone did not separate one client's key from
+    // another's. Two clients using the same key inside that one workspace collided, and the replay
+    // path resolved the original run by workspace only, so the second client was handed the first
+    // client's `run_id` and `conversation_id`. The keys are guessable in practice: the CLI derives one
+    // from the clock and its process id.
+    //
+    // The assertion is that the second principal gets a **fresh claim**, not a replay of the first
+    // principal's run. A test asserting only that the first claim succeeded would pass against the
+    // defect, because the defect is entirely in what the *second* claim does.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                other_conversation_id(),
+                workspace(),
+                other_principal(),
+                None,
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the second principal's conversation is created");
+    repositories
+        .create(
+            NewRun::new(
+                other_run_id(),
+                workspace(),
+                other_conversation_id(),
+                other_principal(),
+                None,
+                now(),
+            )
+            .expect("valid"),
+            run_received_event(other_run_id(), now()),
+        )
+        .await
+        .expect("the second principal's run is created");
+
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: "shared-key".to_owned(),
+                ..idempotency_record()
+            })
+            .await
+            .expect("the first principal claims"),
+        IdempotencyClaim::Claimed,
+    );
+
+    // The second principal presents the **same key** in the **same workspace**. It must be a fresh
+    // claim and it must name its own run; handing back `run_id()` would be the disclosure.
+    assert_eq!(
+        repositories
+            .claim_idempotency(NewIdempotencyRecord {
+                key: "shared-key".to_owned(),
+                principal_id: other_principal(),
+                client_credential: credential("second-client"),
+                run_id: other_run_id(),
+                ..idempotency_record()
+            })
+            .await
+            .expect("the second principal claims"),
+        IdempotencyClaim::Claimed,
+        "one principal's key must not replay into another principal's run",
+    );
+
+    // And the read path must not find the other principal's record either — the lookup is scoped to
+    // the same five dimensions, so a `WHERE` clause that omitted the principal would leak the first
+    // principal's `run_id` here even though the insert was scoped correctly.
+    let found = repositories
+        .lookup_idempotency(workspace(), other_principal(), "runs.create", "shared-key")
+        .await
+        .expect("the lookup answers");
+    assert_eq!(
+        found.map(|(_, run_id)| run_id),
+        Some(other_run_id()),
+        "the lookup must resolve the caller's own record, not another principal's",
+    );
+    assert_ne!(
+        repositories
+            .lookup_idempotency(workspace(), other_principal(), "runs.create", "shared-key")
+            .await
+            .expect("the lookup answers")
+            .map(|(_, run_id)| run_id),
+        Some(run_id()),
+        "a lookup must never resolve another principal's run",
     );
 }
 
@@ -2122,11 +2240,7 @@ async fn the_same_key_in_two_workspaces_does_not_replay_across_them() {
     repositories
         .claim_idempotency(NewIdempotencyRecord {
             key: "shared-key".to_owned(),
-            workspace_id: workspace(),
-            operation: "runs.create".to_owned(),
-            request_digest: "digest-a".to_owned(),
-            run_id: run_id(),
-            created_at: now(),
+            ..idempotency_record()
         })
         .await
         .expect("claims");
@@ -2136,10 +2250,8 @@ async fn the_same_key_in_two_workspaces_does_not_replay_across_them() {
             .claim_idempotency(NewIdempotencyRecord {
                 key: "shared-key".to_owned(),
                 workspace_id: other_workspace(),
-                operation: "runs.create".to_owned(),
-                request_digest: "digest-a".to_owned(),
                 run_id: other_run_id(),
-                created_at: now(),
+                ..idempotency_record()
             })
             .await
             .expect("claims in the other scope"),
@@ -2158,12 +2270,9 @@ async fn a_claim_naming_an_absent_run_is_not_a_conflict() {
         repositories
             .claim_idempotency(NewIdempotencyRecord {
                 key: "key-for-a-ghost".to_owned(),
-                workspace_id: workspace(),
-                operation: "runs.create".to_owned(),
-                request_digest: "digest-a".to_owned(),
                 // Never created.
                 run_id: RunId::from_uuid(id(999)),
-                created_at: now(),
+                ..idempotency_record()
             })
             .await
             .expect_err("a record must name a real run"),
@@ -2179,11 +2288,7 @@ async fn an_empty_idempotency_key_is_refused() {
         repositories
             .claim_idempotency(NewIdempotencyRecord {
                 key: String::new(),
-                workspace_id: workspace(),
-                operation: "runs.create".to_owned(),
-                request_digest: "digest-a".to_owned(),
-                run_id: run_id(),
-                created_at: now(),
+                ..idempotency_record()
             })
             .await
             .expect_err("an empty key is not a key"),

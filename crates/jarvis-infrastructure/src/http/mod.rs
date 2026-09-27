@@ -336,6 +336,36 @@ impl ApiState {
     }
 }
 
+/// Derives a stable digest of a presented credential.
+///
+/// The contract scopes an `Idempotency-Key` to the client credential, so the scope has to be
+/// *recordable* — and recording the credential itself would put a secret in a durable row on the one
+/// path this workspace otherwise keeps secret-free. A digest satisfies both: it distinguishes two
+/// credentials, it survives a rotation observably, and it cannot be replayed.
+///
+/// Domain-separated by a `credential:` prefix, so a credential's digest cannot equal a digest of the
+/// same bytes used for anything else in this daemon. SHA-256 rather than the non-cryptographic fold the
+/// request digests use: those only have to distinguish one request from another inside a workspace,
+/// while this has to make a secret **unrecoverable** from a stored row. Different requirements, which
+/// is why the two folds are not shared.
+#[must_use]
+fn credential_digest(presented: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(b"credential:");
+    hasher.update(presented.as_bytes());
+    let digest = hasher.finalize();
+    // Hex rather than raw bytes, because the value is stored as TEXT and compared for equality.
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            // A write to a `String` cannot fail, and ignoring the result is what the signature requires.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// Returns the `Host` value that addresses `address`.
 ///
 /// The IPv6 form is bracketed because that is what a client sends in the `Host`
@@ -758,6 +788,12 @@ async fn reject_browser_origin(request: Request, next: Next) -> Response {
 pub struct AuthenticatedClient {
     /// The stable client identifier the credential authenticated as.
     pub client_id: String,
+    /// A **digest** of the credential this request authenticated with, never the credential.
+    ///
+    /// The contract scopes an `Idempotency-Key` to the client credential as well as to the principal,
+    /// and a digest is what makes that checkable without putting a secret anywhere it could be logged,
+    /// returned, or stored in a durable row.
+    pub credential_digest: String,
     /// How strongly the caller's identity was proven.
     pub assurance: AuthenticationAssurance,
     /// The channel this request arrived on.
@@ -784,8 +820,20 @@ where
         let Some(client_id) = parts.extensions.get::<AuthenticatedClientId>() else {
             return Err(unauthenticated());
         };
+        // **`Option::unwrap_or_default` rather than a refusal, deliberately.** The digest is a
+        // *scope* input, not an authorization decision — `authentication` already ran and already
+        // verified the credential. A route reached without the layer fails above on the absent id, so
+        // the only way to arrive here without a digest is a caller that never went through
+        // `require_authentication`, and refusing on a scope input would be a second authentication
+        // check in the wrong place. The empty digest simply matches no record, which is fail-closed.
+        let credential_digest = parts
+            .extensions
+            .get::<AuthenticatedCredentialDigest>()
+            .map(|digest| digest.0.clone())
+            .unwrap_or_default();
         Ok(Self {
             client_id: client_id.0.clone(),
+            credential_digest,
             assurance: AuthenticationAssurance::Standard,
             // A local API client is one that reached the loopback surface with a valid
             // credential; the channel is not caller-supplied, so it cannot claim to be
@@ -798,6 +846,14 @@ where
 /// The client id the authentication middleware verified.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedClientId(String);
+
+/// A digest of the credential the authentication middleware verified.
+///
+/// A separate extension from the id, so a route that needs only the identity cannot reach the
+/// credential's digest by accident — and so the value's presence can be asserted independently at the
+/// one place it is minted.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedCredentialDigest(String);
 
 /// The identifier the authentication middleware derived for one request.
 ///
@@ -851,6 +907,14 @@ async fn require_authentication(
     request
         .extensions_mut()
         .insert(AuthenticatedClientId(client.client_id.clone()));
+
+    // The credential's **digest** is recorded beside the id, for the one contract field that is scoped
+    // to the credential itself: an `Idempotency-Key`. The digest is computed once, here, at the point
+    // the credential was verified — so the secret is hashed exactly once and never travels, and a
+    // handler that needs the scope input cannot obtain the credential instead.
+    request
+        .extensions_mut()
+        .insert(AuthenticatedCredentialDigest(credential_digest(presented)));
 
     // Every authenticated request is given a server-derived identifier here, before the handler
     // runs, for two reasons the contract states and nothing implemented.
@@ -1889,10 +1953,15 @@ mod tests {
         runs_fixture_with_bounds(tag, kind, gate, DEFAULT_STREAM_OVERRUN_TIMEOUT).await
     }
 
+    /// The fixture with a **second enrolled client**, for the tests that need two principals.
+    ///
+    /// A local profile shares one workspace between every enrolled client, so the only way to drive the
+    /// cross-principal idempotency case through the real surface is to enroll two clients and present
+    /// each one's own credential. That pair is what makes the case reachable at all — with a single
+    /// client every record belongs to the same principal and the defect is invisible.
     /// The fixture with every bound stated explicitly.
     ///
-    /// The overrun bound is a parameter rather than a constant read inside, because it is the one
-    /// bound a test must *compress* to observe at all — and because leaving it at the production value
+    /// The overrun bound is a parameter rather than a constant read inside, because it is the one    /// bound a test must *compress* to observe at all — and because leaving it at the production value
     /// everywhere else is what lets the other stream tests assert a negative ("no overrun was signalled
     /// to a follower that read") against the value a daemon actually runs.
     async fn runs_fixture_with_bounds(
@@ -4504,6 +4573,7 @@ mod tests {
         // *which* of the two identifiers drifted.
         let client = AuthenticatedClient {
             client_id: "owner".to_owned(),
+            credential_digest: "credential-digest-owner".to_owned(),
             assurance: AuthenticationAssurance::Standard,
             channel: RequestChannel::Api,
         };

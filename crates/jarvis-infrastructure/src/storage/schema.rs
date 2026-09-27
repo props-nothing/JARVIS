@@ -31,7 +31,7 @@ use super::error::StorageError;
 ///
 /// The minimum reader stays at `1`: every later migration is purely additive, so a binary that
 /// understands only the initial schema can still read a database that has the added tables.
-pub const TARGET_SCHEMA_VERSION: i64 = 6;
+pub const TARGET_SCHEMA_VERSION: i64 = 7;
 
 /// The lowest schema version this binary can still read.
 ///

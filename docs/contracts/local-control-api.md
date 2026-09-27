@@ -243,6 +243,27 @@ retained at least as long as the created run and reconciliation window. Reuse
 with the same canonical request returns the original resource; reuse with
 different input returns `idempotency.conflict`.
 
+**All five dimensions are enforced, and the record stores each of them.** The first implementation and
+the migration that created its table enforced only three — workspace, operation, and API major —
+while the migration's own comment claimed all five, so the omission read as implemented. The gap was a
+**disclosure rather than a scoping nicety**: a local profile has exactly one workspace
+(`DEFAULT_WORKSPACE_UUID`) shared by every enrolled client, while each client resolves to its own
+principal. Two clients presenting the same key therefore collided, and the replay path resolved the
+original run by workspace alone — so the second client received the first client's `run_id` **and its
+`conversation_id`**, which is a handle onto another client's conversation. The keys are guessable in
+practice, because the reference client derives one from the clock and its own process id.
+
+The client credential is part of the scope and is recorded as a **digest**, never as the credential
+itself: a secret has no place in a durable row on this path. A credential rotation is thereby
+observable in the record rather than indistinguishable from a plain replay, and a rotation correctly
+produces `idempotency.conflict` instead of silently matching on the same key. A command that arrived
+with no credential records a sentinel that cannot equal a digest, so "no credential" and "a credential
+whose digest is empty" remain different facts.
+
+The scope is a **unique index**, not a table constraint, because that is the form a later migration can
+change — and because the contract's five-part scope is then readable from the schema and asserted
+rather than being a property of a `WHERE` clause.
+
 The server resolves and authorizes the referenced model policy in the active
 workspace. A request may add typed stricter overrides in a later schema, but it
 cannot supply provider evidence or weaken workspace policy.
@@ -400,6 +421,23 @@ Minimum event types for the first slice are `run.received`,
 `run.context_building`, `run.model_started`, `run.output_text.delta`,
 `run.usage`, and the three terminal variants. Clients ignore unknown additive
 event types but never ignore a sequence gap or unknown terminal state.
+
+**"Never ignore a sequence gap" is a client obligation with an exact remedy, so it is stated rather
+than left to interpretation.** `sequence` starts at 1 and increases by exactly one, so a gap means the
+stream the client is reading is not the run's stream. The client **cannot repair it** — it does not know
+which events it missed, whether they are still retained, or whether the run has already ended — and
+reconnecting with `Last-Event-ID` re-reads from the position it already reached, which leaves the gap
+in place. The contract therefore requires the client to **stop and report**, and the reference client
+does: it refuses further frames, prints nothing else, and exits non-zero with the expected and received
+sequences named. Continuing would deliver two halves of an output that were never adjacent, as though
+they were an answer, with nothing in the stream to indicate otherwise.
+
+Two boundaries are deliberate. A **resumed** stream's first frame is exempt, because `Last-Event-ID`
+means "resume strictly after that event" — the first frame of a resume is legitimately not the
+successor of the previous connection's last frame, and requiring contiguity across a reconnect would
+refuse the client's own recovery path. And a frame whose `sequence` cannot be read is **not** treated as
+a gap: the contract bounds what a client may conclude from a frame, and inventing a gap from an absent
+field would refuse a stream the daemon is sending correctly.
 
 A **report is not a state change**, and `run.usage` is the case that makes the distinction concrete:
 it is a public event that leaves the run exactly where it was. The store therefore has an append that
@@ -797,9 +835,8 @@ replay-and-close behaviour fails that test. Its counterpart checks the other ter
 a follow of an already-finished run must replay and close rather than wait for a notification
 nothing will send.
 
-Also outstanding: contract test 12's golden JSON/SSE fixtures and generated OpenAPI drift,
-`Idempotency-Key` scoping per principal and credential rather than per client, and contract
-test 8's disconnect case.
+Also outstanding: contract test 12's golden JSON/SSE fixtures and generated OpenAPI drift, and
+contract test 8's disconnect case.
 
 ### Implemented evidence (Milestone 2, restart recovery)
 

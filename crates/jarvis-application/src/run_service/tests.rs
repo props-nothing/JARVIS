@@ -317,6 +317,91 @@ async fn create(fixture: &Fixture, text: &str, key: &str) -> CreatedRun {
         .expect("the run is created")
 }
 
+/// A second client's context: **the same workspace, a different principal**.
+///
+/// That pair is what a local profile actually looks like — one workspace shared by every enrolled
+/// client, each resolving to its own principal — and it is the shape that made the idempotency scope
+/// too narrow. A context differing only in the workspace would not exercise the same case.
+fn second_client_context() -> RequestContext {
+    api_request_context(
+        workspace(),
+        PrincipalId::from_uuid(id(202)),
+        RequestId::from_uuid(id(203)),
+        CorrelationId::from_uuid(id(204)),
+    )
+    .with_client_credential(Some("credential-digest-second".to_owned()))
+}
+
+#[tokio::test]
+async fn one_clients_idempotency_key_cannot_replay_another_clients_run() {
+    // **The disclosure this round closes, stated as the client experiences it.** The contract scopes an
+    // `Idempotency-Key` to the authenticated principal and the client credential; the record was keyed
+    // on the workspace, operation, and API major only. Since a local profile has ONE workspace shared
+    // by every enrolled client, two clients presenting the same key collided — and the replay path
+    // resolved the run by workspace alone, so the second client received the first client's `run_id`
+    // **and its `conversation_id`**, which is a handle onto another user's conversation. The CLI's own
+    // key is derived from the clock and its process id, so it is guessable rather than secret.
+    //
+    // Asserted through the service, because that is where the ownership check lives as well as the
+    // scope: a record scoped correctly but a `replayed_run` that trusted the workspace alone would
+    // still hand the run over, and only a test that drives two principals can see the difference.
+    let fixture = fixture();
+    let owner = create(&fixture, "the owner's question", "shared-key").await;
+
+    let attempt = fixture
+        .service
+        .create(
+            &second_client_context(),
+            None,
+            "the second client's question",
+            "shared-key",
+            None,
+            &fixture.spawner,
+        )
+        .await;
+
+    // A **conflict**, not a replay: the second client's key collides with a record it does not own, so
+    // the honest answer names the key as already used. It must never be the owner's run.
+    match attempt {
+        Ok(created) => {
+            assert_ne!(
+                created.run_id, owner.run_id,
+                "a distinct principal must not be handed another principal's run",
+            );
+            assert_ne!(
+                created.conversation_id, owner.conversation_id,
+                "the conversation id is a handle onto another client's conversation",
+            );
+            assert!(
+                !created.replayed,
+                "a distinct principal's key is not a replay"
+            );
+        }
+        Err(error) => assert_eq!(
+            error,
+            RunServiceError::IdempotencyConflict,
+            "the second principal's key must be refused as a conflict, got {error:?}",
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_principals_own_key_still_replays_its_own_run() {
+    // **The half that stops the fix from being a blanket refusal.** Scoping the record by principal is
+    // only correct if a principal's *own* replay still works — a fix that refused every replay would
+    // pass the test above and break the feature the key exists for. Same context twice, so this is the
+    // ordinary retried command.
+    let fixture = fixture();
+    let first = create(&fixture, "hello", "own-key").await;
+    let second = create(&fixture, "hello", "own-key").await;
+    assert_eq!(
+        first.run_id, second.run_id,
+        "one principal repeating its own command must reach its own run",
+    );
+    assert!(second.replayed, "the second command is a replay");
+    assert_eq!(first.conversation_id, second.conversation_id);
+}
+
 #[tokio::test]
 async fn a_create_command_returns_a_run_that_is_already_durable_and_streamable() {
     // The API must answer `202` with a run a client can immediately stream, so the

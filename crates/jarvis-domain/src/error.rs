@@ -8,9 +8,6 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// The stable namespace prefix for every JARVIS-owned error code.
-const CODE_PREFIX: &str = "jarvis.";
-
 /// An error produced by a domain primitive.
 ///
 /// Libraries return this typed error; higher layers add human-facing context.
@@ -154,6 +151,96 @@ pub enum DomainError {
     /// list too large to process, and the two need different caller responses.
     #[error("the context candidate is empty, unbounded, or not a usable value")]
     ContextCandidateInvalid,
+    /// A canonical tool identifier was not in its canonical form.
+    ///
+    /// Distinct from an unusable definition: this is the *identity* being wrong, and a
+    /// caller that normalized it instead of refusing would let two spellings denote one
+    /// tool — which is how an approval for one implementation is presented as an approval
+    /// for a different one. See [`crate::tool::ToolCapability`].
+    #[error("the value is not a canonical tool identifier")]
+    ToolIdentifierNotCanonical,
+    /// A canonical tool definition was empty, unbounded, or internally inconsistent.
+    ///
+    /// Carries the offending field rather than a prose message so an operator sees *which*
+    /// part of a manifest was refused; a tool definition is assembled from several sources
+    /// and "the definition is invalid" alone does not say where to look.
+    #[error("the tool definition field `{field}` is not a usable value")]
+    ToolDefinitionInvalid {
+        /// The definition field that failed validation.
+        field: &'static str,
+    },
+    /// Two different tools claimed the same identity.
+    ///
+    /// **A failure rather than a replacement.** Registration is where a collision is detectable,
+    /// and it is the last place it is cheap to detect: both definitions are known here, while a
+    /// caller resolving the identity later sees only one answer and cannot tell that anything was
+    /// overwritten. Silently letting the later registration win is how a discovery cache change
+    /// retargets an existing approval, which is the outcome the tool contract forbids.
+    #[error("a tool with this identity is already registered with different content")]
+    ToolIdentityConflict,
+    /// One source identity was claimed by two different server configurations.
+    ///
+    /// This is the tool fabric's "source-identity collision" case. An identity names a **source**
+    /// as its owner and version, so two servers declaring `acme.files 1.0.0` are indistinguishable
+    /// by identity — and a second server that declares it inherits every approval recorded for the
+    /// first. Refusing the claim is what makes impersonation impossible rather than merely
+    /// detected later, and it is why the server **configuration** identity has to be part of what
+    /// is registered rather than only part of the cache key.
+    #[error("the source identity is already claimed by a different server configuration")]
+    ToolSourceConflict,
+    /// A tool identifier was looked up and is not registered.
+    #[error("the tool is not registered")]
+    ToolNotRegistered,
+    /// An approval transition was attempted from a state that does not permit it.
+    ///
+    /// Covers both an edge the approval diagram does not contain and a transition on a **terminal**
+    /// approval, because the two have the same cause: the approval's state does not allow the move.
+    /// A decision is immutable once terminal, so "approve an already-consumed approval" and
+    /// "consume a rejected one" are one class of refusal with two names for its states.
+    #[error("the approval state transition is not an allowed edge")]
+    ApprovalStateConflict {
+        /// The state the approval is actually in.
+        from: crate::tool::approval::ApprovalState,
+        /// The requested target state.
+        to: crate::tool::approval::ApprovalState,
+    },
+    /// An approval transition lost an optimistic-concurrency race.
+    #[error("the approval version conflicts with a concurrent transition")]
+    ApprovalVersionConflict {
+        /// The version the caller expected.
+        expected: crate::tool::approval::ApprovalVersion,
+        /// The version that is actually current.
+        actual: crate::tool::approval::ApprovalVersion,
+    },
+    /// An approval was presented for an action it did not approve.
+    ///
+    /// **A distinct error rather than a generic denial**, because a refusal of this kind needs a
+    /// different user action from every other: the approval exists, is unexpired, and is unconsumed,
+    /// so re-approving *the same action* changes nothing. The contract names the mechanism directly
+    /// — "approving 'send this email' does not approve a rewritten recipient, subject, body,
+    /// attachment, or account" — and this is the code that says so.
+    #[error("the approval does not cover this action")]
+    ApprovalFingerprintMismatch,
+    /// A tool-call transition was attempted from a state that does not permit it.
+    ///
+    /// Names both states because the executor's response depends on them: a call that cannot be
+    /// reserved is a duplicate submission, while a call that cannot be marked succeeded is a
+    /// lifecycle fault, and "the transition is not allowed" alone does not distinguish them.
+    #[error("the tool call state transition is not an allowed edge")]
+    ToolCallStateConflict {
+        /// The state the call is actually in.
+        from: crate::tool::ledger::ToolCallState,
+        /// The requested target state.
+        to: crate::tool::ledger::ToolCallState,
+    },
+    /// A tool-call transition lost an optimistic-concurrency race.
+    #[error("the tool call version conflicts with a concurrent transition")]
+    ToolCallVersionConflict {
+        /// The version the caller expected.
+        expected: crate::tool::ledger::ToolCallVersion,
+        /// The version that is actually current.
+        actual: crate::tool::ledger::ToolCallVersion,
+    },
 }
 
 impl DomainError {
@@ -196,6 +283,16 @@ impl DomainError {
             Self::ContextBudgetInvalid => "jarvis.context_budget_invalid",
             Self::ContextCandidatesUnbounded => "jarvis.context_candidates_unbounded",
             Self::ContextCandidateInvalid => "jarvis.context_candidate_invalid",
+            Self::ToolIdentifierNotCanonical => "tool.identifier_not_canonical",
+            Self::ToolDefinitionInvalid { .. } => "tool.definition_invalid",
+            Self::ToolIdentityConflict => "tool.conflict",
+            Self::ToolSourceConflict => "tool.source_conflict",
+            Self::ToolNotRegistered => "tool.not_found",
+            Self::ApprovalStateConflict { .. } => "approval.state_conflict",
+            Self::ApprovalVersionConflict { .. } => "approval.version_conflict",
+            Self::ApprovalFingerprintMismatch => "approval.fingerprint_mismatch",
+            Self::ToolCallStateConflict { .. } => "tool.state_conflict",
+            Self::ToolCallVersionConflict { .. } => "tool.version_conflict",
         }
     }
 
@@ -224,27 +321,61 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// A borrowed, namespaced error code with a `jarvis.` prefix.
+/// A borrowed, namespaced error code.
 ///
 /// This is a presentation type for boundaries (the error envelope emits
 /// `code`). It borrows a constant, so constructing it never allocates.
+///
+/// **A code is accepted when its first segment is a namespace JARVIS owns**, not only
+/// when it begins with `jarvis.`. The earlier rule tested the `jarvis.` prefix alone,
+/// and the contracts disagree with it: `tool-contract.md` defines sixteen codes under
+/// `tool.`, the approval contract twelve under `approval.`, and the model and storage
+/// contracts use `model.` and `storage.`. Two consequences followed, and the second is
+/// the one that matters. The tool-fabric codes would have been rewritten to
+/// `jarvis.internal`, so the sixteen codes the contract tells a client to branch on
+/// would **all have collapsed into one** — a client could no longer tell a rate limit
+/// from a rejection. And a namespace the contracts own could not be added without
+/// changing this function, so the rule that decided which codes may exist was written
+/// in a place the contract could not see.
+///
+/// A namespace list rather than a prefix test, because *any* dotted string starts with
+/// something: accepting everything would let a provider or a runtime name a code JARVIS
+/// then forwards to a client as though JARVIS had produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ErrorCode(&'static str);
 
 impl ErrorCode {
+    /// The namespaces the contracts define codes under.
+    ///
+    /// Order is irrelevant; this is a membership set, not a precedence order.
+    pub const NAMESPACES: &'static [&'static str] = &[
+        "jarvis", "tool", "approval", "model", "run", "stream", "storage", "event", "session",
+    ];
+
     /// Creates an error code from a namespaced string.
     ///
-    /// A code that does not carry the JARVIS prefix is replaced by
-    /// [`ErrorCode::INTERNAL`] so an accidental non-namespaced code can never
-    /// reach a client.
+    /// A code whose namespace JARVIS does not own is replaced by
+    /// [`ErrorCode::INTERNAL`], so an accidental or foreign code can never reach a
+    /// client as though JARVIS had produced it.
     #[must_use]
     pub const fn new(code: &'static str) -> Self {
-        // `starts_with` is const-stable for `&str`; fall back to a byte compare.
-        if starts_with(code.as_bytes(), CODE_PREFIX.as_bytes()) {
-            Self(code)
-        } else {
-            Self::INTERNAL
+        let bytes = code.as_bytes();
+        let mut index = 0;
+        while index < Self::NAMESPACES.len() {
+            let namespace = Self::NAMESPACES[index].as_bytes();
+            // Two conditions, and both are needed. The namespace must be followed by `.`, so
+            // `toolbox.x` is not `tool.x` — a boundary-only check would accept it. And there
+            // must be at least one character **after** the dot, because a namespace names a
+            // family of errors and not an error: `tool.` is the family with nothing in it.
+            if starts_with(bytes, namespace)
+                && bytes.len() > namespace.len() + 1
+                && bytes[namespace.len()] == b'.'
+            {
+                return Self(code);
+            }
+            index += 1;
         }
+        Self::INTERNAL
     }
 
     /// The code used when no more specific, namespaced code applies.
@@ -369,23 +500,107 @@ mod tests {
         codes.dedup();
         assert_eq!(codes.len(), errors.len(), "codes must be unique");
         for code in codes {
-            assert!(
-                code.starts_with("jarvis.") || code.starts_with("model."),
-                "code {code} must be namespaced",
+            // **Asserted through `ErrorCode::new` rather than against a hand-written prefix
+            // list**, because the prefix list is what was wrong: it admitted `jarvis.` and
+            // `model.` only, so a `tool.` or `approval.` code passed this loop and was then
+            // rewritten to `jarvis.internal` at the boundary. Asking the type that actually
+            // gates the boundary is the difference between testing the list and testing the
+            // rule. `jarvis.*` and `model.*` are covered as a consequence rather than by a
+            // special case.
+            assert_eq!(
+                ErrorCode::new(code).as_str(),
+                code,
+                "code {code} must be accepted by the boundary, not rewritten to {}",
+                ErrorCode::INTERNAL.as_str(),
             );
         }
     }
 
     #[test]
     fn error_code_rejects_a_non_namespaced_value() {
-        assert_eq!(
-            ErrorCode::new("tool.permission_denied"),
-            ErrorCode::INTERNAL
-        );
+        // A code whose namespace JARVIS does not own falls back to the internal code. This
+        // is the fail-closed direction: a foreign or accidental code must not reach a
+        // client as though JARVIS had produced it.
+        for foreign in [
+            "acme.thing",
+            "Tool.permission_denied",
+            "toolbox.x",
+            "tool.",
+            "tool",
+            "",
+            "toolx",
+        ] {
+            assert_eq!(
+                ErrorCode::new(foreign),
+                ErrorCode::INTERNAL,
+                "{foreign} must not be accepted as a JARVIS code",
+            );
+        }
         assert_eq!(
             ErrorCode::new("jarvis.invalid_timestamp").as_str(),
             "jarvis.invalid_timestamp",
         );
+    }
+
+    #[test]
+    fn every_namespace_the_contracts_define_is_accepted() {
+        // **This is the test whose absence let the defect survive.** The old assertion used
+        // `tool.permission_denied` — a code `tool-contract.md` defines — as its example of a
+        // value that must be REJECTED, so the single test covering the rule encoded the bug
+        // rather than catching it.
+        //
+        // The samples are a table compared against `NAMESPACES` as a **set in both directions**,
+        // rather than a `match` with a catch-all arm. A catch-all arm would accept a namespace
+        // added to `NAMESPACES` without a sample — the one change that could otherwise slip
+        // through, and the one that matters, since the sample is what proves the namespace is
+        // actually reached. Set equality makes either omission a failure.
+        let samples: [(&'static str, &'static str); 9] = [
+            ("jarvis", "jarvis.invalid_timestamp"),
+            ("tool", "tool.permission_denied"),
+            ("approval", "approval.required"),
+            ("model", "model.policy_not_found"),
+            ("run", "run.failed"),
+            ("stream", "stream.overrun"),
+            ("storage", "storage.transition_refused"),
+            ("event", "event.envelope_invalid"),
+            ("session", "session.expired"),
+        ];
+        let mut claimed: Vec<&str> = samples.iter().map(|(namespace, _)| *namespace).collect();
+        claimed.sort_unstable();
+        let mut declared: Vec<&str> = ErrorCode::NAMESPACES.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            claimed, declared,
+            "every declared namespace needs a sample here and every sample needs a declared \
+             namespace; a mismatch means one was added without the other",
+        );
+
+        for (namespace, sample) in samples {
+            assert_eq!(
+                ErrorCode::new(sample).as_str(),
+                sample,
+                "the {namespace} namespace must be accepted",
+            );
+            // The namespace **alone** is not a code: a family name names no error. Written as a
+            // literal pair rather than a concatenation because `ErrorCode::new` takes a
+            // `&'static str` and this must not allocate.
+            let bare = match namespace {
+                "jarvis" => "jarvis.",
+                "tool" => "tool.",
+                "approval" => "approval.",
+                "model" => "model.",
+                "run" => "run.",
+                "stream" => "stream.",
+                "storage" => "storage.",
+                "event" => "event.",
+                _ => "session.",
+            };
+            assert_eq!(
+                ErrorCode::new(bare),
+                ErrorCode::INTERNAL,
+                "the bare namespace {namespace} names no error",
+            );
+        }
     }
 
     #[test]

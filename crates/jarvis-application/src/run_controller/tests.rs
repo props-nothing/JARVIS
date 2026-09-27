@@ -610,14 +610,33 @@ async fn every_output_chunk_is_published_before_the_run_completes() {
         .iter()
         .position(|event| event.event_type == "run.completed")
         .expect("a terminal event exists");
+
+    // **This loop was a test that could not fail, and the reason is worth keeping.**
+    // It compared `event.event_type` against the literal `run.output_text_delta` — an underscore where
+    // the event this daemon actually publishes is `run.output_text.delta`, which a *different*
+    // assertion in this same file spells correctly. So the filter matched nothing, the body never
+    // executed, and the ordering property this test is named for was checked **zero** times. Nothing
+    // failed, because a `for` over an empty selection is still a passing `for`.
+    //
+    // Two fixes, because either alone leaves the trap. The name comes from the constant that owns the
+    // wire string, so a rename is a compile error rather than a silently empty filter; and the count
+    // is asserted **non-empty** first, because that is the assertion which turns "checked nothing" into
+    // "failed". This is the same shape as the resume test whose trigger sat inside the page it
+    // searched, and the same rule: when a filter can produce nothing, assert there is something.
+    let mut deltas_seen = 0_usize;
     for (index, event) in events.iter().enumerate() {
-        if event.event_type == "run.output_text_delta" {
+        if event.event_type == crate::live_events::OUTPUT_TEXT_DELTA_EVENT {
+            deltas_seen += 1;
             assert!(
                 index < terminal_index,
                 "a delta must be persisted before the terminal event",
             );
         }
     }
+    assert!(
+        deltas_seen > 0,
+        "the filter must have selected the run's own deltas, or this test checks nothing: {events:?}",
+    );
 }
 
 #[tokio::test]

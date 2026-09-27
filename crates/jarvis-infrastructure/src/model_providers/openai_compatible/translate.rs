@@ -66,6 +66,20 @@ pub struct ChunkTranslator {
     terminal_emitted: bool,
     /// How many deltas arrived after the terminal.
     late_deltas_ignored: u64,
+    /// How many chunks carried model-internal reasoning text, which was deliberately not translated.
+    ///
+    /// A **counter and not a discard**, because dropping this silently is the one thing it must not be.
+    /// The contract forbids persisting hidden reasoning, so the adapter cannot emit it — but a field
+    /// that is simply *never read* is indistinguishable from a field `translate` forgot, and the two
+    /// have opposite remedies. Counting it makes the decision **observable**: an operator debugging a
+    /// truncated-looking answer can see that the provider spent most of the stream on thinking, and a
+    /// future provider that renamed the field would show a count that stopped moving.
+    ///
+    /// Found by capturing a real stream from an operator-configured endpoint rather than by reading
+    /// the documented schema: `delta.reasoning` is **absent from the Chat Completions documented field
+    /// set** the evidence note's mapping table was built from, and present on most frames of every
+    /// stream this endpoint sends.
+    reasoning_chunks_ignored: u64,
     /// The provider's model identifier, reported on the first chunk that carries one.
     model: Option<String>,
     /// The tool calls this stream has announced, keyed by the provider's index for each.
@@ -110,6 +124,7 @@ impl ChunkTranslator {
             refused: false,
             terminal_emitted: false,
             late_deltas_ignored: 0,
+            reasoning_chunks_ignored: 0,
             model: None,
             tool_calls: std::collections::BTreeMap::new(),
         }
@@ -117,17 +132,45 @@ impl ChunkTranslator {
 
     /// Returns how many output deltas were translated.
     ///
-    /// Used by the adapter to report the measurement `BRN-011` aggregates, from the same counter the
-    /// events came from rather than a second tally that could disagree.
+    /// **`#[cfg(test)]`, and the doc used to say "used by the adapter".** It is not: nothing outside
+    /// this module reads any of this translator's counters, so the claim was a doc comment describing a
+    /// caller that does not exist — the same falsifiable shape as a `pub fn` whose only reference is
+    /// its own definition. The honest options are to wire them somewhere real or to say they are test
+    /// observations; wiring a counter into an observability surface is a feature this round is not,
+    /// and leaving them `pub` with a false claim would be worse than either.
+    ///
+    /// The measurement `BRN-011` aggregates is real and is *not* this counter: `model_calls` records
+    /// `output_delta_count` from the events the controller consumed, which is the value a resumed or
+    /// re-read run still has.
+    /// Test-observation only; see [`Self::delta_count`].
+    #[cfg(test)]
     #[must_use]
     pub const fn delta_count(&self) -> u32 {
         self.delta_count
     }
 
     /// Returns how many deltas arrived after the terminal and were discarded.
+    ///
+    /// Test-observation only; see [`Self::delta_count`].
+    #[cfg(test)]
     #[must_use]
     pub const fn late_deltas_ignored(&self) -> u64 {
         self.late_deltas_ignored
+    }
+
+    /// Returns how many chunks carried model-internal reasoning text.
+    ///
+    /// A **deliberate** drop rather than a gap: the contract's memory rules forbid persisting hidden
+    /// reasoning, so this text may not become an output event. Counting it is what makes the decision
+    /// distinguishable from a field the translator forgot, and the count is asserted by the tests
+    /// below — which is the honest description of what it is for, rather than implying an operator can
+    /// read it somewhere it is not exposed.
+    ///
+    /// Test-observation only; see [`Self::delta_count`].
+    #[cfg(test)]
+    #[must_use]
+    pub const fn reasoning_chunks_ignored(&self) -> u64 {
+        self.reasoning_chunks_ignored
     }
 
     /// Translates one parsed chunk document.
@@ -222,6 +265,30 @@ impl ChunkTranslator {
                 // The argument text is carried through unparsed for the same reason — the adapter
                 // transports, the fabric validates.
                 self.push_tool_calls(&mut events, delta);
+                // **Model-internal reasoning is counted and never translated.** The normalized stream
+                // *does* have a home for reasoning — `ModelStreamEventKind::ReasoningSummaryDelta` —
+                // and this is deliberately not sent there, which is the distinction that makes the
+                // decision a decision rather than a gap. That variant carries a **user-visible
+                // summary** the contract permits; `delta.reasoning` here is the raw thinking text,
+                // and the memory rules forbid persisting hidden reasoning. Mapping one onto the other
+                // would be the violation, with the event type making it look legitimate.
+                //
+                // It is a real provider field rather than a hypothetical one: a captured stream from
+                // an operator-configured endpoint carried `delta.reasoning` on most of its frames and
+                // carried the answer itself on one, and the field is **absent from the documented
+                // Chat Completions field set** this adapter's mapping table was built from. So the
+                // capture, not the schema, is what established its existence.
+                //
+                // Counting it is what stops the drop from being an omission: a field nobody reads is
+                // indistinguishable from a field the translator forgot, and the two have opposite
+                // remedies.
+                if delta
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    self.reasoning_chunks_ignored += 1;
+                }
                 if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
                     && !text.is_empty()
                 {
@@ -509,7 +576,6 @@ fn usage_from(usage: &serde_json::Value) -> Usage {
 mod tests {
     use super::{ChunkTranslator, Translated};
     use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
-
     fn chunk(text: &str) -> serde_json::Value {
         serde_json::from_str(text).expect("the fixture is valid JSON")
     }
@@ -536,6 +602,26 @@ mod tests {
         match translated {
             Translated::Events(events) => events,
             other => assert_unexpected(&format!("expected events, got {other:?}")),
+        }
+    }
+
+    /// The events a translation produced, treating a chunk that contributes nothing as no events.
+    ///
+    /// Distinct from [`kinds`], which asserts that events were produced: a frame whose fields are all
+    /// deliberately ignored — every frame carrying only model-internal reasoning, for instance —
+    /// legitimately produces `Ignored`, and a helper that treated that as a failure could not express
+    /// the assertion those tests need. Using the strict helper here would have made "reasoning produces
+    /// no event" into a panic rather than a check.
+    fn events_or_none(translated: Translated) -> Vec<ModelStreamEventKind> {
+        match translated {
+            Translated::Events(events) => events,
+            Translated::Ignored => Vec::new(),
+            // Named rather than a wildcard: a wildcard here would silently absorb a *new*
+            // `Translated` variant and map it to "no events", which is how a frame that failed to
+            // parse would start passing an assertion about frames that contributed nothing.
+            Translated::Malformed => {
+                assert_unexpected("expected events or nothing, got a malformed frame")
+            }
         }
     }
 
@@ -799,6 +885,137 @@ mod tests {
             Translated::Ignored,
         );
         assert_eq!(translator.delta_count(), 0);
+    }
+
+    #[test]
+    fn model_internal_reasoning_is_counted_and_never_becomes_output() {
+        // **Found by capturing a real stream, not by reading the documented schema.** Every frame of a
+        // live capture from an operator-configured endpoint carried `delta.reasoning` — the model's
+        // own thinking — and `reasoning` is **absent from the documented Chat Completions field set**
+        // this adapter's mapping table was built from. It reached the translator as one of the fields
+        // nobody had named, which is the one condition under which a field is neither translated nor
+        // deliberately dropped.
+        //
+        // Two properties, and the second is the one with teeth. The text must **not** become output,
+        // because the contract's memory rules forbid persisting hidden reasoning — and the fact that it
+        // was seen must be **counted**, because a silent drop is indistinguishable from a field the
+        // translator forgot to handle. A test asserting only the first would pass against an
+        // implementation that discarded the text without noticing it at all.
+        let mut translator = ChunkTranslator::new();
+        let translated = events_or_none(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The user wants"},"finish_reason":null}]}"#,
+        ))));
+        assert!(
+            translated.is_empty(),
+            "reasoning must produce no event at all: {translated:?}",
+        );
+        assert_eq!(
+            translator.reasoning_chunks_ignored(),
+            1,
+            "the reasoning text must be counted, or the drop is an omission rather than a decision",
+        );
+        assert_eq!(
+            translator.delta_count(),
+            0,
+            "reasoning is not an output delta, so it must not inflate the delivery measurement",
+        );
+
+        // **A frame carrying both must yield the answer and only count the thinking.** This is the
+        // real shape: the capture interleaves reasoning with an empty `content`, then sends the answer
+        // in a later frame. An implementation that treated a presence of `reasoning` as "skip this
+        // frame" would lose the answer on a provider that packs both together.
+        let both = events_or_none(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"content":"DONE PROBE","reasoning":"so just say it"},"finish_reason":null}]}"#,
+        ))));
+        // Asserted on the *delta* rather than on the whole event list: the translator opens its item
+        // lazily, so the first event is an `OutputItemAdded` whose identifier it generates. Pinning
+        // that here would make this test assert the translator's internal item management rather than
+        // the property it is about — which is that the answer survives and the thinking does not.
+        let deltas: Vec<&str> = both
+            .iter()
+            .filter_map(|kind| match kind {
+                ModelStreamEventKind::OutputTextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec!["DONE PROBE"],
+            "a frame carrying both must yield the answer and nothing else: {both:?}",
+        );
+        assert_eq!(translator.reasoning_chunks_ignored(), 2);
+        assert_eq!(translator.delta_count(), 1);
+
+        // An empty reasoning string is not a reasoning chunk, matching the empty-`content` rule: the
+        // documented first chunk carries `content: ""`, and counting that as an output delta was a
+        // defect once already.
+        let _ = translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"reasoning":""},"finish_reason":null}]}"#,
+        )));
+        assert_eq!(
+            translator.reasoning_chunks_ignored(),
+            2,
+            "an empty reasoning string is not a reasoning chunk",
+        );
+    }
+
+    #[test]
+    fn the_shape_of_a_captured_stream_from_a_real_endpoint_is_handled() {
+        // **Built from a real capture rather than from the documentation.** The frames below are
+        // transcribed from one stream from an operator-configured OpenAI-compatible endpoint, and this
+        // test exists because the capture disagreed with the schema in two ways that no
+        // documentation-derived fixture could have shown:
+        //
+        // 1. `delta.reasoning` appears on most frames and is **not in the documented field set**.
+        // 2. The stream really does end with `data: [DONE]`, which the evidence note records as
+        //    `OC-C004` and could not verify from the cited page — so `[DONE]`'s presence is now
+        //    **observed** rather than assumed.
+        //
+        // Its assertions are the *properties* the real stream must satisfy, not a recording of a
+        // particular run: the answer arrives exactly once, reasoning never becomes output, the final
+        // usage chunk has empty `choices` (the `OC-C003` shape), and the sentinel terminates nothing.
+        let frames = [
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"","reasoning":" user wants"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"DONE PROBE"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":38,"completion_tokens":22,"total_tokens":60}}"#,
+        ];
+        let mut translator = ChunkTranslator::new();
+        let mut output = String::new();
+        let mut terminals = 0_usize;
+        let mut usage_seen = 0_usize;
+        for frame in frames {
+            for kind in events_or_none(translator.translate(Some(&chunk(frame)))) {
+                match kind {
+                    ModelStreamEventKind::OutputTextDelta { delta, .. } => output.push_str(&delta),
+                    ModelStreamEventKind::CallCompleted { .. } => terminals += 1,
+                    ModelStreamEventKind::UsageUpdated { .. } => usage_seen += 1,
+                    _ => {}
+                }
+            }
+        }
+        // The sentinel last, exactly as the capture has it: it must contribute nothing and must not
+        // be a terminal, or a provider that omits it would end every stream differently.
+        assert_eq!(translator.translate(None), Translated::Ignored);
+
+        assert_eq!(
+            output, "DONE PROBE",
+            "the answer must be exactly the answer, with no reasoning text folded in",
+        );
+        assert_eq!(
+            translator.reasoning_chunks_ignored(),
+            2,
+            "both reasoning frames must be counted",
+        );
+        assert_eq!(
+            terminals, 1,
+            "one terminal, from the first non-null finish_reason"
+        );
+        assert_eq!(
+            usage_seen, 1,
+            "the empty-choices usage chunk must still report usage",
+        );
     }
 
     #[test]

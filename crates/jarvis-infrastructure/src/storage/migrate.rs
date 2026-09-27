@@ -282,6 +282,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idempotency_record_written_before_the_scope_change_survives_the_rebuild() {
+        // **`000007` REBUILDS a table, which no earlier migration here had done**, so the upgrade path
+        // needs its own evidence rather than relying on the `ADD COLUMN` case above. A rebuild that
+        // dropped rows would silently lose every pending idempotency key on upgrade — and the loss
+        // would surface as a client's retried command creating a *second* run, which is exactly what
+        // the key exists to prevent.
+        //
+        // Two properties are asserted, and the second is the one with teeth. The row must survive, and
+        // its `principal_id` must be **attributed from its run** rather than left blank: the run
+        // recorded who asked, and the record is about that same request, so attributing it is exact.
+        // A blank principal would make the row match nobody — indistinguishable from a key that was
+        // never used.
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-migrate-scope-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("the temp directory is creatable");
+        let path = directory.join("jarvis.sqlite");
+
+        seed_version_five(&path).await;
+        let workspace = seed_version_five_rows(&path).await;
+        // The idempotency record, written at the **pre-`000007`** shape. Three scope dimensions, as
+        // `000003` created it — this is the row an upgrading install actually has.
+        let key = "0195f4f0-18dc-729b-bb34-07e8c7627f21";
+        {
+            let database = Database::open(&path)
+                .await
+                .expect("the file database opens");
+            let run_id: String =
+                sqlx::query_scalar("SELECT id FROM agent_runs WHERE workspace_id = ? LIMIT 1")
+                    .bind(workspace.to_string())
+                    .fetch_one(database.pool())
+                    .await
+                    .expect("the seeded run is readable");
+            sqlx::query(
+                "INSERT INTO idempotency_records \
+                 (id, idempotency_key, workspace_id, operation, api_major, request_digest, \
+                  run_id, created_at) \
+                 VALUES (?, ?, ?, 'runs.create', 1, 'digest-a', ?, '2026-01-01T00:00:00Z')",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(key)
+            .bind(workspace.to_string())
+            .bind(&run_id)
+            .execute(database.pool())
+            .await
+            .expect("a pre-scope idempotency record is writable");
+        }
+
+        let database = Database::open(&path)
+            .await
+            .expect("the file database reopens");
+        run(database.pool()).await.expect("the upgrade applies");
+
+        // The row survived the rebuild, and its principal came from the run it names.
+        let (survived, principal, credential): (String, String, String) = sqlx::query_as(
+            "SELECT idempotency_key, principal_id, client_credential FROM idempotency_records \
+             WHERE workspace_id = ?",
+        )
+        .bind(workspace.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("the record survived the rebuild");
+        assert_eq!(survived, key, "the key must survive the table rebuild");
+        assert_eq!(
+            principal,
+            jarvis_domain::ids::PrincipalId::parse(
+                &sqlx::query_scalar::<_, String>(
+                    "SELECT principal_id FROM agent_runs WHERE workspace_id = ? LIMIT 1"
+                )
+                .bind(workspace.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("the run's principal is readable"),
+            )
+            .expect("the stored principal parses")
+            .to_string(),
+            "the record's principal must be attributed from the run it names, not left blank",
+        );
+        // The credential is the `unknown` sentinel, because nothing observed which one created the
+        // row — so an upgraded record never matches on that dimension, which is fail-closed.
+        assert_eq!(
+            credential, "unknown",
+            "a credential that was never recorded must not be invented",
+        );
+
+        // The table's shape, asserted rather than assumed: the rebuilt table must carry the five-part
+        // scope as a unique index, because that is what the contract says the scope *is*.
+        let scope: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_index_info('idx_idempotency_records_scope') ORDER BY seqno",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("the index catalog is readable");
+        assert_eq!(
+            scope,
+            vec![
+                "principal_id".to_owned(),
+                "workspace_id".to_owned(),
+                "client_credential".to_owned(),
+                "operation".to_owned(),
+                "api_major".to_owned(),
+                "idempotency_key".to_owned(),
+            ],
+            "the uniqueness scope must be the contract's five dimensions",
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
     async fn a_database_from_a_supported_prior_version_upgrades_in_place() {
         // `AGENTS.md` requires "test migrations from supported prior versions", and `000006` is the
         // first migration here that **alters a table which can already hold rows**: the four before

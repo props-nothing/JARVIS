@@ -493,6 +493,20 @@ pub struct NewIdempotencyRecord {
     pub key: String,
     /// The workspace the command was made in.
     pub workspace_id: WorkspaceId,
+    /// The **principal** that made the command.
+    ///
+    /// Part of the scope because the contract scopes idempotency to the authenticated principal, and
+    /// because a local profile has exactly **one** workspace shared by every enrolled client. Without
+    /// it, two clients presenting the same key inside that one workspace collided — and the replay
+    /// path resolved the original run by workspace alone, so a client could be handed another
+    /// client's run **and its conversation id**.
+    pub principal_id: PrincipalId,
+    /// The credential the command was authenticated with.
+    ///
+    /// Stored as a digest of the presented credential, never the credential itself, and the contract
+    /// names it as part of the scope. A principal can hold more than one credential, so recording it
+    /// makes a rotation **observable** rather than indistinguishable from a plain replay.
+    pub client_credential: String,
     /// The operation the key was used for.
     pub operation: String,
     /// The digest of the canonical request.
@@ -850,6 +864,7 @@ pub trait RunRepository: Send + Sync {
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,
+        principal: PrincipalId,
         operation: &str,
         key: &str,
     ) -> RepositoryFuture<'_, Option<(String, RunId)>>;

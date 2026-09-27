@@ -87,9 +87,16 @@ pub use jarvis_domain::run::budget::DEFAULT_RUN_DEADLINE_MS as DEFAULT_RUN_BUDGE
 
 /// The scoped operation name for run creation, used in the idempotency key.
 pub const CREATE_OPERATION: &str = "runs.create";
-
 /// The scoped operation name for cancellation, used in the idempotency key.
 pub const CANCEL_OPERATION: &str = "runs.cancel";
+
+/// The scope value recorded for a command that arrived with **no** credential.
+///
+/// A digest is a hex string, so a word cannot collide with one — which is what makes this a usable
+/// sentinel rather than a magic value that happens to fit. It exists because "authenticated with no
+/// credential" and "authenticated with a credential whose digest is empty" are different facts, and
+/// collapsing them would let an in-process caller's record match an HTTP caller's.
+pub const UNCREDENTIALED_CLIENT: &str = "uncredentialed";
 
 /// The data-classification label a run's objective carries.
 ///
@@ -518,7 +525,12 @@ impl RunService {
         if let Some((digest, original)) = self
             .ports
             .runs
-            .lookup_idempotency(context.workspace_id, CREATE_OPERATION, idempotency_key)
+            .lookup_idempotency(
+                context.workspace_id,
+                context.principal_id,
+                CREATE_OPERATION,
+                idempotency_key,
+            )
             .await?
         {
             // The digest needs the conversation id, which a replay does not know, so a
@@ -561,6 +573,14 @@ impl RunService {
                 NewIdempotencyRecord {
                     key: idempotency_key.to_owned(),
                     workspace_id: context.workspace_id,
+                    principal_id: context.principal_id,
+                    // The context carries a **digest**, never the credential, and an absent one is an
+                    // in-process caller rather than an empty credential — so the recorded scope states
+                    // which of the two it was instead of collapsing them.
+                    client_credential: context
+                        .client_credential
+                        .clone()
+                        .unwrap_or_else(|| UNCREDENTIALED_CLIENT.to_owned()),
                     operation: CREATE_OPERATION.to_owned(),
                     request_digest: digest,
                     run_id,
@@ -618,6 +638,22 @@ impl RunService {
         original: RunId,
     ) -> Result<CreatedRun, RunServiceError> {
         let stored = self.ports.runs.load(context.workspace_id, original).await?;
+        // **A replay must be a replay of THIS principal's command, and this is the second of two
+        // independent guards.** The record is scoped by principal, so a lookup can only return one this
+        // caller owns — and *that* scoping is what the adapter test falsifies, since widening the
+        // `WHERE` clause there is exactly the defect this round fixed. This guard covers the future
+        // case rather than the present one: the defect was a query that omitted the principal, so a
+        // check at the read point survives the same widening happening again.
+        //
+        // **Stated because it was measured, not assumed:** disabling this condition leaves
+        // `one_clients_idempotency_key_cannot_replay_another_clients_run` **passing**, because the
+        // scoped lookup returns nothing for the second principal and the service creates a fresh run.
+        // So the test does not cover this guard, and claiming it did would be false. The mismatch is a
+        // **conflict** rather than a not-found: the key genuinely exists and belongs to somebody else,
+        // which is what the contract's "same key with different input" answer describes.
+        if stored.principal_id != context.principal_id {
+            return Err(RunServiceError::IdempotencyConflict);
+        }
         Ok(CreatedRun {
             run_id: stored.id,
             conversation_id: stored.conversation_id,
@@ -754,6 +790,11 @@ impl RunService {
             .claim_idempotency(NewIdempotencyRecord {
                 key: idempotency_key.to_owned(),
                 workspace_id: context.workspace_id,
+                principal_id: context.principal_id,
+                client_credential: context
+                    .client_credential
+                    .clone()
+                    .unwrap_or_else(|| UNCREDENTIALED_CLIENT.to_owned()),
                 operation: CANCEL_OPERATION.to_owned(),
                 request_digest: digest,
                 run_id: run,

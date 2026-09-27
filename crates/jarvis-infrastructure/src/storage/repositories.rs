@@ -482,18 +482,24 @@ async fn insert_run(
 async fn read_idempotency<'e, E>(
     executor: E,
     workspace: WorkspaceId,
+    principal: PrincipalId,
     operation: &str,
     key: &str,
 ) -> Result<Option<(String, String)>, RepositoryError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    // **The principal is part of the lookup, not only of the insert.** Scoping the uniqueness
+    // constraint without scoping the read would let one principal's key resolve another principal's
+    // record — which is the whole defect the constraint change exists to close, moved one statement
+    // along rather than removed.
     sqlx::query_as(
         "SELECT request_digest, run_id FROM idempotency_records \
-         WHERE workspace_id = ? AND operation = ? AND api_major = ? \
+         WHERE workspace_id = ? AND principal_id = ? AND operation = ? AND api_major = ? \
            AND idempotency_key = ?",
     )
     .bind(workspace.to_string())
+    .bind(principal.to_string())
     .bind(operation)
     .bind(i64::from(crate::http::API_MAJOR))
     .bind(key)
@@ -921,6 +927,7 @@ impl RunRepository for SqliteRepositories {
             let existing = read_idempotency(
                 &self.pool,
                 record.workspace_id,
+                record.principal_id,
                 &record.operation,
                 &record.key,
             )
@@ -953,13 +960,15 @@ impl RunRepository for SqliteRepositories {
 
             let inserted = sqlx::query(
                 "INSERT INTO idempotency_records (\
-                     id, idempotency_key, workspace_id, operation, api_major, \
-                     request_digest, run_id, created_at\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     id, idempotency_key, workspace_id, principal_id, client_credential, \
+                     operation, api_major, request_digest, run_id, created_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid::Uuid::now_v7().to_string())
             .bind(&record.key)
             .bind(record.workspace_id.to_string())
+            .bind(record.principal_id.to_string())
+            .bind(&record.client_credential)
             .bind(&record.operation)
             .bind(i64::from(crate::http::API_MAJOR))
             .bind(&record.request_digest)
@@ -982,6 +991,7 @@ impl RunRepository for SqliteRepositories {
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,
+        principal: PrincipalId,
         operation: &str,
         key: &str,
     ) -> RepositoryFuture<'_, Option<(String, RunId)>> {
@@ -990,7 +1000,8 @@ impl RunRepository for SqliteRepositories {
         let operation = operation.to_owned();
         let key = key.to_owned();
         Box::pin(async move {
-            let found = read_idempotency(&self.pool, workspace, &operation, &key).await?;
+            let found =
+                read_idempotency(&self.pool, workspace, principal, &operation, &key).await?;
             found
                 .map(|(digest, run_id)| {
                     Ok((
@@ -1026,6 +1037,7 @@ impl RunRepository for SqliteRepositories {
             let existing = read_idempotency(
                 &mut *tx,
                 record.workspace_id,
+                record.principal_id,
                 &record.operation,
                 &record.key,
             )
@@ -1046,13 +1058,15 @@ impl RunRepository for SqliteRepositories {
 
             let inserted = sqlx::query(
                 "INSERT INTO idempotency_records (\
-                     id, idempotency_key, workspace_id, operation, api_major, \
-                     request_digest, run_id, created_at\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     id, idempotency_key, workspace_id, principal_id, client_credential, \
+                     operation, api_major, request_digest, run_id, created_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid::Uuid::now_v7().to_string())
             .bind(&record.key)
             .bind(record.workspace_id.to_string())
+            .bind(record.principal_id.to_string())
+            .bind(&record.client_credential)
             .bind(&record.operation)
             .bind(i64::from(crate::http::API_MAJOR))
             .bind(&record.request_digest)

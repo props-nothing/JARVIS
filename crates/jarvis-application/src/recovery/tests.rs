@@ -510,10 +510,12 @@ impl RunRepository for StallingWrites {
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,
+        principal: PrincipalId,
         operation: &str,
         key: &str,
     ) -> crate::repository::RepositoryFuture<'_, Option<(String, RunId)>> {
-        self.inner.lookup_idempotency(workspace, operation, key)
+        self.inner
+            .lookup_idempotency(workspace, principal, operation, key)
     }
 
     fn create_run_idempotent(
@@ -848,6 +850,7 @@ async fn a_read_failure_is_reported_rather_than_looking_like_a_clean_pass() {
         fn lookup_idempotency(
             &self,
             _workspace: WorkspaceId,
+            _principal: PrincipalId,
             _operation: &str,
             _key: &str,
         ) -> crate::repository::RepositoryFuture<'_, Option<(String, RunId)>> {

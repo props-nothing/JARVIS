@@ -1367,6 +1367,70 @@ Foundation TODO remains incomplete.
     (`OverranBeforeAnyEvent` vs `OverrunBudgetExhausted`).
   - 1144 workspace tests (+8: 4 in `jarvis-protocol`, 1 in `jarvis-infrastructure`, 3 in `jarvis-cli`).
     All five gates + `cargo doc` green. **DO NOT COMMIT.**
+  - **Two defects found by sweeping this round's own work, both of the same class this project has now
+    seen six times — "a value that exists but is enforced nowhere".**
+    1. **A bound I had written one round earlier and never enforced.**
+       `MAX_STREAM_BYTES_PER_DELIVERY` was declared in `jarvis-protocol` with a doc comment calling it
+       "the largest number of bytes the daemon will spend handing one event to one follower", and its
+       reference count was **exactly one — its own definition**. Nothing read it, no test named it, and
+       it had no enforcement point; the honest fix was deletion, because the byte bound does not exist
+       and the *time* bound is what implements the disconnect. **The trap is that a declared bound
+       reads as coverage**: had it not been deleted, the next reader would have concluded that frames
+       are size-bounded, which is the belief the constant's own comment states. Sweep the constants you
+       *added* in the previous round, not only the ones an earlier round left behind.
+    2. **A test that could not fail, in the same crate.** `every_output_chunk_is_published_before_the_run_completes`
+       filtered `event.event_type == "run.output_text_delta"` — an **underscore** where the event this
+       daemon publishes is `run.output_text.delta`, which a *different* assertion **in the same file**
+       spells correctly. So the filter matched nothing, the loop body never executed, and the ordering
+       property the test is named for was checked **zero** times. Nothing failed, because a `for` over
+       an empty selection is still a passing `for`. Fixed in the two ways that each half a trap: the
+       name now comes from `OUTPUT_TEXT_DELTA_EVENT` (a rename becomes a compile error rather than a
+       silently empty filter), and a **non-empty precondition** is asserted, which is what turns
+       "checked nothing" into "failed". **Falsified** by restoring the underscore, which fails with the
+       event dump showing the two real deltas at sequences 5 and 6. This is the same shape as the
+       resume test whose trigger sat inside the page it searched.
+    - The generalisable rule, stated because it has now caught two different bugs: **when a filter can
+      produce nothing, assert there is something before asserting a property of the contents.** A
+      property over ∅ is vacuously true, so an empty selection and a correct one are indistinguishable
+      from the assertion alone. A `for`-over-filter sweep found no other instance of this shape in the
+      workspace, and the remaining `filter`s each have a non-empty precondition of their own.
+  - 1144 workspace tests (unchanged: the corrected test replaces its own body). All five gates +
+    `cargo doc` green. **DO NOT COMMIT.**
+  - **A raw capture of a real stream closed `OC-C004`'s open half and found a field the documented
+    schema does not have.** The `[DONE]` question had been recorded as UNVERIFIED for rounds because
+    the cited OpenAI page does not mention the sentinel, and the fix the evidence note named was to
+    *capture one stream from the operator-configured endpoint* — which is what an Ollama instance on
+    loopback makes possible without a credential.
+    - **`[DONE]` exists.** The capture ends `data: [DONE]\n\n`, so `OC-C004`'s `[DONE]` half moves from
+      `UNVERIFIED` to `OBSERVED`. It also carries `finish_reason: "stop"` **before** the sentinel, so
+      the adapter's deliberate refusal to *depend* on `[DONE]` is vindicated for this server rather
+      than merely defensible.
+    - **`delta.reasoning` was on most of the frames and is absent from the documented field set.** The
+      capture's shape is five frames of model-internal thinking with an empty `content`, then the
+      answer, then the terminal, then a usage chunk, then `[DONE]`. The adapter already discarded that
+      text — by the accident of reading only `content`, `tool_calls`, and `refusal`, which is exactly
+      the defect: **a field no code names is indistinguishable from a field the translator forgot, and
+      the two have opposite remedies.** One is a security decision to preserve, the other a bug.
+    - Fix: `reasoning_chunks_ignored` counts it and it is **never** translated, with the code stating
+      why it is not mapped onto `reasoning.summary.delta` — that event carries a *user-visible summary*
+      the contract permits, while this is raw thinking the memory rules forbid persisting, so mapping
+      one onto the other would be the violation wearing a legitimate event name.
+    - **Falsified** by emptying the increment, which fails both new tests. One of them is built from the
+      **captured frames themselves**, so the fixture and the wire cannot drift.
+    - **The generalisable rule, and this note has now taught it three times:** a documented field set is
+      a claim about a *page*, not about an endpoint. Every mapping row in the evidence note was derived
+      from the documentation, and two of the three things a real server forced are things the
+      documentation does not contain.
+  - **Two accessors whose doc comment described a caller that does not exist.** `delta_count()` claimed
+    "Used by the adapter to report the measurement `BRN-011` aggregates" — and nothing outside the
+    module reads it, which a reference count showed immediately. `late_deltas_ignored()` and the new
+    `reasoning_chunks_ignored()` are in the same position. They are now `#[cfg(test)]` with an honest
+    doc, because the alternatives are worse: leaving them `pub` with a false claim is the defect this
+    project keeps finding, and wiring a counter into an observability surface is a feature this round
+    is not. **The measurement `BRN-011` aggregates is real and is not this counter** — `model_calls`
+    records `output_delta_count` from the events the controller consumed, which is the value a re-read
+    run still has.
+  - 1146 workspace tests (+2). All five gates + `cargo doc` green. **DO NOT COMMIT.**
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior. This TODO owns the run controller and the repositories' test
   doubles: `jarvis_application::run_controller` drives one durable run from
@@ -1614,7 +1678,93 @@ Foundation TODO remains incomplete.
   the run live, a deadline already passed, each consumption ceiling, a refusal settling the run, and
   the tool-intent refusal — but they are distributed across `run_controller`, `run_service`, and the
   HTTP surface rather than gathered as the contract test 7/8 suites `BRN-009` names, and the
-  contract's disconnect/reconnect cases belong to `BRN-008`'s journey. **DO NOT COMMIT.**
+  contract's disconnect/reconnect cases belong to `BRN-008`'s journey.
+  - **Contract test 7's sequence-gap case is now implemented, and it was the one part of that sentence
+    no code honoured.** The contract requires that clients "never ignore a sequence gap"; the reference
+    client satisfied that by **not looking** — it parsed `event_id`, `event` and the payload, and never
+    read `sequence` at all, so a gap could not be noticed because the value was never read. That is the
+    same failure the rule names, reached by omission instead of by decision, and it is the worse version:
+    the client keeps printing across the gap and delivers two halves of an output that were never
+    adjacent, as a complete answer.
+    - **A gap is fatal rather than resumable, and the reason is that it is unrepairable.** The client
+      cannot know which events it missed or whether they are still retained, and its one recovery
+      mechanism — `Last-Event-ID` — re-reads from the position it already reached, leaving the gap exactly
+      where it was. So the check **outranks the retry decision**, because a gap consulted through the
+      retry path would be answered as a dropped connection and reconnected.
+    - **Two boundaries keep it from refusing healthy streams.** A resumed stream's first frame is exempt
+      (`Last-Event-ID` resumes *strictly after* the named event, so requiring contiguity across a
+      reconnect would refuse the client's own recovery path), and a frame with no readable `sequence` is
+      not a gap (inventing one from an absent field would refuse a stream the daemon is sending
+      correctly). A fresh stream must still open at sequence 1, which is asserted separately.
+    - **⚠ The first version of the end-to-end test was vacuous, and the mutation is what said so.**
+      It ended the stubbed body after the gapped frames, and disabling the entire gap check **passed**:
+      a stream with no terminal event fails the follow as `EndedWithoutTerminal` whether or not the gap
+      was noticed, so `assert_ne!(SUCCESS)` held for the wrong reason. The stream now carries a terminal,
+      so only a client that notices the gap fails — verified by re-running the same mutant, which then
+      failed. **A gap-ignoring client has to be able to succeed for the assertion to be about the gap**,
+      which is the same "assert there is something before asserting a property of it" rule that found
+      the underscore defect in round 79, applied to a test's *expectation* rather than to its filter.
+    - Checked against a **real socket**, not only as a pure function: a stub listener on an ephemeral
+      loopback port serves a stream, so the wiring is exercised rather than assumed. A correct function
+      nothing calls is precisely the shape of the original defect.
+    - **Still outstanding for `BRN-009`:** the deterministic suites are still distributed rather than
+      gathered, and contract test 8's cancellation-race half remains `BRN-008`'s journey. **DO NOT COMMIT.**
+  - **The idempotency scope was three dimensions of the contract's five, and the gap was a disclosure.**
+    `BRN-007`'s outstanding item said "`Idempotency-Key` scoping per principal and credential rather
+    than per client". The migration that created the table keyed on `(workspace_id, operation,
+    api_major)` while its own comment claimed the contract's five — so the omission **read as
+    implemented**. What it permitted: a local profile has exactly ONE workspace
+    (`DEFAULT_WORKSPACE_UUID`) shared by every enrolled client, while each client resolves to its own
+    principal. Two clients presenting the same key collided, and `replayed_run` resolved the original
+    run by workspace only — so the second client was handed the first client's `run_id` **and its
+    `conversation_id`**, a handle onto another client's conversation. The keys are guessable in
+    practice: the CLI derives one from the clock and its process id.
+    - Fix is two dimensions and a check: `000007` rebuilds the table with `principal_id` and a
+      `client_credential` **digest** in the unique index (`UNIQUE` is a table constraint in `000003`
+      and cannot be dropped, so the table is rebuilt rather than altered); the adapter's insert, its
+      lookup, and the in-memory double all name the principal; and `replayed_run` refuses a record it
+      does not own. The credential is a digest because a secret has no place in a durable row — and
+      recording it is what makes a rotation **observable** rather than a silent match.
+    - **⚠ A guard I added is not covered by the test I wrote for it, and the mutation is what said
+      so.** Disabling the ownership check in `replayed_run` leaves
+      `one_clients_idempotency_key_cannot_replay_another_clients_run` **passing**, because the scoped
+      lookup returns nothing for the second principal and the service creates a fresh run. The real
+      guard is the `WHERE` clause, which the adapter test does falsify (dropping `principal_id` there
+      fails it with `left: None, right: Some(...)`). The check stays as defence in depth and the code
+      says plainly that its test does not cover it.
+    - **A migration defect the tests caught, and the fix is the shape.** My first version did
+      `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ''` and then rebuilt — and the rebuild's `INSERT`
+      ran **before** the backfill could matter, so the insert failed on the NOT NULL constraint. The
+      rebuild now populates every column in the statement that creates the rows, which also makes a row
+      with an unset principal **unrepresentable** rather than merely absent. Diagnosed by temporarily
+      distinguishing the two insert failures from a generic conflict — a five-minute probe that a
+      generic `Err(_) => Conflict` had hidden.
+    - **A bulk edit silently changed a test's key.** Converting the record literals to
+      `..idempotency_record()` also moved `"key-1"` out of the first claim, so the "reused key" test
+      claimed with one key and conflicted against another. Caught by the test failing, not by review.
+    - **`000007` rebuilds a table, which no migration here had done before, so the upgrade path got
+      its own evidence.** `an_idempotency_record_written_before_the_scope_change_survives_the_rebuild`
+      seeds a record at the **pre-`000007`** three-column shape and asserts the row survives and its
+      `principal_id` is **attributed from the run it names** — exact rather than guessed, since
+      `agent_runs.principal_id` is NOT NULL and the record's `run_id` is a foreign key to it. It also
+      reads the created index back from `pragma_index_info` and asserts the six-part scope, which is
+      the contract as a thing the database can be asked about.
+      **All three assertions were falsified by mutation**, which is what makes them evidence: removing
+      the backfill fails with `left: "unknown", right: <the run's principal>`; dropping `principal_id`
+      from the index fails the scope assertion; and emptying the rebuild's `SELECT` fails the survival
+      assertion with `RowNotFound`. The first is the one that matters most — the failure it guards
+      against is an upgraded install silently losing a pending key and creating a **second** run for a
+      retried command, which is the exact thing the key exists to prevent.
+  - **The failing journeys were a stale binary, not a regression — and only rebuilding said so.** The
+    first sweep returned `disconnect=1`, `policy=1`, `provider=1` with `the create was refused with
+    409` (`idempotency.conflict`), which looked like the scope change rejecting a legitimate replay.
+    It was not: `cargo test` builds test targets, not the `target/debug` binaries the journeys execute,
+    so the journeys were still driving the **previous** round's `jarvisd` against a database the new
+    migration had already upgraded. A rebuild made all eight pass unchanged. **The lesson is the order:
+    a journey sweep is only meaningful after `cargo build`, and a `409` on a fresh key is a build-age
+    symptom before it is a scoping symptom.**
+  - 1157 workspace tests (+3: the adapter half, the service half, and the migration upgrade).
+    All gates green, all eight journeys green. **DO NOT COMMIT.**
 - [~] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider
   disclosures/effective decisions. **The rules, the evidence predicates, and the
@@ -3548,13 +3698,352 @@ Foundation TODO remains incomplete.
 
 Dependencies: Milestone 2 exit gate.
 
-- [ ] `TLS-001` Define canonical tool schema, identity, origin, effects, scopes,
-  risk, timeout, and retry metadata.
-- [ ] `TLS-002` Implement registry discovery independently from grants.
-- [ ] `TLS-003` Implement input/output validation and bounded result storage.
-- [ ] `TLS-004` Implement deterministic policy evaluation and explainable decisions.
-- [ ] `TLS-005` Implement durable approval records and action fingerprinting.
-- [ ] `TLS-006` Implement idempotent tool-call ledger and execution state machine.
+- [x] `TLS-001` Define canonical tool schema, identity, origin, effects, scopes,
+  risk, timeout, and retry metadata. Owns `jarvis_domain::tool`: the definition, its
+  canonical identity, and the classification it declares. **A discovery defect in the
+  error-code boundary was found and fixed while building this** — see below, because it is
+  the more consequential of the two changes.
+  Evidence: `identity.rs` holds `ToolCapability` (`namespace.name@major`),
+  `ToolVersion`, `SourceKind`, `ToolSource`, and `SchemaFingerprint`.
+  **`ToolIdentity` has no display-name field**, which is what makes the contract's
+  "names are aliases" rule structural rather than documented: `ToolIdentity::authorizes`
+  is the single place that decides whether a recorded grant still covers a tool, and
+  `ACC-024` — *"replace an MCP/plugin tool schema/source behind the same display name;
+  existing approval/grant cannot authorize the replacement"* — is now an executable test
+  (`an_approval_for_a_tool_does_not_authorize_a_replacement_behind_the_same_name`) that
+  asserts an unchanged display name and an unchanged capability while the source **and**
+  the schema change, because a naive check comparing names or capabilities alone would
+  pass exactly that scenario. Three further facts prevent the replacement:
+  `SchemaFingerprint` requires the `sha256:` prefix rather than a bare digest, so a
+  digest from another algorithm cannot compare equal; `SourceKind` distinguishes an MCP
+  server from a native tool so two servers publishing one capability are different tools;
+  and the major version is part of the capability, so `@2` is a *different* tool rather
+  than a replacement of `@1` (`is_replacement_of` and `authorizes` are separate answers
+  because "the tool you approved was replaced" is a different operator conversation from
+  "that tool is not this one").
+  **Four falsifications, each reverting one rule to its naive form.** Replacing
+  `authorizes`' whole-tuple comparison with a capability-only comparison fails
+  `the_same_name_from_a_different_source_is_not_the_same_tool` and
+  `a_changed_schema_under_the_same_source_is_not_the_same_tool` — that is `ACC-024`
+  failing exactly as written. Making `is_replacement_of` always `false` fails both.
+  Allowing an empty effect list fails `a_definition_may_not_declare_no_effects`.
+  Disabling the risk/approval rule fails
+  `a_high_risk_tool_with_no_scopes_may_not_default_to_allow`.
+  `classification.rs` holds the closed sets (`Effect`, `Risk`, `ApprovalHint`,
+  `Idempotency`) and their parsers, each of which **refuses** an unknown value rather
+  than defaulting: the fail-open default of each — an unknown effect ignored, `severe`
+  read as `Low`, `maybe` read as `Allow`, `probably` read as `NaturallyIdempotent` (which
+  would skip the reservation) — is the arm a catch-all would have written, and each is
+  asserted by its own field name. `DataClasses` reuses the model gateway's `Sensitivity`
+  rather than defining a second ladder, and refuses an output classified **below** its
+  input: a result is derived from the arguments, so the only direction derivable from the
+  input alone is upward, and allowing the other would let a tool launder a classification.
+  `definition.rs` enforces the cross-field rules — a non-empty effect list, `read_only`
+  not combined with another effect, a high-risk tool with no scopes not defaulting to
+  `Allow`, and the capability's major matching the release's.
+  - **⚠ The more consequential find: the error-code boundary recognized only the `jarvis.`
+    prefix, and the contracts define codes under nine namespaces.** `ErrorCode::new` was
+    covered by exactly one test, and that test used **`tool.permission_denied` — a code
+    `tool-contract.md` defines — as its example of a value that must be REJECTED.** So the
+    single test for the rule encoded the bug instead of catching it, and the consequence
+    was not cosmetic: the tool contract's sixteen `tool.*` codes, the approval contract's
+    twelve `approval.*` codes, and the `run.`, `stream.`, and `storage.` families would all
+    have been rewritten to `jarvis.internal` at the boundary, so a client told to branch on
+    `tool.rate_limited` or `tool.permission_denied` could no longer tell a rate limit from a
+    rejection. The fix is a namespace **set** (membership, not a prefix test — any dotted
+    string starts with something, so accepting everything would let a provider name a code
+    JARVIS forwards as its own), requiring a separator and a non-empty segment so `toolbox.x`
+    and the bare `tool.` are refused. Falsified three ways: reinstating the old
+    prefix-only rule ahead of the set fails the namespace test, dropping the separator check
+    fails on `toolbox.x`, and allowing a bare namespace fails on `tool.` — and the namespace
+    test compares its sample table against `ErrorCode::NAMESPACES` as a **set in both
+    directions**, so adding a namespace without proving it is reached cannot pass.
+    `common-conventions.md` now states the nine namespaces normatively, so the rule that
+    decides which codes may exist is visible where the contract is rather than only in the
+    function.
+  - 30 domain tests in `tool_tests.rs` plus 3 for the namespace rule. 1186 workspace tests.
+    All gates green. **DO NOT COMMIT.**
+  **Not done**, and deliberately not claimed: this is the *definition* only. There is no
+  registry, no discovery, no validation of arguments against the schema, no policy
+  evaluation, no approval record, no execution, and no call ledger — those are `TLS-002`
+  through `TLS-006`, and `TLS-001`'s own text asks only for the metadata. The
+  `input_schema`/`output_schema` documents are **not stored on the definition**: the
+  contract lists them, and what exists is the *fingerprint* of the input schema, which is
+  the part identity binds to. Holding the schema text needs a JSON implementation in the
+  domain or an adapter that owns the schema subset, and neither exists yet, so the field
+  would be a place to put a document nothing reads — the `model_calls` shape this project
+  keeps finding. It is named here rather than added empty.
+- [x] `TLS-002` Implement registry discovery independently from grants. Owns
+  `jarvis_domain::tool::registry` and `jarvis_domain::tool::discovery`.
+  Evidence: the word the TODO turns on is **independently**, and the architecture states both
+  halves of why: *"Tool discovery never grants execution permission"* and *"Selection affects
+  model context, not authorization at execution time"*. So `ToolRegistry` answers exactly one
+  question — which definitions exist — and holds **no grants at all**, which is asserted as a
+  structural test rather than a claim: the test reaches every type a caller can get from the
+  registry and shows they carry classification (`effects`, `risk`) and no permission, because a
+  registry that grew an `allowed: bool` would be a second authorization decision living beside
+  the policy layer and the one consulted first would be the one that mattered.
+  Two of the tool fabric's own required tests are now executable, and both are silent failures
+  in a naive implementation:
+  - **"tool-name and source-identity collision."** An identity names a *source* as its owner and
+    version, and those come from the server's own manifest — **untrusted input**. Two servers
+    both declaring `acme.files 1.0.0` produce the *same identity*, so the second inherits every
+    approval recorded for the first. The trusted side of the check is therefore the **server
+    configuration identity**, which is why the registry records it (and why it is a separate type
+    from `ToolSource`: one is JARVIS-assigned and trusted, the other is a claim the tool makes).
+    A second server claiming a known source is refused **unconditionally** — even with
+    `RegistrationRequest::replacing`, because the collision is the thing a replacement flag would
+    be used to authorize. `deregister` releases the claim when the source's **last** tool goes,
+    and a test asserts both sides: removing one of two tools keeps the claim, since otherwise a
+    rogue server could claim a source the first still offers a tool under.
+  - **"stale discovery cache and source replacement."** The contract's cache key lists five
+    scopes plus the list-result version, and `DiscoveryCacheKey` holds them together so a partial
+    key is **unrepresentable** rather than remembered. `a_scope_differs_when_any_scope_component_differs`
+    varies each of the five one at a time and requires a different key; `invalidate_server` drops
+    every answer from a replaced server (the enumeration a caller would get wrong);
+    `invalidate_below_version` sweeps a superseded list version per server; and staleness is
+    **counted separately from a miss** because "no answer was ever computed" and "your answer is
+    out of date" lead a caller to different next steps.
+  - **The disclosure case the key exists for.** A local profile has ONE workspace shared by every
+    client, each with its own principal, so a cache keyed on the server and workspace but not the
+    principal answers one client's discovery call with another's catalog. That is the same
+    three-of-five-dimensions shape `BRN-007`'s idempotency key had, and the test states it as a
+    scenario (`an_answer_computed_for_one_principal_is_not_served_to_another`) rather than as an
+    assertion about key equality.
+  - **Four falsifications.** Making the source-claim check unreachable fails 2 tests; making
+    freshness unenforced fails 3; making the existing-identity branch unreachable fails 4; and
+    **dropping the principal from the discovery scope fails 5, including the disclosure test**.
+    A fifth mutation (not storing a permitted replacement) did **not compile** and was redone in
+    a form that did, because a mutation that fails to compile is not evidence.
+  - A registration is **idempotent when nothing changed** (`Unchanged`, because a server re-lists
+    its tools on every reconnect and refusing that would make a healthy reconnect look like an
+    attack) and a **permitted change reports itself** (`Replaced`) so an adapter can log that an
+    approval must be re-obtained rather than recording success while the implementation behind a
+    live approval changed.
+  - 24 registry tests. 1210 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done**, and named: nothing *calls* the registry yet — there is no MCP client, no adapter
+  that computes a schema fingerprint, and no HTTP route, so the registry is a complete domain
+  capability with no producer. `TLS-003` (argument validation against the schema) and `TLS-004`
+  (policy) are the next consumers, and until one exists the registry is exercised only by its own
+  tests. `DiscoveryScope` deliberately has **no `expires_at` field**: the TTL is applied when the
+  answer is stored (`DISCOVERY_TTL_DAYS`) rather than carried in the key, because a key that
+  varied with time would make every entry distinct and the cache useless.
+- [~] `TLS-003` Implement input/output validation and bounded result storage. **The result half and
+  the error-class half are done; validating arguments *against a schema* is not, and that is the
+  whole of `TLS-003`'s first word — so this stays `~` rather than `[x]`.**
+  Evidence: `jarvis_domain::tool::call` and `jarvis_domain::tool::error_class`.
+  - **Bounded result storage is done, and building it found a real defect.** `ContentBlock`,
+    `ResultPayload`, and `ToolResultBody` bound a result by **bytes** rather than characters (a
+    character-counted bound admits four times the memory for the same number, and a test uses a
+    multi-byte string to prove the difference is enforced). The defect: the first version held each
+    block's payload in `ToolArguments`, which bounds at `MAX_ARGUMENT_BYTES` — the *argument* limit —
+    so a block could never exceed 64 KiB and the larger `MAX_RESULT_BYTES` was **unreachable**. The
+    two bounds differ on purpose and the code says why: an argument document is model output, while a
+    result legitimately carries file contents and search hits. Two bounds need two types, or the
+    stricter one silently governs both. `a_block_is_bounded_by_the_result_bound_rather_than_the_argument_bound`
+    is the regression test, and reverting the payload to the argument bound fails it.
+  - **The total is enforced in the constructor, not left to the caller.** The per-block bound cannot
+    substitute: `MAX_RESULT_BLOCKS` blocks each at `MAX_RESULT_BYTES` is 64 times the intended total.
+    A first version returned the oversized body and exposed `is_within_bound` as advice, so a result
+    of 64 legal blocks constructed successfully — a bound whose invalid value can still be built is
+    not a bound. Falsified by disabling it, which fails 3 tests.
+  - **The error classes are a closed set of sixteen**, parsed only from the contract's codes, so a
+    provider's error text must be *mapped* by its adapter rather than passed through. Each carries a
+    **`RetryPosture` rather than a `retryable` boolean**, because this project's own rule is that
+    "retryability describes a specific operation outcome, not an error class in every context" — and
+    for a tool call the same class answers differently per tool. `Timeout` on a tool that declared
+    `Idempotency::None` must not be retried (the message may already have been sent) while the same
+    class on a caller-keyed tool may be. A per-class boolean would have to pick one answer and be
+    wrong for the other, and the wrong direction **sends twice**. Both directions are falsified, since
+    a test asserting only `true` would pass against an implementation that always said `true`.
+  - `ToolCallIntent` holds **no principal, workspace, or grant** — the contract says those are
+    "trusted context, not accepted from model arguments", and carrying them would move the trust
+    boundary to whatever produced the intent, which is commonly a model. Its `capability` is a
+    bounded `String` rather than a parsed `ToolCapability` **on purpose**: a model emits a name, and
+    "the model named a tool that does not exist" has to be representable, because that is what
+    produces `tool.not_found` rather than a parse refusal. Its `Display` renders the name and the
+    argument *size* and never the argument bytes, asserted by searching the rendered form for a
+    secret-looking payload.
+  - **Also swept from round 84:** `ToolRegistry` held a `capability_index` that was **written and
+    never read** — the "field with no reader" shape — whose comment claimed it made a capability
+    collision detectable while nothing consulted it. Removed, and the removal is why the code now
+    says explicitly that a shared capability is *not* a conflict (two majors, two servers) and that
+    the source claim is the check that makes impersonation impossible.
+  - 24 tests in `call_tests.rs`. 1234 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done, and this is the larger half:** no JSON Schema subset, no validator, and therefore no
+  argument validation at all — `ToolArguments` carries a document and bounds its size, which is
+  *shape* checking, not *schema* checking. A schema validator needs a supported-subset decision
+  (which dialect keywords JARVIS honours) and belongs wherever that decision is owned, which is not
+  the domain layer. There is also no durable result storage: these are in-memory values, and the
+  ledger that would persist them is `TLS-006`.
+- [x] `TLS-004` Implement deterministic policy evaluation and explainable decisions. Owns
+  `jarvis_domain::tool::policy`.
+  Evidence: `evaluate` is a **pure function** of a request and its inputs, and determinism is a
+  property of the *types* rather than a promise in a comment: `PolicyInputs` holds values — a
+  timestamp, grants, approvals, deny rules — and no port, clock, environment, or I/O, so the function
+  cannot read one even by accident. `now` is a parameter exactly so two evaluations of one request are
+  comparable, which is what an audit needs when it asks which decision authorized an effect. Two tests
+  assert it: the same request evaluated twice is identical, and a request evaluated with its grant list
+  in reverse order is identical — the second is the stronger claim, because a first-match-wins
+  evaluator would answer differently for the same *set* of grants depending on how a repository
+  happened to order them, and a repository order is not a policy.
+  - **Precedence is the content of the module.** Deny rules are consulted **first**, because they are
+    the only input with no override; a grant consulted first would let a grant override an explicit
+    refusal. Availability and the run's deadline come next, then grant resolution, then grant
+    constraints, then approvals, then the tool's own default. Falsified by disabling the deny-rule
+    check, which fails 3 tests including `an_approval_can_never_overturn_a_deny`.
+  - **No allow by omission.** Every `Allow` carries a positive reason — `ApprovalMatched`,
+    `LowRiskReadOnly`, or a later layer's — and a request with no grant, no approval, and no deny rule
+    is **denied**. That is the single assertion a happy-path suite omits, and it is falsified by
+    substituting a fabricated permissive grant for the real ones: the test then fails alongside
+    eleven others.
+  - **Three refusals a user reacts to differently are kept distinct**: no grant, grant expired, and
+    grant naming a **different implementation** of the same capability. The last is `ACC-024` at the
+    policy layer — a grant exists and still names the tool, while the source or schema changed — and a
+    user told "no grant" would go looking for a missing grant rather than at the replacement. The
+    boundary is asserted too: a grant for a *different* capability is `NoGrant` rather than a
+    replacement, because otherwise a user would be told their tool was replaced when they never had a
+    grant for it.
+  - **An approval can never overturn a deny**, and can only raise an `Ask` to an `Allow`. The
+    fingerprint is checked **before** expiry and consumption, because re-approving cannot fix a digest
+    that still will not match — reporting "expired" would tell a user to do exactly that.
+  - **⚠ A refactor introduced a defect and a test caught it.** Extracting the evaluator into staged
+    helpers (for `clippy::too_many_lines`) gave `resolve_approval` a `Result<(), PolicyReason>`
+    signature, which cannot express "nothing matched" separately from "something matched and failed" —
+    both are `Err`. The absent case returned `Err(DefaultAsk)`, which **overrode a tool's declared
+    `Deny` and turned a refusal into a prompt**. The `ApprovalOutcome` enum now names the three cases,
+    and `an_absent_approval_is_not_a_mismatched_approval` pins all three against one request shape.
+  - **The decision maps to a tool error class**, and the mapping is where it is because getting it
+    wrong produces a message a user cannot act on: an `Ask` is `tool.approval_required`, which prompts
+    them, while a denial for a missing grant is `tool.permission_denied`, which does not. An expired
+    approval maps to `tool.approval_expired` so a user re-approves rather than seeking permission they
+    already hold.
+  - 29 policy tests. 1263 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done, and deliberately not implied:** grants, approvals, and deny rules are **in-memory
+  values passed in**, not persisted records with a lifecycle — durable approvals are `TLS-005` and the
+  call ledger is `TLS-006`, so nothing writes them yet. There is no policy *store* (no per-workspace
+  configuration, no versioning of rules), no budget or quiet-hours input despite the architecture
+  listing them, and no user-facing explanation rendering — `PolicyReason` is the machine half of
+  "explainable", and the human summary the contract asks for is a presentation concern with no
+  consumer. `action_digest` is compared but **not computed**: the canonicalization and SHA-256 the
+  approval contract requires (RFC 8785) is `TLS-005`'s, and inventing one here would put an
+  unreviewed canonicalization under an approval fingerprint.
+- [~] `TLS-005` Implement durable approval records and action fingerprinting. **The record and its
+  lifecycle are done; the fingerprint is a type without a computation, so this stays `~`.**
+  Evidence: `jarvis_domain::tool::approval`.
+  - **The state machine is the contract's seven states with the transition table asserted cell by
+    cell**, not through its happy path: `the_transition_table_permits_exactly_the_contracts_edges`
+    walks all forty-nine pairs and requires seven legal edges and forty-two refusals, written out
+    rather than derived, so adding an edge to the implementation fails here instead of silently
+    widening what an approval lifecycle permits.
+  - **⚠ The absorbing rule existed but was enforced nowhere, and only a mutation said so.**
+    `can_transition_to` began `if self.is_terminal() { return false; }` and then listed the legal
+    edges — and disabling that guard **compiled and passed every test**, because no arm in the table
+    has a terminal source, so the branch was unreachable. It read exactly like enforcement while
+    enforcing nothing, the same class as an unused constant. The rule is now a property of the table,
+    and `has_any_transition` gives a test something to assert that a deleted guard would fail:
+    `every_state_either_absorbs_or_can_be_left` requires a legal exit for every non-terminal state and
+    none for every terminal one, in both directions.
+  - **Lapse is computed at use, not trusted from the state column.** An approval that lapsed while
+    nothing ran still says `Approved` in storage, so a check reading only the stored state would honour
+    it. `covers` compares the expiry at the moment of the check, and the boundary matches the rest of
+    the project: an expiry at `T` does not permit work at `T`. Falsified by removing the comparison.
+  - `covers` gathers **all four** conditions that must hold — approved, matching digest, unexpired,
+    and (via the state) unconsumed — so there is one definition of "this approval covers this action"
+    rather than one per caller. Falsified twice: removing the state condition breaks a pending
+    approval and a consumed one; removing the digest comparison would let a rewritten action through,
+    which is the contract's "approving 'send this email' does not approve a rewritten recipient".
+  - **An approval with no permitted channel is unrepresentable**, because one could never be decided
+    and would sit `Pending` until it lapsed — the "no legal way out" shape this project has now found
+    seven times. `AllowedChannels::new` refuses the empty set, and the channel a decision came from is
+    checked against it, so recording `allowed_channels` is not a field with a reader and no effect.
+  - **Time is not a decider.** `ApprovalActor` distinguishes a principal, an expiry, an invalidation, a
+    consumption, and a withdrawal, so `decided_by` stays empty when time lapsed an approval — a record
+    claiming a user expired one late at night would be an audit trail that lies. Non-decision
+    transitions are deliberately not channel-checked, or expiry would be unreachable.
+  - A preview item refuses **control characters**, not as cosmetics: a preview is rendered inside the
+    prompt a user reads to decide, so it is the one place a crafted string could make the prompt
+    misrepresent the action. A preview may be *empty* though, because whether a tool must show
+    something is about the tool rather than a domain invariant.
+  - **A first attempt at grouping the transition arms merged `Approved -> Rejected`, which is not a
+    contract edge, and the exhaustive table test caught it immediately** — the reason that test writes
+    the expected set out rather than trusting the implementation's own shape.
+  - 25 approval tests. 1285 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done, and it is the half the TODO names second:** the **action fingerprint is not computed.**
+    `action_digest` is a `String` compared for equality, and nothing produces one. The approval contract
+    requires a *researched deterministic JSON canonicalization* (it names RFC 8785) plus SHA-256 with
+    an explicit algorithm prefix, and both a new dependency decision and an official-specification
+    review. `docs/research/integrations/` has no note for it and `evidence-manifest.json` has no entry,
+    so implementing it now would be integration code with no evidence note — which `AGENTS.md` forbids
+    outright. It needs a research round of its own, and inventing a canonicalization would put an
+    unreviewed one underneath every approval in the product.
+    Also not done: nothing persists these records, so "durable" means the *shape* is durable and
+    serialization-tested rather than that a row exists — the repository port is not written, and there
+    is no approval list/decide API (`TLS-013`) or channel-assurance check (`ACC-027`). The `preview` is
+    structured but **not redacted**: the contract requires it redacted, and only a tool's producer knows
+    which of its values is sensitive, so redaction belongs where a tool builds its own preview.
+- [x] `TLS-006` Implement idempotent tool-call ledger and execution state machine. Owns
+  `jarvis_domain::tool::ledger`.
+  Evidence: the eleven contract states with their transition table, a reservation keyed by **all five
+  dimensions**, and the `ACC-025` classification as one executable sequence.
+  - **`ACC-025` is a test, not a sentence.** *"Crash after the fake provider accepts an effect but
+    before result persistence. Recovery enters reconciliation and proves no duplicate effect."*
+    `a_crash_after_dispatch_enters_reconciliation_and_never_a_retry` walks it: a call reaches
+    `EXECUTING` (the state the contract requires **before** an external effect), the process stops, the
+    startup scan finds it, the classification is `Reconcile` and **not** a retry — and a duplicate
+    submission meanwhile is reported as *unsettled* rather than granted. Only after the provider is
+    read and confirms nothing landed does a dispatch become permissible, so the permission comes from
+    **checking the world**, not from elapsed time or from the tool declaring itself idempotent.
+  - **⚠ A real defect the tests found, of exactly the class this round is about.**
+    `may_have_effected()` was derived as `state.was_dispatched()` — a question about *where the call is
+    now*. A call that reached `EXECUTING` and then ended `FAILED` is no longer in a dispatched state,
+    so the answer became `false`, and a dispatched call that failed would have been treated as having
+    provably had **no effect** and retried — duplicating the effect. That inverts the one conclusion
+    `ACC-025` depends on. Dispatch is now recorded as a **fact** (`dispatched_at`, stamped on the first
+    entry into `EXECUTING`), because a thing that happened once is not recoverable from a state that
+    has since moved on — the same lesson as `TLS-004`'s approval lapse.
+  - **Reconciliation is a transition, not a flag.** The first version set the no-effect claim and left
+    the row in `RECONCILING`, so the row still looked unsettled to every reader — including the
+    reservation check, which reported a duplicate as needing reconciliation *after the reconciliation
+    had happened*. `confirm_no_effect` now ends the call as `Failed` (it did not succeed) with the claim
+    recorded, and the claim is **sticky** (OR-assigned) so no later transition can un-confirm an effect
+    the provider was already read about.
+  - **A pre-dispatch refusal and a post-dispatch failure are distinguished by one fact**, asserted as a
+    pair over two calls whose only difference is where they were refused: the first proves no effect
+    (nothing reached the provider) and the second proves nothing (the effect may have landed). A
+    single-assertion test could not show the difference, and the failure of that pair is a duplicate
+    effect.
+  - **⚠ `ToolCallState` had two spellings for one value.** `as_contract_str` returned the contract's
+    uppercase prose (`EXECUTING`) while the serde derive produced `snake_case` (`executing`), so a state
+    had one spelling to parse and another to store — the "two spellings denote one value" defect this
+    project refuses for identifiers, in the enum that records whether a side effect happened. It
+    surfaced because a test asserted the serialized bytes. One spelling is now chosen (the lowercase
+    one, which is what the contract's own JSON examples show) and
+    `every_state_serializes_to_its_own_spelling` asserts the method and the derive agree for **every**
+    variant, so neither can drift.
+  - **`ReservationOutcome` has four variants rather than a `Result`**, because "an equivalent call
+    already exists" is not a failure — it is the point of a reservation — and the three duplicate
+    shapes need different responses: read the answer, wait, or **reconcile and never retry**. A
+    `Result<(), Error>` collapses them into "no", and a caller given "no" retries, which is the single
+    most dangerous response available here. `permits_dispatch` is the one definition of the retry
+    question.
+  - The transition table is asserted **cell by cell** (twenty-two legal edges against a hundred and
+    twenty-one pairs) with the expected set written out by hand, and `Executing -> Executing` is
+    refused so a second dispatch cannot be recorded while the reservation still looks held.
+    `Approved -> Executing` is refused too, so the reservation cannot be skipped.
+  - **The attempt number is private** so a zero attempt is unrepresentable — "attempt zero" has no
+    meaning, and the first version left the field public and normalised `0` in `reserve`, so a caller
+    could put one in afterwards.
+  - 30 ledger tests. 1318 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done, and named:** the ledger is **in memory only** — there is no repository port or SQLite
+  adapter, so "durable" means the shape is durable and serialization-tested rather than that a row
+  exists. Nothing calls it: there is no executor, and the controller still refuses a tool intent with
+  `run.tools_not_implemented`. `possibly_effecting_without_outcome` is a scan a startup pass *would*
+  walk; no such pass is wired into `jarvisd`. There is no attempt-count ceiling (the retry budget is
+  `BRN-008`'s), no per-call deadline in the row, and no outbox event per transition — that is `AUT-004`
+  and `ACC-044`, whose test asserts state and outbox never diverge. And the reservation is atomic only
+  within one process's memory: the adapter that makes it atomic across processes is part of the
+  persistence work, not of this module.
 - [ ] `TLS-007` Implement safe reference filesystem read and write-plan tools.
 - [ ] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.

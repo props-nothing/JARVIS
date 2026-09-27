@@ -166,7 +166,7 @@ struct Store {
     /// this crate needing a JSON serializer to build the event payload.
     deltas: Vec<(String, String)>,
     /// The stored idempotency records, keyed by the scoped natural key.
-    idempotency: BTreeMap<(String, String, String), (String, RunId)>,
+    idempotency: BTreeMap<(String, String, String, String), (String, RunId)>,
     /// Stored policy versions, keyed by their natural key.
     ///
     /// A map rather than a list because the natural key is the identity: a second write at
@@ -726,6 +726,7 @@ impl RunRepository for InMemoryRepositories {
                 validate_idempotency_key(&record.key)?;
                 let key = (
                     record.workspace_id.to_string(),
+                    record.principal_id.to_string(),
                     record.operation.clone(),
                     record.key.clone(),
                 );
@@ -792,6 +793,7 @@ impl RunRepository for InMemoryRepositories {
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,
+        principal: jarvis_domain::ids::PrincipalId,
         operation: &str,
         key: &str,
     ) -> RepositoryFuture<'_, Option<(String, RunId)>> {
@@ -803,7 +805,7 @@ impl RunRepository for InMemoryRepositories {
             self.with(|store| {
                 Ok(store
                     .idempotency
-                    .get(&(workspace.to_string(), operation, key))
+                    .get(&(workspace.to_string(), principal.to_string(), operation, key))
                     .map(|(digest, run_id)| (digest.clone(), *run_id)))
             })
         })
@@ -828,6 +830,7 @@ impl RunRepository for InMemoryRepositories {
                 // equivalent of a single transaction.
                 let key = (
                     record.workspace_id.to_string(),
+                    record.principal_id.to_string(),
                     record.operation.clone(),
                     record.key.clone(),
                 );

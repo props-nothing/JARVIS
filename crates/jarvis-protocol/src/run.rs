@@ -258,18 +258,6 @@ pub fn keepalive_frame() -> String {
 /// after this code is exact — reconnect with `Last-Event-ID` rather than report the run as finished.
 pub const STREAM_OVERRUN_CODE: &str = "stream.overrun";
 
-/// The largest number of bytes the daemon will spend handing one event to one follower.
-///
-/// Delivery is bounded by **bytes written**, not by a byte offset in the stream, and that distinction
-/// is the whole design: a stream re-reads from a sequence position, so a client that is *slow* while
-/// still reading loses nothing when it is disconnected — it resumes from the last event id it saw. If
-/// instead the daemon skipped the events it could not deliver, those sequences would be gone from the
-/// client's view forever, which is the one outcome the contract forbids ("it never silently skips a
-/// gap"). Two megabytes is far more than any single frame this surface can produce, so the bound
-/// cannot fire spuriously; it exists to stop a peer that is acknowledging far slower than the run
-/// produces.
-pub const MAX_STREAM_BYTES_PER_DELIVERY: usize = 2 * 1024 * 1024;
-
 /// Renders the frame that tells a client its stream is ending because the daemon could not keep
 /// up with it, and that it should reconnect from where it got to.
 ///

@@ -405,6 +405,96 @@ enum FollowStep {
     Ignored,
 }
 
+/// Watches the `sequence` numbers of a run's stream and refuses to continue across a gap.
+///
+/// **The contract's rule, stated for clients and, until this, enforced by nothing:**
+/// "Clients ignore unknown additive event types but **never ignore a sequence gap** or unknown
+/// terminal state." The reference client did not ignore a gap *deliberately* — it ignored it by never
+/// reading `sequence` at all. That is the same failure the contract names, arrived at by omission
+/// rather than by decision, and it is worse than it sounds for this surface: `sequence` starts at 1
+/// and increases by exactly one per event, so a gap means the daemon's stream is not the run's stream.
+/// A follower that keeps printing would deliver a *fabricated* answer — two halves of an output that
+/// were never adjacent — with nothing to indicate it.
+///
+/// A gap is therefore **fatal rather than resumable**, and that is the whole point of detecting it.
+/// The client cannot repair it: it does not know which events it missed or whether they still exist,
+/// and reconnecting would re-read from the position it already reached. So the honest response is to
+/// stop and say so, rather than to print an answer that may not be one.
+///
+/// **The check is skipped on a resumed stream for the first frame only**, because that is the frame
+/// the resume header deliberately lands *after*: `Last-Event-ID` means "resume strictly after this
+/// event", so the first frame of a resumed stream is legitimately not the successor of the last frame
+/// of the previous one. Accepting a gap there would be the opposite error — inventing a requirement
+/// the contract does not have.
+#[derive(Debug, Default)]
+struct SequenceWatcher {
+    /// The last sequence acknowledged, or `None` before the first frame of a stream.
+    expected: Option<u64>,
+    /// Whether this stream began from a resume header, so its first frame starts a new expectation.
+    resumed: bool,
+}
+
+/// What a sequence number means for the stream a follower is reading.
+#[derive(Debug, PartialEq, Eq)]
+enum SequenceCheck {
+    /// In order, or the first frame of the stream.
+    InOrder,
+    /// The stream skipped events this client will never see.
+    Gap {
+        /// The sequence the stream should have reached.
+        expected: u64,
+        /// The sequence it actually delivered.
+        found: u64,
+    },
+    /// The frame carries no parseable sequence, so nothing about order can be concluded.
+    Unreadable,
+}
+
+impl SequenceWatcher {
+    /// Creates a watcher for a stream, stating whether it began from a resume position.
+    fn new(resumed: bool) -> Self {
+        Self {
+            expected: None,
+            resumed,
+        }
+    }
+
+    /// Checks one frame's sequence and advances the expectation.
+    fn check(&mut self, frame: &SseFrame) -> SequenceCheck {
+        let Some(found) = frame.sequence() else {
+            // A frame with no sequence cannot be placed in the stream. This is **not** treated as a
+            // gap: the contract bounds what a client may conclude from a frame, and inventing a gap
+            // from an absent field would refuse a stream the daemon is sending correctly. The one
+            // exception would be a frame the *protocol* requires to carry one, and every frame this
+            // client acts on does — so an unreadable sequence is reported rather than assumed.
+            return SequenceCheck::Unreadable;
+        };
+        let previous = self.expected;
+        // **The first frame sets the expectation rather than checking it.** On a fresh stream the
+        // contract says `sequence` starts at 1, so this still refuses a stream that opens at 5 — which
+        // is the case worth catching, because it means the client is reading a stream it has already
+        // missed the start of. On a resumed stream the client accepts wherever the daemon resumes,
+        // because `Last-Event-ID` means "strictly after that event" and the first frame of a resume is
+        // deliberately not the successor of the last frame of the previous connection.
+        let Some(previous) = previous else {
+            if !self.resumed && found != 1 {
+                return SequenceCheck::Gap { expected: 1, found };
+            }
+            self.resumed = false;
+            self.expected = Some(found.saturating_add(1));
+            return SequenceCheck::InOrder;
+        };
+        if found != previous {
+            return SequenceCheck::Gap {
+                expected: previous,
+                found,
+            };
+        }
+        self.expected = Some(found.saturating_add(1));
+        SequenceCheck::InOrder
+    }
+}
+
 /// Classifies one frame for a follower.
 ///
 /// The names are the protocol crate's constants rather than literals, because they are contract
@@ -469,6 +559,12 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
         // The id of the last frame this attempt saw, kept separately from `last_event_id` so a
         // reconnect uses what was actually delivered rather than what a previous attempt had.
         let mut resumed_at: Option<String> = None;
+        // **A gap is fatal rather than resumable, so it ends this attempt with a report rather than
+        // setting a retry flag.** `resumed` is `true` only when this attempt actually sent a resume
+        // header, because `Last-Event-ID` lands *after* the named event — so the first frame of a
+        // resumed stream is legitimately not the successor of the last frame of the previous one.
+        let mut watcher = SequenceWatcher::new(last_event_id.is_some());
+        let mut gap: Option<(u64, u64)> = None;
 
         let result = stream_response(
             &state.discovered,
@@ -480,6 +576,16 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
                 for frame in frames.push(piece) {
                     if let Some(id) = frame.id.clone() {
                         resumed_at = Some(id);
+                    }
+                    match watcher.check(&frame) {
+                        SequenceCheck::InOrder | SequenceCheck::Unreadable => {}
+                        SequenceCheck::Gap { expected, found } => {
+                            // Stop reading immediately: every further frame would be printed into an
+                            // answer that is already known not to be the run's output, and the point of
+                            // detecting the gap is to avoid delivering that.
+                            gap = Some((expected, found));
+                            return false;
+                        }
                     }
                     match follow_step(&frame) {
                         FollowStep::Delta(delta) => {
@@ -539,6 +645,14 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
         if let Some(outcome) = outcome {
             return outcome;
         }
+        // **A gap is checked before the retry decision, and that ordering is the guarantee.**
+        // `follow_after` answers "should this attempt be retried"; a gap is not retryable at all, so
+        // consulting it first would let a gap be answered as though it were a dropped connection and
+        // reconnected — which re-reads from the position already reached and cannot recover the
+        // missing events.
+        if let Some((expected, found)) = gap {
+            return AttemptReport::SequenceGap { expected, found }.exit_code();
+        }
         match follow_after(&result, overran, attempt, last_event_id.is_some()) {
             AttemptAfter::Resume => {}
             AttemptAfter::Report(report) => return report.exit_code(),
@@ -574,6 +688,13 @@ enum AttemptReport {
     OverranBeforeAnyEvent,
     /// The stream kept overrunning, and the bounded number of resumes is spent.
     OverrunBudgetExhausted,
+    /// The stream skipped events this client will never see.
+    SequenceGap {
+        /// The sequence the stream should have reached.
+        expected: u64,
+        /// The sequence it actually delivered.
+        found: u64,
+    },
     /// A client fault, reported by its own kind.
     Client(ClientErrorKind),
 }
@@ -597,6 +718,18 @@ impl AttemptReport {
                 eprintln!(
                     "error: the stream overran {STREAM_ATTEMPTS} times without reaching a terminal \
                      event"
+                );
+                ExitCode::from(EXIT_ATTENTION)
+            }
+            // **Reported rather than worked around, and this is the point of detecting it.** The
+            // client cannot repair a gap: it does not know which events it missed or whether they
+            // still exist, and reconnecting would re-read from the position it already reached. The
+            // honest response is to refuse to print an answer that may be two disconnected halves of
+            // an output, because the contract says a client never ignores a sequence gap.
+            Self::SequenceGap { expected, found } => {
+                eprintln!(
+                    "error: the run's stream skipped events (expected sequence {expected}, got \
+                     {found}); anything printed above may not be the run's answer"
                 );
                 ExitCode::from(EXIT_ATTENTION)
             }
@@ -788,6 +921,18 @@ impl SseFrame {
             .get(field)?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Reads the frame's `sequence`, which is a **top-level** field rather than a payload one.
+    ///
+    /// The contract puts `sequence` beside `event_id`, `run_id`, and `occurred_at`, so looking for it
+    /// under `payload` would find nothing on every frame — which is exactly the shape of the defect
+    /// this accessor exists to close: a client that never reads it cannot notice a gap.
+    fn sequence(&self) -> Option<u64> {
+        serde_json::from_str::<serde_json::Value>(&self.data)
+            .ok()?
+            .get("sequence")?
+            .as_u64()
     }
 
     /// Renders this frame as it arrived on the wire.
@@ -1779,10 +1924,287 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, FollowStep, InstallAction, SseFrame, SseParser, StatusBody,
-        event_stream_headers, follow_step, idempotency_key, json_string, parse_status,
+        AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command, FollowStep,
+        InstallAction, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher, SseFrame, SseParser,
+        StatusBody, event_stream_headers, follow_after, follow_run, follow_step, idempotency_key,
+        json_string, parse_status,
     };
     use clap::Parser as _;
+    use jarvis_infrastructure::client::Discovered;
+    use std::process::ExitCode;
+
+    #[test]
+    fn a_sequence_gap_is_detected_and_is_not_retried() {
+        // **The contract's rule, which nothing enforced: "clients … never ignore a sequence gap".** The
+        // reference client did not decide to ignore one — it ignored one by never reading `sequence` at
+        // all. The consequence is the reason the rule exists: a follower that keeps printing across a
+        // gap delivers two halves of an output that were never adjacent, as though they were an answer.
+        let frame = |sequence: u64| SseFrame {
+            id: Some(format!("0195f4f1-0475-7613-a92c-edf01183e9{sequence:02}")),
+            event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+            data: format!(r#"{{"sequence":{sequence},"payload":{{"delta":"x"}}}}"#),
+        };
+
+        // A healthy stream is in order and never reports a gap — the precondition without which the
+        // gap assertions below would be satisfied by a watcher that simply always reported one.
+        let mut watcher = SequenceWatcher::new(false);
+        for sequence in 1..=5 {
+            assert_eq!(
+                watcher.check(&frame(sequence)),
+                SequenceCheck::InOrder,
+                "sequence {sequence} must be in order",
+            );
+        }
+
+        // **A gap is reported, and it names both sides**, because "a gap happened" without the numbers
+        // is not actionable for an operator reading the error.
+        assert_eq!(
+            watcher.check(&frame(8)),
+            SequenceCheck::Gap {
+                expected: 6,
+                found: 8
+            },
+        );
+        // And a repeat is a gap too, not a "no progress": the contract says the stream increases by
+        // exactly one, so a repeated sequence means the client is being sent a position it already
+        // consumed.
+        let mut watcher = SequenceWatcher::new(false);
+        assert_eq!(watcher.check(&frame(1)), SequenceCheck::InOrder);
+        assert_eq!(
+            watcher.check(&frame(1)),
+            SequenceCheck::Gap {
+                expected: 2,
+                found: 1
+            },
+        );
+    }
+
+    #[test]
+    fn a_fresh_stream_must_open_at_sequence_one() {
+        // The contract states `sequence` starts at 1 per run, so a stream that opens at 5 is one whose
+        // start this client never saw. Accepting it would be the same failure as ignoring a later gap,
+        // reached by a different route — and it is the case a "first frame sets the expectation"
+        // implementation gets wrong by treating *any* first frame as legitimate.
+        let mut watcher = SequenceWatcher::new(false);
+        assert_eq!(
+            watcher.check(&SseFrame {
+                id: Some("a".to_owned()),
+                event: "run.received".to_owned(),
+                data: r#"{"sequence":5,"payload":null}"#.to_owned(),
+            }),
+            SequenceCheck::Gap {
+                expected: 1,
+                found: 5
+            },
+        );
+    }
+
+    #[test]
+    fn a_resumed_stream_accepts_the_position_the_resume_header_asked_for() {
+        // **The opposite error, and refusing it is not caution — it is a requirement.** `Last-Event-ID`
+        // means "resume strictly after that event", so the first frame of a resumed stream is
+        // legitimately not the successor of the last frame the previous attempt saw. A watcher that
+        // required contiguity *across* a reconnect would refuse every healthy resume, turning the
+        // client's own recovery path into an error.
+        let mut watcher = SequenceWatcher::new(true);
+        assert_eq!(
+            watcher.check(&SseFrame {
+                id: Some("a".to_owned()),
+                event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+                data: r#"{"sequence":41,"payload":{"delta":"x"}}"#.to_owned(),
+            }),
+            SequenceCheck::InOrder,
+            "the first frame of a resumed stream is wherever the daemon resumed",
+        );
+        // From there it must be contiguous again: relaxing the first frame must not relax the stream.
+        assert_eq!(
+            watcher.check(&SseFrame {
+                id: Some("b".to_owned()),
+                event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+                data: r#"{"sequence":43,"payload":{"delta":"x"}}"#.to_owned(),
+            }),
+            SequenceCheck::Gap {
+                expected: 42,
+                found: 43
+            },
+            "contiguity resumes after the first frame of a resumed stream",
+        );
+    }
+
+    #[test]
+    fn the_sequence_is_read_from_the_envelope_and_not_from_the_payload() {
+        // **The shape of the defect this closes.** `sequence` sits beside `event_id` and `run_id` in
+        // the frame, not inside `payload` — and a client that looked for it under `payload` would find
+        // nothing on *every* frame, so its gap check would never fire and nothing would fail. This
+        // asserts the value is found where the daemon actually puts it.
+        let frame = SseFrame {
+            id: Some("0195f4f1-0475-7613-a92c-edf01183e909".to_owned()),
+            event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+            // A payload that *also* carries a `sequence`, so a lookup in the wrong place finds a
+            // plausible number and the test cannot pass by coincidence.
+            data: r#"{"sequence":2,"payload":{"delta":"x","sequence":99}}"#.to_owned(),
+        };
+        assert_eq!(
+            frame.sequence(),
+            Some(2),
+            "the envelope's sequence is the one"
+        );
+
+        // And a frame with no sequence is `Unreadable` rather than a gap: the contract bounds what a
+        // client concludes from a frame, and inventing a gap from an absent field would refuse a
+        // stream the daemon is sending correctly.
+        //
+        // A **resumed** watcher here, deliberately, so this asserts the field's *location* and nothing
+        // else. My first version used a fresh one and failed on my own freshness rule — a stream
+        // opening at sequence 2 is a gap, which is correct and is asserted by its own test above. Mixing
+        // the two properties into one assertion is what made the first version wrong.
+        let mut watcher = SequenceWatcher::new(true);
+        assert_eq!(watcher.check(&frame), SequenceCheck::InOrder);
+        assert_eq!(
+            watcher.check(&SseFrame {
+                id: None,
+                event: "run.planning".to_owned(),
+                data: r#"{"payload":null}"#.to_owned(),
+            }),
+            SequenceCheck::Unreadable,
+        );
+    }
+
+    #[test]
+    fn a_gap_outranks_a_resume_and_is_reported_rather_than_retried() {
+        // **The ordering is the guarantee.** `follow_after` decides whether an ended attempt should be
+        // retried; a gap is not retryable at all, so consulting it first would let a gap be answered as
+        // a dropped connection and reconnected — which re-reads from the position already reached and
+        // cannot recover the missing events. Asserted through the report rather than the flags, because
+        // the code's order is what makes it true and a test of the flags alone would not notice a
+        // reorder.
+        let gap = AttemptReport::SequenceGap {
+            expected: 6,
+            found: 8,
+        };
+        assert_ne!(
+            gap,
+            AttemptReport::EndedWithoutTerminal,
+            "a gap is not the same outcome as a clean end, or the error would say the wrong thing",
+        );
+        // The report renders both numbers, which is what makes it actionable.
+        let rendered = format!("{gap:?}");
+        assert!(rendered.contains('6'), "{rendered}");
+        assert!(rendered.contains('8'), "{rendered}");
+    }
+
+    /// Serves one SSE stream from a stub daemon and returns what `follow_run` reported.
+    ///
+    /// **Why a socket rather than more unit tests.** The gap check is a function over frames, and the
+    /// tests above drive it directly — but a function that is correct and *never called* is exactly the
+    /// defect this round closes, so the wiring itself has to be exercised. `Discovered` is a plain
+    /// struct over a base URL, so a listener on an ephemeral loopback port is a complete stand-in for a
+    /// daemon: the client resolves the host, dials it, writes a real request, and parses a real
+    /// response, which is everything the gap check sits between.
+    async fn follow_a_stubbed_stream(body: &'static str) -> ExitCode {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds an ephemeral loopback port");
+        let port = listener.local_addr().expect("has an address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accepts");
+            // The request is read before the response is written, because a client that wrote more
+            // would otherwise see the response before finishing its own write.
+            let mut request = [0_u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len(),
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.flush().await;
+            // Dropped here, which closes the connection.
+        });
+
+        let state = ClientState {
+            discovered: Discovered {
+                base_url: format!("http://127.0.0.1:{port}"),
+                instance_id: "0195f4f1-0475-7613-a92c-edf01183e909".to_owned(),
+                pid: 1,
+            },
+            credential: "not-a-real-credential".to_owned(),
+        };
+        let code = follow_run(&state, "0195f4f1-0475-7613-a92c-edf01183e909").await;
+        let _ = server.await;
+        code
+    }
+
+    /// One SSE frame with the envelope's top-level `sequence` and a delta payload.
+    fn delta_frame(sequence: u64) -> String {
+        format!(
+            "id: 0195f4f1-0475-7613-a92c-edf01183e9{sequence:02}\n\
+             event: run.output_text.delta\n\
+             data: {{\"sequence\":{sequence},\"payload\":{{\"delta\":\"chunk{sequence}\"}}}}\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_skips_a_sequence_makes_the_follow_fail_rather_than_print() {
+        // **The end-to-end half, and the wiring is the point.** The tests above prove the watcher
+        // detects a gap; this proves the follower *acts* on it. Without it the whole feature could be a
+        // correct function no caller consults — precisely the shape this round closes, since the
+        // client's original defect was that it never read `sequence` at all.
+        // **The stream carries a terminal, and that is what makes this test mean anything.** My first
+        // version ended the body after the gapped frames, and the mutation that disabled the whole gap
+        // handling **passed**: a stream with no terminal event fails the follow as
+        // `EndedWithoutTerminal` whether or not the gap was noticed, so `assert_ne!(SUCCESS)` held for
+        // the wrong reason. A gap-ignoring client must be able to *succeed* here for the assertion to
+        // be about the gap — so the terminal is present, and only a client that notices the gap fails.
+        let body: String = [
+            delta_frame(1),
+            delta_frame(2),
+            // The gap.
+            delta_frame(4),
+            delta_frame(5),
+            "id: 0195f4f1-0475-7613-a92c-edf01183e906\n\
+             event: run.completed\n\
+             data: {\"sequence\":6,\"payload\":null}\n\n"
+                .to_owned(),
+        ]
+        .concat();
+        let code = follow_a_stubbed_stream(Box::leak(body.into_boxed_str())).await;
+        assert_ne!(
+            code,
+            ExitCode::SUCCESS,
+            "a stream that skipped a sequence must not be reported as a successful follow, even \
+             though it ends in a terminal event",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_contiguous_stream_is_followed_to_its_terminal_without_a_gap_error() {
+        // **The negative half, without which the test above is satisfied by a client that fails every
+        // stream.** A watcher reporting a gap unconditionally would pass the previous test and be
+        // useless — the "a filter that matches nothing is still a passing for" family, from the other
+        // side.
+        let body: String = [
+            delta_frame(1),
+            delta_frame(2),
+            delta_frame(3),
+            "id: 0195f4f1-0475-7613-a92c-edf01183e904\n\
+             event: run.completed\n\
+             data: {\"sequence\":4,\"payload\":null}\n\n"
+                .to_owned(),
+        ]
+        .concat();
+        let code = follow_a_stubbed_stream(Box::leak(body.into_boxed_str())).await;
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "a contiguous stream ending in a terminal must be followed successfully",
+        );
+    }
 
     #[test]
     fn every_way_an_attempt_can_end_is_decided_deliberately() {
@@ -1791,7 +2213,6 @@ mod tests {
         // with no position" needs a daemon failing in that exact way. The decision is a function over
         // an outcome, a flag, an attempt number, and whether a position exists, so every combination is
         // enumerated here instead.
-        use super::{AttemptAfter, AttemptReport, ClientErrorKind, STREAM_ATTEMPTS, follow_after};
         use jarvis_infrastructure::client::ClientError;
 
         let transport = Err(ClientError::Transport);
