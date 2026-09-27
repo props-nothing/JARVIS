@@ -9,6 +9,7 @@
 
 use crate::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ModelCallId, ModelRouteDecisionId, RunId, WorkspaceId};
+use jarvis_domain::model::capability::IncrementalDelivery;
 use jarvis_domain::model::identity::{ModelId, ModelRef, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, Usage};
 use jarvis_domain::time::UtcTimestamp;
@@ -159,6 +160,19 @@ pub struct ModelCallOutcome {
     pub error_code: Option<String>,
     /// When the first output arrived, once it has.
     pub first_output_at: Option<UtcTimestamp>,
+    /// When the **last** output arrived, once it has.
+    ///
+    /// Beside `first_output_at` rather than replaced by a stored profile, because the two are
+    /// instants and a profile is a verdict: storing `chunk_spread_ms` would freeze a number that
+    /// `MIN_INCREMENTAL_SPREAD_MS` can change the meaning of, so an already-written row would keep
+    /// answering the old question. The profile is *derived* from this row when it is read.
+    pub last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas the attempt produced.
+    ///
+    /// The sample size, and the half of the burst test that timing cannot express: one delta
+    /// arriving slowly is still one piece. `None` for a row written before the column existed,
+    /// which is a different fact from a call that produced zero deltas.
+    pub output_delta_count: Option<u32>,
     /// When the attempt reached its outcome.
     pub completed_at: Option<UtcTimestamp>,
 }
@@ -188,6 +202,22 @@ impl ModelCallOutcome {
         if self.state.is_terminal() && self.completed_at.is_none() {
             return Err(RepositoryError::Conflict {
                 what: "completed_at",
+            });
+        }
+        // A last-output instant without a first is half a measurement, and a caller that read it
+        // would compute a spread from a missing endpoint. A delta count above zero with no instant
+        // is the same contradiction from the other direction: output happened, and nothing says
+        // when. Both are refused rather than stored, because the pair is what the profile is
+        // derived from and a half-pair would silently produce a burst verdict from absent data.
+        if self.last_output_at.is_some() && self.first_output_at.is_none() {
+            return Err(RepositoryError::Conflict {
+                what: "last_output_at",
+            });
+        }
+        if self.output_delta_count.is_some_and(|count| count > 0) && self.first_output_at.is_none()
+        {
+            return Err(RepositoryError::Conflict {
+                what: "output_delta_count",
             });
         }
         Ok(self)
@@ -232,6 +262,15 @@ pub struct StoredModelCall {
     pub provider_request_id: Option<String>,
     /// The instant the attempt started.
     pub started_at: UtcTimestamp,
+    /// When its first output arrived, when it produced any.
+    ///
+    /// Read back because it is one end of the interval an incremental-delivery measurement is
+    /// computed from, and a measurement whose input cannot be re-read is not reproducible.
+    pub first_output_at: Option<UtcTimestamp>,
+    /// When its last output arrived, when it produced any.
+    pub last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas it produced, when that was recorded.
+    pub output_delta_count: Option<u32>,
     /// When it reached its outcome.
     pub completed_at: Option<UtcTimestamp>,
 }
@@ -285,6 +324,52 @@ pub trait ModelCallRepository: Send + Sync {
         workspace: WorkspaceId,
         logical_call_id: ModelCallId,
     ) -> RepositoryFuture<'_, Vec<StoredModelCall>>;
+
+    /// Returns the recorded delivery samples per model, for a measurement campaign.
+    ///
+    /// Scoped to `workspace` for the same reason every other read is: a capability profile is a
+    /// fact about *this* deployment's calls, and one workspace's figures must never be used to
+    /// route another workspace's traffic.
+    ///
+    /// **Only calls that emitted output contribute.** A call with a `NULL` first-output instant was
+    /// never measured — it failed before producing anything, or was cancelled — and folding it in
+    /// as a zero would report a burst for a model that was simply never given the chance to stream.
+    /// That is the same `NULL`-is-not-zero rule the columns were added with, applied at the group
+    /// boundary: the query filters, so an unmeasured call cannot be averaged into a profile.
+    ///
+    /// A group is returned for every model that has at least one measured call, including models
+    /// whose group is **too small to attest** anything. The sufficiency floor is a rule about what
+    /// the samples mean, so it is applied where it can be tested — in
+    /// [`DeliverySamples::aggregate`](jarvis_domain::model::capability::DeliverySamples::aggregate)
+    /// — rather than being hidden inside a `HAVING COUNT(*) >= 3` that a test could only observe
+    /// through a caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] for a driver failure and
+    /// [`RepositoryError::Corrupted`] for an uninterpretable column.
+    fn delivery_campaigns(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<ModelDeliverySamples>>;
+}
+
+/// One model's measured delivery calls, as loaded from the store.
+///
+/// Carries the provider, model, and revision separately rather than a `ModelRef`, because a stored
+/// `ModelRef` would already have resolved the revision — and the caller needs to know whether the
+/// campaign covers a pinned revision or every revision of a moving model, since those are not the
+/// same claim about the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDeliverySamples {
+    /// The provider that served every sample in this group.
+    pub provider_id: ProviderId,
+    /// The model that served every sample in this group.
+    pub model_id: ModelId,
+    /// The pinned revision, when the group is a single revision.
+    pub revision: Option<ModelRevision>,
+    /// Each measured call's profile, in load order.
+    pub samples: Vec<IncrementalDelivery>,
 }
 
 #[cfg(test)]
@@ -420,6 +505,8 @@ mod tests {
             finish_reason: None,
             error_code: None,
             first_output_at: None,
+            last_output_at: None,
+            output_delta_count: None,
             completed_at,
         }
     }

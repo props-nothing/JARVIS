@@ -170,4 +170,209 @@ mod tests {
             .await
             .expect("clean after migration");
     }
+
+    /// Builds a version-5 database at `path`, applying every migration before `000006` by hand.
+    ///
+    /// Applied outside the migrator on purpose: the point is to reach an older schema **without**
+    /// this binary's migrations, and the first five are the exact bytes this build still ships, so a
+    /// hand-written approximation would test a schema nobody has. `SqlStr` is itself `SqlSafeStr`,
+    /// so the embedded SQL passes through unchanged — the one place in this crate where dynamic SQL
+    /// is right, because the statement is not input but the migration the build already executes.
+    async fn seed_version_five(path: &std::path::Path) {
+        let database = Database::open(path).await.expect("the file database opens");
+        // The migrator's own ledger, in the shape sqlx creates it. Written here because the fixture
+        // applies the migrations outside the migrator, and the migrator reads this table to decide
+        // what is pending: without it, `run` would see every migration as unapplied and try to
+        // create tables that already exist.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS _sqlx_migrations ( \
+                 version BIGINT PRIMARY KEY, \
+                 description TEXT NOT NULL, \
+                 installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                 success BOOLEAN NOT NULL, \
+                 checksum BLOB NOT NULL, \
+                 execution_time BIGINT NOT NULL \
+             )",
+        )
+        .execute(database.pool())
+        .await
+        .expect("the migration ledger is creatable");
+        for migration in MIGRATOR.iter().filter(|migration| migration.version < 6) {
+            sqlx::query(migration.sql.clone())
+                .execute(database.pool())
+                .await
+                .expect("a prior migration applies");
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, installed_on, success, checksum, execution_time) \
+                 VALUES (?, ?, '1970-01-01T00:00:00Z', 1, ?, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(database.pool())
+            .await
+            .expect("the applied migration is recorded");
+        }
+        // The compatibility record the earlier migrations left behind. Read back by the caller as
+        // the precondition the test depends on: if the hand-application were wrong, the upgrade
+        // would be tested from a schema that never existed.
+        sqlx::query("UPDATE schema_version SET schema_version = 5 WHERE id = 1")
+            .execute(database.pool())
+            .await
+            .expect("the compatibility record is set");
+    }
+
+    /// Writes one conversation, run, and model call at version 5, before the delivery columns.
+    ///
+    /// The parent rows come first because `agent_runs.conversation_id` and
+    /// `model_calls.run_id` are foreign keys and `foreign_keys` is on in this profile: a child row
+    /// naming a parent that does not exist is refused, which is the schema working rather than a
+    /// fixture problem. Returns the workspace so the caller can read the rows back.
+    async fn seed_version_five_rows(path: &std::path::Path) -> jarvis_domain::ids::WorkspaceId {
+        let workspace = jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::now_v7());
+        let conversation = uuid::Uuid::now_v7();
+        let run_id = uuid::Uuid::now_v7();
+        let database = Database::open(path)
+            .await
+            .expect("the file database reopens");
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, workspace_id, owner_user_id, status, channel_origin, created_at, updated_at) \
+             VALUES (?, ?, ?, 'active', 'local_cli', '2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .bind(conversation.to_string())
+        .bind(workspace.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(database.pool())
+        .await
+        .expect("a version-5 conversation row is writable");
+        sqlx::query(
+            "INSERT INTO agent_runs \
+             (id, workspace_id, conversation_id, principal_id, state, version, objective_ref, \
+              created_at, updated_at, runtime_id, runtime_version) \
+             VALUES (?, ?, ?, ?, 'received', 1, 'obj', '2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:00Z', 'jarvis-native', '0.1.0')",
+        )
+        .bind(run_id.to_string())
+        .bind(workspace.to_string())
+        .bind(conversation.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(database.pool())
+        .await
+        .expect("a version-5 run row is writable");
+        // The row whose survival the test is really about: `ALTER TABLE ADD COLUMN` on a table with
+        // rows is the case a fresh-database test cannot exercise.
+        sqlx::query(
+            "INSERT INTO model_calls \
+             (id, workspace_id, run_id, logical_call_id, attempt, provider_id, model_id, \
+              state, started_at) \
+             VALUES (?, ?, ?, ?, 1, 'scripted.local', 'fixture-1', 'pending', \
+                     '2026-01-01T00:00:00Z')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(workspace.to_string())
+        .bind(run_id.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(database.pool())
+        .await
+        .expect("a version-5 model call is writable");
+        workspace
+    }
+
+    #[tokio::test]
+    async fn a_database_from_a_supported_prior_version_upgrades_in_place() {
+        // `AGENTS.md` requires "test migrations from supported prior versions", and `000006` is the
+        // first migration here that **alters a table which can already hold rows**: the four before
+        // it created tables or replaced one that had no writer, so a fresh-database test was enough.
+        // Adding columns to `model_calls` is different — an existing row must survive the upgrade
+        // with the new columns present and `NULL`, which is the state the read treats as "written
+        // before the measurement existed" rather than as corruption.
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-migrate-upgrade-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("the temp directory is creatable");
+        let path = directory.join("jarvis.sqlite");
+
+        seed_version_five(&path).await;
+        {
+            let database = Database::open(&path)
+                .await
+                .expect("the file database opens");
+            let before = read_compatibility(database.pool())
+                .await
+                .expect("compatibility readable");
+            assert_eq!(
+                before.schema_version, 5,
+                "the fixture must stand at version 5",
+            );
+        }
+        seed_version_five_rows(&path).await;
+
+        // Now upgrade with this binary's own migrator.
+        let database = Database::open(&path)
+            .await
+            .expect("the file database reopens");
+        run(database.pool()).await.expect("the upgrade applies");
+
+        let after = read_compatibility(database.pool())
+            .await
+            .expect("compatibility readable");
+        assert_eq!(
+            after.schema_version, TARGET_SCHEMA_VERSION,
+            "the upgrade must record the version this binary writes",
+        );
+        assert_eq!(
+            after.min_reader_version, 1,
+            "an additive migration must not raise the minimum reader, or an older binary would \
+             be refused a database it can still read",
+        );
+
+        // The new columns exist, and every pre-existing row reports `NULL` for both rather than a
+        // default. `NULL` is what the read treats as "this row predates the measurement", which is
+        // a different fact from a call that measured zero deltas — inventing a `0` here would make
+        // every upgraded database claim its old calls were measured bursts.
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('model_calls') WHERE name IN \
+             ('last_output_at', 'output_delta_count') ORDER BY name",
+        )
+        .fetch_all(database.pool())
+        .await
+        .expect("the column catalog is readable");
+        assert_eq!(
+            columns,
+            vec!["last_output_at".to_owned(), "output_delta_count".to_owned()],
+            "both delivery columns must exist after the upgrade",
+        );
+
+        // The row written at version 5 survived, and reports `NULL` for both added columns rather
+        // than a default. **This is the assertion that makes the test about an upgrade rather than
+        // about a schema**: `0` here would claim the old call was measured and delivered nothing,
+        // which is a burst verdict invented for a call nobody measured. The read treats `NULL` as
+        // "this row predates the measurement", and that reading is only available because the
+        // column was added without a backfill.
+        let surviving: (i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT count(*), max(last_output_at), max(output_delta_count) FROM model_calls",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("the upgraded rows are readable");
+        assert_eq!(surviving.0, 1, "the pre-upgrade row must survive");
+        assert_eq!(
+            surviving.1, None,
+            "a row written before the column existed must read as NULL, not as a default instant",
+        );
+        assert_eq!(
+            surviving.2, None,
+            "and NULL for the count, which is a different fact from a measured zero",
+        );
+
+        // And the database is still sound, which is the property an `ALTER TABLE` could break.
+        database
+            .check_integrity()
+            .await
+            .expect("the upgraded database is intact");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }

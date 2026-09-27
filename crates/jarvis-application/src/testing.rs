@@ -25,6 +25,8 @@ use jarvis_domain::ids::{
     ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId,
     PolicyExceptionId, RunId, WorkspaceId,
 };
+use jarvis_domain::model::capability::DeliveryMeasurement;
+use jarvis_domain::model::identity::ModelRevision;
 use jarvis_domain::model::policy::{ModelRouteDecision, PolicyVersionRef};
 use jarvis_domain::model::stream::{FinishReason, Usage};
 use jarvis_domain::run::budget::RunBudget;
@@ -36,7 +38,8 @@ use crate::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation, StoredMessage,
 };
 use crate::repository::model_call::{
-    ModelCallOutcome, ModelCallRepository, ModelCallState, NewModelCall, StoredModelCall,
+    ModelCallOutcome, ModelCallRepository, ModelCallState, ModelDeliverySamples, NewModelCall,
+    StoredModelCall,
 };
 use crate::repository::run::{
     IdempotencyClaim, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord,
@@ -136,6 +139,15 @@ struct CallRow {
     completed_at: Option<UtcTimestamp>,
     /// When the first output arrived, recorded with the outcome for the same reason.
     first_output_at: Option<UtcTimestamp>,
+    /// When the **last** output arrived, recorded with the outcome.
+    ///
+    /// The double must carry it for the same reason it carries the first instant: a divergence
+    /// between the double and the adapter is invisible to a test exercising either one alone, and
+    /// a double that stored fewer columns is the dangerous direction — a rule the adapter keeps
+    /// could be asserted against a store that never held it.
+    last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas the attempt produced, when recorded.
+    output_delta_count: Option<u32>,
     usage: Option<Usage>,
     estimated_cost_microunits: Option<u64>,
 }
@@ -318,6 +330,8 @@ impl InMemoryRepositories {
                     finish_reason: call.finish_reason.clone(),
                     provider_request_id: call.provider_request_id.clone(),
                     first_output_at: call.first_output_at,
+                    last_output_at: call.last_output_at,
+                    output_delta_count: call.output_delta_count,
                 })
                 .collect())
         })
@@ -375,6 +389,19 @@ pub struct RecordedUsage {
     /// every path, so the column was absent on every row and no time-to-first-token interval could
     /// be computed. Projected here so a test can assert the stored instant.
     pub first_output_at: Option<UtcTimestamp>,
+    /// When the call's last output delta arrived, as recorded with the outcome.
+    ///
+    /// The other end of the interval a delivery measurement is computed from. Read here so a test
+    /// can assert the **spread** the controller observed rather than only its start — a measurement
+    /// whose end is never asserted would let `last_output_at` stay frozen at the first instant,
+    /// which reports every call as a burst.
+    pub last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas the call produced, as recorded with the outcome.
+    ///
+    /// `None` means the column was never written, which is different from a written `Some(0)`:
+    /// the first is a call from before the column existed, the second is a call that produced no
+    /// output. The domain's own reason for keeping every `Usage` counter an `Option` applies here.
+    pub output_delta_count: Option<u32>,
 }
 
 impl RunRepository for InMemoryRepositories {
@@ -1030,6 +1057,10 @@ impl ModelCallRepository for InMemoryRepositories {
                         started_at: call.started_at,
                         completed_at: None,
                         first_output_at: None,
+                        // Populated only by `record_outcome`, so a pending attempt reports no
+                        // delivery timing rather than an inherited one.
+                        last_output_at: None,
+                        output_delta_count: None,
                         usage: None,
                         estimated_cost_microunits: None,
                     },
@@ -1063,6 +1094,12 @@ impl ModelCallRepository for InMemoryRepositories {
         outcome: ModelCallOutcome,
     ) -> RepositoryFuture<'_, ()> {
         Box::pin(async move {
+            // Validated here as well as in the adapter, and for the same reason: the double must
+            // enforce what the real store enforces, or a rule the adapter keeps can be asserted
+            // against a store that never held it. `validated()` refuses the half-measurement
+            // shapes — a last-output instant with no first, a delta count with no instant — whose
+            // fields are public and therefore constructible by a caller.
+            let outcome = outcome.validated()?;
             self.with(|store| {
                 let row = store
                     .calls
@@ -1092,6 +1129,8 @@ impl ModelCallRepository for InMemoryRepositories {
                 // adapter does not keep.
                 row.finish_reason.clone_from(&outcome.finish_reason);
                 row.first_output_at = outcome.first_output_at;
+                row.last_output_at = outcome.last_output_at;
+                row.output_delta_count = outcome.output_delta_count;
                 Ok(())
             })
         })
@@ -1113,6 +1152,100 @@ impl ModelCallRepository for InMemoryRepositories {
                     .collect();
                 rows.sort_by_key(|row| row.attempt);
                 Ok(rows)
+            })
+        })
+    }
+
+    fn delivery_campaigns(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<ModelDeliverySamples>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut groups: Vec<ModelDeliverySamples> = Vec::new();
+                let mut rows: Vec<&CallRow> = store
+                    .calls
+                    .values()
+                    .filter(|row| row.workspace_id == workspace)
+                    // The same measurement filter as the adapter's `WHERE first_output_at IS NOT
+                    // NULL` clause, and it must be here for the reason the double exists: a call
+                    // that produced nothing has no timing, and counting it as a zero would report
+                    // a burst for a model that was never allowed to stream. A double that folded
+                    // such a row in would pass a test the adapter fails.
+                    .filter(|row| {
+                        row.first_output_at.is_some()
+                            && row.last_output_at.is_some()
+                            && row.output_delta_count.is_some()
+                    })
+                    .collect();
+                // Ordered the way the adapter's `ORDER BY` orders, so a grouping bug that depends
+                // on iteration order cannot pass here and fail against SQLite.
+                rows.sort_by(|left, right| {
+                    (
+                        left.call.model.provider_id.as_str(),
+                        left.call.model.model_id.as_str(),
+                        left.call.model.revision.as_ref().map(ModelRevision::as_str),
+                        left.started_at,
+                    )
+                        .cmp(&(
+                            right.call.model.provider_id.as_str(),
+                            right.call.model.model_id.as_str(),
+                            right
+                                .call
+                                .model
+                                .revision
+                                .as_ref()
+                                .map(ModelRevision::as_str),
+                            right.started_at,
+                        ))
+                });
+
+                for row in rows {
+                    // Every filtered row has all three, and the `filter` above is what makes that
+                    // true — so a `None` here would be the filter and this read disagreeing, not an
+                    // ordinary absent value.
+                    let (Some(first), Some(last), Some(count)) = (
+                        row.first_output_at,
+                        row.last_output_at,
+                        row.output_delta_count,
+                    ) else {
+                        continue;
+                    };
+                    // The profile is derived by the domain's own producer, so the double and the
+                    // adapter compute the intervals the same way — including the clamp rule.
+                    let sample = DeliveryMeasurement {
+                        started_at: row.started_at,
+                        first_output_at: first,
+                        last_output_at: last,
+                        delta_count: count,
+                    }
+                    .profile();
+                    let key = (
+                        row.call.model.provider_id.as_str(),
+                        row.call.model.model_id.as_str(),
+                        row.call.model.revision.as_ref().map(ModelRevision::as_str),
+                    );
+                    let same_group = groups.last().is_some_and(|group| {
+                        (
+                            group.provider_id.as_str(),
+                            group.model_id.as_str(),
+                            group.revision.as_ref().map(ModelRevision::as_str),
+                        ) == key
+                    });
+                    if same_group {
+                        if let Some(group) = groups.last_mut() {
+                            group.samples.push(sample);
+                        }
+                    } else {
+                        groups.push(ModelDeliverySamples {
+                            provider_id: row.call.model.provider_id.clone(),
+                            model_id: row.call.model.model_id.clone(),
+                            revision: row.call.model.revision.clone(),
+                            samples: vec![sample],
+                        });
+                    }
+                }
+                Ok(groups)
             })
         })
     }
@@ -1184,6 +1317,9 @@ fn stored_call(row: &CallRow) -> StoredModelCall {
         state: row.state,
         provider_request_id: row.provider_request_id.clone(),
         started_at: row.started_at,
+        first_output_at: row.first_output_at,
+        last_output_at: row.last_output_at,
+        output_delta_count: row.output_delta_count,
         completed_at: row.completed_at,
     }
 }

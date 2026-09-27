@@ -3419,6 +3419,36 @@ async fn the_first_output_instant_is_recorded_when_the_first_delta_arrives() {
         "the interval is measured to the FIRST token, not the last",
     );
     assert_ne!(instant, later);
+    // The **other** end of the interval, and the delta count that makes it a measurement rather
+    // than a pair of instants. Asserted here rather than in a test of its own because the two ends
+    // describe one interval: a `first_output_at`-only assertion would pass while `last_output_at`
+    // stayed `None`, which is exactly the state this column pair exists to leave behind.
+    assert_eq!(
+        recorded[0].last_output_at,
+        Some(later),
+        "the LAST delta's instant is what completes the spread; a first-wins implementation \
+         would record the first instant here and report every call as a burst",
+    );
+    assert_eq!(
+        recorded[0].output_delta_count,
+        Some(2),
+        "the count is the measurement's sample size, not a boolean",
+    );
+    // And the derived profile is the one the router would read, computed from the stored row.
+    let measurement = jarvis_domain::model::capability::DeliveryMeasurement {
+        started_at: now(),
+        first_output_at: instant,
+        last_output_at: later,
+        delta_count: recorded[0].output_delta_count.expect("recorded"),
+    };
+    let profile = measurement.profile();
+    assert_eq!(profile.time_to_first_token_ms, 0);
+    assert_eq!(profile.chunk_spread_ms, 500);
+    assert_eq!(profile.observed_deltas, 1);
+    assert!(
+        profile.is_incremental(),
+        "500 ms of spread with a delta after the first is a genuine stream",
+    );
     // And it survives a read through the port, so the column is neither write-only nor readable
     // only through the double.
     let calls = fixture
@@ -3433,6 +3463,54 @@ async fn the_first_output_instant_is_recorded_when_the_first_delta_arrives() {
     assert!(
         stored.started_at <= instant,
         "the instant is after the start"
+    );
+    assert_eq!(stored.last_output_at, Some(later));
+    assert_eq!(stored.output_delta_count, Some(2));
+}
+
+#[tokio::test]
+async fn a_single_delta_call_records_a_burst_profile() {
+    // The case the whole `BRN-011` measurement exists for, driven through the real controller:
+    // a model that "streams" and delivers its answer in one piece. Both instants are equal, so a
+    // spread-of-zero reading is correct here, and the **count** is what makes the verdict a burst
+    // rather than an unknown. A first-token-only measurement would report this call as a fast
+    // stream and route to a model that cannot be streamed from.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "the whole answer at once")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(
+        recorded[0].output_delta_count,
+        Some(1),
+        "one delta is one delta, whatever the text length",
+    );
+    let measurement = jarvis_domain::model::capability::DeliveryMeasurement {
+        started_at: now(),
+        first_output_at: recorded[0].first_output_at.expect("output arrived"),
+        last_output_at: recorded[0].last_output_at.expect("output arrived"),
+        delta_count: 1,
+    };
+    assert!(
+        !measurement.profile().is_incremental(),
+        "a reply delivered in one piece must not satisfy a measured-incremental requirement",
     );
 }
 
@@ -3461,6 +3539,22 @@ async fn a_call_that_produced_no_output_records_no_first_output_instant() {
     assert!(
         recorded[0].first_output_at.is_none(),
         "a call with no output has no first-output instant",
+    );
+    // The same negative for the new pair, and it is not redundant: a `last_output_at` written on
+    // every path — say from the completion instant — would give this call a spread of zero and a
+    // measurable-looking profile derived from a call that produced nothing at all.
+    assert!(
+        recorded[0].last_output_at.is_none(),
+        "a call with no output has no last-output instant either",
+    );
+    // And the count is `None`, not `Some(0)`, which is the distinction this test initially got
+    // **wrong** — it asserted `Some(0)` and passed, because that is what the controller wrote. The
+    // controller writing `Some(0)` made a call that produced nothing indistinguishable from one
+    // observed to produce zero deltas, and the column documents `NULL` as "not measured" precisely
+    // so those two facts stay apart. `Some(0)` is a measurement of a delivery nobody made.
+    assert_eq!(
+        recorded[0].output_delta_count, None,
+        "a call that produced no output was not measured, which is not the same as measuring zero",
     );
 }
 

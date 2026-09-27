@@ -95,6 +95,7 @@ const REQUIRED_FILES = [
   "docs/research/integrations/elevenlabs.md",
   "docs/research/integrations/github-actions.md",
   "docs/research/integrations/mcp.md",
+  "docs/research/integrations/openai-compatible-model.md",
   "docs/research/integrations/release-signing.md",
   "docs/research/integrations/rust-foundation.md",
   "docs/research/integrations/tauri.md",
@@ -106,7 +107,17 @@ const REQUIRED_FILES = [
   "docs/testing/acceptance.md",
   "docs/testing/strategy.md",
 ];
-const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "target"]);
+// Directories excluded from the repository that must also be invisible to this
+// validator.
+//
+// `.scratch` is here for the same reason as `target` and `node_modules`: it is a
+// gitignored working area (`.gitignore` line 13), so its contents are not part of the
+// repository and must not be able to fail a gate or change a validated count. This
+// matters most for the text-encoding check, whose extension list already reaches
+// `.rs` and `.mjs`: a scratch copy of a corrupted file is precisely what a developer
+// debugging this check would leave behind, and it must not turn that debugging into a
+// red build.
+const SKIPPED_DIRECTORIES = new Set([".git", ".scratch", "node_modules", "target"]);
 
 // Directories excluded from the repository by `.gitignore` that must also be
 // invisible to this validator.
@@ -118,6 +129,96 @@ const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "target"]);
 // intentionally explicit rather than derived from `.gitignore`, so a new
 // exclusion is a deliberate, reviewable edit instead of a silent side effect.
 const EXCLUDED_DIRECTORIES = new Set(["docs/research-telephony"]);
+
+// Round-trip damage a legacy code page leaves in a text file.
+//
+// Every gate in this repository has passed while a document contained this damage. It happens
+// when a file is read with a non-UTF-8 default and written back as UTF-8: the em dash
+// (bytes `E2 80 94`) is decoded as three cp1252 characters and re-encoded, producing the bytes
+// `C3 A2 E2 82 AC E2 80 9D`. The file still compiles, the link and ID checks still pass, and
+// only the bytes reveal it — which is why a `.rs` file stayed corrupted for several rounds while
+// this validator, `cargo fmt`, `clippy`, and every journey reported success. The check is on the
+// file's **content**, not its file encoding: the damage is valid UTF-8 either way, so an
+// encoding check cannot see it.
+//
+// The markers below are written as escapes rather than as the characters themselves, because a
+// literal copy here would be damaged text in the checker — which is the defect, not the fix. The
+// set is the small number of sequences a reader actually sees in a diff, chosen so a legitimate
+// document cannot contain them; the four-byte form is included because it is the tell when the
+// damage has been through the round trip more than once.
+const MOJIBAKE_MARKERS = [
+  "\u00e2\u20ac\u201d", // U+00E2 U+20AC U+201D, an em dash read as cp1252
+  "\u00e2\u20ac\u201c", // the same, for an en dash
+  "\u00e2\u20ac\u2122", // the same, for a right single quote (an apostrophe in prose)
+  "\u00c3\u00a2", // U+00C3 U+00A2, the same damage applied twice
+  "\u00ef\u00bb\u00bf", // a UTF-8 byte-order mark read as text and re-encoded
+];
+
+/**
+ * The source and script extensions whose **content** is reviewed as text.
+ *
+ * The damage is not a Markdown problem — the one instance found in this repository was in a
+ * Rust module, where it survived for several rounds because the file still compiled. Source
+ * files are therefore checked with the same rule, and the list is explicit so a new language is
+ * a deliberate edit rather than something the check silently ignores.
+ */
+const TEXT_SOURCE_EXTENSIONS = [
+  ".rs",
+  ".toml",
+  ".json",
+  ".mjs",
+  ".js",
+  ".yml",
+  ".yaml",
+  ".sh",
+  ".sql",
+];
+
+/**
+ * Reports code-page round-trip damage in a document.
+ *
+ * Exported so the fail-closed test can drive it directly, and kept as a pure function of the
+ * text so it cannot depend on which file it happens to be looking at.
+ */
+export function encodingErrors(relativePath, text) {
+  const errors = [];
+  if (text.startsWith("\ufeff")) {
+    errors.push(`${relativePath}: file starts with a UTF-8 byte-order mark`);
+  }
+  for (const marker of MOJIBAKE_MARKERS) {
+    let index = text.indexOf(marker);
+    while (index !== -1) {
+      const line = text.slice(0, index).split(/\r?\n/).length;
+      errors.push(
+        `${relativePath}:${line}: text contains a code-page round-trip artefact ` +
+          `(${JSON.stringify(marker)}); re-encode the file from its real content`,
+      );
+      index = text.indexOf(marker, index + marker.length);
+    }
+  }
+  return errors;
+}
+
+/**
+ * Checks the encoding of every reviewed text file, not only the documents.
+ *
+ * This is deliberately part of the documentation gate rather than a separate lint: the gate is
+ * the one command every change already runs, and a check nobody runs is a check that does not
+ * exist. The walk reuses the same skipped and excluded directories as the Markdown pass, so a
+ * scratch area stays invisible here too, and the extensions are listed explicitly so a new
+ * language is a deliberate edit rather than something the check silently ignores.
+ */
+export function validateTextEncoding(errors) {
+  const files = walk(ROOT).filter((filePath) =>
+    TEXT_SOURCE_EXTENSIONS.some((extension) => filePath.endsWith(extension)),
+  );
+
+  for (const filePath of files) {
+    const text = readFileSync(filePath, "utf8");
+    errors.push(...encodingErrors(relative(filePath), text));
+  }
+  return files.length;
+}
 
 function parseArguments() {
   const changedFiles = [];
@@ -505,6 +606,8 @@ function validateMarkdown(errors) {
     const text = readFileSync(filePath, "utf8");
     const relativePath = relative(filePath);
 
+    errors.push(...encodingErrors(relativePath, text));
+
     for (const status of matches(statusPattern, text)) {
       if (!ALLOWED_STATUSES.has(status)) {
         errors.push(`${relativePath}: unsupported Status value ${JSON.stringify(status)}`);
@@ -867,6 +970,7 @@ function main() {
   validateRequiredFiles(errors);
   validateIndexCompleteness(errors);
   const markdownCount = validateMarkdown(errors);
+  const textFileCount = validateTextEncoding(errors);
   const { acceptanceCount, requirementCount, todoCount } =
     validateIdsAndTraceability(errors);
   const integrationCount = validateEvidence(
@@ -888,6 +992,7 @@ function main() {
       `${todoCount} TODO IDs, ${acceptanceCount} acceptance scenarios, and ` +
       `${integrationCount} integration evidence entries.`,
   );
+  console.log(`Checked text encoding of ${textFileCount} source and document files.`);
   return 0;
 }
 

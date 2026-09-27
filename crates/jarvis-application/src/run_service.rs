@@ -31,7 +31,9 @@ use jarvis_domain::ids::{
     ConversationId, CorrelationId, MessageId, ModelRouteDecisionId, PolicyExceptionId, PrincipalId,
     RequestId, RunId, WorkspaceId,
 };
-use jarvis_domain::model::capability::CapabilityDescriptor;
+use jarvis_domain::model::capability::{
+    CapabilityDescriptor, DeliverySamples, MIN_PROFILE_SAMPLES,
+};
 use jarvis_domain::model::policy::{PolicyRules, PolicyVersionRef, Sensitivity};
 use jarvis_domain::model::routing::{
     RouteCandidate, RouteRequest, RouteSelectionFailure, select_route_explained,
@@ -363,6 +365,18 @@ pub struct RunPorts {
     /// a run created without this port records **no policy**, and the controller treats that as
     /// "hold nothing back but record every label" rather than as "a policy permitted everything".
     pub policies: Option<Arc<dyn ModelDataPolicyRepository>>,
+    /// The stored delivery measurements, one group per model, for capability attestation.
+    ///
+    /// Carried on the ports rather than read inside `route_candidates`, because that function is a
+    /// free function over a provider and giving it a store would make it perform I/O in a helper the
+    /// daemon also calls from a synchronous context. The daemon reads it once at startup, so a
+    /// probe and a run attest from the same measurement of the same database — which is the same
+    /// agreement `route_candidates` exists to guarantee about the model list itself.
+    ///
+    /// An **empty** vector is the ordinary fresh-install state and is not a configuration error: it
+    /// means nothing has been measured yet, so every descriptor keeps `None` and a route requiring
+    /// incremental delivery refuses rather than passing on an absent measurement.
+    pub delivery_campaigns: Vec<crate::repository::model_call::ModelDeliverySamples>,
 }
 
 /// Orchestrates run creation, execution, and cancellation.
@@ -950,10 +964,12 @@ impl RunService {
             return Ok(None);
         };
 
-        let candidates = route_candidates(self.ports.provider.as_ref());
-        // The evidence-revalidation day is derived from the same instant the decision records, so
-        // the day and the instant cannot straddle midnight and describe different moments.
         let today = created_at.utc_date();
+        let candidates = route_candidates(
+            self.ports.provider.as_ref(),
+            &self.ports.delivery_campaigns,
+            today,
+        );
         let request = RouteRequest {
             rules,
             policy: reference,
@@ -1045,16 +1061,28 @@ impl RunService {
     }
 }
 
-/// Builds the candidate list from a provider, applying each served model's own endpoint class.
+/// Builds the candidate list from a provider, applying each served model's own endpoint class
+/// and **attesting a measured delivery profile where a campaign exists**.
 ///
 /// A free function so the daemon's `ProviderInventory` and this caller produce the **same**
 /// candidates from the same provider. Two builders would let the diagnostic probe and the run
 /// disagree about which models exist, which is the failure mode an operator would most struggle
-/// to see: the probe would report a route the run never took.
+/// to see: the probe would report a route the run never took. Attestation happens *inside* this one
+/// builder for exactly the same reason — a probe that attested profiles while a run did not would
+/// report a route the run would refuse, which is the same defect in the opposite direction.
+///
+/// `campaigns` is the stored measurement state and `today` is the day evidence freshness is
+/// evaluated against. Both come from the caller so this stays a pure function: a helper that read
+/// its own store could not be called from a synchronous context, and one that read its own clock
+/// would evaluate the same database differently on two calls.
 #[must_use]
-pub fn route_candidates(provider: &dyn ModelProvider) -> Vec<RouteCandidate> {
+pub fn route_candidates(
+    provider: &dyn ModelProvider,
+    campaigns: &[crate::repository::model_call::ModelDeliverySamples],
+    today: jarvis_domain::time::IsoDate,
+) -> Vec<RouteCandidate> {
     let endpoint_class = provider.endpoint_class();
-    provider
+    let mut candidates: Vec<RouteCandidate> = provider
         .models()
         .iter()
         .map(|model| RouteCandidate {
@@ -1066,14 +1094,96 @@ pub fn route_candidates(provider: &dyn ModelProvider) -> Vec<RouteCandidate> {
             // direction, since a provider that does not say where it processes cannot be shown to
             // be inside an allowed region.
             region: None,
-            // No retention or training-use evidence: `BRN-011` measures capabilities and no adapter
-            // attaches provider terms yet. `None` is the honest value and it makes a policy that
-            // demands documentation refuse rather than pass on a guess.
+            // No retention or training-use evidence: no adapter attaches provider terms yet.
+            // `None` is the honest value and it makes a policy that demands documentation refuse
+            // rather than pass on a guess. This half is a **data-policy** obligation and is not
+            // what `BRN-011` measures; the delivery profile below is.
             retention: None,
             training_use: None,
         })
-        .collect()
+        .collect();
+    attach_delivery_profiles(&mut candidates, campaigns, today);
+    candidates
 }
+
+/// The provider identifier recorded on a measured delivery profile.
+///
+/// The evidence names **which adapter produced the numbers**, because "the provider documented
+/// this" and "this deployment measured the provider's endpoint" are different claims and an
+/// operator has to be able to tell them apart. A single constant rather than the composed
+/// provider's own name: the measurement is taken against whichever adapter is configured, and
+/// today that is the one OpenAI-compatible adapter this repository's evidence note covers.
+const DELIVERY_MEASUREMENT_INTEGRATION: &str = "openai-compatible-model";
+
+/// How long a measured delivery profile may be used before it must be re-measured.
+///
+/// Three months, matching the 90-day revalidation window `integration-research-policy.md` sets for
+/// beta and realtime APIs and the same order of magnitude as every other evidence note here. A
+/// profile describes how an endpoint behaved when it was measured, and a provider that reroutes
+/// traffic, upgrades a kernel, or changes an inference engine changes that behaviour without
+/// announcing it. The date is derived from the measurement instant rather than written by hand, so
+/// a profile cannot be created already expired or accidentally dated in the far future.
+const DELIVERY_PROFILE_VALID_DAYS: i64 = 90;
+
+/// Replaces each candidate's delivery descriptor with an attested profile from stored measurements.
+///
+/// **This is the step that turns a measurement into capability evidence.** `BRN-011`'s first half
+/// recorded three timings on every call that produced output, and every `CapabilityDescriptor` was
+/// still built here with `incremental_delivery: None` — so the figures existed, the profile type
+/// existed, the routing predicate that consumes it existed, and no route could ever require
+/// incremental delivery because nothing ever attested it. The producer and the consumer were
+/// connected, and the *evidence* joining them was missing.
+///
+/// Four decisions:
+///
+/// - **The samples come from the caller, not from a store this function opens.** The same reason
+///   `RouteRequest` carries its policy rules: a descriptor builder that read its own store would be
+///   a second place a scope could be applied, and a workspace filter that existed in the reader but
+///   not here would leak one workspace's figures into another's routes.
+/// - **A model with fewer than [`MIN_PROFILE_SAMPLES`] calls keeps `None`.** Not a profile from one
+///   observation, and not a partial one — an absent descriptor is exactly what makes a route
+///   requiring incremental delivery *refuse*, which is the fail-closed answer for a model that has
+///   not been measured enough to rely on. The floor is applied by
+///   [`DeliverySamples::attested_profile`], so this function cannot accept a campaign below it.
+/// - **The endpoint class comes from the candidate, not from the campaign.** The class is a
+///   property of where the call went, which the provider port reports; a class read back from a
+///   stored row would be a second answer to the same question.
+/// - **A campaign for a model the provider no longer serves is ignored.** Applying it would
+///   attest a capability to a candidate that is not offered, and the loop is driven by the
+///   candidate list precisely so that cannot happen.
+pub fn attach_delivery_profiles(
+    candidates: &mut [RouteCandidate],
+    campaigns: &[crate::repository::model_call::ModelDeliverySamples],
+    today: jarvis_domain::time::IsoDate,
+) {
+    for candidate in candidates.iter_mut() {
+        let Some(campaign) = campaigns.iter().find(|group| {
+            group.provider_id == candidate.model.provider_id
+                && group.model_id == candidate.model.model_id
+                && group.revision == candidate.model.revision
+        }) else {
+            continue;
+        };
+        let samples = DeliverySamples {
+            model: candidate.model.clone(),
+            endpoint_class: candidate.endpoint_class,
+            samples: campaign.samples.clone(),
+        };
+        let revalidate_by = today.adding_days(DELIVERY_PROFILE_VALID_DAYS);
+        if let Some(attested) =
+            samples.attested_profile(DELIVERY_MEASUREMENT_INTEGRATION, today, revalidate_by)
+        {
+            candidate.descriptor.incremental_delivery = Some(attested);
+        }
+    }
+}
+
+/// The fewest measured calls any model needs before its delivery profile is attested.
+///
+/// Re-exported through this module so `docs/architecture/model-gateway.md`'s "measured, not
+/// declared" claim has one number to name, and so a caller does not have to reach into the domain
+/// for it. It is the domain's constant, not a copy.
+pub const DELIVERY_PROFILE_MIN_SAMPLES: usize = MIN_PROFILE_SAMPLES;
 /// Builds the budget a newly created run starts with.
 ///
 /// Every run gets a budget, derived rather than left unset. An unset budget is not a neutral

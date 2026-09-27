@@ -29,7 +29,7 @@ use jarvis_application::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation, StoredMessage,
 };
 use jarvis_application::repository::model_call::{
-    ModelCallOutcome, ModelCallRepository, NewModelCall, StoredModelCall,
+    ModelCallOutcome, ModelCallRepository, ModelDeliverySamples, NewModelCall, StoredModelCall,
 };
 use jarvis_application::repository::run::{
     EventVisibility, IdempotencyClaim, IncompleteRun, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
@@ -41,6 +41,7 @@ use jarvis_domain::ids::{
     ConversationId, MessageId, ModelCallId, ModelRouteDecisionId, PrincipalId, RunActivityEventId,
     RunId, WorkspaceId,
 };
+use jarvis_domain::model::capability::IncrementalDelivery;
 use jarvis_domain::model::identity::{ModelId, ModelRevision, ProviderId};
 use jarvis_domain::model::stream::{FinishReason, Role};
 use jarvis_domain::run::budget::RunBudget;
@@ -203,6 +204,20 @@ fn opt_text(
         .map_err(|_| RepositoryError::Corrupted { column })
 }
 
+/// Reads a nullable integer column.
+///
+/// A `NULL` column is `None` rather than an error, and an INTEGER column holding a non-integer
+/// is `Corrupted` rather than `None`: the two are different facts, and collapsing them would let
+/// a value JARVIS wrote but cannot read look like one it never wrote. That distinction is why a
+/// nullable column needs its own reader rather than going through [`int`], which refuses `NULL`.
+fn opt_int(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<Option<i64>, RepositoryError> {
+    row.try_get(column)
+        .map_err(|_| RepositoryError::Corrupted { column })
+}
+
 /// Begins a transaction that will **write**, taking the write lock up front.
 ///
 /// `BEGIN IMMEDIATE` rather than the driver's default deferred `BEGIN`, and this is a
@@ -335,6 +350,21 @@ const RUN_SELECT: &str = concat!(
     run_columns!(),
     " FROM agent_runs WHERE workspace_id = ? AND id = ?"
 );
+
+/// The model-call columns every model-call read selects.
+///
+/// Written **once** for the same reason [`run_columns`] is: `load_attempt` and `load_attempts`
+/// each carried their own copy of this list, and that is exactly how a column added to one and
+/// forgotten in the other becomes `Corrupted { column: … }` on a valid row. `load_attempts` had
+/// already been missed once, when `route_decision_id` was added to `load_attempt` only.
+macro_rules! model_call_columns {
+    () => {
+        "id, run_id, logical_call_id, attempt, provider_id, model_id, \
+         model_revision, route_decision_id, finish_reason, state, \
+         provider_request_id, started_at, first_output_at, last_output_at, \
+         output_delta_count, completed_at"
+    };
+}
 
 /// Reads one run inside `executor`.
 ///
@@ -1393,6 +1423,22 @@ fn stored_model_call(row: &sqlx::sqlite::SqliteRow) -> Result<StoredModelCall, R
         )?)?,
         provider_request_id: opt_text(row, "provider_request_id")?,
         started_at: parse_time(&text(row, "started_at")?, "started_at")?,
+        first_output_at: opt_text(row, "first_output_at")?
+            .map(|value| parse_time(&value, "first_output_at"))
+            .transpose()?,
+        last_output_at: opt_text(row, "last_output_at")?
+            .map(|value| parse_time(&value, "last_output_at"))
+            .transpose()?,
+        // An out-of-range or non-integer count is `Corrupted` rather than absent: reporting it
+        // absent would say "this call's delta count was never recorded", when the truth is that
+        // JARVIS wrote a value this build cannot read.
+        output_delta_count: opt_int(row, "output_delta_count")?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| RepositoryError::Corrupted {
+                    column: "output_delta_count",
+                })
+            })
+            .transpose()?,
         completed_at: opt_text(row, "completed_at")?
             .map(|value| parse_time(&value, "completed_at"))
             .transpose()?,
@@ -1448,12 +1494,11 @@ impl ModelCallRepository for SqliteRepositories {
         call: ModelCallId,
     ) -> RepositoryFuture<'_, StoredModelCall> {
         Box::pin(async move {
-            let row = sqlx::query(
-                "SELECT id, run_id, logical_call_id, attempt, provider_id, model_id, \
-                        model_revision, route_decision_id, finish_reason, state, \
-                        provider_request_id, started_at, completed_at \
-                 FROM model_calls WHERE workspace_id = ? AND id = ?",
-            )
+            let row = sqlx::query(concat!(
+                "SELECT ",
+                model_call_columns!(),
+                " FROM model_calls WHERE workspace_id = ? AND id = ?"
+            ))
             .bind(workspace.to_string())
             .bind(call.to_string())
             .fetch_optional(&self.pool)
@@ -1471,6 +1516,12 @@ impl ModelCallRepository for SqliteRepositories {
         outcome: ModelCallOutcome,
     ) -> RepositoryFuture<'_, ()> {
         Box::pin(async move {
+            // Validated at the boundary rather than only in the constructor. The outcome's fields
+            // are public, so a caller can build one this type refuses — and the half-measurement
+            // rules (a last-output instant with no first, a delta count with no instant) are the
+            // ones a partially filled struct would violate. A port that stored whatever it was
+            // handed would make `validated()` a suggestion only in-crate callers follow.
+            let outcome = outcome.validated()?;
             let usage_json = outcome
                 .usage
                 .as_ref()
@@ -1493,7 +1544,8 @@ impl ModelCallRepository for SqliteRepositories {
             let result = sqlx::query(
                 "UPDATE model_calls SET state = ?, provider_request_id = ?, \
                      continuation_ref = ?, usage_json = ?, estimated_cost_microunits = ?, \
-                     finish_reason = ?, error_code = ?, first_output_at = ?, completed_at = ? \
+                     finish_reason = ?, error_code = ?, first_output_at = ?, \
+                     last_output_at = ?, output_delta_count = ?, completed_at = ? \
                  WHERE workspace_id = ? AND id = ? \
                    AND state NOT IN ('completed', 'failed', 'cancelled')",
             )
@@ -1509,6 +1561,8 @@ impl ModelCallRepository for SqliteRepositories {
             .bind(finish_reason.as_deref())
             .bind(outcome.error_code.as_deref())
             .bind(outcome.first_output_at.map(|value| value.to_string()))
+            .bind(outcome.last_output_at.map(|value| value.to_string()))
+            .bind(outcome.output_delta_count.map(i64::from))
             .bind(outcome.completed_at.map(|value| value.to_string()))
             .bind(workspace.to_string())
             .bind(call.to_string())
@@ -1551,13 +1605,12 @@ impl ModelCallRepository for SqliteRepositories {
         logical_call_id: ModelCallId,
     ) -> RepositoryFuture<'_, Vec<StoredModelCall>> {
         Box::pin(async move {
-            let rows = sqlx::query(
-                "SELECT id, run_id, logical_call_id, attempt, provider_id, model_id, \
-                        model_revision, route_decision_id, finish_reason, state, \
-                        provider_request_id, started_at, completed_at \
-                 FROM model_calls WHERE workspace_id = ? AND logical_call_id = ? \
-                 ORDER BY attempt ASC",
-            )
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                model_call_columns!(),
+                " FROM model_calls WHERE workspace_id = ? AND logical_call_id = ? \
+                 ORDER BY attempt ASC"
+            ))
             .bind(workspace.to_string())
             .bind(logical_call_id.to_string())
             .fetch_all(&self.pool)
@@ -1566,6 +1619,132 @@ impl ModelCallRepository for SqliteRepositories {
             rows.iter().map(stored_model_call).collect()
         })
     }
+
+    fn delivery_campaigns(
+        &self,
+        workspace: WorkspaceId,
+    ) -> RepositoryFuture<'_, Vec<ModelDeliverySamples>> {
+        Box::pin(async move {
+            // The three timings are selected as their **stored spellings** and parsed with the same
+            // `UtcTimestamp::parse` every other timestamp column uses, rather than being summed in
+            // SQL. Two reasons, and both are correctness rather than style: the intervals are
+            // computed by `DeliveryMeasurement::profile`, which is the one place the clamping and
+            // saturation rules live — a `julianday()` subtraction in the query would be a second
+            // implementation that could disagree with it — and text timestamps have a fixed
+            // canonical form, so SQL ordering and Rust parsing agree.
+            //
+            // The three `IS NOT NULL` clauses are what make this a measurement read rather than a
+            // call read. A call that produced nothing has no timing to contribute, and folding it
+            // in as zero would report a burst for a model that was never allowed to stream.
+            //
+            // They are stated **separately even though the write path always sets all three
+            // together** (`ModelCallOutcome::validated` refuses a half-measurement), so in this
+            // build any one of them excludes the same rows. That redundancy is deliberate defence in
+            // depth against a row this binary did not write — an older binary, a hand edit, a
+            // restored backup — but it has a cost worth recording: **removing one clause does not
+            // fail a test**, because the other two still exclude the row. The falsification that
+            // means something is removing *all three*, and `an_unmeasured_call_contributes_no_
+            // delivery_sample` is written to fail on that rather than on one clause.
+            let rows = sqlx::query(
+                "SELECT provider_id, model_id, model_revision, started_at, first_output_at, \
+                     last_output_at, output_delta_count \
+                 FROM model_calls \
+                 WHERE workspace_id = ? AND first_output_at IS NOT NULL \
+                   AND last_output_at IS NOT NULL AND output_delta_count IS NOT NULL \
+                 ORDER BY provider_id ASC, model_id ASC, model_revision ASC, started_at ASC",
+            )
+            .bind(workspace.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+
+            let mut groups: Vec<ModelDeliverySamples> = Vec::new();
+            for row in &rows {
+                let sample = delivery_sample(row)?;
+                let provider_id: String = row
+                    .try_get("provider_id")
+                    .map_err(corrupted("provider_id"))?;
+                let model_id: String = row.try_get("model_id").map_err(corrupted("model_id"))?;
+                let revision: Option<String> = row
+                    .try_get("model_revision")
+                    .map_err(corrupted("model_revision"))?;
+                let key = (provider_id.as_str(), model_id.as_str(), revision.as_deref());
+                match groups.last_mut() {
+                    Some(group)
+                        if (
+                            group.provider_id.as_str(),
+                            group.model_id.as_str(),
+                            group.revision.as_ref().map(ModelRevision::as_str),
+                        ) == key =>
+                    {
+                        group.samples.push(sample);
+                    }
+                    _ => groups.push(ModelDeliverySamples {
+                        provider_id: ProviderId::parse(&provider_id).map_err(|_| {
+                            RepositoryError::Corrupted {
+                                column: "provider_id",
+                            }
+                        })?,
+                        model_id: ModelId::parse(&model_id)
+                            .map_err(|_| RepositoryError::Corrupted { column: "model_id" })?,
+                        revision: revision
+                            .map(|value| {
+                                ModelRevision::parse(&value).map_err(|_| {
+                                    RepositoryError::Corrupted {
+                                        column: "model_revision",
+                                    }
+                                })
+                            })
+                            .transpose()?,
+                        samples: vec![sample],
+                    }),
+                }
+            }
+            Ok(groups)
+        })
+    }
+}
+
+/// Builds one delivery sample from a stored row.
+///
+/// The interval is derived by [`DeliveryMeasurement::profile`] rather than here, so the store and
+/// the completion path cannot disagree about what a set of timings means — including the
+/// clamp-to-zero rule for a clock that stepped backwards between writing the row and reading it.
+fn delivery_sample(row: &sqlx::sqlite::SqliteRow) -> Result<IncrementalDelivery, RepositoryError> {
+    use jarvis_domain::model::capability::DeliveryMeasurement;
+
+    let started_at: String = row.try_get("started_at").map_err(corrupted("started_at"))?;
+    let first_output_at: String = row
+        .try_get("first_output_at")
+        .map_err(corrupted("first_output_at"))?;
+    let last_output_at: String = row
+        .try_get("last_output_at")
+        .map_err(corrupted("last_output_at"))?;
+    // A negative stored count is `Corrupted` rather than clamped: the column is written from a
+    // `u32` and read back through `i64`, so a negative value means something other than this
+    // binary wrote the row, which is a fact an operator needs rather than a number to smooth over.
+    let delta_count: i64 = row
+        .try_get("output_delta_count")
+        .map_err(corrupted("output_delta_count"))?;
+    let delta_count = u32::try_from(delta_count).map_err(|_| RepositoryError::Corrupted {
+        column: "output_delta_count",
+    })?;
+
+    let parse = |column: &'static str, value: &str| {
+        UtcTimestamp::parse(value).map_err(|_| RepositoryError::Corrupted { column })
+    };
+    Ok(DeliveryMeasurement {
+        started_at: parse("started_at", &started_at)?,
+        first_output_at: parse("first_output_at", &first_output_at)?,
+        last_output_at: parse("last_output_at", &last_output_at)?,
+        delta_count,
+    }
+    .profile())
+}
+
+/// Returns a mapper that reports `column` as corrupted.
+fn corrupted(column: &'static str) -> impl Fn(sqlx::Error) -> RepositoryError {
+    move |_| RepositoryError::Corrupted { column }
 }
 
 /// Returns whether `visibility` may be shown to an ordinary client.

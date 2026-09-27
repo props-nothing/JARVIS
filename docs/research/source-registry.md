@@ -31,6 +31,7 @@ again before concluding none exists.
 | System | AI-readable docs | API/source entry | Status and implementation note |
 | --- | --- | --- | --- |
 | OpenAI API | https://developers.openai.com/api/llms.txt | https://developers.openai.com/api/ | VERIFIED via parent https://developers.openai.com/llms.txt; Responses, Realtime, tools, auth, limits, changelog must be re-read |
+| OpenAI Chat Completions (the OpenAI-compatible wire contract) | https://developers.openai.com/api/reference/llms.txt | https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events.md | VERIFIED INDEX; the streaming-events page owns the chunk schema. The reference index is the working index for this subtree — `.../chat/llms.txt`, `.../chat/create.md`, and `.../chat/completions/methods/create.md` all 404. Chat Completions, not Responses, is the compatibility contract |
 | Anthropic/Claude | https://platform.claude.com/docs/llms.txt | https://platform.claude.com/docs/en/api/overview.md | VERIFIED INDEX; no official Rust SDK found in reviewed SDK list, so do not assume one |
 | Gemini API | https://ai.google.dev/gemini-api/docs/llms.txt | https://ai.google.dev/api | VERIFIED INDEX; current docs distinguish recommended Interactions API from legacy generateContent |
 | Ollama | https://docs.ollama.com/llms.txt | https://docs.ollama.com/openapi.yaml | VERIFIED INDEX and OpenAPI; verify local versus cloud auth separately |

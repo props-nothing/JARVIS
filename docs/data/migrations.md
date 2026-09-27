@@ -41,7 +41,7 @@ Startup behavior:
 
 | State | Behavior | Verified by |
 | --- | --- | --- |
-| DB older, auto-migration safe | Acquire lock, backup/preflight, migrate, verify | `a_fresh_database_migrates_and_reports_the_target_version` |
+| DB older, auto-migration safe | Acquire lock, backup/preflight, migrate, verify | `a_fresh_database_migrates_and_reports_the_target_version` (a fresh database) and `a_database_from_a_supported_prior_version_upgrades_in_place` (a populated version-5 database) |
 | DB older, explicit approval required | Readiness false; show command/impact | not implemented — `start` always migrates |
 | DB newer than binary | Refuse writes/start, preserve state, explain update | `a_database_written_by_a_newer_binary_is_refused_and_left_untouched` |
 | Checksum mismatch | Refuse readiness; require diagnosis | `a_checksum_mismatch_is_refused_rather_than_applied_over` |
@@ -57,6 +57,20 @@ binary. The two rows still marked unimplemented are not defects to fix later by 
 to take, and a test of behaviour that does not exist would be the false evidence this column exists
 to prevent. **A table of states with no way to tell which are real is how a reader concludes a
 control exists.**
+
+**The first row needed a second test, and the row read as covered without it.** Its evidence was a
+**fresh** database migrating from nothing, which is not an upgrade: `AGENTS.md` requires "test
+migrations from supported prior versions", and the two are different operations. A migration that
+only creates tables is exercised by both; one that **alters a populated table** — `000006`, which
+adds two columns to `model_calls` — is exercised only by the second, because `ALTER TABLE ADD COLUMN`
+has no row to affect on an empty table. `a_database_from_a_supported_prior_version_upgrades_in_place`
+applies the first five migrations by hand, writes a run and a model call at version 5, then upgrades
+with this binary's migrator and asserts the pre-existing row **survives and reports `NULL` for both
+new columns**. That last assertion is what makes it an upgrade test rather than a schema test: a
+migration that backfilled `0` would claim every old call had been measured and delivered nothing — a
+burst verdict invented for a call nobody measured, which the read cannot distinguish from a real one.
+Falsified by adding exactly that backfill, which fails with `left: Some(0), right: None`.
+
 
 ## Local Upgrade Flow
 

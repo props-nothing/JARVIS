@@ -471,8 +471,15 @@ struct RecordedOutcome {
     usage: Option<Usage>,
     /// Why the provider stopped, when it reached a terminal.
     finish_reason: Option<FinishReason>,
-    /// When the first output arrived, when it did.
-    first_output_at: Option<UtcTimestamp>,
+    /// The delivery timing observed for the attempt.
+    ///
+    /// Grouped rather than three sibling fields so no call site can pass a last-output instant
+    /// where a first-output one belongs. The two are the same type, so that transposition would
+    /// compile and would compute the chunk-spread interval backwards — a plausible wrong number
+    /// in a measurement whose entire purpose is being trustworthy. Grouping also gives the failure
+    /// paths one argument to carry instead of three, which is what keeps `finish_expired` and
+    /// `fail_after_acceptance` inside clippy's argument budget without a suppression.
+    delivery: DeliveryTiming,
     /// The provider's own request identifier, when it reported one.
     ///
     /// Recorded with the outcome rather than in a second write, for the same reason the usage
@@ -483,6 +490,36 @@ struct RecordedOutcome {
     /// start frame's metadata and then stopped, exactly the shape `finish_reason` had before
     /// `BRN-017`.
     provider_request_id: Option<String>,
+}
+
+/// When an attempt's output arrived, and how many pieces it arrived in.
+///
+/// This is the input an incremental-delivery measurement is computed from, and it is a value
+/// rather than three parameters because the three belong together: a last-output instant without
+/// a first is half an interval, and a delta count without an instant describes output nothing can
+/// place in time. The grouping is also what keeps a failure path's signature short enough to read.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeliveryTiming {
+    /// The instant the first output delta arrived, when any did.
+    first_output_at: Option<UtcTimestamp>,
+    /// The instant the last output delta arrived, when any did.
+    last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas were observed.
+    output_delta_count: u32,
+}
+
+impl DeliveryTiming {
+    /// Returns the timing observed while draining `drained`.
+    ///
+    /// One reader for the three fields, so a call site cannot carry two of them and silently drop
+    /// the third — which is how `first_output_at` reached some paths and not others before.
+    fn of(drained: &DrainedTurn) -> Self {
+        Self {
+            first_output_at: drained.first_output_at,
+            last_output_at: drained.last_output_at,
+            output_delta_count: drained.output_delta_count,
+        }
+    }
 }
 
 /// Everything one model turn needs besides the run it belongs to.
@@ -555,6 +592,23 @@ struct DrainedTurn {
     /// first token" had nothing to measure. Set once, on the first `output.text.delta`, so a later
     /// delta cannot move it: the first output is what "time to first token" means.
     first_output_at: Option<UtcTimestamp>,
+    /// When the **last** output delta of this call arrived, from the controller's own clock.
+    ///
+    /// Written unconditionally on every delta, unlike `first_output_at`.
+    ///
+    /// **This is the other half of `BRN-011`'s measurement.** `first_output_at` was produced and
+    /// nothing produced `last_output_at`, so `IncrementalDelivery` — the type the model gateway
+    /// architecture requires routing to consult, and which the routing layer already enforces —
+    /// had **no producer anywhere in the workspace**: every `CapabilityDescriptor` was built with
+    /// `incremental_delivery: None`, which meant "nobody measured this" for every model in every
+    /// deployment. A first token and a burst are indistinguishable without the interval's end.
+    last_output_at: Option<UtcTimestamp>,
+    /// How many output deltas this call produced.
+    ///
+    /// The measurement's sample size. Counted rather than inferred from the text length, because
+    /// a provider may deliver one large delta or many small ones for the same answer, and the
+    /// profile's `observed_deltas` is a statement about the *delivery*, not about the content.
+    output_delta_count: u32,
 }
 
 /// Drives one durable run to a terminal state.
@@ -1086,8 +1140,10 @@ impl RunController {
                             run,
                             None,
                             // No stream was drained on this path — the backoff elapsed before a
-                            // retry began — so no output was produced and there is no instant.
-                            None,
+                            // retry began — so no output was produced and the timing is the
+                            // default: no first instant, no sample, which is what "nothing was
+                            // measured" looks like rather than a zeroed profile.
+                            DeliveryTiming::default(),
                             "deadline_exceeded",
                             ControllerError::DeadlineExceeded.code(),
                         )
@@ -1157,7 +1213,9 @@ impl RunController {
         let mut stream = match opened {
             // The bound elapsed before the provider answered.
             None => {
-                self.finish_deadline_exceeded(run, Some(call_id), None)
+                // Nothing was drained, so no output was produced: the default timing says "no
+                // measurement" rather than a zeroed profile.
+                self.finish_deadline_exceeded(run, Some(call_id), DeliveryTiming::default())
                     .await?;
                 return Err(ControllerError::DeadlineExceeded);
             }
@@ -1214,9 +1272,9 @@ impl RunController {
                 RecordedOutcome {
                     usage: usage_of(&drained),
                     provider_request_id: drained.provider_request_id.clone(),
-                    // Carried through: the output happened, so the time-to-first-token interval
-                    // this call produced is a real measurement even though the caller stopped it.
-                    first_output_at: drained.first_output_at,
+                    // Carried through: the output happened, so the delivery measurement this call
+                    // produced is real even though the caller stopped it.
+                    delivery: DeliveryTiming::of(&drained),
                     ..RecordedOutcome::default()
                 },
             )
@@ -1284,7 +1342,7 @@ impl RunController {
             RecordedOutcome {
                 usage: usage.cloned(),
                 finish_reason: drained.finish_reason.clone(),
-                first_output_at: drained.first_output_at,
+                delivery: DeliveryTiming::of(drained),
                 provider_request_id: drained.provider_request_id.clone(),
             },
         )
@@ -1300,9 +1358,13 @@ impl RunController {
         call_id: ModelCallId,
         drained: DrainedTurn,
     ) -> Result<AttemptOutcome, ControllerError> {
-        // Captured before anything is moved out of `drained`, because three paths below
-        // need it and a later borrow would be a borrow of a partially moved value.
+        // Captured before anything is moved out of `drained`, because several paths below
+        // need them and a later borrow would be a borrow of a partially moved value. The
+        // delivery timing is captured here rather than at each use for exactly that reason:
+        // `drained.tool_intent` is moved out a few lines below, and reading the timing after
+        // that move does not compile.
         let usage = usage_of(&drained);
+        let delivery = DeliveryTiming::of(&drained);
 
         // A tool intent needs the fabric that does not exist yet. Refused with a
         // terminal, typed outcome rather than a fabricated observation.
@@ -1327,8 +1389,8 @@ impl RunController {
                 ModelCallState::Failed,
                 RecordedOutcome {
                     usage,
+                    delivery,
                     provider_request_id: drained.provider_request_id,
-                    first_output_at: drained.first_output_at,
                     ..RecordedOutcome::default()
                 },
             )
@@ -1350,7 +1412,7 @@ impl RunController {
             self.finish_expired(
                 run,
                 Some(call_id),
-                drained.first_output_at,
+                DeliveryTiming::of(&drained),
                 "consumption_budget_exceeded",
                 ControllerError::BudgetExceeded { limit }.code(),
             )
@@ -1376,9 +1438,10 @@ impl RunController {
         let finish_reason = drained.finish_reason.clone();
         // Captured before `drained` is moved into `complete_run` below, and from the same
         // value the completion records, so the row and the answer cannot name different
-        // provider calls.
+        // provider calls. The delivery timing is captured here for the same reason: it is part
+        // of the recorded outcome, and reading it after the move is not possible.
         let provider_request_id = drained.provider_request_id.clone();
-        let first_output_at = drained.first_output_at;
+        let delivery = DeliveryTiming::of(&drained);
         self.record_call_outcome_with(
             run,
             call_id,
@@ -1386,7 +1449,7 @@ impl RunController {
             RecordedOutcome {
                 usage: usage.clone(),
                 finish_reason,
-                first_output_at,
+                delivery,
                 provider_request_id,
             },
         )
@@ -1571,7 +1634,7 @@ impl RunController {
 
             // The bound elapsed while waiting for a frame.
             let Some(frame) = next else {
-                self.finish_deadline_exceeded(run, Some(call_id), drained.first_output_at)
+                self.finish_deadline_exceeded(run, Some(call_id), DeliveryTiming::of(&drained))
                     .await?;
                 return Ok(Err(ControllerError::DeadlineExceeded));
             };
@@ -1580,7 +1643,7 @@ impl RunController {
                 Ok(None) => break,
                 Err(error) => {
                     return self
-                        .fail_after_acceptance(run, call_id, drained.first_output_at, error)
+                        .fail_after_acceptance(run, call_id, DeliveryTiming::of(&drained), error)
                         .await;
                 }
             };
@@ -1630,6 +1693,12 @@ impl RunController {
                     // `occurred_at` the durable event carries so the column and the event cannot
                     // name different instants for the same token.
                     drained.first_output_at.get_or_insert(occurred_at);
+                    // And the last one unconditionally, because it is the interval's other end:
+                    // `get_or_insert` here would freeze the first instant and report a chunk
+                    // spread of zero for every call, which is the exact reading that makes a
+                    // genuine stream look like a burst.
+                    drained.last_output_at = Some(occurred_at);
+                    drained.output_delta_count = drained.output_delta_count.saturating_add(1);
                     drained.answer.push_str(delta);
                 }
                 // Everything else is recorded by folding the frame into the turn, which keeps
@@ -1832,7 +1901,7 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: ModelCallId,
-        first_output_at: Option<UtcTimestamp>,
+        delivery: DeliveryTiming,
         error: ProviderError,
     ) -> Result<Result<DrainedTurn, ControllerError>, ControllerError> {
         self.finish(
@@ -1845,16 +1914,16 @@ impl RunController {
             ),
         )
         .await?;
-        // The first-output instant is carried through: the provider accepted the call and may have
-        // emitted tokens before it failed, so the interval it produced is a real measurement rather
-        // than nothing. Passing `None` unconditionally would have recorded "no output" for a call
-        // that had sent three tokens.
+        // The delivery timing is carried through: the provider accepted the call and may have
+        // emitted tokens before it failed, so the measurement it produced is real rather than
+        // nothing. Passing a default would have recorded "no output" for a call that had sent
+        // three tokens.
         self.record_call_outcome_with(
             run,
             call_id,
             ModelCallState::Failed,
             RecordedOutcome {
-                first_output_at,
+                delivery,
                 ..RecordedOutcome::default()
             },
         )
@@ -1880,12 +1949,12 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
-        first_output_at: Option<UtcTimestamp>,
+        delivery: DeliveryTiming,
     ) -> Result<(), ControllerError> {
         self.finish_expired(
             run,
             call_id,
-            first_output_at,
+            delivery,
             "deadline_exceeded",
             ControllerError::DeadlineExceeded.code(),
         )
@@ -1900,7 +1969,7 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
-        first_output_at: Option<UtcTimestamp>,
+        delivery: DeliveryTiming,
         reason: &'static str,
         code: &'static str,
     ) -> Result<(), ControllerError> {
@@ -1913,14 +1982,14 @@ impl RunController {
             // The attempt is closed as failed rather than left pending: a call that was
             // abandoned mid-stream is finished, and a pending row would make a later
             // reconciliation pass read it as still outstanding.
-            // The first-output instant is carried through, because a call abandoned *after*
+            // The delivery timing is carried through, because a call abandoned *after*
             // emitting tokens still produced them.
             self.record_call_outcome_with(
                 run,
                 call_id,
                 ModelCallState::Failed,
                 RecordedOutcome {
-                    first_output_at,
+                    delivery,
                     ..RecordedOutcome::default()
                 },
             )
@@ -1974,7 +2043,19 @@ impl RunController {
                     estimated_cost_microunits,
                     finish_reason: recorded.finish_reason,
                     error_code: None,
-                    first_output_at: recorded.first_output_at,
+                    first_output_at: recorded.delivery.first_output_at,
+                    last_output_at: recorded.delivery.last_output_at,
+                    // `None` when the attempt produced no output, because `Some(0)` would claim a
+                    // measurement of a call that delivered nothing — and a reader could not tell
+                    // that from a call genuinely observed to produce zero deltas. The column
+                    // documents `NULL` as "not measured", and a delta is what increments the
+                    // count, so a count without a first-output instant is a shape that cannot
+                    // occur; deriving the `Option` from the instant is what makes that true here
+                    // rather than merely intended.
+                    output_delta_count: recorded
+                        .delivery
+                        .first_output_at
+                        .map(|_| recorded.delivery.output_delta_count),
                     completed_at: Some(completed_at),
                 },
             )

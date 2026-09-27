@@ -30,6 +30,7 @@ or an unpinned `latest` page. The required workflow is:
 - [Official source registry](source-registry.md)
 - [Upstream project architecture study](upstream-projects.md)
 - [Rust Foundation evidence](integrations/rust-foundation.md)
+- [OpenAI-compatible model provider evidence](integrations/openai-compatible-model.md)
 - [GitHub Actions CI evidence](integrations/github-actions.md)
 - [Release signing and verification evidence](integrations/release-signing.md)
 - [MCP evidence](integrations/mcp.md)

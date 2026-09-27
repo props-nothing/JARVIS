@@ -13,7 +13,7 @@ claims is
 
 | Workflow | Lane | What it proves |
 | --- | --- | --- |
-| `CI` | `docs` | The documentation, requirement, TODO, contract, and evidence structures are consistent, and the service assertion holds on every platform's rendering |
+| `CI` | `docs` | The documentation, requirement, TODO, contract, and evidence structures are consistent, the service assertion holds on every platform's rendering, and no reviewed text file carries code-page round-trip damage |
 | `CI` | `lint` | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo doc --workspace --no-deps --all-features` |
 | `CI` | `test` | `cargo test --workspace --all-features` on Linux x86_64 |
 | `Native targets` | `native` | Per-target build, test, and clean-machine journey on each tier-1 target |
@@ -21,6 +21,34 @@ claims is
 The `docs` lane runs `node --test scripts/validate-docs.test.mjs` **before**
 `node scripts/validate-docs.mjs`. The order matters: a weakened validator must not
 be able to pass the gate it implements.
+
+## The Text Encoding Check
+
+`validateTextEncoding` in `scripts/validate-docs.mjs` reads every `.md`, `.rs`, `.toml`,
+`.json`, `.mjs`, `.js`, `.yml`, `.yaml`, and `.sh` file the walk reaches and refuses
+code-page round-trip damage, plus a leading UTF-8 byte-order mark. `encodingErrors` reports
+the file and **line** of each artefact.
+
+This check exists because the damage is invisible to every other gate. A file read with a
+legacy code page and written back as UTF-8 turns an em dash into three characters, and the
+result still compiles, still links, still parses, and still formats. The instance that
+prompted it lived in `crates/jarvis-protocol/src/run.rs` for several rounds — `cargo fmt`,
+`clippy`, `cargo test`, this validator, and all three journeys were green while eleven em
+dashes in its doc comments were corrupted. **A check on a file's encoding cannot find it**,
+because the damaged text is valid UTF-8; the check has to be on the content.
+
+The markers are written as `\u` escapes in the checker itself, deliberately: a literal copy
+of the damaged characters in the source would be the defect rather than the guard. The
+fail-closed test drives a damaged `.md` **and** a damaged `.rs` fixture and requires the
+validator to exit `1` for each, because the file that motivated the guard was source rather
+than documentation.
+
+`.scratch/` is in the walk's skipped set (beside `.git`, `target`, and `node_modules`)
+because it is gitignored, and wiring the encoding check exposed why that matters: a stale
+scratch document left there since an earlier round had been **counted** as a validated
+Markdown file, so the gate's headline count had never described the repository. A damaged
+file in a disposable working area must not be able to fail the gate or change its count, and
+a fail-closed test writes both a `.scratch` probe and asserts the count is unchanged.
 
 The `lint` lane's `cargo doc` step is what makes the crate-level
 `#![deny(rustdoc::broken_intra_doc_links)]` real. `clippy` compiles doc comments

@@ -89,6 +89,7 @@ documents.
 - [Official source registry](research/source-registry.md)
 - [Upstream project study](research/upstream-projects.md)
 - [Rust Foundation evidence](research/integrations/rust-foundation.md)
+- [OpenAI-compatible model provider evidence](research/integrations/openai-compatible-model.md)
 - [GitHub Actions CI evidence](research/integrations/github-actions.md)
 - [Release signing and verification evidence](research/integrations/release-signing.md)
 - [MCP evidence](research/integrations/mcp.md)

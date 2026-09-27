@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DomainError;
 use crate::model::identity::EndpointClass;
-use crate::time::IsoDate;
+use crate::time::{IsoDate, UtcTimestamp};
 
 /// How strongly a capability value is supported by evidence.
 ///
@@ -183,6 +183,214 @@ impl IncrementalDelivery {
     }
 }
 
+/// One call's raw delivery timing, before it becomes a [`IncrementalDelivery`] profile.
+///
+/// **This is the producer `IncrementalDelivery` never had.** The profile type, the routing
+/// predicate that consumes it, and the burst tests all existed and were correct, while every
+/// `CapabilityDescriptor` in the workspace was constructed with `incremental_delivery: None`:
+/// nothing measured a call, so the "verified time to first token *and* token spread" the model
+/// gateway architecture requires could not be recorded for any model. The measurement lives
+/// here rather than in the controller because turning three raw instants into a profile is a
+/// rule about what the profile *means* — the same reason `is_incremental` is not re-derived at
+/// each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryMeasurement {
+    /// The instant the call was handed to the provider.
+    ///
+    /// The interval this anchors is the one an operator feels: from "JARVIS asked" to "the
+    /// first token appeared". Anchoring it at the first delta instead would measure nothing —
+    /// a call's first delta *is* its first delta — which is the mistake this field exists to
+    /// make unrepresentable.
+    pub started_at: UtcTimestamp,
+    /// The instant the first output delta arrived.
+    pub first_output_at: UtcTimestamp,
+    /// The instant the last output delta arrived.
+    ///
+    /// Equal to `first_output_at` for a call that produced exactly one delta, which is why
+    /// the delta count is a separate input: one delta is a burst whatever its timing, and
+    /// the two instants cannot express that on their own.
+    pub last_output_at: UtcTimestamp,
+    /// How many output deltas the call produced.
+    pub delta_count: u32,
+}
+
+impl DeliveryMeasurement {
+    /// Derives the profile this measurement describes.
+    ///
+    /// Three decisions are deliberate, and each exists because the alternative records a
+    /// plausible wrong number:
+    ///
+    /// - **`observed_deltas` counts the deltas *after the first*.** The profile's own
+    ///   documentation says so, and its consumer reads `> 0` as "more than one piece
+    ///   arrived". A `delta_count` of one is therefore zero observed deltas — a burst by
+    ///   observation — which is the value that makes a one-delta call fail an
+    ///   incremental-delivery requirement rather than pass it on a fast first token.
+    /// - **A negative elapsed interval is clamped to zero rather than refused.** All three
+    ///   instants come from the same clock in arrival order, but a clock that steps backwards
+    ///   would make a later instant precede an earlier one and `u32::try_from` would fail on
+    ///   the subtraction — turning a clock skew into a storage error on the completion path.
+    ///   Zero says "no measurable interval", which is the fail-closed reading, and it keeps
+    ///   the `is_incremental` verdict a function of the measurement alone.
+    /// - **A duration beyond `u32::MAX` milliseconds saturates.** A call cannot run for 49
+    ///   days under any run budget, so the branch is unreachable in practice, and a
+    ///   saturating value keeps a nonsensical input from panicking on the completion path
+    ///   where there is no caller to answer an error.
+    #[must_use]
+    pub fn profile(&self) -> IncrementalDelivery {
+        IncrementalDelivery {
+            time_to_first_token_ms: millis_between(self.started_at, self.first_output_at),
+            chunk_spread_ms: millis_between(self.first_output_at, self.last_output_at),
+            observed_deltas: self.delta_count.saturating_sub(1),
+        }
+    }
+}
+
+/// The whole milliseconds from `from` to `to`, clamped to zero when `to` precedes `from`.
+///
+/// A free function so both intervals in [`DeliveryMeasurement::profile`] are computed by the
+/// same rule: one clamped inline and the other not is how a clock skew becomes an error on
+/// one field and a wrong number on the other.
+fn millis_between(from: UtcTimestamp, to: UtcTimestamp) -> u32 {
+    let elapsed = to.as_timestamp().as_millisecond() - from.as_timestamp().as_millisecond();
+    if elapsed < 0 {
+        return 0;
+    }
+    u32::try_from(elapsed).unwrap_or(u32::MAX)
+}
+
+/// The fewest distinct calls that may back an attested per-model delivery profile.
+///
+/// **One call is an anecdote, and this constant is the whole difference between "measured" and
+/// "measured once".** A single attempt's figures are a property of that attempt — the prompt
+/// that happened to be sent, the moment the provider happened to be under load, the one network
+/// path it happened to take — so a descriptor built from one row would tell the routing layer a
+/// model's delivery *profile* while having observed one sample of it. Three is chosen as the
+/// smallest count that can disagree with itself: two samples that agree prove nothing about the
+/// next, while three are the fewest from which a spread across calls is even visible. It is a
+/// floor on sample size, not a confidence claim; a real campaign should record far more.
+pub const MIN_PROFILE_SAMPLES: usize = 3;
+
+/// The `source_url` recorded for a value JARVIS measured itself.
+///
+/// An `Evidence` value normally cites an official source, and a measurement taken from this
+/// deployment's own recorded calls has no external one. A scheme with no host is used rather
+/// than an empty string or a plausible-looking `https://` address, because both of those would
+/// be worse: an empty string reads as a defect, and a fabricated URL is a citation to a page
+/// that does not say what the value says — which is the promotion evidence exists to prevent.
+/// `jarvis://` cannot be fetched and cannot be mistaken for a provider's documentation.
+pub const MEASURED_SOURCE_URL: &str = "jarvis://model-calls";
+
+/// The capability key a measured delivery profile is recorded under.
+const DELIVERY_CAPABILITY_KEY: &str = "incremental_delivery";
+
+/// One model's measurement campaign: every call that produced output, as raw figures.
+///
+/// A collection rather than a pre-computed average, because the aggregation rule is domain
+/// knowledge and it must be applied where it can be tested against the samples rather than
+/// entrusted to whoever happened to write the `SELECT`. The reader supplies rows; this type
+/// decides what they mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverySamples {
+    /// The provider-qualified model every sample belongs to.
+    pub model: crate::model::identity::ModelRef,
+    /// The endpoint class the samples were taken against.
+    pub endpoint_class: EndpointClass,
+    /// Each call's profile, in the order it was loaded.
+    pub samples: Vec<IncrementalDelivery>,
+}
+
+impl DeliverySamples {
+    /// Returns whether there are enough samples to attest a profile.
+    ///
+    /// The count is checked against [`MIN_PROFILE_SAMPLES`]. A campaign below the floor returns
+    /// `false` here rather than a profile, and the caller must then record no evidence at all —
+    /// which is the fail-closed direction, since an absent descriptor makes a route that requires
+    /// incremental delivery *refuse* rather than pass on one observation.
+    #[must_use]
+    pub fn is_sufficient(&self) -> bool {
+        self.samples.len() >= MIN_PROFILE_SAMPLES
+    }
+
+    /// Aggregates the samples into one profile, or `None` when the campaign is too small.
+    ///
+    /// Three decisions, and the first is the one that keeps the verdict honest:
+    ///
+    /// - **The aggregate is incremental only if every sample was.** A profile describes what a
+    ///   model does, so a campaign in which any call burst is a model that *can* burst, and
+    ///   reporting the best sample — or an average spread that a few good samples lift over the
+    ///   threshold — would answer "this model delivers incrementally" for a model that sometimes
+    ///   does not. The routing layer's question is whether a caller may rely on incremental
+    ///   delivery, so the aggregate is the *worst* sample, not the mean. This is deliberately the
+    ///   conservative direction, and it is why the field is not named `average_spread_ms`.
+    /// - **`time_to_first_token_ms` is the maximum, and `chunk_spread_ms` is the minimum.** Both
+    ///   are the pessimistic reading of the same rule: a caller planning for latency uses the
+    ///   slowest first token observed, and a caller asking "do deltas keep arriving" uses the
+    ///   narrowest spread observed. The optimistic figure for either would let a model be routed
+    ///   to on the strength of its best call.
+    /// - **`observed_deltas` is the minimum.** It is the sample size of the thinnest call, so a
+    ///   campaign containing a one-delta reply reports zero observed deltas and the profile is a
+    ///   burst by observation even when the other calls streamed — the same conservative rule as
+    ///   the spread, expressed on the count a timing-only measurement cannot see.
+    ///
+    /// A campaign with too few samples returns `None` even though the folds below would be
+    /// vacuously satisfiable, because an aggregate over an insufficient sample is not a profile.
+    #[must_use]
+    pub fn aggregate(&self) -> Option<IncrementalDelivery> {
+        if !self.is_sufficient() {
+            return None;
+        }
+        let mut worst_time_to_first_token_ms = 0u32;
+        let mut narrowest_chunk_spread_ms = u32::MAX;
+        let mut thinnest_observed_deltas = u32::MAX;
+        for sample in &self.samples {
+            worst_time_to_first_token_ms =
+                worst_time_to_first_token_ms.max(sample.time_to_first_token_ms);
+            narrowest_chunk_spread_ms = narrowest_chunk_spread_ms.min(sample.chunk_spread_ms);
+            thinnest_observed_deltas = thinnest_observed_deltas.min(sample.observed_deltas);
+        }
+        Some(IncrementalDelivery {
+            time_to_first_token_ms: worst_time_to_first_token_ms,
+            chunk_spread_ms: narrowest_chunk_spread_ms,
+            observed_deltas: thinnest_observed_deltas,
+        })
+    }
+
+    /// Returns the profile with the evidence that attests it, or `None` when the campaign is
+    /// too small to attest anything.
+    ///
+    /// The label is always [`EvidenceLabel::Verified`], and that is a deliberate reading of the
+    /// contract rather than an upgrade. `VERIFIED` is "confirmed by a current official
+    /// specification, schema, or **live test against the pinned version**"; these figures are
+    /// exactly that live test — observed against the endpoint this deployment is pinned to, by
+    /// this deployment. `DOCUMENTED` would be the wrong label in the other direction, because no
+    /// document states them. A value asserted with no samples at all is unreachable: the
+    /// sufficiency floor is checked here, so a caller cannot attest a campaign it does not have.
+    ///
+    /// `integration_id` names the adapter that produced the numbers, because "which provider did
+    /// JARVIS measure" is not answerable from the figures themselves, and `last_verified` /
+    /// `revalidate_by` come from the caller's clock rather than from inside, so a campaign cannot
+    /// silently certify itself as fresh forever.
+    #[must_use]
+    pub fn attested_profile(
+        &self,
+        integration_id: &str,
+        last_verified: IsoDate,
+        revalidate_by: IsoDate,
+    ) -> Option<Attested<IncrementalDelivery>> {
+        Some(Attested {
+            value: self.aggregate()?,
+            evidence: Evidence {
+                integration_id: integration_id.to_owned(),
+                capability_key: DELIVERY_CAPABILITY_KEY.to_owned(),
+                label: EvidenceLabel::Verified,
+                source_url: MEASURED_SOURCE_URL.to_owned(),
+                last_verified,
+                revalidate_by,
+            },
+        })
+    }
+}
+
 /// A capability value with the evidence that supports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attested<T> {
@@ -322,10 +530,11 @@ impl CapabilityDescriptor {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attested, Capability, CapabilityDescriptor, Evidence, EvidenceLabel, IncrementalDelivery,
+        Attested, Capability, CapabilityDescriptor, DeliveryMeasurement, DeliverySamples, Evidence,
+        EvidenceLabel, IncrementalDelivery, MEASURED_SOURCE_URL, MIN_PROFILE_SAMPLES,
     };
     use crate::model::identity::{EndpointClass, ModelId, ModelRef, ProviderId};
-    use crate::time::IsoDate;
+    use crate::time::{IsoDate, UtcTimestamp};
 
     fn evidence(label: EvidenceLabel, revalidate_by: &str) -> Evidence {
         Evidence {
@@ -425,6 +634,101 @@ mod tests {
         assert!(incremental.is_incremental());
     }
 
+    /// Builds a measurement from millisecond offsets, so a test states intervals rather than
+    /// instants: the assertions below are about a spread and a delay, and spelling them as
+    /// timestamps would make a reader subtract three numbers to see the interval being asserted.
+    fn measured(
+        start_ms: i64,
+        first_output_ms: i64,
+        last_output_ms: i64,
+        delta_count: u32,
+    ) -> DeliveryMeasurement {
+        fn at(offset_ms: i64) -> UtcTimestamp {
+            let base = UtcTimestamp::parse("2026-09-20T12:00:00Z").expect("valid");
+            UtcTimestamp::from_timestamp(
+                base.as_timestamp() + jiff::SignedDuration::from_millis(offset_ms),
+            )
+        }
+        DeliveryMeasurement {
+            started_at: at(start_ms),
+            first_output_at: at(first_output_ms),
+            last_output_at: at(last_output_ms),
+            delta_count,
+        }
+    }
+
+    #[test]
+    fn a_measurement_produces_the_profile_the_router_reads() {
+        // The producer `IncrementalDelivery` never had. Every part of this pipeline existed and
+        // worked — the profile type, the routing predicate, the burst tests — and **nothing
+        // measured a call**, so every descriptor in the workspace was built with
+        // `incremental_delivery: None`. The interval asserted here is the one an operator feels:
+        // from the call being handed to the provider to the first token appearing.
+        let profile = measured(0, 250, 1_450, 40).profile();
+        assert_eq!(profile.time_to_first_token_ms, 250);
+        assert_eq!(profile.chunk_spread_ms, 1_200);
+        // 40 deltas means 39 after the first, because `observed_deltas` is documented as the
+        // number *after* the first and the routing predicate reads `> 0` as "more than one piece".
+        assert_eq!(profile.observed_deltas, 39);
+        assert!(profile.is_incremental());
+    }
+
+    #[test]
+    fn a_single_delta_is_a_burst_by_observation_whatever_its_timing() {
+        // The case a timing-only measurement cannot see. One delta arriving after a long wait
+        // has a plausible first-token number and a spread of zero — and a *nonzero* first-token
+        // interval, so a profile derived from instants alone would look like a very slow but
+        // legitimate stream. Only the count says otherwise.
+        let profile = measured(0, 5_000, 5_000, 1).profile();
+        assert_eq!(profile.time_to_first_token_ms, 5_000);
+        assert_eq!(profile.chunk_spread_ms, 0);
+        assert_eq!(
+            profile.observed_deltas, 0,
+            "one delta is zero deltas after the first",
+        );
+        assert!(
+            !profile.is_incremental(),
+            "a reply delivered in one piece is a burst however long it took",
+        );
+    }
+
+    #[test]
+    fn deltas_arriving_together_are_a_burst_despite_the_count() {
+        // The other half, and the reason both inputs are needed: many deltas arriving within the
+        // minimum window are a burst, because a caller waiting for the first token gains nothing
+        // from a flush that arrives all at once.
+        let profile = measured(0, 100, 120, 30).profile();
+        assert_eq!(profile.observed_deltas, 29);
+        assert!(
+            profile.chunk_spread_ms < IncrementalDelivery::MIN_INCREMENTAL_SPREAD_MS,
+            "the fixture must sit below the minimum spread or it proves nothing",
+        );
+        assert!(!profile.is_incremental());
+    }
+
+    #[test]
+    fn a_clock_that_steps_backwards_yields_no_spread_rather_than_a_refusal() {
+        // All three instants come from the same clock in arrival order, so a later one preceding
+        // an earlier one is a clock fault rather than a caller error. Clamping to zero keeps the
+        // verdict fail-closed and, more importantly, keeps the completion path from failing on a
+        // subtraction — there is no caller at that point to answer an error.
+        let profile = measured(1_000, 500, 400, 10).profile();
+        assert_eq!(profile.time_to_first_token_ms, 0);
+        assert_eq!(profile.chunk_spread_ms, 0);
+        assert!(!profile.is_incremental());
+    }
+
+    #[test]
+    fn a_measurement_with_no_deltas_still_produces_a_profile_a_router_must_reject() {
+        // Zero deltas is `observed_deltas: 0`, which is a burst — not "unknown". A caller that
+        // wanted "no measurement" must leave the descriptor's field absent; arriving here with a
+        // count of zero means the call produced nothing, and routing to it as incremental would
+        // be the optimistic reading of an empty measurement.
+        let profile = measured(0, 0, 0, 0).profile();
+        assert_eq!(profile.observed_deltas, 0);
+        assert!(!profile.is_incremental());
+    }
+
     #[test]
     fn a_descriptor_without_a_measurement_does_not_support_incremental_delivery() {
         let descriptor = CapabilityDescriptor::new(model_ref(), EndpointClass::Local);
@@ -501,5 +805,174 @@ mod tests {
         assert_eq!(EvidenceLabel::Observed.to_string(), "OBSERVED");
         assert_eq!(EvidenceLabel::Documented.to_string(), "DOCUMENTED");
         assert_eq!(EvidenceLabel::Verified.to_string(), "VERIFIED");
+    }
+
+    /// Builds a campaign from `(spread_ms, observed_deltas)` pairs.
+    fn campaign(samples: &[(u32, u32)]) -> DeliverySamples {
+        DeliverySamples {
+            model: model_ref(),
+            endpoint_class: EndpointClass::Local,
+            samples: samples
+                .iter()
+                .map(|(spread, deltas)| IncrementalDelivery {
+                    time_to_first_token_ms: 100,
+                    chunk_spread_ms: *spread,
+                    observed_deltas: *deltas,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn one_call_is_not_a_profile() {
+        // The whole difference between "measured" and "measured once". A single attempt's figures
+        // are a property of that attempt, so a descriptor built from one row would tell the router
+        // a model's *profile* while having observed one sample of it — and `VERIFIED` would then be
+        // asserted for something that was never a campaign.
+        let single = campaign(&[(900, 40)]);
+        assert!(!single.is_sufficient());
+        assert_eq!(single.aggregate(), None);
+        assert_eq!(
+            single.attested_profile("openai-compatible-model", today(), today()),
+            None
+        );
+
+        // Two agreeing samples still prove nothing about the next, so the floor is three and the
+        // boundary is asserted from both sides rather than only below it.
+        assert!(!campaign(&[(900, 40), (900, 40)]).is_sufficient());
+        assert!(campaign(&[(900, 40), (900, 40), (900, 40)]).is_sufficient());
+    }
+
+    #[test]
+    fn one_burst_sample_makes_the_whole_campaign_a_burst() {
+        // **The falsification this rule exists for.** Three calls spread over ~400 ms and one that
+        // arrived in a single flush: a mean of the spreads clears `MIN_INCREMENTAL_SPREAD_MS`
+        // comfortably, and an "any sample was incremental" rule also passes — both would report
+        // this model as delivering incrementally, and a caller relying on that would wait for the
+        // whole generation on the one call that burst.
+        let samples = campaign(&[(900, 40), (900, 40), (900, 40), (0, 8)]);
+        let aggregate = samples.aggregate().expect("four samples is sufficient");
+
+        assert_eq!(
+            aggregate.chunk_spread_ms, 0,
+            "the narrowest spread is the one that decides, so the burst sample wins",
+        );
+        assert!(
+            !aggregate.is_incremental(),
+            "a model that burst once is a model that can burst",
+        );
+
+        // The mean is computed here only to show the two rules disagree on this exact input: a
+        // rule that averaged would reach the opposite verdict, which is what makes this test a
+        // check rather than a restatement.
+        let mean_spread = samples
+            .samples
+            .iter()
+            .map(|s| s.chunk_spread_ms)
+            .sum::<u32>()
+            / u32::try_from(samples.samples.len()).expect("small");
+        assert!(
+            mean_spread >= IncrementalDelivery::MIN_INCREMENTAL_SPREAD_MS,
+            "the fixture must be one the averaging rule would wrongly accept",
+        );
+    }
+
+    #[test]
+    fn one_single_delta_sample_makes_the_whole_campaign_a_burst_by_observation() {
+        // The count half of the same rule, and the half a spread-only aggregate cannot express:
+        // every sample spread over a healthy window while one reply arrived as a single delta, so
+        // the thinnest sample reports zero observed deltas. Note the fixture uses `0`, which is
+        // what `DeliveryMeasurement::profile` produces for a one-delta call — the delta count is
+        // a raw input and `observed_deltas` is the derived "after the first" figure, so passing
+        // `1` here would be constructing a profile that a measurement cannot produce.
+        let aggregate = campaign(&[(900, 40), (900, 40), (900, 0)])
+            .aggregate()
+            .expect("three samples is sufficient");
+        assert_eq!(aggregate.observed_deltas, 0);
+        assert!(!aggregate.is_incremental());
+    }
+
+    #[test]
+    fn the_aggregate_takes_the_pessimistic_figure_for_every_field() {
+        // A campaign where the calls disagree in the *other* direction — every one incremental —
+        // still reports the slowest first token, the narrowest spread, and the thinnest count.
+        // Taking the best of anything would let a model be routed to on its strongest call.
+        let samples = DeliverySamples {
+            model: model_ref(),
+            endpoint_class: EndpointClass::Local,
+            samples: vec![
+                IncrementalDelivery {
+                    time_to_first_token_ms: 80,
+                    chunk_spread_ms: 2_000,
+                    observed_deltas: 60,
+                },
+                IncrementalDelivery {
+                    time_to_first_token_ms: 640,
+                    chunk_spread_ms: 900,
+                    observed_deltas: 12,
+                },
+                IncrementalDelivery {
+                    time_to_first_token_ms: 300,
+                    chunk_spread_ms: 1_400,
+                    observed_deltas: 31,
+                },
+            ],
+        };
+        let aggregate = samples.aggregate().expect("three samples is sufficient");
+        assert_eq!(
+            aggregate.time_to_first_token_ms, 640,
+            "the slowest first token"
+        );
+        assert_eq!(aggregate.chunk_spread_ms, 900, "the narrowest spread");
+        assert_eq!(aggregate.observed_deltas, 12, "the thinnest sample size");
+        assert!(
+            aggregate.is_incremental(),
+            "every sample streamed, so this one may route"
+        );
+    }
+
+    #[test]
+    fn a_measured_profile_carries_verified_evidence_and_no_fabricated_source() {
+        let samples = campaign(&[(900, 40), (1_100, 30), (700, 50)]);
+        let attested = samples
+            .attested_profile(
+                "openai-compatible-model",
+                today(),
+                IsoDate::parse("2027-01-01").expect("valid"),
+            )
+            .expect("three samples attest a profile");
+
+        // `VERIFIED` is "confirmed by a live test against the pinned version", which is exactly
+        // what these figures are and what no document states. `DOCUMENTED` would be wrong in the
+        // other direction.
+        assert_eq!(attested.evidence.label, EvidenceLabel::Verified);
+        assert_eq!(attested.evidence.integration_id, "openai-compatible-model");
+        assert_eq!(attested.evidence.source_url, MEASURED_SOURCE_URL);
+        // A measurement cites no external page. The sentinel must not be mistakable for one, and
+        // an empty string would read as a defect rather than as "JARVIS measured this itself".
+        assert!(MEASURED_SOURCE_URL.starts_with("jarvis://"));
+        assert!(!MEASURED_SOURCE_URL.starts_with("http"));
+
+        // The evidence makes the descriptor routable, which is the point of attesting at all.
+        let mut descriptor = CapabilityDescriptor::new(model_ref(), EndpointClass::Local);
+        descriptor.incremental_delivery = Some(attested);
+        assert!(descriptor.supports_on(Capability::IncrementalDelivery, today()));
+        assert!(descriptor.incremental_delivery_on(today()).is_ok());
+    }
+
+    #[test]
+    fn a_campaign_too_small_to_attest_cannot_claim_verified_evidence() {
+        // The floor is checked *inside* the attesting call, not only at its call site, so a caller
+        // cannot reach `Some(Attested { label: Verified })` with one sample however it constructs
+        // the campaign. A label asserted over an insufficient sample is the promotion the evidence
+        // rule exists to forbid.
+        for size in 0..MIN_PROFILE_SAMPLES {
+            let samples = campaign(&vec![(900, 40); size]);
+            assert_eq!(
+                samples.attested_profile("openai-compatible-model", today(), today()),
+                None,
+                "a campaign of {size} samples must attest nothing",
+            );
+        }
     }
 }

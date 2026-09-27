@@ -660,7 +660,165 @@ Foundation TODO remains incomplete.
   on its `REQUIRED` evidence note, `BRN-004` and `BRN-005` follow, and the measured
   per-model capability inventory that `BRN-011` and `NFR-VOI-002` need is not
   collected.
-- [ ] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
+- [~] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
+  Evidence: **both halves now exist** — the research gate (previous round) and the adapter itself.
+  `crates/jarvis-infrastructure/src/model_providers/openai_compatible/` holds it in three layers,
+  chosen so every provider-shaped trap is testable without a socket: `sse.rs` reassembles frames from
+  a chunked byte stream (8 tests), `translate.rs` maps one chunk onto normalized events (15 tests),
+  and `mod.rs` owns the socket, the HTTP exchange, chunked decoding, error mapping, and the credential
+  (19 tests). `tests/openai_compatible_stream.rs` drives all of it against a **real loopback socket**
+  with a hand-written server (12 tests), because the two pure layers were already covered by fixtures
+  and what remained unproven was exactly the transport.
+  - **Two real defects were found by the socket-level test and by nothing else.** The **chunked
+    decoder handed chunk framing to the SSE parser**: its first version drained the payload while the
+    reader delivered whatever was buffered, so the *next* decode read payload bytes as a hex size
+    line. The symptom was `model.provider_malformed` against a perfectly healthy stream — a framing
+    bug wearing a protocol error's clothes, and invisible to a unit test that fed the SSE parser
+    directly. Fixed by leaving the payload buffered behind a `payload_remaining` counter, so a chunk
+    larger than the caller's output buffer is delivered across several reads instead of dropped. The
+    second was not a bug but a shape: `ModelProvider::open` borrows the context, request, and
+    cancellation scope for the stream's lifetime, so a caller must **own** all three — a constraint
+    only the out-of-crate test could make concrete.
+  - **The refusal flag is deliberately NOT folded here.** The run controller's `completed_reason`
+    already owns that fold and upgrades a plain `Stop` and nothing else, so folding in the translator
+    as well would put one rule in two layers that could drift — and a second implementation of "did
+    this model decline" is the duplicate the architecture forbids. The translator reports the
+    provider's reason verbatim with `refused` beside it, which is why its own test asserts `Stop` and
+    the flag rather than asserting `Refusal`.
+  - **The transport is loopback-only, and the constructor refuses everything else.** The evidence
+    note records the measurement behind that: `Cargo.lock` contains **no TLS implementation at all**
+    on 2026-09-27, so reaching a remote host would send a credential in the clear. `ConfigError::
+    NotLoopback` refuses a name, a private address, and a public address alike, and `UrlShaped`
+    refuses a scheme, path, query, or userinfo — the shapes that are how a key ends up inside a base
+    URL. A host is therefore parsed as an address rather than prefix-matched, so `127.0.0.1.evil`
+    cannot pass.
+  - **The credential is a header value and a private field.** `BearerKey` has no accessor other than
+    `expose_for_header`, no derived `Debug`, and no `Clone`, which is the same construction the
+    authentication module's `GeneratedCredential` uses — **no new dependency was added for it**,
+    because a crate for that property would be a dependency change with its own evidence obligation
+    while the property is a private field this file can establish and test. A canary test asserts the
+    value cannot reach the adapter's `Debug`, any frame, a failure code, or a mapped error.
+  - **A `429` is mapped by its code, not its status.** The provider's own guide states that different
+    conditions share a status: an exhausted balance, an organization spend limit, a project spend
+    limit, and a usage limit all arrive as `429` and **none is retryable**, because retrying cannot
+    restore access. Only the rate-limit family is, and an unrecognized `429` is treated as retryable
+    since the run's budget still bounds the attempts. A `403` with `insufficient_quota` is an
+    exhausted balance wearing a permission status.
+  - **Verification.** 1111 workspace tests (+72 across the two slices) with `fmt` and
+    `clippy -D warnings` clean; both doc gates green, including `--changed-file` for every new adapter
+    and composition path. `cargo doc` reports only the 7 pre-existing intra-doc-link warnings
+    (4 `private_intra_doc_links`, 3 `redundant_explicit_links`), which `AGENTS.md` explicitly scopes
+    out of the `-D warnings` requirement; the adapter adds none. The manifest's
+    `implementation_paths` gained the **underscore** spellings
+    (`crates/**/src/model_providers/openai_compatible/**`) because a Rust module directory cannot
+    contain a hyphen — so the pre-existing hyphen-only globs matched no real path, and an adapter
+    written at the only legal location was refused by its own gate. Found by running the gate against
+    the new files rather than by reading the glob.
+  - **Now composed into the daemon.** The adapter is no longer a library nothing reaches:
+    `jarvis_infrastructure::model_providers::resolve` maps a configuration document plus a secret
+    resolver to the provider a daemon calls, `jarvisd` composes it **before** startup, and `run_ports`
+    uses it in place of the inline script. Four properties, each of which the tests hold:
+    **no `[model.provider]` table means the scripted provider** (the default for a fresh install and
+    every test, so a profile naming no endpoint cannot silently reach the network); **a configured
+    endpoint that cannot be composed is a startup refusal, not a fallback** — the load-bearing rule,
+    because falling back would let a typo route every run to a provider that answers with a fixed
+    acknowledgement while the operator saw successful runs, making the misconfiguration invisible;
+    **the credential is resolved once, at composition**, which for a long-lived daemon is the last
+    responsible moment, so the value is held for the process's lifetime, never written to a record,
+    and never rendered; and **the provider id and model names are validated with the domain's own
+    identifier rule**, because both reach a persisted row and a routing decision.
+  - **Three defects-or-findings the composition surfaced.** (1) **The configuration schema had to
+    move 1 → 2.** A version-1 binary's unknown-field rejection would report a document naming a
+    provider endpoint as a *parse* failure, when the accurate diagnostic is "written by a newer
+    JARVIS" — so the version moved, and **version 1 remains readable**, because the only difference is
+    an optional table and refusing it would lock an operator out of their own profile for no security
+    benefit. (2) **The configuration layer must not validate the host.** Whether an endpoint is
+    admissible is the adapter's loopback rule, and a second predicate here could disagree with the
+    first, so an invalid endpoint fails with the **adapter's own code** from the one place that owns
+    the decision. (3) **Two Operational Readiness items in the evidence note were wrong**, not merely
+    unchecked: it claimed a key takes effect "on the next call" (it takes effect on the next **start**,
+    because composition resolves it once) and that removing the provider yields
+    `model.provider_no_route` (the run instead fails with `run.no_model_served`, because the recorded
+    route names the adapter's model and the controller requires the provider to still serve it — so
+    removal surfaces as a run failure rather than a quiet switch of source). Both are corrected in the
+    note.
+  - **The end-to-end proof is at the level the composition can fail.** `tests/daemon_provider_composition.rs`
+    starts a **real daemon** over a **real socket**, points it at a **local fake OpenAI-compatible
+    server**, creates a run through the **real control API**, and reads it back. It asserts the two
+    things no provider-level test can see: that the fake server **received** the request (naming the
+    routed model, with the credential as a header) and that the streamed answer is **durable** in the
+    run's own events. **Falsified**: replacing the composition with the scripted provider fails the
+    test with "the provider was called exactly once" — the server was never reached. The negative half
+    is covered too: an unconfigured profile composes the scripted provider, and a configuration the
+    adapter refuses stops the daemon rather than falling back.
+  - **Not done, and named:** **no capture from a real endpoint exists**, so every claim about a real
+    provider's behaviour stays `DOCUMENTED` rather than `OBSERVED` and the `[DONE]` question
+    (`OC-C004`) is still open — the note's Contract Fixtures section is unchecked and says so. The
+    daemon is composed but **not yet exercised against a real provider by any journey**: the e2e
+    journeys still run on the scripted default, and a gated live smoke test is `BRN-009`. Structured
+    output, tool-call translation, and portable sampling settings are refused rather than silently
+    dropped, so they are missing capabilities rather than defects. `BRN-009`'s gated provider smoke
+    test is the next step, and the Milestone 2 exit gate ("a gated real-provider smoke test streams a
+    response") is still unmet. **DO NOT COMMIT.**
+  `docs/research/integrations/openai-compatible-model.md` moves the manifest entry
+  from `REQUIRED` to `IMPLEMENTATION_READY`, which is the first time any path
+  matching `crates/**/src/model_providers/openai-compatible/**` has been *reachable*
+  rather than refused by the gate — before this, the first adapter edit was
+  impossible by policy, not by difficulty. Three findings change the design rather
+  than decorate it. **The target contract is Chat Completions streaming, not
+  Responses.** `BRN-002`'s port maps onto `output.text.delta` / `call.completed`,
+  and the repository's compatibility edge (`api-protocols.md`) names
+  `/v1/chat/completions`; the Responses API is a *different* documented contract
+  with a different request shape (`input`/`instructions`), a different event set
+  (`response.output_text.delta`), and `store` defaulting to **true**, so the two
+  pages must not be treated as one API with two spellings. The streaming-events
+  page is the one that owns the frame schema, and the reference subtree has no
+  working per-section `llms.txt`: `.../chat/llms.txt`, `.../chat/create.md`, and
+  `.../chat/completions/methods/create.md` all 404 while
+  `/api/reference/llms.txt` lists the real slugs. **A refusal arrives as HTTP 200**
+  with `delta.refusal` populated, so a reader keyed on the status records a refusal
+  as a finished answer — which is exactly the failure `FinishReason::Refusal`
+  exists to prevent, and it is the reason that variant is not merely stylistic.
+  And **abuse-monitoring retention is 30 days and is not client-side disablable**;
+  the per-endpoint table records training use `No` but application-state retention
+  and a 30-day monitoring window whose exclusion requires provider approval, so a
+  JARVIS policy asserting `maximum_provider_retention: none_documented` against a
+  cloud endpoint of this contract is false by default and the honest inventory
+  value is a bounded 30-day window. Two further facts are recorded as
+  `UNVERIFIED` rather than assumed: the `[DONE]` sentinel does not appear on the
+  page this note cites, so the adapter terminates on the first non-null
+  `finish_reason` or end-of-body and treats `[DONE]` as an ignorable sentinel, and
+  the streaming-events page renders `finish_reason` as five literals plus
+  "or 2 more", so an unmodelled value maps to `FinishReason::Other` rather than
+  being flattened to `Stop`.
+  **The transport is loopback and plaintext, and the reason is a measurement rather
+  than a preference.** A lockfile inspection on 2026-09-27 found `rustls`, `ring`,
+  `aws-lc-rs`, `webpki`, `native-tls`, `openssl`, `hyper-rustls`, and `tokio-rustls`
+  all **absent**; only `hyper` (a transitive server component), `hyper-util`,
+  `tower-http`, `http-body-util`, and `httparse` resolve. Reaching a cloud endpoint
+  therefore requires a *new reviewed dependency*, which `AGENTS.md` makes its own
+  evidence obligation, so shipping it as a side effect of an adapter would be the
+  failure mode the dependency gate exists to prevent. `EndpointClass::Local` already
+  models the local case, and the Foundation client already establishes the pattern
+  and its rationale (a minimal HTTP/1.1 exchange rather than a general client
+  stack), so the first slice is a real streamed provider call with no unreviewed TLS
+  stack smuggled in and the cloud path left as a separately evidenced step.
+  **Verification performed**: the metadata cross-check was falsified in both
+  directions rather than trusted — mutating `Last verified` to disagree with the
+  manifest produced `ERROR: openai-compatible-model: Last verified metadata
+  mismatch` and exit 1, restoring it returned exit 0; and a changed path matching
+  `crates/**/src/model_providers/openai-compatible/**` now validates at exit 0 where
+  it was previously refused. `node scripts/validate-docs.mjs` reports 90 Markdown
+  files and 19 evidence entries (89 -> 90, 18 -> 19), the changed-file invocation
+  passes, and the 18 validator tests still pass. The note also carries 10 falsifiable
+  claims and marks its Contract Fixtures and Gated Live Tests sections **unchecked**,
+  with the fixture item called out because a synthetic fixture only proves the
+  implementation agrees with itself.
+  **Not done**: no adapter, no request builder, no SSE parser, and no gated live
+  test exists. Every runtime item in the note's Operational Readiness list is
+  unchecked, and the `[DONE]` question stays open until a real capture settles it.
+  `BRN-011`'s per-model aggregation is therefore still blocked, and the Milestone 2
+  exit gate ("a gated real-provider smoke test streams a response") is still unmet.
 - [x] `BRN-005` Implement native agent state machine with explicit terminal and
   waiting states.
   Evidence: `jarvis_domain::run` (`state.rs`, `lifecycle.rs`) implements the state
@@ -2888,10 +3046,148 @@ Foundation TODO remains incomplete.
     already enforces, but no metric or event counts refusals yet. That is the observability half
     (`OBS-*`), and the input now exists.
   1014 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
-- [ ] `BRN-011` Measure and record incremental-delivery capability per model
+- [x] `BRN-048` Make code-page round-trip damage in a text file fail a gate, because it is
+  invisible to every one of them while it sits in a committed file. Found by **scanning the bytes**
+  of every tracked text file for the `C3 A2` sequence the earlier rounds had recorded as a hazard,
+  rather than by reading code: `crates/jarvis-protocol/src/run.rs` carried **eleven** corrupted em
+  dashes in its doc comments, introduced by commit `5bb0493` and present at `HEAD`.
+  - **The damage is invisible by construction.** A file read with a legacy code page and written
+    back as UTF-8 turns `E2 80 94` into `C3 A2 E2 82 AC E2 80 9D`, and the result still compiles,
+    still resolves its doc links, still links from the index, and still passes `cargo fmt`. The
+    defect was in the one file whose whole purpose is being read by a human, and nothing in the
+    repository could see it — which is exactly the "a check nobody runs is not a check" class.
+  - Fix, in two halves. The file is repaired by replacing the three-character sequence with a real
+    em dash and writing it back as **UTF-8 without a BOM**, so the diff is ten lines and no other
+    byte moves. Then `validateTextEncoding` in `scripts/validate-docs.mjs` reads every `.md`,
+    `.rs`, `.toml`, `.json`, `.mjs`, `.js`, `.yml`, `.yaml`, and `.sh` file the walk reaches and
+    refuses the artefact, reporting the file and **line**. It lives in the docs gate because that
+    is the one command every change already runs.
+  - **The guard found real instances the moment it was wired in, including in its own source.**
+    The first run failed with 24 errors: my own `.scratch/` copies of the corrupted blob, and the
+    literal damaged characters I had written into the checker's explanatory comment. The markers
+    are now `\u` **escapes** — a literal copy of the damaged text in the guard would be the defect
+    rather than the fix — and the scratch copies were deleted.
+  - **Falsified both ways, and the second one is why the guard covers source.** A damaged `.md`
+    fixture makes the validator exit `1`; so does a damaged `.rs` fixture, which the pre-fix
+    validator passed. The source half is asserted separately because the file that motivated the
+    guard was Rust, not Markdown.
+  - **A second, pre-existing defect fell out of wiring the check.** Adding `.scratch` to the
+    walk's skipped set dropped the validated Markdown count from **90 to 89**, because a stale
+    `falsify43.md` left there since an earlier round had been counted as a document — so the
+    gate's own headline number had never described the repository. A gitignored working area must
+    be invisible here exactly as `target/` and `node_modules/` are, and that is doubly true once
+    the check reaches `.rs` and `.mjs`, since a scratch copy of the corrupted file is precisely
+    what a developer debugging it leaves behind. A fail-closed test now writes a `.scratch` probe,
+    requires the run to pass, and asserts the count is **unchanged** — the count half is the
+    stronger one, since a file that was counted while still passing is exactly how this hid.
+  1014 workspace tests (unchanged); both doc gates green (18 fail-closed tests, +2); all five
+  journeys pass (clean-machine, install, release, disconnect, policy-surface). **DO NOT COMMIT.**
+- [x] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its
   output in one burst.
+  Evidence: **both halves now exist** — the per-call measurement (previous round) and the per-model
+  aggregation that was the recorded gap. `DeliverySamples` in
+  `jarvis_domain::model::capability` is a *campaign* and `aggregate` folds it into one
+  `IncrementalDelivery`; `ModelCallRepository::delivery_campaigns` reads the samples from
+  `model_calls`; `route_candidates` attests them onto the descriptor the selector reads; and
+  `RunPorts::delivery_campaigns` carries them from the composition into run creation.
+  - **The gap, closed by connecting an existing producer to an existing consumer.** The previous
+    round recorded three timings on every call that emitted output, and every
+    `CapabilityDescriptor` in the workspace was still built with `incremental_delivery: None` in the
+    one place (`run_service::route_candidates`) that constructs them. So the figures existed, the
+    profile type existed, the routing predicate that consumes it existed, and **no route could ever
+    require incremental delivery** because nothing ever attested it. This is the `BRN-017` / `BRN-042`
+    / `BRN-043` class a third time: found by asking what consumes the value, not by reading the type.
+  - **The previous round's half, preserved because it explains the columns this one reads.**
+    `last_output_at` and `output_delta_count` were added in migration
+    `000006_model_call_delivery_profile.sql` (schema version 6) because one instant and a first token
+    cannot distinguish a stream from a burst. The profile is **derived, not stored**, so editing
+    `MIN_INCREMENTAL_SPREAD_MS` applies to every row rather than only to new ones; a negative elapsed
+    interval is clamped to zero rather than refused, because a subtraction is not where a completion
+    path should fail; and the three timings travel as one `DeliveryTiming` value, since the two
+    instants are the same type and transposing them would compute the interval backwards.
+  - **Two defects the previous round's own tests found, both recorded rather than smoothed over.**
+    The half-measurement was **storable** — `ModelCallOutcome`'s fields are public and `validated()`
+    ran only in the constructor, so a caller could persist a spread with no first instant; both the
+    adapter and the in-memory double now validate at the boundary. And a no-output call recorded
+    `output_delta_count: Some(0)`, a *verdict* where the column documents `NULL` as "not measured" —
+    **the round's own test asserted `Some(0)` and passed**, which is the round-17 lesson: a test can
+    encode the bug it should catch. The count is now derived from the first-output instant, so the
+    bad shape is unconstructible. ⚠ The falsification cycle also produced a **false result** worth
+    remembering: restoring a mutated file with `Copy-Item` preserved the *backup's* older mtime, so
+    Cargo reused the **mutant** binary and the test appeared to fail after restoration. A
+    mutation/restore cycle must force a rebuild, or the restore is unverified.
+  - **`000006` needed an upgrade test a fresh database could not be.** It is the first migration here
+    that `ALTER TABLE ADD COLUMN`s a table which can already hold rows, so
+    `a_fresh_database_migrates_and_reports_the_target_version` was the wrong evidence for the row
+    `docs/data/migrations.md` heads "DB older, auto-migration safe" — and `AGENTS.md` requires
+    "test migrations from supported prior versions". `a_database_from_a_supported_prior_version_
+    upgrades_in_place` applies the first five migrations by hand, writes a conversation, run, and
+    model call at version 5, upgrades with this binary's own migrator, and asserts the old row
+    **survives with `NULL` for both new columns**. That last assertion is what makes it an upgrade
+    test: a migration that backfilled `0` would claim every old call was measured and delivered
+    nothing — a burst verdict invented for a call nobody measured. Falsified by adding that backfill.
+  - **The aggregate is the worst sample, not the mean, and that is the design decision.** A campaign
+    in which any call burst is a model that *can* burst, so `chunk_spread_ms` is the **minimum**
+    observed, `observed_deltas` the minimum, and `time_to_first_token_ms` the **maximum**. A mean —
+    the obvious implementation — reports "delivers incrementally" for a model that sometimes does not,
+    and a caller relying on that waits for the whole generation on exactly the call that burst. The
+    field is deliberately not named `average_spread_ms` so the mistake cannot be made by naming.
+  - **`MIN_PROFILE_SAMPLES` (3) is a floor on sample size, not a confidence claim, and it is checked
+    inside the attesting call.** "One call is an anecdote" is the whole difference between *measured*
+    and *measured once*: a single attempt's figures describe that attempt — the prompt it happened to
+    send, the load it happened to meet — so a descriptor built from one row would tell the router a
+    model's *profile* while having observed one sample of it. Below the floor the descriptor keeps
+    `None`, which makes a route requiring incremental delivery **refuse**; the floor is enforced in
+    `attested_profile` rather than at a call site, so a caller cannot reach
+    `Some(Attested { label: Verified })` with one sample however it builds the campaign.
+  - **Measured evidence is `VERIFIED` and cites no document.** `VERIFIED` is defined as "confirmed by
+    a current official specification, schema, or **live test against the pinned version**" — a
+    recorded call against the configured endpoint is exactly that live test, and `DOCUMENTED` would be
+    wrong in the other direction because no document states these figures. The `source_url` is
+    `jarvis://model-calls`, a scheme with no host, rather than an empty string (reads as a defect) or
+    a plausible-looking `https://` address (**cites a page that does not say what the value says** —
+    the promotion the evidence rule exists to prevent). The revalidation window is derived from the
+    measurement day via a new `IsoDate::adding_days`, so a profile cannot be created already expired
+    or hand-dated into the far future, and the absence of a clock fails **closed**: the inventory
+    stamps `IsoDate::UNIX_EPOCH`, which every freshness check reads as stale, rather than silently
+    reading a real clock and defeating the reproducibility the parameter exists for.
+  - **The read filters, and the filter's redundancy is recorded rather than implied.** Only calls that
+    emitted output contribute, because a call with no first-output instant was never measured and
+    folding it in as zero would report a burst for a model that was never allowed to stream. The three
+    `IS NOT NULL` clauses are written separately as defence in depth against a row this binary did not
+    write, and **removing one of them does not fail a test** — the other two exclude the same rows,
+    because the write path always sets all three together. That was discovered by falsifying it, and
+    is now stated in the code and the test rather than left as an implication: the falsification that
+    means something is removing *all three*, which is what the test was rewritten to fail on.
+  - **Falsified four times, and one attempt taught something.** (1) Changing the spread fold from
+    `min` to `max` fails `one_burst_sample_makes_the_whole_campaign_a_burst` and
+    `the_aggregate_takes_the_pessimistic_figure_for_every_field` with
+    `assertion left == right failed: the narrowest spread is the one that decides` — the assertion
+    the whole rule exists for, and the same fixture is asserted to be one the averaging rule would
+    wrongly accept. (2) Removing **one** `IS NOT NULL` clause passes, which is the finding above.
+    (3) Removing **all three** fails `an_unmeasured_call_contributes_no_delivery_sample`. (4) The
+    domain test `one_single_delta_sample…` **failed on first run and exposed a wrong fixture of my
+    own**: `campaign(&[…, (900, 1)])` passes `observed_deltas` directly, and a one-delta call derives
+    `0` — so the fixture was constructing a profile `DeliveryMeasurement::profile` cannot produce.
+    The helper's parameter is the *derived* figure, not the raw count, and the test now says so.
+  - ⚠ **A PowerShell quoting trap that cost three attempts, worth recording.** Mutating a SQL string
+    literal containing backslash line continuations via
+    `$orig.Replace('…\' + "`n" + '…')` left PowerShell on a continuation prompt and needed Ctrl-C;
+    the file was unharmed but the mutation never applied. A literal containing `\` + newline must be
+    mutated from a script (`.scratch/mutate.mjs`, which reads with `readFileSync`, applies the
+    replacement, runs the command, and **restores the original bytes**), not through PowerShell's
+    quoting.
+  1039 workspace tests (+15: domain 255 -> 261, application 215 -> 220, infrastructure 469 -> 473);
+  `fmt` and `clippy -D warnings` clean; both doc gates green; all five journeys pass.
+  **Not done, and named:** the pipeline is complete end to end but **no real provider has been
+  measured**, so for a real model the item is still unmeasured — a route that requires incremental
+  delivery is refused, correctly, because nothing real has produced figures. `model-gateway.md`'s
+  list item therefore stays `UNVERIFIED` for a real model: the remaining work is a campaign against a
+  real endpoint, which is `BRN-003`'s adapter plus operator time rather than more code. Retention and
+  training-use evidence is still absent from `route_candidates` (`None`), which is the data-policy
+  half and is `BRN-010`'s, not this item's. **DO NOT COMMIT.**
 
 ## Milestone 3: Tool Fabric
 

@@ -154,6 +154,14 @@ impl serde::de::Visitor<'_> for TimestampVisitor {
 pub struct IsoDate(Date);
 
 impl IsoDate {
+    /// The first day of the Unix epoch, used where a day is required but none was supplied.
+    ///
+    /// A fixed past day rather than a clock read, so a caller that deliberately supplied no instant
+    /// — a synchronous context with no clock, or a test that wants reproducibility — cannot get
+    /// "now" by accident. Evidence stamped against it reads as **stale** on every real day, so an
+    /// absent clock fails closed instead of attesting.
+    pub const UNIX_EPOCH: Self = Self(Date::constant(1970, 1, 1));
+
     /// Wraps a calendar date.
     #[must_use]
     pub const fn from_date(date: Date) -> Self {
@@ -189,6 +197,33 @@ impl IsoDate {
     #[must_use]
     pub fn is_no_earlier_than(self, other: Self) -> bool {
         self.0 >= other.0
+    }
+
+    /// Returns the day `days` after this one, saturating at the representable maximum.
+    ///
+    /// Used to derive an evidence note's `revalidate_by` day from the day it was measured, so a
+    /// profile cannot be created already expired or dated by hand into the far future. The
+    /// arithmetic lives here rather than at the call site because a date *addition* is a rule
+    /// about this type — and because doing it with a `jiff::Span` at each caller would put a
+    /// second implementation of "what does 90 days mean" in the application layer.
+    ///
+    /// **A negative `days` is clamped to zero, and an overflowing addition saturates.** Both are
+    /// the same decision: this is called on a path that records evidence about a completed call,
+    /// where there is no caller to answer an error and where the fail-closed reading of a
+    /// nonsensical input is "the window is as short as possible" rather than "the window failed to
+    /// be computed". Saturating to the maximum is the one exception, and it is safe in this
+    /// direction because the caller's own freshness check reads the *day*, so a window that cannot
+    /// be exceeded cannot admit anything.
+    #[must_use]
+    pub fn adding_days(self, days: i64) -> Self {
+        if days <= 0 {
+            return self;
+        }
+        let span = jiff::Span::new().days(days);
+        match self.0.checked_add(span) {
+            Ok(date) => Self(date),
+            Err(_) => Self(Date::MAX),
+        }
     }
 }
 

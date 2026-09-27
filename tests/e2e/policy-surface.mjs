@@ -253,7 +253,8 @@ async function readFirstOutputAt(profile, runId) {
   return await withDatabase(profile, (database) =>
     database
       .prepare(
-        "SELECT first_output_at FROM model_calls WHERE run_id = ? " +
+        "SELECT first_output_at, last_output_at, output_delta_count " +
+          "FROM model_calls WHERE run_id = ? " +
           "ORDER BY started_at DESC LIMIT 1",
       )
       .get(runId),
@@ -876,6 +877,38 @@ async function main() {
       );
     } else {
       pass(`the model call records its first output at: ${firstOutput.first_output_at}`);
+    }
+
+    // And the **other** end of the interval plus its sample size, from `BRN-011`: a genuine stream
+    // and a burst are identical at the start, so the spread's end and the delta count are what make
+    // this a measurement rather than a first-token figure. Asserted against a real daemon because
+    // the columns are only reachable through the profile database — no route exposes a model call —
+    // and a value the double stores and the adapter drops would pass every unit test.
+    if (typeof firstOutput?.last_output_at !== "string" || firstOutput.last_output_at === "") {
+      fail(
+        "the call must record when its last output arrived, got " +
+          JSON.stringify(firstOutput?.last_output_at),
+      );
+    } else if (!Number.isInteger(firstOutput.output_delta_count)) {
+      fail(
+        "the call must record its delta count, got " +
+          JSON.stringify(firstOutput.output_delta_count),
+      );
+    } else if (
+      Date.parse(firstOutput.last_output_at) < Date.parse(firstOutput.first_output_at)
+    ) {
+      // The end of the interval can never precede its start. A `get_or_insert` on the last instant
+      // would freeze it at the first, which passes a presence check and reports every call as a
+      // burst — so the ordering, not the presence, is what this asserts.
+      fail(
+        "the last-output instant must not precede the first, got " +
+          JSON.stringify(firstOutput),
+      );
+    } else {
+      pass(
+        `the model call records its delivery spread: ${firstOutput.output_delta_count} delta(s), ` +
+          `${firstOutput.output_delta_count === 1 ? "a burst" : "streaming"} by measurement`,
+      );
     }
 
     // Narrow the ceiling to `public`, below the objective's `internal` label, so the same create

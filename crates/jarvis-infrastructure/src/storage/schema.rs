@@ -11,7 +11,7 @@ use super::error::StorageError;
 
 /// The schema version this binary targets and writes.
 ///
-/// **`5`, not the `3` this doc used to claim.** It said "Bumped to `3` by `000003_idempotency.sql`"
+/// **`6`, not the `3` this doc once claimed.** It said "Bumped to `3` by `000003_idempotency.sql`"
 /// while the constant read `5`, because migrations `000004_model_data_policy.sql` and
 /// `000005_model_policy_exceptions.sql` were added afterwards without revisiting the sentence — so
 /// the one place a reader looks to learn what version this build writes was describing a build two
@@ -27,10 +27,11 @@ use super::error::StorageError;
 /// | 3 | `000003_idempotency.sql` — idempotency records |
 /// | 4 | `000004_model_data_policy.sql` — the policy store |
 /// | 5 | `000005_model_policy_exceptions.sql` — policy exceptions |
+/// | 6 | `000006_model_call_delivery_profile.sql` — a call's last-output instant and delta count |
 ///
 /// The minimum reader stays at `1`: every later migration is purely additive, so a binary that
 /// understands only the initial schema can still read a database that has the added tables.
-pub const TARGET_SCHEMA_VERSION: i64 = 5;
+pub const TARGET_SCHEMA_VERSION: i64 = 6;
 
 /// The lowest schema version this binary can still read.
 ///

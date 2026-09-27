@@ -40,12 +40,12 @@
     {
       "id": "openai-compatible-model",
       "todos": ["BRN-003", "BRN-009", "BRN-010"],
-      "evidence": null,
-      "state": "REQUIRED",
-      "implementation_ready": false,
-      "last_verified": null,
-      "revalidate_by": null,
-      "implementation_paths": ["adapters/models/openai-compatible/**", "crates/**/src/adapters/models/openai-compatible/**", "crates/**/src/providers/openai-compatible/**", "crates/**/src/model_providers/openai-compatible/**", "tests/integration/openai-compatible/**"]
+      "evidence": "docs/research/integrations/openai-compatible-model.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-27",
+      "revalidate_by": "2027-03-26",
+      "implementation_paths": ["adapters/models/openai-compatible/**", "crates/**/src/adapters/models/openai-compatible/**", "crates/**/src/providers/openai-compatible/**", "crates/**/src/model_providers/**", "crates/**/src/model_providers/openai-compatible/**", "crates/**/src/model_providers/openai_compatible/**", "tests/integration/openai-compatible/**", "tests/integration/openai_compatible/**"]
     },
     {
       "id": "github-actions-ci",

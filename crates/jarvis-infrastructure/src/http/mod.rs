@@ -165,18 +165,37 @@ pub struct ProviderInventory {
 }
 
 impl ProviderInventory {
-    /// Builds the inventory from a provider and a clock.
+    /// Builds the inventory from a provider, a clock, and the stored delivery campaigns.
     ///
     /// The clock is read here so every request through one daemon evaluates evidence freshness
-    /// against the same instant, which is what makes two probes in one run reproducible.
+    /// against the same instant, which is what makes two probes in one run reproducible. The
+    /// campaigns are passed rather than read here for the same reason: an inventory that read its
+    /// own store would be a second reader that could be given a different workspace's rows, and the
+    /// measurement must be the same one the run path attests from.
     #[must_use]
-    pub fn new(provider: &dyn ModelProvider, now: Option<UtcTimestamp>) -> Self {
+    pub fn new(
+        provider: &dyn ModelProvider,
+        campaigns: &[jarvis_application::repository::model_call::ModelDeliverySamples],
+        now: Option<UtcTimestamp>,
+    ) -> Self {
         // Built by the *same* function the run path uses, rather than by a second copy of this
         // loop. Two builders would let the diagnostic probe and a real run disagree about which
         // models exist — the failure an operator would least likely see, because the probe would
-        // report a route the run never took.
+        // report a route the run never took. The evidence day comes from the same instant the
+        // freshness check uses, so a probe cannot attest a profile the run would treat as stale.
+        //
+        // With no clock the day is a fixed past date rather than "now": a caller that supplied no
+        // clock has not told this inventory when it is, and reading a real clock here would defeat
+        // the reproducibility the parameter exists for. A measurement attested against a date in
+        // the past is treated as **stale** by every freshness check, which is the fail-closed
+        // reading — a probe with no clock refuses rather than attests.
+        let today = now.map_or(jarvis_domain::time::IsoDate::UNIX_EPOCH, |instant| {
+            instant.utc_date()
+        });
         Self {
-            candidates: jarvis_application::run_service::route_candidates(provider),
+            candidates: jarvis_application::run_service::route_candidates(
+                provider, campaigns, today,
+            ),
             now,
         }
     }
@@ -1703,6 +1722,9 @@ mod tests {
                 // records, which is what makes the policy reference in a create request reach the
                 // run. `None` here would make every run in these tests policy-less.
                 policies: Some(Arc::clone(&repositories) as Arc<dyn ModelDataPolicyRepository>),
+                // Nothing measured in this fixture: the handler tests are about the HTTP surface,
+                // and an empty campaign is the fresh-profile state they should exercise.
+                delivery_campaigns: Vec::new(),
             },
             Arc::new(RunCancellationRegistry::new()),
         ));
@@ -3949,7 +3971,7 @@ mod tests {
         let policies = Arc::new(PolicyService::new(
             Arc::clone(&repositories) as Arc<dyn ModelDataPolicyRepository>
         ));
-        let inventory = Arc::new(ProviderInventory::new(&provider, Some(policy_now())));
+        let inventory = Arc::new(ProviderInventory::new(&provider, &[], Some(policy_now())));
 
         let state = Arc::new(
             ApiState::new(
@@ -4413,7 +4435,7 @@ mod tests {
             EndpointClass::Local,
             "the compliant arm depends on this provider being local"
         );
-        let inventory = Arc::new(ProviderInventory::new(&provider, Some(policy_now())));
+        let inventory = Arc::new(ProviderInventory::new(&provider, &[], Some(policy_now())));
         let policies = Arc::new(PolicyService::new(
             repositories as Arc<dyn ModelDataPolicyRepository>,
         ));

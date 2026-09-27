@@ -194,7 +194,7 @@ id, workspace_id, run_id, step_id, logical_call_id, attempt,
 provider_id, model_id, model_revision, route_decision_id,
 state, request_fingerprint, provider_request_id, continuation_ref,
 usage_json, estimated_cost_microunits, finish_reason,
-error_code, started_at, first_output_at, completed_at
+error_code, started_at, first_output_at, last_output_at, output_delta_count, completed_at
 UNIQUE(logical_call_id, attempt)
 ```
 
@@ -215,6 +215,32 @@ computed from. It was the last column in this group to gain a producer: the port
 output and then fails still records it, because the tokens were really produced; a call refused
 before the provider accepted it does not, which is why those two paths pass `None` explicitly rather
 than by omission.
+
+`last_output_at` and `output_delta_count` complete that measurement (`BRN-011`). One instant and a
+first token cannot distinguish a genuine stream from a burst — a model that advertises streaming and
+delivers its whole reply at once looks identical at the start — so the interval needs its **end** and
+the count needs its **sample size**. `last_output_at` is the last delta's instant and
+`output_delta_count` the number of deltas, and `IncrementalDelivery` is **derived** from the three
+values at read time rather than stored: a stored verdict would be a second answer to "was this a
+burst", and a change to the domain's minimum-spread constant would silently not apply to rows already
+written. Both are `NULL` for a row written before the migration **and** for a call that delivered no
+output, and neither is `0`: `NULL` means "no measurement was taken" while `0` would mean "measured,
+and the answer is zero deltas", and the two must stay apart — the same "unknown is not zero" rule
+the usage counters follow. The count is written only when a first-output instant exists, so a count
+without an instant is a shape the writer cannot produce.
+
+`ModelCallRepository::delivery_campaigns` reads those three columns into one profile per call and
+groups them per `(provider, model, revision)` **for a measurement campaign**, which is how a model's
+delivery profile is aggregated (`BRN-011`). The read filters out any call whose timing columns are
+`NULL`, so a call that produced nothing cannot be folded in as a zero and invent a burst for a model
+that was never allowed to stream — the same `NULL`-is-not-zero rule applied at the group boundary.
+The three `IS NOT NULL` clauses are written separately although the write path always sets all three
+together; that redundancy guards against a row this binary did not write, and the consequence is
+recorded rather than implied: **removing one clause changes no result**, so the falsification that
+means something is removing all three. Groups are returned even when they are too small to attest
+anything, because the sufficiency floor is a rule about what the samples *mean* and belongs where it
+can be tested (`DeliverySamples::aggregate`), not hidden in a `HAVING COUNT(*) >= 3` a test could only
+observe through a caller.
 
 Prompt/output content uses protected artifact/content references under retention
 policy rather than being duplicated in telemetry rows.

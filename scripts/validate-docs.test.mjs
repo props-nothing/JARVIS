@@ -10,6 +10,7 @@ import {
   canonicalEvidencePath,
   dependencyEvidenceErrors,
   duplicateProductRequirements,
+  encodingErrors,
   globMatches,
   hasNonemptyEvidence,
   lacksIntegrationSpecificEvidence,
@@ -310,6 +311,111 @@ test("the excluded scratch area is invisible to the validator", () => {
     // again, so a real scratch area is never destroyed by a test run.
     if (createdDirectory && readdirSync(excluded).length === 0) {
       rmSync(excluded, { force: true, recursive: true });
+    }
+  }
+});
+
+test("code-page round-trip damage in a document fails closed", () => {
+  // A document whose em dash was read with a legacy code page and written back as UTF-8 still
+  // compiles, still links, and still parses — which is why the same damage lived in a checked-in
+  // `.rs` file for several rounds while every gate reported success. Only the bytes reveal it, so
+  // the check has to look at the content rather than the file encoding: the damaged text IS
+  // valid UTF-8.
+  assert.deepEqual(encodingErrors("docs/x.md", "a plain ascii document\n"), []);
+  assert.deepEqual(
+    encodingErrors("docs/x.md", "an em dash \u2014 reads fine\n"),
+    [],
+  );
+  // The dash the repository actually uses in prose is not damage.
+  assert.equal(encodingErrors("docs/x.md", "caf\u00e9 \u2014 \u65e5\u672c\u8a9e\n").length, 0);
+
+  const damaged = "a client shares \u00e2\u20ac\u201d a type\n";
+  const errors = encodingErrors("docs/x.md", damaged);
+  assert.equal(errors.length, 1, errors.join("\n"));
+  assert.match(errors[0], /docs\/x\.md:1: text contains a code-page round-trip artefact/);
+
+  // The line number is the artefact's own line, not the file's first line.
+  const laterLine = "first\nsecond\nthird \u00e2\u20ac\u201d here\n";
+  assert.match(encodingErrors("docs/x.md", laterLine)[0], /docs\/x\.md:3:/);
+
+  // A byte-order mark is the same class: a signature that reached the content.
+  assert.match(
+    encodingErrors("docs/x.md", "\ufeff# Title\n")[0],
+    /starts with a UTF-8 byte-order mark/,
+  );
+
+  // And the validator itself refuses a real file with the damage, so the check is wired into
+  // the gate rather than only being callable.
+  const fixture = path.join(ROOT, "docs", "testing", "temp-mojibake-probe.md");
+  writeFileSync(fixture, "# Probe \u00e2\u20ac\u201d damaged\n\nStatus: PROPOSED\n", "utf8");
+  try {
+    const result = runValidator("docs/testing/strategy.md");
+    assert.equal(result.status, 1, "a damaged document must fail the gate");
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /temp-mojibake-probe\.md:1: text contains a code-page round-trip artefact/,
+    );
+  } finally {
+    rmSync(fixture, { force: true });
+  }
+
+  // The instance this check exists for was in a **Rust source file**, not a document, and it
+  // survived because damaged source still compiles. A source fixture therefore has to be
+  // rejected too, or the guard would miss the case that motivated it.
+  const sourceFixture = path.join(ROOT, "crates", "jarvis-protocol", "src", "temp-mojibake-probe.rs");
+  writeFileSync(sourceFixture, "//! a comment \u00e2\u20ac\u201d damaged\n", "utf8");
+  try {
+    const result = runValidator("docs/testing/strategy.md");
+    assert.equal(result.status, 1, "a damaged source file must fail the gate");
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /temp-mojibake-probe\.rs:1: text contains a code-page round-trip artefact/,
+    );
+  } finally {
+    rmSync(sourceFixture, { force: true });
+  }
+});
+
+test("a damaged file in the scratch area cannot fail the gate or change the count", () => {
+  // `.scratch/` is gitignored (`.gitignore` line 13), so its contents are not part of the
+  // repository and must be invisible here exactly as `target/` and `node_modules/` are. This
+  // matters most for the encoding check, whose extension list already reaches `.rs` and `.mjs`:
+  // a developer debugging that check leaves a scratch copy of the corrupted file behind, and that
+  // copy must not turn the debugging into a red build.
+  //
+  // The count assertion is the stronger half. Before `.scratch` was added to the skipped set, a
+  // stale scratch document was being **counted** as a validated Markdown file — so the gate was
+  // reading a file that is not in the repository at all, and its count did not describe the repo.
+  const scratch = path.join(ROOT, ".scratch");
+  const probe = path.join(scratch, "temp-validator-probe.rs");
+  const createdDirectory = !existsSync(scratch);
+  if (createdDirectory) {
+    mkdirSync(scratch, { recursive: true });
+  }
+  const countBefore = validatedFileCount(runValidator("docs/testing/strategy.md"));
+
+  writeFileSync(probe, "//! damaged \u00e2\u20ac\u201d probe\n", "utf8");
+  try {
+    const result = runValidator("docs/testing/strategy.md");
+    assert.equal(
+      result.status,
+      0,
+      `a scratch file must not affect the gate: ${result.stdout}${result.stderr}`,
+    );
+    assert.doesNotMatch(
+      `${result.stdout}${result.stderr}`,
+      /temp-validator-probe/,
+      "the scratch file must not be mentioned at all",
+    );
+    assert.equal(
+      validatedFileCount(result),
+      countBefore,
+      "a scratch file must not change the validated file count",
+    );
+  } finally {
+    rmSync(probe, { force: true });
+    if (createdDirectory && readdirSync(scratch).length === 0) {
+      rmSync(scratch, { force: true, recursive: true });
     }
   }
 });

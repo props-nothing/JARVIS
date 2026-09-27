@@ -24,14 +24,33 @@ use crate::http::{ApiState, Readiness};
 use crate::lifecycle::{DiscoveryError, InstanceError, InstanceGuard};
 use crate::storage::StorageError;
 use crate::storage::repositories::SqliteRepositories;
+use jarvis_application::repository::model_call::ModelCallRepository;
 use jarvis_application::repository::run::RecoverySummary;
 use jarvis_application::run_service::{RunCancellationRegistry, RunService};
+use jarvis_domain::ids::WorkspaceId;
 
+/// The workspace whose measurements seed the process-wide capability inventory.
+///
+/// A measured delivery profile is a fact about an endpoint, and a local profile serves exactly one
+/// workspace — the same assumption [`crate::http::runs::DEFAULT_WORKSPACE_UUID`] is built on. This
+/// constant is deliberately **not** a second source of that identifier: a test asserts the two
+/// agree, so a change to one that misses the other fails rather than silently measuring a workspace
+/// no request uses.
+const DEFAULT_WORKSPACE: WorkspaceId = WorkspaceId::from_uuid(uuid::Uuid::from_u128(
+    crate::http::runs::DEFAULT_WORKSPACE_UUID,
+));
 /// The default bounded drain grace period.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// The daemon's resolved runtime configuration.
-#[derive(Debug, Clone)]
+///
+/// The provider is carried as a composed value rather than a description of one, because
+/// **which provider a daemon calls is decided once, before it serves**: resolving a credential,
+/// refusing a non-loopback endpoint, and validating an identifier are all startup decisions, and a
+/// daemon that deferred them would accept runs it could never serve. `None` means the operator
+/// configured no provider, which composes the deterministic scripted provider — so a profile that
+/// names no endpoint does not silently reach the network, and an operator opts **in** to a real
+/// provider rather than discovering one was already in use.
 pub struct DaemonConfig {
     /// The directory holding the single-instance lock.
     pub lock_path: PathBuf,
@@ -43,6 +62,29 @@ pub struct DaemonConfig {
     pub database_path: PathBuf,
     /// The bounded drain grace period.
     pub drain_grace: Duration,
+    /// The composed model provider, when one was configured.
+    provider: Option<Arc<dyn jarvis_application::model::ModelProvider>>,
+}
+
+/// `Debug` is hand-written because the provider is a trait object: a derived implementation would
+/// not compile, and printing a *provider description* rather than the value is what a diagnostic
+/// actually needs. The adapter's own `Debug` redacts its credential, but this prints only the model
+/// references, so a credential cannot reach a log line through this path at all.
+impl std::fmt::Debug for DaemonConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let models = self.provider.as_ref().map_or_else(Vec::new, |provider| {
+            provider.models().iter().map(ToString::to_string).collect()
+        });
+        formatter
+            .debug_struct("DaemonConfig")
+            .field("lock_path", &self.lock_path)
+            .field("discovery_dir", &self.discovery_dir)
+            .field("config_dir", &self.config_dir)
+            .field("database_path", &self.database_path)
+            .field("drain_grace", &self.drain_grace)
+            .field("provider_models", &models)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonConfig {
@@ -58,13 +100,42 @@ impl DaemonConfig {
             config_dir: paths.config_dir().to_path_buf(),
             database_path: paths.database_dir().join("jarvis.sqlite"),
             drain_grace: DEFAULT_DRAIN_GRACE,
+            provider: None,
         }
+    }
+
+    /// Supplies the composed model provider.
+    ///
+    /// A builder rather than a `from_profile` argument, so the profile layout stays a pure function
+    /// of the filesystem and the provider stays an explicit composition step the caller has to
+    /// perform. A caller that forgets it gets the scripted provider, which is a *visible* outcome
+    /// (its model id says `scripted.local`) rather than a run that mysteriously reaches the network.
+    #[must_use]
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn jarvis_application::model::ModelProvider>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     /// Returns the discovery file path.
     #[must_use]
     pub fn discovery_path(&self) -> PathBuf {
         self.discovery_dir.join("discovery.json")
+    }
+
+    /// Returns the model references the composed provider serves, or an empty list.
+    ///
+    /// Rendered as strings because this exists for diagnostics and for a test asserting *which*
+    /// provider was wired: comparing model identity text is what distinguishes the configured adapter
+    /// from the scripted fallback, and an empty list is the honest answer for an unconfigured profile
+    /// rather than a claim that the scripted provider serves nothing.
+    #[must_use]
+    pub fn provider_models(&self) -> Vec<String> {
+        self.provider.as_ref().map_or_else(Vec::new, |provider| {
+            provider.models().iter().map(ToString::to_string).collect()
+        })
     }
 }
 
@@ -401,7 +472,23 @@ pub async fn start(
     // readiness must stay false until that classification completes — so this cannot
     // follow the discovery publication, or a client could reach a daemon that has not
     // yet settled the runs it is about to serve.
-    let ports = run_ports(Arc::clone(&repositories));
+    //
+    // The measured delivery campaigns are read **once, here**, and handed to both consumers — the
+    // run ports and the diagnostic inventory below. Two reads would let the probe and a run attest
+    // from two different measurements of the same table, which is exactly the disagreement
+    // `route_candidates` exists to prevent about the model list. A read failure is not fatal: an
+    // empty campaign leaves every descriptor without a profile, which is precisely the state before
+    // anything has been measured, so a diagnostic surface stays available rather than the daemon
+    // refusing to start because one read failed.
+    let delivery_campaigns = repositories
+        .delivery_campaigns(DEFAULT_WORKSPACE)
+        .await
+        .unwrap_or_default();
+    let ports = run_ports(
+        Arc::clone(&repositories),
+        delivery_campaigns.clone(),
+        config.provider.clone(),
+    );
     let report = jarvis_application::recovery::reconcile(
         &ports.runs,
         crate::time::SystemClock::new()
@@ -450,8 +537,12 @@ pub async fn start(
     // freshness against the instant it started rather than against a per-request `now`. That is
     // what makes two probes in one run reproducible, and a `None` keeps the surface available
     // rather than failing startup over a clock that cannot report.
+    //
+    // The campaigns are read from the store so the probe attests the **same** measured profiles a
+    // run would, from the same database — the read happened once, above, and is reused here.
     let inventory = Arc::new(crate::http::ProviderInventory::new(
         ports.provider.as_ref(),
+        &delivery_campaigns,
         crate::time::SystemClock::new().now().ok(),
     ));
 
@@ -494,57 +585,33 @@ pub async fn start(
 ///
 /// It is not a fake of something that exists: it is the deterministic provider the
 /// plan requires, and its model identifier says `scripted.local` so an operator can
-/// see which source served a run.
+/// see which source served a run. When an operator **has** configured a provider, that
+/// composed adapter is used instead — see `DaemonConfig::provider` — and this fallback is
+/// reached only when no endpoint was configured.
 ///
 /// The repository is passed in rather than built here, and it is the same value the
 /// daemon's policy surface uses, so the policy a run's route is selected from is the
 /// policy the API reads back.
-fn run_ports(repositories: Arc<SqliteRepositories>) -> jarvis_application::run_service::RunPorts {
-    use jarvis_application::model::{ModelProvider, ScriptedProvider};
+fn run_ports(
+    repositories: Arc<SqliteRepositories>,
+    delivery_campaigns: Vec<jarvis_application::repository::model_call::ModelDeliverySamples>,
+    provider: Option<Arc<dyn jarvis_application::model::ModelProvider>>,
+) -> jarvis_application::run_service::RunPorts {
     use jarvis_application::run_service::RunPorts;
-    use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
-    use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
 
-    let provider: Arc<dyn ModelProvider> = match (
-        // The identifiers are literals this build controls, so a failure here would be a
-        // programming error rather than a runtime condition. They are validated once and
-        // fall back rather than being unwrapped, so a future edit that mistypes one degrades
-        // to a provider that serves no model — which makes every run fail with
-        // `run.no_model_served`, a state an operator can see — instead of panicking on the
-        // startup path.
-        ProviderId::from_literal("scripted.local"),
-        ModelId::from_literal("scripted-echo"),
-    ) {
-        (Some(provider_id), Some(model_id)) => {
-            // The script echoes a bounded acknowledgement rather than the caller's text,
-            // so the deterministic path cannot be mistaken for a real model's answer and
-            // its output cannot reflect prompt content into a public event payload.
-            Arc::new(
-                ScriptedProvider::new(ModelRef::new(provider_id, model_id))
-                    .emit(ModelStreamEventKind::OutputItemAdded {
-                        item_id: "scripted-answer".to_owned(),
-                    })
-                    .emit_text(
-                        "scripted-answer",
-                        "The scripted provider received this run. Configure a model provider to receive real answers.",
-                    )
-                    .emit(ModelStreamEventKind::CallCompleted {
-                        finish_reason: FinishReason::Stop,
-                        usage: None,
-                        refused: false,
-                    }),
-            )
-        }
-        _ => Arc::new(ScriptedProvider::serving_no_model()),
-    };
+    // A configured provider is used as-is; otherwise the deterministic default. The fallback is
+    // `scripted_provider()` rather than an inline script so the *same* value is used by the
+    // composition tests and by a daemon, and a change to the scripted answer cannot reach one
+    // without the other.
+    let provider: Arc<dyn jarvis_application::model::ModelProvider> =
+        provider.unwrap_or_else(|| Arc::new(crate::model_providers::scripted_provider()));
 
     RunPorts {
         runs: Arc::clone(&repositories)
             as Arc<dyn jarvis_application::repository::run::RunRepository>,
         conversations: Arc::clone(&repositories)
             as Arc<dyn jarvis_application::repository::conversation::ConversationRepository>,
-        model_calls: Arc::clone(&repositories)
-            as Arc<dyn jarvis_application::repository::model_call::ModelCallRepository>,
+        model_calls: Arc::clone(&repositories) as Arc<dyn ModelCallRepository>,
         deltas: Arc::clone(&repositories)
             as Arc<dyn jarvis_application::live_events::StreamDeltaSink>,
         provider,
@@ -558,6 +625,7 @@ fn run_ports(repositories: Arc<SqliteRepositories>) -> jarvis_application::run_s
             repositories
                 as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
         ),
+        delivery_campaigns,
     }
 }
 

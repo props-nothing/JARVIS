@@ -154,6 +154,10 @@ fn fixture_policied() -> Fixture {
             clock: Arc::new(ManualClock::new(now())),
             policies: Some(Arc::clone(&repositories)
                 as Arc<dyn crate::repository::policy::ModelDataPolicyRepository>),
+            // No stored measurements in this fixture: it exists for policy selection, and an empty
+            // campaign keeps every descriptor without a delivery profile. The attestation path has
+            // its own tests, which drive `route_candidates` directly rather than through a run.
+            delivery_campaigns: Vec::new(),
         },
         Arc::clone(&cancellations),
     );
@@ -211,6 +215,9 @@ fn fixture_with(provider: Arc<ScriptedProvider>) -> Fixture {
             // state several of these tests are about (a Foundation composition with no policy
             // configured), and it is asserted rather than incidental.
             policies: None,
+            // Nothing measured. Every descriptor keeps `incremental_delivery: None`, which is the
+            // fresh-profile state a route requiring that capability must refuse.
+            delivery_campaigns: Vec::new(),
         },
         Arc::clone(&cancellations),
     );
@@ -241,6 +248,7 @@ fn fixture_with_provider(provider: Arc<dyn crate::model::ModelProvider>) -> Fixt
             provider,
             clock: Arc::new(ManualClock::new(now())),
             policies: None,
+            delivery_campaigns: Vec::new(),
         },
         Arc::clone(&cancellations),
     );
@@ -1259,6 +1267,7 @@ async fn fixture_local_only_with_locality_grant(
             clock: Arc::new(ManualClock::new(now())),
             policies: Some(Arc::clone(&repositories)
                 as Arc<dyn crate::repository::policy::ModelDataPolicyRepository>),
+            delivery_campaigns: Vec::new(),
         },
         Arc::clone(&cancellations),
     );
@@ -1553,4 +1562,141 @@ async fn the_recorded_decision_is_the_one_the_run_route_names() {
         stored.budget.policy.expect("the policy is recorded"),
     );
     assert_eq!(decisions[0].effective.model, route.model);
+}
+
+/// Builds a campaign group for `model()` from `(spread_ms, observed_deltas)` pairs.
+fn campaign(samples: &[(u32, u32)]) -> crate::repository::model_call::ModelDeliverySamples {
+    use jarvis_domain::model::capability::IncrementalDelivery;
+
+    crate::repository::model_call::ModelDeliverySamples {
+        provider_id: model().provider_id.clone(),
+        model_id: model().model_id.clone(),
+        revision: None,
+        samples: samples
+            .iter()
+            .map(|(spread, deltas)| IncrementalDelivery {
+                time_to_first_token_ms: 100,
+                chunk_spread_ms: *spread,
+                observed_deltas: *deltas,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_sufficient_campaign_attests_a_profile_onto_the_candidate() {
+    // **The join `BRN-011` was missing.** The measurement existed on every call, the profile type
+    // existed, and the routing predicate that consumes it existed — while every descriptor was
+    // built with `incremental_delivery: None`, so no route could ever require the capability. This
+    // asserts the evidence now reaches the candidate the selector reads.
+    let provider = ScriptedProvider::new(model());
+    let campaigns = [campaign(&[(900, 40), (1_100, 30), (700, 50)])];
+    let candidates = super::route_candidates(
+        &provider,
+        &campaigns,
+        jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid"),
+    );
+
+    assert_eq!(candidates.len(), 1);
+    let attested = candidates[0]
+        .descriptor
+        .incremental_delivery
+        .as_ref()
+        .expect("a measured campaign must attest a profile");
+    // The pessimistic fold, not the best sample: the slowest first token, the narrowest spread,
+    // the thinnest count.
+    assert_eq!(attested.value.chunk_spread_ms, 700);
+    assert_eq!(attested.value.observed_deltas, 30);
+    assert_eq!(
+        attested.evidence.label,
+        jarvis_domain::model::capability::EvidenceLabel::Verified,
+    );
+}
+
+#[test]
+fn a_campaign_below_the_floor_attests_nothing_rather_than_a_thin_profile() {
+    // The fail-closed direction, asserted through the real builder: two calls are not a profile, so
+    // the descriptor keeps `None` and a route requiring incremental delivery **refuses** instead of
+    // routing on two observations.
+    let provider = ScriptedProvider::new(model());
+    for size in 0..super::DELIVERY_PROFILE_MIN_SAMPLES {
+        let campaigns = [campaign(&vec![(900, 40); size])];
+        let candidates = super::route_candidates(
+            &provider,
+            &campaigns,
+            jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid"),
+        );
+        assert!(
+            candidates[0].descriptor.incremental_delivery.is_none(),
+            "a campaign of {size} samples must attest nothing",
+        );
+    }
+}
+
+#[test]
+fn a_burst_in_the_campaign_reaches_the_descriptor_as_a_refusal() {
+    // The end-to-end consequence of the worst-sample rule, through the type the selector reads:
+    // one burst call among four means `incremental_delivery_on` fails, which is what makes a route
+    // that requires incremental delivery refuse the candidate rather than route to it.
+    let provider = ScriptedProvider::new(model());
+    let campaigns = [campaign(&[(900, 40), (900, 40), (900, 40), (0, 8)])];
+    let candidates = super::route_candidates(
+        &provider,
+        &campaigns,
+        jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid"),
+    );
+    let today = jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid");
+    assert!(
+        candidates[0]
+            .descriptor
+            .incremental_delivery_on(today)
+            .is_err(),
+        "a campaign containing a burst must refuse, not route",
+    );
+}
+
+#[test]
+fn a_campaign_for_another_model_is_not_applied() {
+    // The loop is driven by the candidate list, so evidence keyed to a model the provider does not
+    // serve cannot leak onto one it does — the same scope discipline the storage read enforces one
+    // layer down.
+    let provider = ScriptedProvider::new(model());
+    let mut foreign = campaign(&[(900, 40), (1_100, 30), (700, 50)]);
+    foreign.model_id = ModelId::parse("another-model").expect("valid");
+    let candidates = super::route_candidates(
+        &provider,
+        &[foreign],
+        jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid"),
+    );
+    assert!(candidates[0].descriptor.incremental_delivery.is_none());
+}
+
+#[test]
+fn an_attested_profile_carries_a_revalidation_window_the_freshness_check_honours() {
+    // The window is derived from the evaluated day, not written by hand, so a profile cannot be
+    // created already expired. The second half is the point: the same descriptor read one day
+    // after its window returns `None` from `incremental_delivery_on`, so staleness behaves like
+    // "unmeasured" rather than like a still-valid measurement.
+    let provider = ScriptedProvider::new(model());
+    let campaigns = [campaign(&[(900, 40), (1_100, 30), (700, 50)])];
+    let today = jarvis_domain::time::IsoDate::parse("2026-09-22").expect("valid");
+    let candidates = super::route_candidates(&provider, &campaigns, today);
+    let attested = candidates[0]
+        .descriptor
+        .incremental_delivery
+        .as_ref()
+        .expect("attested");
+
+    assert!(
+        attested.evidence.is_fresh_on(today),
+        "the profile must be usable on the day it was measured",
+    );
+    // The window must be a real one rather than "today": a zero-length validity would make every
+    // attested profile unusable the instant it was created, which would pass a freshness
+    // assertion that only ever asked about the measurement day.
+    let after = today.adding_days(super::DELIVERY_PROFILE_VALID_DAYS + 1);
+    assert!(
+        !attested.evidence.is_fresh_on(after),
+        "a profile must not stay fresh indefinitely",
+    );
 }

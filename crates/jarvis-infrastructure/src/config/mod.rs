@@ -12,8 +12,8 @@ pub mod secret;
 pub use atomic::{MAX_CONFIG_BYTES, read_bounded, read_tail_window, write_atomic};
 pub use loader::{
     Config, ConfigOverrides, ENV_ALLOWLIST, EnvApplication, LogLevel, ModelSection, PrivacySection,
-    RuntimeSection, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, StorageKind, StorageSection,
-    config_file_path,
+    ProviderSection, RuntimeSection, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, StorageKind,
+    StorageSection, config_file_path,
 };
 pub use secret::{EnvSecretResolver, MapSecretResolver, SecretReference, SecretResolver};
 

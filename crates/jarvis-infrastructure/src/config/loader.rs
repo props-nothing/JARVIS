@@ -18,10 +18,21 @@ use super::atomic::{read_bounded, write_atomic};
 use super::secret::SecretReference;
 
 /// The configuration schema version this binary writes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added the optional `[model.provider]` table. The version moved because a
+/// document that **names a provider endpoint** is not one a version-1 binary can read:
+/// that binary's `deny_unknown_fields` would reject the unknown table as a *parse*
+/// failure, when the accurate diagnostic is "written by a newer JARVIS". A file with no
+/// `[model.provider]` table loads unchanged under both versions, so an existing profile
+/// is not rewritten merely because the binary was upgraded.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The schema versions this binary can read.
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1];
+///
+/// Both are accepted. Version 1 remains readable because the only difference is an
+/// optional table, so refusing it would lock an operator out of their own profile for no
+/// security benefit.
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2];
 
 /// Log verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +92,30 @@ impl Default for StorageSection {
     }
 }
 
+/// A configured model provider endpoint.
+///
+/// This is **operator configuration for reaching an endpoint**, and it deliberately does not
+/// validate the host. Whether an endpoint is admissible is a property of the *adapter* — the
+/// openai-compatible adapter refuses a non-loopback host because this build has no TLS — and
+/// duplicating that predicate here would be a second implementation of one rule that could
+/// disagree with the first. An invalid value therefore fails at startup with the adapter's own
+/// code, from the one place that owns the decision.
+///
+/// The credential is **not** here: it stays in [`ModelSection::api_key_ref`], which is a
+/// *reference* resolved at startup and never written back to the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSection {
+    /// The provider identifier recorded on a `model_calls` row and shown in diagnostics.
+    pub id: String,
+    /// The endpoint host. An address, never a URL; the port is a separate field for that reason.
+    pub host: String,
+    /// The endpoint port.
+    pub port: u16,
+    /// The models this endpoint serves. At least one is required.
+    pub models: Vec<String>,
+}
+
 /// Model routing policy selection.
 ///
 /// The credential is a *reference*. A configuration file never carries a key
@@ -93,6 +128,14 @@ pub struct ModelSection {
     /// A reference to the provider credential, if one is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<SecretReference>,
+    /// The provider endpoint, when a real provider is configured.
+    ///
+    /// `None` is the deterministic default: the daemon composes the scripted provider, so
+    /// a profile with no provider answers runs without reaching any network endpoint. That
+    /// is the correct default for a fresh install and for every test, and it means an
+    /// operator opts **in** to a real provider rather than discovering one was already in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderSection>,
 }
 
 impl Default for ModelSection {
@@ -100,6 +143,7 @@ impl Default for ModelSection {
         Self {
             policy_id: "default".to_owned(),
             api_key_ref: None,
+            provider: None,
         }
     }
 }
@@ -403,8 +447,9 @@ mod tests {
     use crate::config::atomic::MAX_CONFIG_BYTES;
     use crate::config::secret::SecretReference;
 
+    /// A complete document at the version this binary writes.
     const VALID: &str = r#"
-schema_version = 1
+schema_version = 2
 
 [runtime]
 log_level = "debug"
@@ -419,6 +464,17 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
 [privacy]
 telemetry = false
 allow_remote_context = false
+"#;
+
+    /// The same document as a version-1 binary would have written: no provider table, and
+    /// the older version number. Kept as a literal rather than derived from [`VALID`] so the
+    /// upgrade test cannot drift into testing the current shape against itself.
+    const VERSION_ONE: &str = r#"
+schema_version = 1
+
+[model]
+policy_id = "local-default"
+api_key_ref = "env:JARVIS_MODEL_KEY"
 "#;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -447,12 +503,64 @@ allow_remote_context = false
 
     #[test]
     fn a_minimal_document_uses_documented_defaults() {
-        let config = Config::from_toml("schema_version = 1").expect("minimal document must parse");
+        let config = Config::from_toml("schema_version = 2").expect("minimal document must parse");
         assert_eq!(config, Config::default());
         assert_eq!(config.runtime.log_level, LogLevel::Info);
         assert_eq!(config.storage.kind, StorageKind::Sqlite);
         assert_eq!(config.privacy, PrivacySection::default());
         assert!(config.model.api_key_ref.is_none());
+        assert!(config.model.provider.is_none());
+    }
+
+    #[test]
+    fn a_version_one_document_remains_readable_and_defaults_to_no_provider() {
+        // The upgrade path that matters: a profile written by the version-1 binary must load,
+        // and must not acquire a provider it never configured. A version bump that silently
+        // locked an operator out of their own profile would be a migration defect.
+        let config = Config::from_toml(VERSION_ONE).expect("a version-1 document must still parse");
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.model.policy_id, "local-default");
+        assert!(
+            config.model.provider.is_none(),
+            "a document with no provider table must not gain one"
+        );
+    }
+
+    #[test]
+    fn a_document_that_names_a_provider_parses_and_round_trips() {
+        let document = format!(
+            "{VALID}\n[model.provider]\nid = \"local.llamacpp\"\nhost = \"127.0.0.1\"\n\
+             port = 8080\nmodels = [\"qwen2.5-7b-instruct\"]\n"
+        );
+        let config = Config::from_toml(&document).expect("a provider table must parse");
+        let provider = config
+            .model
+            .provider
+            .as_ref()
+            .expect("a configured provider");
+        assert_eq!(provider.id, "local.llamacpp");
+        assert_eq!(provider.host, "127.0.0.1");
+        assert_eq!(provider.port, 8080);
+        assert_eq!(provider.models, vec!["qwen2.5-7b-instruct".to_owned()]);
+
+        // The credential stays a reference through a round trip, so a save cannot write a value.
+        let text = config.to_toml().expect("serialization succeeds");
+        assert!(text.contains("env:JARVIS_MODEL_KEY"), "{text}");
+        assert_eq!(Config::from_toml(&text).expect("round trip"), config);
+    }
+
+    #[test]
+    fn a_provider_table_field_is_required_and_an_unknown_one_is_rejected() {
+        // A misspelled key must fail rather than being ignored, because a silently dropped
+        // `port` would leave the adapter dialling the wrong endpoint.
+        for document in [
+            "schema_version = 2\n[model.provider]\nid = \"a\"\nhost = \"127.0.0.1\"\nmodels = []\n",
+            "schema_version = 2\n[model.provider]\nid = \"a\"\nhost = \"127.0.0.1\"\nport = 1\n",
+            "schema_version = 2\n[model.provider]\nid = \"a\"\nhost = \"127.0.0.1\"\nport = 1\nmodels = []\napi_key = \"sk-live\"\n",
+        ] {
+            let error = Config::from_toml(document).expect_err("must be rejected");
+            assert_eq!(error.code(), "jarvis.config_parse", "{document}");
+        }
     }
 
     #[test]
@@ -462,6 +570,7 @@ allow_remote_context = false
             "schema_version = 1\n[runtime]\nlog_level = \"info\"\nunknown = true\n",
             "schema_version = 1\n[storage]\nkind = \"sqlite\"\npath = \"/tmp/db\"\n",
             "schema_version = 1\n[model]\npolicy_id = \"a\"\nkey = \"sk-live\"\n",
+            "schema_version = 2\n[model]\npolicy_id = \"a\"\nsecret = \"sk-live\"\n",
         ] {
             let error = Config::from_toml(document).expect_err("must be rejected");
             assert_eq!(error.code(), "jarvis.config_parse", "{document}");
@@ -482,7 +591,7 @@ allow_remote_context = false
         assert_eq!(missing_field.code(), "jarvis.config_missing_version");
 
         for future in [
-            "schema_version = 2",
+            "schema_version = 3",
             "schema_version = 0",
             "schema_version = 999",
         ] {
@@ -494,6 +603,9 @@ allow_remote_context = false
             );
         }
 
+        // Both supported versions are accepted, so the version-1 upgrade path is real rather
+        // than only documented. `2` must not appear in the rejecting list above.
+
         // A negative or non-integer version is not silently accepted.
         assert!(Config::from_toml("schema_version = -1").is_err());
         assert!(Config::from_toml("schema_version = \"1\"").is_err());
@@ -503,7 +615,7 @@ allow_remote_context = false
     fn an_unsupported_version_is_not_rewritten() {
         let dir = temp_dir("no-rewrite");
         let path = config_file_path(&dir);
-        let original = "schema_version = 2\n[runtime]\nlog_level = \"info\"\n";
+        let original = "schema_version = 3\n[runtime]\nlog_level = \"info\"\n";
         std::fs::write(&path, original).expect("write fixture");
 
         // Loading fails, so there is nothing to save and the file is untouched.

@@ -44,13 +44,71 @@ A model descriptor records independently verified support for:
 Capabilities have provenance and last-verified dates. Provider marketing names
 are not capability evidence.
 
-**Partly wired (`BRN-043`).** The `first_output_at` half of the time-to-first-token measurement now
-has a producer: the controller observes its own clock at the **first** `output.text.delta` and records
-it on the call's `first_output_at` with the outcome, so a call that emitted output and then failed or
-timed out still carries a real interval. This is the **input** the descriptor above needs, not the
-measurement: nothing yet aggregates a first-token figure per model, nothing measures token spread,
-and nothing reads either back to constrain a route. The list item above therefore remains
-`UNVERIFIED` for a real model — the scripted provider's numbers are not provider behaviour.
+**The measurement now has a producer (`BRN-011`), and it is still an input rather than a verdict.**
+
+Three values are recorded on every attempt that produced output: `first_output_at` (the instant the
+**first** delta arrived, observed from JARVIS's own clock so it is comparable across providers),
+`last_output_at` (the last delta's instant, which is what distinguishes a genuine stream from a burst
+— both look identical at the start), and `output_delta_count` (the sample size, because one delta is a
+burst whatever its timing). `jarvis_domain::model::capability::DeliveryMeasurement::profile` derives
+the descriptor's `IncrementalDelivery` from those three, and its `observed_deltas` counts the deltas
+**after the first** — so a single-delta reply is a burst by observation rather than by timing, which
+is the case a first-token-only measurement cannot see.
+
+The routing half already existed and is unchanged: `select_route` refuses a candidate whose fresh
+measurement says burst, and `RouteRequirements::requires_incremental_delivery` is what makes a route
+ask for it. What this closes is `BRN-043`'s remaining half — before it, `IncrementalDelivery` had
+**no producer anywhere in the workspace**, so every `CapabilityDescriptor` was built with
+`incremental_delivery: None`: "nobody measured this" for every model in every deployment, and no
+routing decision could ever have required the capability.
+
+Still open in `BRN-011`, and it is the half a single call cannot supply: **nothing aggregates these
+per-model figures.** One attempt's measurement is not a model's delivery profile, and a descriptor's
+evidence has to come from a measurement campaign against a real provider rather than from one call
+this daemon happened to serve. The list item above therefore remains `UNVERIFIED` for a real model:
+the recorded numbers are honest, and no campaign has yet been run against a provider that exists.
+
+**The aggregation now exists, and the producer is connected to the consumer.**
+
+`DeliverySamples` (`jarvis_domain::model::capability`) is a *campaign* — every measured call for one
+model — and `aggregate` folds it into one `IncrementalDelivery`. Three properties make the fold a
+rule rather than arithmetic:
+
+- **The aggregate is the worst sample, not the mean.** `chunk_spread_ms` is the minimum observed,
+  `observed_deltas` the minimum, and `time_to_first_token_ms` the maximum. A campaign in which any
+  call burst is a model that *can* burst, so reporting the best sample — or an average that a few
+  good samples lift over the threshold — would answer "this model delivers incrementally" for a model
+  that sometimes does not. The field is therefore deliberately not named `average_spread_ms`.
+- **`MIN_PROFILE_SAMPLES` (3) is a floor on sample size, not a confidence claim.** Two agreeing
+  samples still prove nothing about the next, so a campaign below the floor attests **nothing** and
+  the descriptor keeps `None` — which makes a route that requires incremental delivery refuse rather
+  than pass on one observation. The floor is checked *inside* the attesting call, so a caller cannot
+  reach `Some(Attested { label: Verified })` with one sample.
+- **Measured evidence is `VERIFIED`, and cites no document.** `VERIFIED` is "confirmed by a live test
+  against the pinned version", which is exactly what a recorded call is; `DOCUMENTED` would be wrong
+  in the other direction because no document states these figures. The `source_url` is
+  `jarvis://model-calls` rather than a plausible-looking `https://` address, because a fabricated URL
+  cites a page that does not say what the value says — the promotion the evidence rule exists to
+  prevent. The revalidation window is derived from the measurement day
+  (`IsoDate::adding_days`), not written by hand, so a profile cannot be created already expired.
+
+The read is `ModelCallRepository::delivery_campaigns`: one group per `(provider, model, revision)`
+that has at least one measured call, scoped to a workspace, with the measurement filter written as
+three `IS NOT NULL` clauses. **Only calls that emitted output contribute**, because a call with no
+first-output instant was never measured and folding it in as zero would report a burst for a model
+that was never allowed to stream.
+
+`route_candidates` — the single builder both the run path and the daemon's diagnostic inventory call
+— attests the profiles, so a probe and a run cannot disagree about a model's delivery evidence. The
+daemon reads the campaigns once at startup and hands the same value to both, and
+`RunPorts::delivery_campaigns` carries them into run creation.
+
+**What is still `UNVERIFIED`, and why.** No campaign has been run against a provider that
+exists, so for a real model the item above remains unmeasured: the pipeline is complete end to end
+and exercised by tests, and the figures in every deployment today are the scripted provider's. A route
+that *requires* incremental delivery is therefore still refused — correctly — because nothing real has
+been measured. The remaining work is a campaign against a real endpoint, which is `BRN-003`'s adapter
+plus operator time, not more code.
 
 ## Normalized Request
 
@@ -277,14 +335,123 @@ The retry policy is also not yet settable per request: it is a field on the run'
 budget, defaulting to no retry, and the `CreateRunRequest` schema has no typed override
 for it.
 
+## The First Adapter
+
+The first real adapter is now implemented, and where it lives is part of the
+contract rather than a detail: `crates/jarvis-infrastructure/src/model_providers/`
+is the manifest-gated path, so a file added there is an external-integration change
+that the documentation gate will refuse until an evidence entry's
+`implementation_paths` covers it. The gate is what keeps "adapter" and "evidence
+note" from drifting apart.
+
+It is one provider class, not one vendor: an OpenAI-compatible chat-completions
+endpoint addressed by loopback address and port. That is a deliberately narrow
+class, because the shapes an adapter must get right — framing, error codes, the
+credential, the stream's terminal — are the same for every member of it.
+
+The adapter is split so that the provider-shaped traps are testable **without a
+socket**, and only the transport needs one:
+
+| Layer | Owns | Fixture-testable |
+| --- | --- | --- |
+| `sse.rs` | reassembling frames from an arbitrarily chunked byte stream | yes — bytes in, frames out |
+| `translate.rs` | mapping one parsed chunk onto normalized events | yes — chunk in, events out |
+| `mod.rs` | socket, HTTP exchange, chunked decoding, status mapping, credential | no — hence the socket test |
+
+That split is not stylistic. The two pure layers were already covered by fixtures
+when the socket test was written, and everything it went on to find was in the
+third layer: a chunked decoder that handed framing bytes to the SSE parser, so a
+healthy stream died as `model.provider_malformed`. A protocol error's name on a
+framing bug is exactly the failure a fixture-driven test cannot reach, because the
+fixture is fed to the parser *past* the layer that was broken.
+
+Two boundaries are enforced at construction rather than documented and trusted:
+
+- **The transport is loopback-only.** There is no TLS implementation in the
+  dependency graph as of 2026-09-27, so a remote endpoint would send the credential
+  in the clear. A **non-loopback host is refused** — parsed as an address rather
+  than prefix-matched, so a name that merely begins with `127.0.0.1` cannot pass.
+  This is why the class is called "loopback" and not "local or remote": a cloud
+  endpoint is a separate change that brings its own transport dependency, and that
+  dependency has its own evidence obligation.
+- **The credential is a header, never part of a URL.** The key is a private field
+  with no accessor other than the one that writes the request header, so it cannot
+  be interpolated into an endpoint string, which is the shape that makes a key a
+  substring of every later log line. A URL-shaped value and a key-shaped value are
+  rejected on the same reasoning that `ApiKey` rejects a pasted URL elsewhere in
+  this repository: a pasted URL fails upstream as a generic auth error and sends the
+  operator to debug the plan instead of the value.
+
+Provider status codes are **not** treated as JARVIS meanings. The provider's own
+guide states that an exhausted balance, an organization spend limit, a project
+spend limit, and a usage limit all arrive as `429` and none of them is retryable,
+because retrying does not restore access; only the rate-limit family is. So the
+adapter maps on the documented pair, and an unrecognized status or code becomes
+`InvalidRequest` rather than a guess. The provider's raw error code is never
+promoted to a JARVIS code — it is reported as evidence, so a mapped failure cannot
+be mistaken for a JARVIS classification.
+
+## Composing a Provider
+
+An adapter that no daemon composes is a library, not a capability. The daemon now
+**composes the provider once, at startup**, from the operator's own configuration
+document, and a run reaches that provider or the daemon does not start.
+
+Three rules make the composition safe rather than merely present:
+
+- **No `[model.provider]` table means the scripted provider.** That is the default for
+  a fresh install and for every test, and it is why a profile that names no endpoint
+  cannot silently reach the network. The scripted provider's model identifier says
+  `scripted.local`, so an operator can always tell which source served a run — which
+  is a property the *identity*, not a log line, carries.
+- **A configured endpoint that cannot be composed is a startup refusal.** This is the
+  load-bearing rule. Falling back to the scripted provider would let a typo in a host, a
+  port, or a credential route every run to a provider that answers with a fixed
+  acknowledgement, and the operator would see successful runs while their real endpoint
+  was never contacted. Refusing to start makes the misconfiguration impossible to miss.
+- **The credential is resolved once, at composition.** The repository's rule is to
+  resolve secret material at the last responsible moment; for a long-lived daemon that
+  moment is startup, not each request. The value is then held for the process's lifetime,
+  is never written to a record, and is never rendered — the adapter's `Debug` redacts it.
+  Resolving per request would re-read the environment thousands of times and would let the
+  provider's identity change underneath a run that had already selected it.
+
+The configuration schema version moved from 1 to 2 for the added table, and **version 1
+remains readable**. The version moved because a document that names a provider endpoint is
+not one a version-1 binary can read: that binary's unknown-field rejection would report a
+*parse* failure, when the accurate diagnostic is "written by a newer JARVIS". A file with
+no provider table loads unchanged under both, so an existing profile is not rewritten
+merely because the binary was upgraded.
+
+The configuration layer deliberately does **not** validate the host. Whether an endpoint is
+admissible is the adapter's decision — the loopback rule above — and a second predicate in
+the configuration layer could disagree with the first. So an invalid endpoint fails with the
+adapter's own code, from the one place that owns the decision, and the composition carries
+that code through rather than inventing a spelling for it.
+
+The provider id and the model names **are** validated at composition, with the same
+identifier rule the rest of the domain uses: a provider id reaches a `model_calls` row, a
+routing decision, and a diagnostic, so "this is a legal model identity" belongs to the
+domain's one definition of it rather than to an adapter's string handling.
+
 ## Credentials and Data
 
-- Resolve provider secrets inside the adapter immediately before the request.
+- Resolve provider secrets at the last responsible moment — which, for a long-lived
+  daemon, is **composition at startup** rather than each request. See "Composing a
+  Provider" above for why the daemon's moment is earlier than a one-shot caller's.
 - Never include keys in endpoint logs, error messages, prompts, or persisted
   request bodies.
 - Record secret reference ID and credential principal, not secret value.
 - Classify and redact prompts, tool schemas, output, and trace metadata.
 - Respect provider-specific zero-retention and residency constraints in routing.
+
+Two shapes make the credential's exposure structural rather than a matter of care. The
+configuration file holds a **reference** (`env:JARVIS_MODEL_KEY`), never a value, and the
+reference parser refuses a locator that does not begin with `JARVIS_` — so a configuration
+file cannot direct the daemon to read an unrelated ambient secret such as a cloud
+credential or a CI token. And the adapter holds the resolved value in a private field with
+no derived `Debug` and exactly one accessor, so it cannot be interpolated into an endpoint
+string, which is the shape that makes a key a substring of every later log line.
 
 ## Testing
 
@@ -312,4 +479,17 @@ the `ModelProvider` port, so the "Deterministic" list above is assertable today 
 including the negative cases (a replayed sequence, a frame for another call, an
 unfinished tool call) that a well-behaved provider can never produce. See the
 [model stream contract](../contracts/model-stream.md) for the rule-to-test table
-and the two defects its negative cases found.
+and the two defects its negative cases found. It is also the daemon's **default**
+provider, so the deterministic path is not a fixture that only tests reach.
+
+**The composition is tested at the level it can fail.** The adapter's own socket test
+proves the transport, and the composition tests prove the assembled product: a real daemon
+over a real socket, pointed at a local fake OpenAI-compatible server, with a run created
+through the real control API. Two things are asserted there that no provider-level test
+can see — that the fake server **received** the request (so the daemon is wired to the
+configured adapter and not to the scripted fallback), and that the streamed answer is
+durable in the run's own events. The negative half matters just as much: an unconfigured
+profile composes the scripted provider, and a configuration the adapter refuses stops the
+daemon rather than falling back. Both were confirmed by mutation — replacing the
+composition with the scripted provider fails the test by showing the fake server was never
+called.

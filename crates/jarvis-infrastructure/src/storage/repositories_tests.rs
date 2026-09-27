@@ -253,6 +253,8 @@ fn outcome(state: ModelCallState, completed_at: Option<UtcTimestamp>) -> ModelCa
         finish_reason: None,
         error_code: None,
         first_output_at: None,
+        last_output_at: None,
+        output_delta_count: None,
         completed_at,
     }
     .validated()
@@ -1243,6 +1245,257 @@ async fn a_model_call_attempt_records_and_loads() {
     );
 }
 
+/// Builds an outcome that produced `deltas` output deltas over `spread_ms`, as the store sees it.
+///
+/// The three timing columns are written together because a row carrying only some of them is the
+/// half-measurement `ModelCallOutcome::validated` refuses; this helper goes through that same
+/// validation so the fixture cannot construct a row the port would reject.
+fn measured_outcome(spread_ms: i64, deltas: u32) -> ModelCallOutcome {
+    let started = now();
+    let first = UtcTimestamp::from_timestamp(
+        started.as_timestamp() + jiff::SignedDuration::from_millis(200),
+    );
+    let last = UtcTimestamp::from_timestamp(
+        first.as_timestamp() + jiff::SignedDuration::from_millis(spread_ms),
+    );
+    ModelCallOutcome {
+        state: ModelCallState::Completed,
+        provider_request_id: None,
+        continuation_ref: None,
+        usage: None,
+        estimated_cost_microunits: None,
+        finish_reason: None,
+        error_code: None,
+        first_output_at: Some(first),
+        last_output_at: Some(last),
+        output_delta_count: Some(deltas),
+        completed_at: Some(last),
+    }
+    .validated()
+    .expect("the fixture is valid")
+}
+
+/// Records a completed, measured call whose row id is `row` and whose logical id is `row`.
+///
+/// Separate from `attempt` because the campaign tests need several measured calls on the *same*
+/// run, and `attempt(id_value, ...)` derives both identifiers from one number — so a loop over it
+/// would collide on `(logical_call_id, attempt)` rather than create distinct calls.
+async fn record_measured(
+    repositories: &SqliteRepositories,
+    row: u128,
+    model: &ModelRef,
+    spread_ms: i64,
+    deltas: u32,
+) {
+    let mut call = attempt(row, 1, ModelCallId::from_uuid(id(row)));
+    call.model = model.clone();
+    repositories.record_attempt(call).await.expect("records");
+    repositories
+        .record_outcome(
+            workspace(),
+            ModelCallId::from_uuid(id(row)),
+            measured_outcome(spread_ms, deltas),
+        )
+        .await
+        .expect("records the outcome");
+}
+
+#[tokio::test]
+async fn a_delivery_campaign_groups_measured_calls_per_model() {
+    // The read `BRN-011`'s aggregation needs. Two models, three measured calls for one and two for
+    // the other, so the grouping is asserted rather than one group being taken on faith.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    let other_model = ModelRef::new(
+        ProviderId::parse("scripted.local").expect("valid"),
+        ModelId::parse("fixture-2").expect("valid"),
+    );
+
+    for (row, spread) in [(101u128, 900i64), (102, 1_100), (103, 700)] {
+        record_measured(&repositories, row, &model(), spread, 40).await;
+    }
+    for row in [201u128, 202] {
+        record_measured(&repositories, row, &other_model, 500, 20).await;
+    }
+
+    let campaigns = repositories
+        .delivery_campaigns(workspace())
+        .await
+        .expect("reads");
+    assert_eq!(campaigns.len(), 2, "one group per measured model");
+
+    let first = campaigns
+        .iter()
+        .find(|group| group.model_id.to_string() == "fixture-1")
+        .expect("the first model has a group");
+    assert_eq!(first.samples.len(), 3);
+    assert_eq!(first.provider_id.to_string(), "scripted.local");
+    assert!(
+        first.revision.is_none(),
+        "an unpinned model has no revision"
+    );
+
+    let second = campaigns
+        .iter()
+        .find(|group| group.model_id.to_string() == "fixture-2")
+        .expect("the second model has a group");
+    assert_eq!(second.samples.len(), 2, "the groups must not be merged");
+
+    // The profile is derived by the domain's own producer, so the store and the completion path
+    // cannot disagree about what a set of timings means: 40 deltas is 39 after the first, and the
+    // spread is the interval the two instants describe.
+    assert_eq!(first.samples[0].observed_deltas, 39);
+    assert_eq!(first.samples[0].chunk_spread_ms, 900);
+    assert_eq!(first.samples[0].time_to_first_token_ms, 200);
+}
+
+#[tokio::test]
+async fn an_unmeasured_call_contributes_no_delivery_sample() {
+    // **The falsification that matters most for this read.** A call that produced nothing has no
+    // timing to contribute, and folding it in as a zero would report a burst for a model that was
+    // never allowed to stream — a verdict invented by the query. Measured: removing the *whole*
+    // `IS NOT NULL` filter leaves this test reading four samples where three are measured. Removing
+    // only one of the three clauses does **not** fail it, because the write path always sets all
+    // three together, so the clauses are defence in depth against a foreign row rather than
+    // three independent guards — and that is recorded rather than implied.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    for row in [101u128, 102, 103] {
+        record_measured(&repositories, row, &model(), 900, 40).await;
+    }
+    // A fourth call that reached a terminal state **without** producing output. Its three timing
+    // columns are all `NULL`, which is what "not measured" means for this table.
+    repositories
+        .record_attempt(attempt(104, 1, ModelCallId::from_uuid(id(104))))
+        .await
+        .expect("records");
+    repositories
+        .record_outcome(
+            workspace(),
+            ModelCallId::from_uuid(id(104)),
+            outcome(ModelCallState::Failed, Some(now())),
+        )
+        .await
+        .expect("records the outcome");
+
+    let campaigns = repositories
+        .delivery_campaigns(workspace())
+        .await
+        .expect("reads");
+    assert_eq!(campaigns.len(), 1);
+    assert_eq!(
+        campaigns[0].samples.len(),
+        3,
+        "a call with no output is not a delivery sample",
+    );
+}
+
+#[tokio::test]
+async fn a_delivery_campaign_never_crosses_a_workspace() {
+    // A profile is a fact about *this* deployment's calls, so the read must be scoped even though
+    // every other model-call read is. Without the `workspace_id = ?` predicate this returns both
+    // workspaces' samples and the aggregate silently describes a model as measured partly against
+    // traffic that never touched this profile.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    // The foreign workspace needs its own run, because a model call names one by foreign key.
+    let mut foreign_run = NewRun::new(
+        other_run_id(),
+        other_workspace(),
+        other_conversation_id(),
+        principal(),
+        Some("objective-2".to_owned()),
+        now(),
+    )
+    .expect("valid");
+    foreign_run.conversation_id = other_conversation_id();
+    repositories
+        .create_conversation(
+            NewConversation::new(
+                other_conversation_id(),
+                other_workspace(),
+                principal(),
+                Some("second".to_owned()),
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the foreign conversation is created");
+    repositories
+        .create(foreign_run, run_received_event(other_run_id(), now()))
+        .await
+        .expect("the foreign run is created");
+
+    let mut foreign = attempt(101, 1, ModelCallId::from_uuid(id(101)));
+    foreign.workspace_id = other_workspace();
+    foreign.run_id = other_run_id();
+    repositories.record_attempt(foreign).await.expect("records");
+    repositories
+        .record_outcome(
+            other_workspace(),
+            ModelCallId::from_uuid(id(101)),
+            measured_outcome(900, 40),
+        )
+        .await
+        .expect("records the outcome");
+
+    assert!(
+        repositories
+            .delivery_campaigns(workspace())
+            .await
+            .expect("reads")
+            .is_empty(),
+        "another workspace's measurements must not seed this one's profile",
+    );
+    assert_eq!(
+        repositories
+            .delivery_campaigns(other_workspace())
+            .await
+            .expect("reads")
+            .len(),
+        1,
+        "the row exists and is readable by its own workspace, so the emptiness above is the scope rule rather than an absent row",
+    );
+}
+
+#[tokio::test]
+async fn a_negative_stored_delta_count_is_corruption_not_a_clamp() {
+    // The column is written from a `u32` and read back through `i64`, so a negative value means
+    // something other than this binary wrote the row. Clamping it to zero would turn "the store is
+    // not what this build wrote" into "the call delivered nothing", which is a measurement defect
+    // an operator could never see.
+    let (database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    record_measured(&repositories, 101, &model(), 900, 40).await;
+    // Written behind the port's back, because no validated outcome can produce a negative count —
+    // which is exactly why the read has to refuse it rather than trust the column.
+    sqlx::query("UPDATE model_calls SET output_delta_count = -1 WHERE id = ?")
+        .bind(id(101).to_string())
+        .execute(database.pool())
+        .await
+        .expect("the raw update runs");
+
+    let error = repositories
+        .delivery_campaigns(workspace())
+        .await
+        .expect_err("a negative count is corruption");
+    assert!(
+        matches!(
+            error,
+            RepositoryError::Corrupted {
+                column: "output_delta_count"
+            }
+        ),
+        "expected a typed corruption for the column, got {error:?}",
+    );
+}
+
 #[tokio::test]
 async fn a_call_records_the_route_decision_that_authorized_it() {
     // The column `model_calls.route_decision_id` was in the schema, was selected by the read
@@ -2171,6 +2424,8 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
                 finish_reason: Some(FinishReason::Stop),
                 error_code: None,
                 first_output_at: None,
+                last_output_at: None,
+                output_delta_count: None,
                 completed_at: Some(now()),
             },
         )
@@ -2250,6 +2505,146 @@ async fn a_call_records_the_finish_reason_it_was_completed_with() {
 }
 
 #[tokio::test]
+async fn a_call_records_the_delivery_measurement_it_was_completed_with() {
+    // The two columns `BRN-011` adds, round-tripped through the adapter rather than only through
+    // the in-memory double. A value that the double stores and the adapter drops is invisible to a
+    // test exercising either one alone — and this is a measurement, so a dropped column means a
+    // number nobody can re-read rather than a visible failure.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+
+    let first = now();
+    let last = UtcTimestamp::parse("2026-09-22T12:00:01.250Z").expect("valid");
+    let mut completed = outcome(ModelCallState::Completed, Some(now()));
+    completed.first_output_at = Some(first);
+    completed.last_output_at = Some(last);
+    completed.output_delta_count = Some(12);
+    repositories
+        .record_outcome(workspace(), model_call_id(), completed)
+        .await
+        .expect("records the outcome");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert_eq!(call.first_output_at, Some(first));
+    assert_eq!(call.last_output_at, Some(last));
+    assert_eq!(call.output_delta_count, Some(12));
+
+    // Both `SELECT`s agree, because they now share one column list. The list was duplicated before
+    // and `load_attempts` had already been missed once when `route_decision_id` was added to
+    // `load_attempt` alone, which surfaced as `Corrupted { column: … }` on a valid row.
+    let chain = repositories
+        .load_attempts(workspace(), logical_call_id())
+        .await
+        .expect("loads the chain");
+    assert_eq!(chain.len(), 1, "{chain:?}");
+    assert_eq!(chain[0].first_output_at, Some(first));
+    assert_eq!(chain[0].last_output_at, Some(last));
+    assert_eq!(chain[0].output_delta_count, Some(12));
+
+    // And the derived profile is computable from the stored row alone, which is the point: the
+    // measurement is a measurement because the router can recompute the verdict from it.
+    let profile = jarvis_domain::model::capability::DeliveryMeasurement {
+        started_at: call.started_at,
+        first_output_at: call.first_output_at.expect("stored"),
+        last_output_at: call.last_output_at.expect("stored"),
+        delta_count: call.output_delta_count.expect("stored"),
+    }
+    .profile();
+    assert_eq!(profile.time_to_first_token_ms, 0);
+    assert_eq!(profile.chunk_spread_ms, 1_250);
+    assert_eq!(profile.observed_deltas, 11);
+    assert!(profile.is_incremental());
+}
+
+#[tokio::test]
+async fn a_call_that_produced_no_output_records_no_delivery_measurement() {
+    // The negative direction, and the one that keeps a zeroed profile from being invented: a call
+    // that produced no output has no instants **and no count**, because `Some(0)` would be a
+    // measurement of a delivery nobody made. The writer derives the count from the first-output
+    // instant, so this asserts the shape the controller produces rather than a value a fixture
+    // chose — an `outcome(...)` with the default fields is exactly what a no-output call records.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+
+    repositories
+        .record_outcome(
+            workspace(),
+            model_call_id(),
+            outcome(ModelCallState::Completed, Some(now())),
+        )
+        .await
+        .expect("records the outcome");
+
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert!(
+        call.first_output_at.is_none(),
+        "a call with no output has no first-output instant",
+    );
+    assert!(
+        call.last_output_at.is_none(),
+        "nor a last-output instant, which a completion-instant default would have invented",
+    );
+    assert!(
+        call.output_delta_count.is_none(),
+        "and no count, because `Some(0)` would say the call was measured and delivered nothing \
+         — a verdict about a delivery nobody observed",
+    );
+}
+
+#[tokio::test]
+async fn a_half_written_delivery_measurement_is_refused_rather_than_stored() {
+    // A last-output instant with no first is half an interval, and a positive delta count with no
+    // instant describes output nothing can place in time. Both would let the read derive a spread
+    // from a missing endpoint — the fail-open direction, since the derived profile would then be a
+    // burst rather than a refusal.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+    repositories
+        .record_attempt(attempt(7, 1, logical_call_id()))
+        .await
+        .expect("records");
+
+    let mut orphaned_last = outcome(ModelCallState::Completed, Some(now()));
+    orphaned_last.last_output_at = Some(now());
+    let error = repositories
+        .record_outcome(workspace(), model_call_id(), orphaned_last)
+        .await
+        .expect_err("a last-output instant without a first must be refused");
+    assert_eq!(error.code(), "storage.conflict");
+
+    let mut orphaned_count = outcome(ModelCallState::Completed, Some(now()));
+    orphaned_count.output_delta_count = Some(3);
+    let error = repositories
+        .record_outcome(workspace(), model_call_id(), orphaned_count)
+        .await
+        .expect_err("a delta count without a first-output instant must be refused");
+    assert_eq!(error.code(), "storage.conflict");
+
+    // And nothing was written by either refusal, so the attempt is still open rather than
+    // carrying half a measurement.
+    let call = repositories
+        .load_attempt(workspace(), model_call_id())
+        .await
+        .expect("loads");
+    assert!(call.last_output_at.is_none());
+    assert!(call.output_delta_count.is_none());
+}
+
+#[tokio::test]
 async fn a_call_with_no_finish_reason_reads_back_without_one() {
     // The other direction: a call that reached no finish reports nothing, because reporting a
     // reason would describe a provider decision that was never made.
@@ -2312,6 +2707,8 @@ async fn a_call_with_no_reported_usage_stores_no_block_and_no_cost() {
                 finish_reason: None,
                 error_code: None,
                 first_output_at: None,
+                last_output_at: None,
+                output_delta_count: None,
                 completed_at: Some(now()),
             },
         )

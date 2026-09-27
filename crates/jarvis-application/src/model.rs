@@ -150,8 +150,15 @@ impl ProviderError {
 /// A stream-scoped value rather than a free function so the counters a stream
 /// needs cannot be shared between two concurrent calls, and so a cancellation
 /// frame is stamped from the same source as the frames around it.
+///
+/// Public because an adapter's own translator needs it. `AdapterStream` validates and orders the
+/// frames it is handed; it does **not** stamp them, so a translator that built its own sequences
+/// would be a second implementation of "what number is this frame" — and the two would disagree in
+/// the one place it matters, the transition from a translated frame to a synthesized terminal.
+/// `FrameStamper::new` is private and `start` is the adapter-facing entry, so an adapter cannot
+/// choose a starting sequence and produce a stream whose first frame is not sequence 1.
 #[derive(Debug)]
-struct FrameStamper<'a> {
+pub struct FrameStamper<'a> {
     call_id: ModelCallId,
     ids: &'a dyn IdGenerator,
     next: Sequence,
@@ -167,8 +174,22 @@ impl<'a> FrameStamper<'a> {
         }
     }
 
+    /// Returns a stamper for `call_id` that an adapter owns.
+    ///
+    /// The only way to obtain one, so every stream begins at [`Sequence::FIRST`] and the
+    /// sequence rule lives here rather than in each adapter.
+    #[must_use]
+    pub fn start(call_id: ModelCallId, ids: &'a dyn IdGenerator) -> Self {
+        Self::new(call_id, ids)
+    }
+
     /// Builds the next frame, advancing the sequence.
-    fn stamp(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Malformed`] when the sequence space is exhausted, which makes a
+    /// stream that cannot be numbered fail rather than wrap and look like a duplicate.
+    pub fn stamp(
         &mut self,
         kind: ModelStreamEventKind,
         metadata: Option<ProviderMetadata>,

@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use jarvis_infrastructure::auth::{ClientCredentialPath, ClientRegistry};
+use jarvis_infrastructure::config::{Config, EnvSecretResolver, config_file_path};
 use jarvis_infrastructure::daemon::{DaemonConfig, RunningDaemon, start};
 use jarvis_infrastructure::profile::resolve;
 use jarvis_observability::logging::{LoggingConfig, init};
@@ -57,6 +58,19 @@ async fn run() -> ExitCode {
     // The resolved source is recorded because an operator diagnosing a
     // surprising profile needs to know which input won.
     tracing::info!(profile_source = resolved.source.name(), "profile resolved");
+
+    // Compose the model provider **before** the daemon starts, so a configuration it cannot serve
+    // is refused while nothing has been published and no client can reach a daemon that would fail
+    // every run. The layered load is `jarvisd`'s job rather than `daemon::start`'s because startup
+    // owns the process lifecycle and configuration is an input to it, not part of it.
+    let config = match compose_provider(paths.config_dir(), config) {
+        Ok(config) => config,
+        Err(code) => {
+            // The code names a failure class, never a value; the credential is never in it.
+            tracing::error!(code, "model provider configuration was refused");
+            return ExitCode::from(EXIT_STARTUP_FAILED);
+        }
+    };
 
     // Enroll the owner client if this profile has none yet. A newly created
     // credential is registered for redaction before anything else can log it;
@@ -117,6 +131,43 @@ fn portable_root_argument() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Loads the layered configuration and composes the model provider it names.
+///
+/// Returns `Err(code)` with the failing step's stable, namespaced code. A configuration that
+/// **cannot be read** is not fatal — a fresh profile has no file, and a daemon must start — but a
+/// configuration that **was read and refused** is, because serving runs against a misconfigured
+/// endpoint is worse than not starting.
+///
+/// The environment layer is read through the explicit allowlist, so an unrelated `JARVIS_*`
+/// variable is ignored rather than projected onto a setting.
+fn compose_provider(
+    config_dir: &std::path::Path,
+    config: DaemonConfig,
+) -> Result<DaemonConfig, &'static str> {
+    // The environment layer is read as a snapshot of borrowed pairs. A snapshot rather than a
+    // lazy iterator because the layer is applied once, at startup, and reading the environment
+    // twice could observe two different values for one key.
+    let environment: Vec<(String, String)> = std::env::vars().collect();
+    let environment: Vec<(&str, &str)> = environment
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let path = config_file_path(config_dir);
+    let layered = Config::layered(
+        Some(&path),
+        environment,
+        &jarvis_infrastructure::config::ConfigOverrides::default(),
+    )
+    .map_err(|error| error.code())?;
+    // The environment resolver is the operator-facing source: a reference such as
+    // `env:JARVIS_MODEL_KEY` reads the process environment at resolution time, so the value never
+    // lives in the configuration file and never reaches a record.
+    let provider =
+        jarvis_infrastructure::model_providers::resolve(&layered, &EnvSecretResolver::new())
+            .map_err(jarvis_infrastructure::model_providers::ProviderResolutionError::code)?;
+    Ok(config.with_provider(provider))
 }
 
 /// Serves the local surface until a shutdown signal arrives, then drains.
