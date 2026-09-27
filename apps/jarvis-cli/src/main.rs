@@ -382,6 +382,56 @@ async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
     follow_run(&state, &run_id).await
 }
 
+/// What a follower should do with one frame.
+///
+/// **Extracted so the classification is assertable without a running daemon.** Which event names mean
+/// "print this", "the run is over", and "resume" is exactly the kind of decision that is invisible
+/// until it is wrong — and the wrong version of it is not a crash but a *report*: a client that
+/// mistook the overrun signal for a run ending would tell an operator a working run had finished,
+/// which is the failure the signal exists to prevent. A test can drive this over every event type the
+/// protocol defines, which it cannot do for a loop that needs a daemon on the other end.
+#[derive(Debug, PartialEq, Eq)]
+enum FollowStep {
+    /// Print the increment this frame carries.
+    Delta(String),
+    /// The run reached a terminal state, and whether it ended successfully.
+    RunEnded {
+        /// `true` only for `run.completed`.
+        success: bool,
+    },
+    /// The stream was cut short because this client fell behind, and resuming is the correct response.
+    Resume,
+    /// Nothing for the follower to do.
+    Ignored,
+}
+
+/// Classifies one frame for a follower.
+///
+/// The names are the protocol crate's constants rather than literals, because they are contract
+/// fields a client switches on: a typo in a literal here would be invisible to this build and would
+/// simply stop matching, so the follower would silently treat a terminal event as ignorable. Using the
+/// constants makes a rename a compile error.
+fn follow_step(frame: &SseFrame) -> FollowStep {
+    use jarvis_protocol::run::event_type as kind;
+    if frame.event == kind::OUTPUT_TEXT_DELTA {
+        // A delta with no text is still a frame this client has classified; there is simply nothing
+        // to print, which is what `Ignored` says.
+        return frame
+            .payload("delta")
+            .map_or(FollowStep::Ignored, FollowStep::Delta);
+    }
+    if frame.event == kind::COMPLETED {
+        return FollowStep::RunEnded { success: true };
+    }
+    if frame.event == kind::FAILED || frame.event == kind::CANCELLED {
+        return FollowStep::RunEnded { success: false };
+    }
+    if frame.event == kind::STREAM_OVERRUN {
+        return FollowStep::Resume;
+    }
+    FollowStep::Ignored
+}
+
 /// Follows a run's events until it reaches a terminal state, printing its answer.
 async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
     // **One connection, held open, with deltas printed as they arrive.** This used to poll: the loop
@@ -408,6 +458,11 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
     let mut streamed = false;
 
     for attempt in 0..STREAM_ATTEMPTS {
+        // Whether the attempt that just ended did so because the daemon **said** it cut the stream
+        // short. Declared inside the loop, because it describes one connection: a previous attempt's
+        // overrun must not explain a later attempt ending for a different reason, or a genuine silence
+        // would be retried as though the daemon had asked for it.
+        let mut overran = false;
         let extra = event_stream_headers(last_event_id.as_deref());
         let mut frames = SseParser::new();
         let mut outcome: Option<ExitCode> = None;
@@ -426,37 +481,51 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
                     if let Some(id) = frame.id.clone() {
                         resumed_at = Some(id);
                     }
-                    if frame.event == "run.output_text.delta"
-                        && let Some(delta) = frame.payload("delta")
-                    {
-                        print!("{delta}");
-                        // Flushed per delta, because stdout is block-buffered when it is not a
-                        // terminal and an unflushed buffer would deliver the whole answer at the end —
-                        // which is exactly the behaviour streaming exists to avoid. A failure to flush
-                        // is ignored deliberately: it means the reader went away, and stopping the
-                        // stream over that would abort a run's follow for no reason.
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                        streamed = true;
-                    }
-                    if frame.event == "run.completed"
-                        || frame.event == "run.failed"
-                        || frame.event == "run.cancelled"
-                    {
-                        if streamed {
-                            println!();
+                    match follow_step(&frame) {
+                        FollowStep::Delta(delta) => {
+                            print!("{delta}");
+                            // Flushed per delta, because stdout is block-buffered when it is not a
+                            // terminal and an unflushed buffer would deliver the whole answer at the
+                            // end — which is exactly the behaviour streaming exists to avoid. A
+                            // failure to flush is ignored deliberately: it means the reader went
+                            // away, and stopping the stream over that would abort a run's follow for
+                            // no reason.
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            streamed = true;
                         }
-                        outcome = Some(if frame.event == "run.completed" {
-                            ExitCode::SUCCESS
-                        } else {
-                            // A failed or cancelled run is reported by its own event, so an operator
-                            // sees what happened rather than only that the command did not succeed.
-                            eprintln!("error: {}", frame.event.replace("run.", "run "));
-                            ExitCode::from(EXIT_ATTENTION)
-                        });
-                        // `false` hangs up. A disconnect never cancels a durable run, so stopping
-                        // after the terminal event is safe and closes the connection rather than
-                        // waiting for the daemon to do it.
-                        return false;
+                        FollowStep::RunEnded { success } => {
+                            if streamed {
+                                println!();
+                            }
+                            outcome = Some(if success {
+                                ExitCode::SUCCESS
+                            } else {
+                                // A failed or cancelled run is reported by its own event, so an
+                                // operator sees what happened rather than only that the command did
+                                // not succeed.
+                                eprintln!("error: {}", frame.event.replace("run.", "run "));
+                                ExitCode::from(EXIT_ATTENTION)
+                            });
+                            // `false` hangs up. A disconnect never cancels a durable run, so stopping
+                            // after the terminal event is safe and closes the connection rather than
+                            // waiting for the daemon to do it.
+                            return false;
+                        }
+                        FollowStep::Resume => {
+                            // **The one frame this client must not mistake for an ending.** The run is
+                            // untouched — the daemon cut the *stream* because this client stopped
+                            // reading fast enough — so the correct response is to reconnect from the
+                            // last event id actually received, which is exactly what the retry loop
+                            // below does when a stream ends without a terminal. Treating it as an
+                            // ending would report a working run as finished, which is the failure the
+                            // signal exists to prevent, and `follow_step`'s tests hold that apart.
+                            //
+                            // `overran` is set so the end of this stream is *expected* rather than
+                            // reported as a fault in the loop below.
+                            overran = true;
+                            return false;
+                        }
+                        FollowStep::Ignored => {}
                     }
                 }
                 true
@@ -470,24 +539,146 @@ async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
         if let Some(outcome) = outcome {
             return outcome;
         }
-        match result {
-            // A transport failure is the one error a resume can fix, and only when there is a
-            // position to resume from — a connection that failed before any event arrived has nothing
-            // to ask for, and retrying it would just be the same failure again.
-            Err(ClientError::Transport | ClientError::Timeout)
-                if attempt + 1 < STREAM_ATTEMPTS && last_event_id.is_some() => {}
-            // A clean end with no terminal event means the daemon closed the stream without saying
-            // how the run ended, which is not success — a stream that stops is not a stream that
-            // finished.
-            Ok(()) => {
-                eprintln!("error: the run's stream ended without a terminal event");
-                return ExitCode::from(EXIT_ATTENTION);
-            }
-            Err(error) => return report_client_error(&error),
+        match follow_after(&result, overran, attempt, last_event_id.is_some()) {
+            AttemptAfter::Resume => {}
+            AttemptAfter::Report(report) => return report.exit_code(),
         }
     }
     eprintln!("error: the run's stream could not be followed to a terminal event");
     ExitCode::from(EXIT_ATTENTION)
+}
+
+/// What a follower should do when one attempt's stream has ended without a terminal event.
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptAfter {
+    /// Reconnect from the last delivered event id.
+    Resume,
+    /// Stop, and say this.
+    Report(AttemptReport),
+}
+
+/// Why a follow ended without a terminal event, as something a follower can act on.
+///
+/// **Extracted from the loop as a decision over values.** Every clause here is a comparison the
+/// compiler cannot check and the daemon cannot demonstrate: whether a transport failure is worth
+/// retrying, whether a *signalled* overrun is, and — the one that matters most — that an overrun is
+/// **not** the client's own fault to report. An `if` chain inside a loop driven by a live connection
+/// can only be exercised with a daemon on the other end reproducing the exact failure, so the clause
+/// that is wrong is the clause nobody tests. As a function over an error, a flag, an attempt number,
+/// and whether a position exists, every combination is enumerated by a test.
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptReport {
+    /// The daemon closed the stream without saying how the run ended.
+    EndedWithoutTerminal,
+    /// The overrun signal arrived before a single event, so there is no position to resume from.
+    OverranBeforeAnyEvent,
+    /// The stream kept overrunning, and the bounded number of resumes is spent.
+    OverrunBudgetExhausted,
+    /// A client fault, reported by its own kind.
+    Client(ClientErrorKind),
+}
+
+impl AttemptReport {
+    /// The message this report prints, and the code to exit with.
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::EndedWithoutTerminal => {
+                eprintln!("error: the run's stream ended without a terminal event");
+                ExitCode::from(EXIT_ATTENTION)
+            }
+            Self::OverranBeforeAnyEvent => {
+                eprintln!(
+                    "error: the stream overran before any event arrived, so there is no position to \
+                     resume from"
+                );
+                ExitCode::from(EXIT_ATTENTION)
+            }
+            Self::OverrunBudgetExhausted => {
+                eprintln!(
+                    "error: the stream overran {STREAM_ATTEMPTS} times without reaching a terminal \
+                     event"
+                );
+                ExitCode::from(EXIT_ATTENTION)
+            }
+            Self::Client(kind) => kind.report(),
+        }
+    }
+}
+/// Which shape of client failure ended an attempt.
+///
+/// A mirror of [`ClientError`]'s variants rather than the error itself, because the decision has to be
+/// a pure function of *what kind* of failure this was: carrying the error into [`AttemptAfter`] would
+/// invite a decision branch that reads the error's fields, and fields are exactly what a test over
+/// this enum cannot enumerate.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientErrorKind {
+    /// The connection failed or timed out, which is the one case a resume can fix.
+    Transport,
+    /// Anything else, reported as it is.
+    Other,
+}
+
+impl ClientErrorKind {
+    /// Reports a client failure, by kind.
+    ///
+    /// The two kinds print **different messages** because they call for different operator responses,
+    /// which is also what makes this a method on the value rather than on the enum: a transport failure
+    /// that has spent its attempt budget is a daemon that keeps dropping connections, while any other
+    /// failure is one this client cannot interpret and the operator should read. Printing one message
+    /// for both would hide which of the two happened.
+    fn report(&self) -> ExitCode {
+        match self {
+            Self::Transport => eprintln!(
+                "error: the run's stream could not be followed to a terminal event after \
+                 {STREAM_ATTEMPTS} attempts"
+            ),
+            Self::Other => eprintln!("error: the run's stream could not be read"),
+        }
+        ExitCode::from(EXIT_ATTENTION)
+    }
+}
+
+/// Decides what to do when an attempt ends without a terminal event.
+fn follow_after(
+    result: &Result<(), ClientError>,
+    overran: bool,
+    attempt: u32,
+    has_position: bool,
+) -> AttemptAfter {
+    let more_attempts = attempt + 1 < STREAM_ATTEMPTS;
+    match result {
+        // A transport failure is the one error a resume can fix, and only when there is a position to
+        // resume from — a connection that failed before any event arrived has nothing to ask for, and
+        // retrying it would just be the same failure again.
+        Err(ClientError::Transport | ClientError::Timeout) if more_attempts && has_position => {
+            AttemptAfter::Resume
+        }
+        // **A signalled overrun is a resume, not a failure, and it must not be reported as a fault.**
+        // The daemon said to reconnect; telling the operator the stream "ended without a terminal
+        // event" would be this client arguing with the daemon about a fact the daemon just stated.
+        // Still bounded, because a daemon disconnecting in a loop must surface as an error rather than
+        // as a command that never returns.
+        Ok(()) if overran && more_attempts && has_position => AttemptAfter::Resume,
+        // The overrun signal with nothing to resume *from* is one unusable case: the signal came
+        // before a single event, so reconnecting would name a position that does not exist. Said
+        // plainly rather than retried, because no number of retries reaches an event that never came.
+        Ok(()) if overran && !has_position => {
+            AttemptAfter::Report(AttemptReport::OverranBeforeAnyEvent)
+        }
+        // **An overrun past the budget is its own outcome, not the silent-ending one.** The stream did
+        // end for the reason the daemon stated, so reporting it as "ended without a terminal event"
+        // would drop the one fact the signal carried — and the two are reached by different conditions,
+        // which is what made this a real distinction rather than a nicety: a test written against the
+        // conflated version failed here, naming `OverranBeforeAnyEvent` where it expected this.
+        Ok(()) if overran => AttemptAfter::Report(AttemptReport::OverrunBudgetExhausted),
+        // A clean end with no terminal event means the daemon closed the stream without saying how the
+        // run ended, which is not success — a stream that stops is not a stream that finished.
+        Ok(()) => AttemptAfter::Report(AttemptReport::EndedWithoutTerminal),
+        Err(ClientError::Transport | ClientError::Timeout) => {
+            AttemptAfter::Report(AttemptReport::Client(ClientErrorKind::Transport))
+        }
+        Err(_) => AttemptAfter::Report(AttemptReport::Client(ClientErrorKind::Other)),
+    }
 }
 
 /// Inspects a run.
@@ -1588,10 +1779,168 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, InstallAction, SseFrame, SseParser, StatusBody, event_stream_headers,
-        idempotency_key, json_string, parse_status,
+        Cli, Command, FollowStep, InstallAction, SseFrame, SseParser, StatusBody,
+        event_stream_headers, follow_step, idempotency_key, json_string, parse_status,
     };
     use clap::Parser as _;
+
+    #[test]
+    fn every_way_an_attempt_can_end_is_decided_deliberately() {
+        // **The clause that is wrong is the clause nobody tests**, and this loop is the worst place for
+        // that: it is driven by a live connection, so reproducing "a transport failure on attempt 2
+        // with no position" needs a daemon failing in that exact way. The decision is a function over
+        // an outcome, a flag, an attempt number, and whether a position exists, so every combination is
+        // enumerated here instead.
+        use super::{AttemptAfter, AttemptReport, ClientErrorKind, STREAM_ATTEMPTS, follow_after};
+        use jarvis_infrastructure::client::ClientError;
+
+        let transport = Err(ClientError::Transport);
+        let other = Err(ClientError::MalformedResponse); // any non-transport failure
+
+        // A transport failure with a position and budget left is the one case a resume can fix.
+        assert_eq!(
+            follow_after(&transport, false, 0, true),
+            AttemptAfter::Resume,
+        );
+        // Without a position there is nothing to ask for, so retrying repeats the same failure.
+        assert_eq!(
+            follow_after(&transport, false, 0, false),
+            AttemptAfter::Report(AttemptReport::Client(ClientErrorKind::Transport)),
+            "a transport failure with nothing to resume from must not be retried",
+        );
+        // And the budget is a real bound: the last attempt reports rather than looping for ever.
+        assert_eq!(
+            follow_after(&transport, false, STREAM_ATTEMPTS - 1, true),
+            AttemptAfter::Report(AttemptReport::Client(ClientErrorKind::Transport)),
+            "the attempt budget must end the follow",
+        );
+
+        // **A signalled overrun resumes, and it is NOT reported as a fault.** This is the pair the
+        // extraction exists for: the same "stream ended, no terminal" condition leads to opposite
+        // outcomes depending on a flag, and the wrong answer tells an operator a working run failed.
+        assert_eq!(follow_after(&Ok(()), true, 0, true), AttemptAfter::Resume);
+        assert_ne!(
+            follow_after(&Ok(()), true, 0, true),
+            AttemptAfter::Report(AttemptReport::EndedWithoutTerminal),
+            "a signalled overrun must not be reported as the stream ending silently",
+        );
+        // An overrun with no position is the one unusable case: it is not retried, and it says why.
+        assert_eq!(
+            follow_after(&Ok(()), true, 0, false),
+            AttemptAfter::Report(AttemptReport::OverranBeforeAnyEvent),
+        );
+        // An overrun past the budget is still bounded, like any other resume — and it reports
+        // *that*, rather than claiming the stream ended silently.
+        assert_eq!(
+            follow_after(&Ok(()), true, STREAM_ATTEMPTS - 1, true),
+            AttemptAfter::Report(AttemptReport::OverrunBudgetExhausted),
+            "an unbounded overrun loop would be a command that never returns",
+        );
+
+        // A clean end with no overrun and no terminal is the client's own honest report.
+        assert_eq!(
+            follow_after(&Ok(()), false, 0, true),
+            AttemptAfter::Report(AttemptReport::EndedWithoutTerminal),
+        );
+        // A non-transport failure is never retried, whatever else is true.
+        assert_eq!(
+            follow_after(&other, false, 0, true),
+            AttemptAfter::Report(AttemptReport::Client(ClientErrorKind::Other)),
+            "only a transport failure is resumable, because only it is fixed by reconnecting",
+        );
+    }
+
+    #[test]
+    fn an_overrun_signal_is_a_resume_and_never_a_run_ending() {
+        // **The assertion that stops the worst outcome.** The daemon sends `stream.overrun` when it
+        // cut a *stream* short because this client stopped reading; the run itself is untouched and
+        // still working. A client that classified it as a terminal event would tell an operator a
+        // working run had finished — and, worse, would stop following a run that is going to produce
+        // an answer. Both halves are asserted, because "it is classified as resume" is only meaningful
+        // beside "it is not classified as an ending".
+        let overrun = SseFrame {
+            id: None,
+            event: jarvis_protocol::run::event_type::STREAM_OVERRUN.to_owned(),
+            data: r#"{"contract_version":"0.1.0","error":{"code":"stream.overrun"}}"#.to_owned(),
+        };
+        assert_eq!(follow_step(&overrun), FollowStep::Resume);
+        assert_ne!(
+            follow_step(&overrun),
+            FollowStep::RunEnded { success: true },
+            "an overrun is not a success",
+        );
+        assert_ne!(
+            follow_step(&overrun),
+            FollowStep::RunEnded { success: false },
+            "an overrun is not a failure of the run",
+        );
+
+        // And the three real terminals must still be terminals, so the new arm cannot have swallowed
+        // one — a classification bug in the *other* direction, which would leave this client
+        // following a run that had already ended until the daemon closed the connection.
+        for (event, success) in [
+            (jarvis_protocol::run::event_type::COMPLETED, true),
+            (jarvis_protocol::run::event_type::FAILED, false),
+            (jarvis_protocol::run::event_type::CANCELLED, false),
+        ] {
+            assert_eq!(
+                follow_step(&SseFrame {
+                    id: Some("0195f4f1-0475-7613-a92c-edf01183e909".to_owned()),
+                    event: event.to_owned(),
+                    data: "{}".to_owned(),
+                }),
+                FollowStep::RunEnded { success },
+                "{event} must still end the follow",
+            );
+        }
+    }
+
+    #[test]
+    fn every_event_type_the_protocol_defines_is_classified_deliberately() {
+        // The gap this closes is a *silent* one: a client switches on wire strings, so an event type
+        // added to the protocol and not named here simply stops matching, and the follower treats it
+        // as ignorable with nothing failing. Enumerating the protocol's own constants means a new
+        // event type has to be given an answer — and `Ignored` is a legitimate answer, which is why
+        // this asserts the *classification exists* rather than that it is a particular one.
+        for event in [
+            jarvis_protocol::run::event_type::RECEIVED,
+            jarvis_protocol::run::event_type::CONTEXT_BUILDING,
+            jarvis_protocol::run::event_type::PLANNING,
+            jarvis_protocol::run::event_type::MODEL_STARTED,
+            jarvis_protocol::run::event_type::RESPONDING,
+            jarvis_protocol::run::event_type::USAGE,
+        ] {
+            assert_eq!(
+                follow_step(&SseFrame {
+                    id: None,
+                    event: event.to_owned(),
+                    data: "{}".to_owned(),
+                }),
+                FollowStep::Ignored,
+                "{event} carries nothing for a text follow to print, and this asserts that is a \
+                 decision rather than a gap",
+            );
+        }
+        // A delta prints its text, which is the one arm that carries data.
+        assert_eq!(
+            follow_step(&SseFrame {
+                id: None,
+                event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+                data: r#"{"payload":{"delta":"hello"}}"#.to_owned(),
+            }),
+            FollowStep::Delta("hello".to_owned()),
+        );
+        // And a delta whose payload a build cannot parse prints nothing rather than panicking, because
+        // an unreadable payload is a version skew this client should survive.
+        assert_eq!(
+            follow_step(&SseFrame {
+                id: None,
+                event: jarvis_protocol::run::event_type::OUTPUT_TEXT_DELTA.to_owned(),
+                data: "not json".to_owned(),
+            }),
+            FollowStep::Ignored,
+        );
+    }
 
     #[test]
     fn the_event_stream_request_states_the_media_type_the_contract_requires() {

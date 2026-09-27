@@ -220,8 +220,22 @@ impl SseEvent {
     ///
     /// A comment (keepalive) is `: text\n\n` and carries no `id`, which is why the
     /// contract can state that keepalives do not consume sequence numbers.
+    ///
+    /// **An empty `id` is omitted rather than emitted as a bare `id:`.** The two are not equivalent to
+    /// a client: an empty `id:` field sets `Last-Event-ID` to the empty string on a reconnect, which is
+    /// not a position any run has and which a server must then refuse. Omitting it leaves the client
+    /// resuming from whatever it last genuinely saw, which is the behaviour a frame that deliberately
+    /// carries no position requires. The CLI's own renderer already omitted an absent id, so this also
+    /// removes a case where the daemon and the client would have spelled one frame two different ways.
     #[must_use]
     pub fn render(&self) -> String {
+        if self.id.is_empty() {
+            return format!(
+                "event: {event_type}\ndata: {data}\n\n",
+                event_type = self.event_type,
+                data = self.data,
+            );
+        }
         format!(
             "id: {id}\nevent: {event_type}\ndata: {data}\n\n",
             id = self.id,
@@ -235,6 +249,53 @@ impl SseEvent {
 #[must_use]
 pub fn keepalive_frame() -> String {
     ": keepalive\n\n".to_owned()
+}
+
+/// The error code a stream's overrun signal carries.
+///
+/// It is in the minimum-code table because a client must be able to *name* what happened: a stream
+/// that ends silently is indistinguishable from a run that is still working, and the client's job
+/// after this code is exact — reconnect with `Last-Event-ID` rather than report the run as finished.
+pub const STREAM_OVERRUN_CODE: &str = "stream.overrun";
+
+/// The largest number of bytes the daemon will spend handing one event to one follower.
+///
+/// Delivery is bounded by **bytes written**, not by a byte offset in the stream, and that distinction
+/// is the whole design: a stream re-reads from a sequence position, so a client that is *slow* while
+/// still reading loses nothing when it is disconnected — it resumes from the last event id it saw. If
+/// instead the daemon skipped the events it could not deliver, those sequences would be gone from the
+/// client's view forever, which is the one outcome the contract forbids ("it never silently skips a
+/// gap"). Two megabytes is far more than any single frame this surface can produce, so the bound
+/// cannot fire spuriously; it exists to stop a peer that is acknowledging far slower than the run
+/// produces.
+pub const MAX_STREAM_BYTES_PER_DELIVERY: usize = 2 * 1024 * 1024;
+
+/// Renders the frame that tells a client its stream is ending because the daemon could not keep
+/// up with it, and that it should reconnect from where it got to.
+///
+/// It is a **real event and not a comment**, deliberately, for the same reason a keepalive is the
+/// opposite: a comment is for a client that is waiting, and this is for a client that must act. An
+/// event carrying no `id:` is what makes it safe to emit as the stream's last frame — it consumes no
+/// sequence number and describes no run state, so it cannot leave a resuming client pointing at a
+/// position that never existed, and it is not a second terminal event claiming to end the run.
+///
+/// It is also **not** an SSE `error` field. That would be a connection-level failure the client's
+/// transport reports as a broken read, losing the one fact the frame exists to carry: the stream was
+/// cut short on purpose and resuming is the correct response.
+#[must_use]
+pub fn stream_overrun_frame() -> String {
+    // Built through `SseEvent` rather than assembled here, so the framing rules — the field order and
+    // the terminating blank line — stay in the one place a client's parser and its fixture test both
+    // read. The `id` is deliberately empty and is skipped by `render`, because emitting one would
+    // invent a position; the frame therefore cannot be resumed *from*, only *after*.
+    SseEvent {
+        id: String::new(),
+        event_type: event_type::STREAM_OVERRUN.to_owned(),
+        data: format!(
+            r#"{{"contract_version":"{RUN_CONTRACT_VERSION}","error":{{"code":"{STREAM_OVERRUN_CODE}"}}}}"#
+        ),
+    }
+    .render()
 }
 
 /// The event types the first slice must publish.
@@ -263,6 +324,14 @@ pub mod event_type {
     pub const FAILED: &str = "run.failed";
     /// The run was cancelled.
     pub const CANCELLED: &str = "run.cancelled";
+    /// The stream is ending because it could not be delivered fast enough.
+    ///
+    /// **Not a run event.** It is the only member of this module that describes the *connection*
+    /// rather than a transition in the run: the run is untouched and still working, and the client is
+    /// told to reconnect. It is named `stream.*` rather than `run.*` for exactly that reason, so a
+    /// consumer switching on the prefix reaches the connection handling rather than the state machine
+    /// — and so it cannot be mistaken for a fourth terminal outcome alongside the three above.
+    pub const STREAM_OVERRUN: &str = "stream.overrun";
 }
 
 /// The client-visible run states this contract exposes.
@@ -314,10 +383,25 @@ pub fn failed_payload(code: &str, retryable: bool) -> serde_json::Value {
     serde_json::json!({ "code": code, "retryable": retryable })
 }
 
-/// Builds the payload for a cancellation.
+/// Builds the payload for a cancellation that came from a caller, which carries both the caller's
+/// own words and the controller's closed-set label.
+///
+/// The two are separate on purpose. The `label` is a value this control plane owns, drawn from a
+/// closed set, so a client can branch on it without caring how it is escaped. The `reason` is the
+/// text the cancel endpoint asked the caller for, carried through so a durable record can answer
+/// the question that was asked. Neither can stand in for the other: a label cannot reproduce what a
+/// person typed, and caller text cannot be branched on.
 #[must_use]
-pub fn cancelled_payload(reason_code: &str) -> serde_json::Value {
-    serde_json::json!({ "reason": reason_code })
+pub fn cancelled_payload(reason: &str, label: &str) -> serde_json::Value {
+    serde_json::json!({ "reason": reason, "label": label })
+}
+
+/// Builds the payload for a cancellation with no requester, such as one the provider reported or the
+/// supervisor forced. Only the closed-set label is published, because attributing a cancellation to
+/// a caller who never asked for one would put a fabricated reason in a durable record.
+#[must_use]
+pub fn cancelled_payload_without_requester(label: &str) -> serde_json::Value {
+    serde_json::json!({ "reason": label })
 }
 
 /// Builds the payload for provider-reported usage.
@@ -343,7 +427,8 @@ mod contract_tests;
 mod tests {
     use super::{
         CancelRunRequest, CreateRunRequest, MAX_RUN_INPUT_BYTES, NATIVE_RUNTIME, RunInput,
-        RunLinks, RunView, SseEvent, keepalive_frame, output_text_delta_payload, run_links,
+        RunLinks, RunView, STREAM_OVERRUN_CODE, SseEvent, event_type, keepalive_frame,
+        output_text_delta_payload, run_links, stream_overrun_frame,
     };
 
     #[test]
@@ -499,6 +584,55 @@ mod tests {
         let frame = keepalive_frame();
         assert!(frame.starts_with(':'), "{frame}");
         assert!(!frame.contains("id:"), "{frame}");
+    }
+
+    #[test]
+    fn a_frame_with_no_id_omits_the_field_rather_than_leaving_it_empty() {
+        // The distinction a client sees: an empty `id:` sets `Last-Event-ID` to the empty string,
+        // which is not a position any run has. The frame must therefore carry no `id:` line at all.
+        let event = SseEvent {
+            id: String::new(),
+            event_type: "stream.overrun".to_owned(),
+            data: "{}".to_owned(),
+        };
+        let rendered = event.render();
+        assert_eq!(rendered, "event: stream.overrun\ndata: {}\n\n");
+        assert!(!rendered.contains("id:"), "{rendered}");
+    }
+
+    #[test]
+    fn the_overrun_signal_is_an_event_a_client_can_name_and_not_a_terminal_one() {
+        let frame = stream_overrun_frame();
+        // It is a real event, so a client's parser reports it — unlike a keepalive comment.
+        assert!(!frame.starts_with(':'), "{frame}");
+        assert!(frame.contains("event: stream.overrun"), "{frame}");
+        // It names the code, because a client must be able to key on what happened rather than on a
+        // human-readable message.
+        assert!(frame.contains(r#""code":"stream.overrun""#), "{frame}");
+        // And it carries no position, so a client resuming after it returns to the last genuine event.
+        assert!(!frame.contains("id:"), "{frame}");
+        // It must not be able to be read as a run ending: the three terminal names are a closed set,
+        // and this frame must not contain one. Without this the whole point of the signal is lost,
+        // because a client treating it as terminal would report a working run as finished.
+        for terminal in [
+            event_type::COMPLETED,
+            event_type::FAILED,
+            event_type::CANCELLED,
+        ] {
+            assert!(
+                !frame.contains(terminal),
+                "the overrun signal is not a run terminal, so it must not name {terminal}: {frame}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_overrun_signal_carries_the_code_the_contract_publishes() {
+        // The code is asserted against the document in `run_contract_tests`, which owns the file
+        // reading. This asserts the pair is not merely present but *joined*: the constant the frame
+        // is built from and the one the contract names must be the same string.
+        assert_eq!(STREAM_OVERRUN_CODE, "stream.overrun");
+        assert!(stream_overrun_frame().contains(STREAM_OVERRUN_CODE));
     }
 
     #[test]

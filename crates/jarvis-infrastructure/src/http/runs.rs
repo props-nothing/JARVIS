@@ -530,7 +530,12 @@ pub async fn run_events(
             // A stream that may be cached is a stream a client can be shown stale output from.
             (header::CACHE_CONTROL, "no-store"),
         ],
-        Body::from_stream(follow_stream(follower, initial, state.keepalive_interval)),
+        Body::from_stream(follow_stream(
+            follower,
+            initial,
+            state.keepalive_interval,
+            state.stream_overrun_timeout,
+        )),
     )
         .into_response()
 }
@@ -634,7 +639,79 @@ impl LiveFollow {
 /// unaffected — its events are durable — so a slow client slows only its own delivery, and the
 /// contract's "a slow consumer can replay from its last delivered event" holds because the store
 /// still has everything the channel had not yet handed over.
-const FOLLOW_CHANNEL_DEPTH: usize = 32;
+///
+/// **Backpressure alone was not the whole contract.** A full channel parks this task, and a parked
+/// task is invisible to the client: the connection stays open, nothing is sent, and a follower that
+/// has stopped reading cannot tell that from a run that has nothing to say. The contract says a slow
+/// consumer "is disconnected", so [`send_bounded`] adds the missing half — a bound on how long one
+/// hand-off may take — and this constant remains what makes that bound necessary rather than
+/// theoretical.
+///
+/// `pub(crate)` rather than private because the test that proves the disconnect must flood with more
+/// frames than this, and that precondition is asserted rather than assumed: a test whose trigger sits
+/// *inside* the bound it is testing passes against the defect.
+pub(crate) const FOLLOW_CHANNEL_DEPTH: usize = 32;
+
+/// Hands one piece of a stream to a follower, or reports that the follower is not keeping up.
+///
+/// Returns `false` when the follower should be disconnected: either because the channel is closed
+/// (the client went away), or because the hand-off took longer than the daemon will wait. The second
+/// case is the one this function exists for, and its shape is deliberate — nothing is dropped and
+/// nothing is skipped, because the signal tells the client to reconnect and a **reconnect re-reads
+/// from a sequence position**. That is why delivery is bounded by *time* rather than by a position:
+/// a dropped frame would be a permanent gap in the client's view, whereas a disconnected client
+/// resumes and loses nothing.
+///
+/// The wait is per *piece*, not per batch, so the bound describes the thing that is actually slow —
+/// how long one frame takes to reach one follower — rather than how long a page took to render. A
+/// batch of frames from one read must each clear it in turn, which is the same statement made for
+/// every frame rather than an average over the batch.
+async fn send_bounded(
+    sender: &tokio::sync::mpsc::Sender<Bytes>,
+    piece: String,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, sender.send(Bytes::from(piece))).await,
+        Ok(Ok(())),
+    )
+}
+
+/// Where a follow task leaves the reason it gave up, for the response body to deliver last.
+///
+/// **The signal cannot travel through the follow channel, and that is a property of the failure
+/// rather than an inconvenience.** The one moment an overrun exists is the moment that channel is
+/// full — a follower that were keeping up would never trigger the bound — so a signal sent through it
+/// would be blocked behind the very congestion it is describing, and `try_send` would simply fail.
+/// The signal therefore travels *beside* the channel and is delivered by the body once the channel
+/// closes, which is the first moment the body can be sure the queue is drained and therefore the
+/// first moment the client is genuinely going to read it.
+///
+/// A `watch` rather than a `Mutex<Option<String>>`: the body's `poll_next` must not block or need a
+/// lock to decide, and `watch::Receiver::borrow_and_update` is a synchronous read of the latest
+/// value. It is written once, by the only task that can decide an overrun happened.
+#[derive(Clone)]
+struct OverrunSignal {
+    sender: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl OverrunSignal {
+    /// Creates a signal that has nothing to report yet.
+    fn new() -> (Self, tokio::sync::watch::Receiver<Option<String>>) {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        (Self { sender }, receiver)
+    }
+
+    /// Records that the follower fell behind, so the body delivers the signal before it ends.
+    ///
+    /// `send_replace` rather than `send`, because the value is read by the body and an unobserved send
+    /// would be dropped: this is a piece of *state* ("this stream ended in an overrun"), not an event,
+    /// and a receiver that reads it a moment later must still find it.
+    fn record_overrun(&self) {
+        self.sender
+            .send_replace(Some(jarvis_protocol::run::stream_overrun_frame()));
+    }
+}
 
 /// Builds the response body that follows a run to its terminal event.
 ///
@@ -660,17 +737,21 @@ fn follow_stream(
     follower: LiveFollow,
     initial: Vec<String>,
     keepalive: Duration,
+    overrun: Duration,
 ) -> impl futures_core::Stream<Item = Result<Bytes, std::convert::Infallible>> {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(FOLLOW_CHANNEL_DEPTH);
+    let (signal, signal_receiver) = OverrunSignal::new();
 
     tokio::spawn(async move {
         // The initial page is sent first, so a replayed run's frames are delivered before the task
         // waits on anything — and a run that is already terminal closes the channel on the first
         // iteration below without waiting for a notification that will never come.
         for frame in initial {
-            if sender.send(Bytes::from(frame)).await.is_err() {
-                // The client went away. Nothing to clean up: a disconnect never cancels a durable
-                // run, and the run's events remain in the store for a later follower.
+            if !send_bounded(&sender, frame, overrun).await {
+                // The initial page is where a client that never intended to read is caught, and it is
+                // the one place the signal cannot be distinguished from a vanished peer — so it is
+                // recorded either way, and the body delivers it if there is a body left to deliver to.
+                signal.record_overrun();
                 return;
             }
         }
@@ -695,12 +776,18 @@ fn follow_stream(
             match follower.read().await {
                 Ok((frames, terminal)) => {
                     for frame in frames {
-                        if sender.send(Bytes::from(frame)).await.is_err() {
+                        if !send_bounded(&sender, frame, overrun).await {
+                            signal.record_overrun();
                             return;
                         }
                     }
                     if terminal {
                         // The contract: "the server closes after delivering the terminal event".
+                        // **No overrun signal here**, and the distinction is the whole reason the
+                        // signal is a separate event: this stream ended because the run ended, which
+                        // the client already knows, whereas the stalled path ends because the
+                        // *connection* failed while the run continues. Sending a signal beside a
+                        // terminal would also tell a client to reconnect to a run that is over.
                         return;
                     }
                 }
@@ -708,7 +795,9 @@ fn follow_stream(
                     // A read that fails after the response has begun cannot become a status code, so
                     // the stream ends. The client reconnects with `Last-Event-ID` and receives a
                     // `409` if the position is genuinely gone, which is the contract's own recovery
-                    // path rather than a silent gap.
+                    // path rather than a silent gap. No overrun signal: a failure to *read the store*
+                    // is not a follower that fell behind, and labelling it as one would send a client
+                    // to re-read a position that may well fail again for the same reason.
                     return;
                 }
             }
@@ -729,11 +818,14 @@ fn follow_stream(
                     }
                 }
                 _ = ticker.tick() => {
-                    if sender
-                        .send(Bytes::from(jarvis_protocol::run::keepalive_frame()))
-                        .await
-                        .is_err()
+                    if !send_bounded(
+                        &sender,
+                        jarvis_protocol::run::keepalive_frame(),
+                        overrun,
+                    )
+                    .await
                     {
+                        signal.record_overrun();
                         return;
                     }
                 }
@@ -741,7 +833,11 @@ fn follow_stream(
         }
     });
 
-    ReceiverStream { receiver }
+    ReceiverStream {
+        receiver,
+        signal: signal_receiver,
+        overrun_delivered: false,
+    }
 }
 
 /// The response body: a stream over frames the follow task has rendered.
@@ -749,8 +845,26 @@ fn follow_stream(
 /// Implements `futures_core::Stream` by delegating to the channel's own `poll_recv`, so no future is
 /// stored and no waker is at risk of being dropped. `Ready(None)` means the follow task closed the
 /// channel, which is how the body learns the run is over.
+///
+/// **The overrun signal is delivered after the channel closes, not through it.** That ordering is
+/// forced rather than chosen: the channel is full at exactly the moment an overrun exists — a
+/// follower that were reading would never trigger the bound — so a signal queued ahead of the
+/// undelivered frames could never be sent, and one queued behind them would be read only by the
+/// follower that was already too far behind to reach it. Delivering it as the body's **last** item
+/// means the client reads every frame the daemon did manage to hand over and *then* learns why the
+/// stream stopped, which is what makes the reconnect instruction actionable: it says where to resume
+/// from, and the position it names is the last frame the client actually received.
 struct ReceiverStream {
     receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    signal: tokio::sync::watch::Receiver<Option<String>>,
+    /// Whether the overrun frame has been handed over.
+    ///
+    /// **A flag rather than relying on the channel, and this is a defect I introduced and the
+    /// compiler could not see.** `watch::Receiver::borrow_and_update` marks the value *seen*; it does
+    /// **not** consume it, so a second poll returns the same `Some(frame)` — and since a `Stream` is
+    /// polled again after every `Ready`, the body would have emitted the overrun frame for ever
+    /// instead of ending. The frame is one-shot by contract, so the one-shot-ness is tracked here.
+    overrun_delivered: bool,
 }
 
 impl futures_core::Stream for ReceiverStream {
@@ -762,7 +876,25 @@ impl futures_core::Stream for ReceiverStream {
     ) -> Poll<Option<Self::Item>> {
         // `Infallible` as the error type: a frame is already-rendered text, so there is no per-item
         // failure to report — the only way this ends is the channel closing.
-        self.receiver.poll_recv(context).map(|item| item.map(Ok))
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(None) => {
+                // The task has finished. If it recorded an overrun, this is the stream's last item.
+                if self.overrun_delivered {
+                    return Poll::Ready(None);
+                }
+                // Cloned before the flag is set, so the `Ref` guard does not overlap the mutation.
+                let frame = self.signal.borrow_and_update().clone();
+                match frame {
+                    Some(frame) => {
+                        self.overrun_delivered = true;
+                        Poll::Ready(Some(Ok(Bytes::from(frame))))
+                    }
+                    None => Poll::Ready(None),
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

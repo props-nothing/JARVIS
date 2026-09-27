@@ -199,9 +199,33 @@ merely present:
   it the run exists. Missed ticks are not repaid as a burst, because a delayed loop emitting
   several comments at once is traffic with no purpose.
 
-**Not implemented:** an explicit slow-consumer *disconnect* with `stream.overrun` is not
-implemented, so a slow client is backpressured rather than told it fell behind. Generated OpenAPI and
-golden fixtures are also outstanding.
+**A stalled follower is told why its stream ended.** The rule above — "slow clients have bounded
+buffers" — had a channel but no disconnect: a full channel parks the follow task, and a parked task is
+indistinguishable to the client from a run with nothing to say. The connection stayed open, nothing was
+sent, and the contract's "a slow consumer is disconnected" described a control that did not exist. Two
+things were needed, and the split is the reason this is worth recording:
+
+- **A bound on how long one hand-off may take**, measured on *delivery* rather than on the run. A
+  follower that is keeping up never waits on a send, so the bound cannot fire for it; a follower that
+  has stopped reading waits for ever. This is what makes the buffer bound *observable* rather than
+  merely real.
+- **A signal that travels beside the channel, not through it.** The one moment an overrun exists is the
+  moment the channel is full — a follower that were reading would never trigger the bound — so a signal
+  sent through it would be blocked behind the congestion it is describing. It is therefore recorded
+  beside the channel and delivered by the body as its **last** item, after everything the daemon did
+  manage to hand over. Delivering it last is also what makes the client's instruction actionable: it
+  says "resume from the last event id you saw", and the last frame the client read is exactly that.
+
+The signal is a real event and not a comment, which is the mirror of the keepalive's reasoning: a
+comment is for a client that is waiting, and this is for a client that must act. It carries **no `id:`**
+and consumes no sequence number, so a client that resumes on it is returned to the last genuine
+position rather than to one that never existed. Nothing is dropped and nothing is skipped, because the
+events are durable and delivery is bounded by *time* rather than by a position — a client that is
+simply slow loses nothing when it reconnects, which is the property that makes "disconnect the slow
+consumer" safe to do at all. `send_bounded` is where this lives; `FOLLOW_CHANNEL_DEPTH` is what makes
+the bound necessary, and `DEFAULT_STREAM_OVERRUN_TIMEOUT` is what the daemon serves.
+
+**Generated OpenAPI and golden fixtures are still outstanding.**
 
 **The client streams, and it resumes.** The reference client (`jarvis`) follows a run on **one
 connection**, printing each delta as it arrives rather than reconnecting on a timer — which matters
@@ -222,6 +246,21 @@ worth recording, because both were absent while the endpoint replayed and closed
   id and reconnects with it, which the contract makes exact ("`Last-Event-ID` resumes strictly after
   that event"), so a resume cannot duplicate output. Attempts are bounded, and a failure with no
   position to resume from is not retried at all: the retry would be the same failure.
+- **An overrun is resumed as well, and it is classified rather than recognised.** The daemon's signal
+  is not a failure and not an ending, so a client that treated "my stream stopped" as one uniform
+  condition would either report a working run as finished or print a fault for a decision the daemon
+  made on its behalf. The classification is therefore a **function over the frame** rather than an
+  `if` inside the callback — because the interesting property is what a frame is *not*, and an `if`
+  buried in a streaming loop can only be tested with a daemon on the other end. It is asserted over
+  every event type the protocol defines, in both directions: the signal resumes, and the three real
+  terminals still end the follow. That second half is not decoration — the arms are adjacent, so a
+  careless edit that widened the signal's arm would swallow a terminal and leave the client following a
+  run that had already finished.
+- **A signalled overrun still has a floor.** Retrying an overrun is bounded like any other resume, so a
+  daemon disconnecting in a loop surfaces as an error rather than as a command that never returns. The
+  one case that is not retried at all is an overrun that arrived **before any event did**: there is no
+  position to resume from, and no number of retries reaches an event that never arrived, so the client
+  says so rather than asking again.
 
 ## Generated Contracts
 

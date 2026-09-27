@@ -1299,9 +1299,74 @@ Foundation TODO remains incomplete.
     (`ApiState::with_keepalive_interval`, production `DEFAULT_KEEPALIVE_INTERVAL = 15s`) because a
     keepalive is only observable by *waiting*, so a production interval would make its test take as
     long as the interval. 1116 workspace tests (+2); `fmt`, `clippy -D warnings`, and both doc gates
-    clean. **Still not done:** an explicit slow-consumer disconnect with `stream.overrun` (a slow
-    client is backpressured rather than told it fell behind), and the CLI still follows by
-    reconnecting rather than from one connection.
+    clean. **Still not done at this point:** an explicit slow-consumer disconnect with `stream.overrun`
+    (a slow client was backpressured rather than told it fell behind), and the CLI still followed by
+    reconnecting. **The overrun half is closed by the bullet below; the CLI half was closed by the
+    single-connection follow above.**
+  - **The slow-consumer disconnect is now implemented, and the contract sentence was the spec.** "Per-client
+    buffers are bounded. A slow consumer is disconnected; it can replay from its last delivered event
+    while retention permits." The buffer *was* bounded — a full follow channel parks the follow task —
+    but a **parked** follower was told nothing, and a client that has stopped reading cannot distinguish a
+    silent daemon from a run with nothing to say. The bound existed; the disconnect did not. Two pieces
+    were needed, and the split is the finding rather than the implementation:
+    1. **A bound on one hand-off, measured on delivery.** A follower that is keeping up never waits on a
+       send, so `DEFAULT_STREAM_OVERRUN_TIMEOUT` (10s) cannot fire for one; a follower that has stopped
+       reading waits for ever. This is what makes the buffer bound *observable* rather than merely real.
+    2. **A signal that travels BESIDE the channel, not through it.** The one moment an overrun exists is
+       the moment the channel is full — a follower that were reading would never trigger the bound — so a
+       signal sent through it would be blocked behind the congestion it is describing, and `try_send`
+       would simply fail. It is recorded in a `watch` beside the channel and delivered by the response
+       body as its **last** item, after everything the daemon did manage to hand over. Delivering it last
+       is also what makes the client's instruction actionable: "resume from the last event id you saw",
+       and the last frame it read is exactly that.
+  - **Nothing is dropped and nothing is skipped, and that is why the bound is on time rather than on a
+    position.** The events are durable, so a client that is merely slow loses nothing when it reconnects —
+    which is the property that makes "disconnect the slow consumer" safe at all. Bounding by position
+    instead (skipping what could not be delivered) would leave a permanent gap, the one outcome the
+    contract forbids outright.
+  - **The signal is a real event and not a comment, the mirror of the keepalive's reasoning.** A comment is
+    for a client that is *waiting*; this is for a client that must *act*. It carries no `id:` and consumes
+    no sequence number, so resuming on it returns the client to the last genuine position rather than one
+    that never existed — and it is emitted as the stream's last frame, not beside a terminal, because a
+    terminal means the run ended and this means the *connection* did.
+  - **A defect I introduced and the compiler could not see.** `watch::Receiver::borrow_and_update` marks a
+    value *seen*; it does not consume it. A `Stream` is polled again after every `Ready`, so the body would
+    have emitted the overrun frame **for ever** instead of ending. One-shot-ness is tracked explicitly
+    (`overrun_delivered`), because the contract makes the frame one-shot and nothing in the watch channel
+    does.
+  - **Two attempts at the test were wrong for reasons worth keeping.** The first flooded 64 frames — fewer
+    bytes than a loopback socket buffer, so the kernel absorbed the whole response and the run completed
+    normally, with a `200` and no signal; the flood must now clear an asserted byte floor, because a test
+    whose trigger fits inside the buffer it is not measuring passes against the defect. The second drove a
+    real `TcpStream` that never read, which *should* work but adds the OS send and receive buffers between
+    the daemon and the bound — a layer that cannot be sized portably. The test now polls the response body
+    through the router and simply does not collect it for several bounds, which leaves the bound it is
+    about and nothing else. It also asserts the delivered frames are **contiguous from sequence 1**, since
+    a skipped event would be lost rather than deferred.
+  - **The CLI classifies the signal rather than recognising it**, and the classification is a function over
+    the frame (`follow_step`) because the interesting property is what a frame is *not*: an `if` inside a
+    streaming callback can only be tested with a daemon on the other end. Asserted over **every** event
+    type the protocol defines and in both directions — the signal resumes, and the three real terminals
+    still end the follow. That second half is not decoration: the arms are adjacent, so an edit that
+    widened the signal's arm would swallow a terminal and leave the client following a finished run.
+    **Falsified** by making the signal a success, which fails the assertion naming it.
+  - **The contract's minimum-code table gained its first `n/a` status row**, and the row is the finding:
+    `stream.overrun` is delivered *inside* a stream after the `200` has begun, so there is no status left
+    to carry it. Both table parsers now share one row predicate that accepts `n/a`, rather than the shape
+    check being written twice — two copies is how the code comparison and the flag comparison come to
+    disagree about which rows they see.
+  - **The retry decision is now a function over values rather than an `if` chain in a live loop.** The
+    clause that is wrong is the clause nobody tests, and this loop is the worst place for that: it is
+    driven by a connection to a real daemon, so reproducing "a transport failure on attempt 2 with no
+    position" needs a daemon failing in that exact way. `follow_after` takes the outcome, the overrun
+    flag, the attempt number, and whether a position exists, and returns *resume* or a typed report —
+    so every combination is enumerated by a test. Writing that test immediately found a real
+    conflation: an overrun with **no position** and an overrun that **exhausted its budget** were the
+    same branch, so a client that had retried three times was told there was no position to resume
+    from. They are different facts and now have different outcomes
+    (`OverranBeforeAnyEvent` vs `OverrunBudgetExhausted`).
+  - 1144 workspace tests (+8: 4 in `jarvis-protocol`, 1 in `jarvis-infrastructure`, 3 in `jarvis-cli`).
+    All five gates + `cargo doc` green. **DO NOT COMMIT.**
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior. This TODO owns the run controller and the repositories' test
   doubles: `jarvis_application::run_controller` drives one durable run from
@@ -2020,8 +2085,91 @@ Foundation TODO remains incomplete.
     reason is caller-supplied text, so a public event needs escaping; hand-rolling a JSON escaper
     is the ad-hoc string manipulation the architecture forbids, and adding `serde_json` as a real
     dependency is a research-gate change. I attempted it, hit the dependency wall, and **reverted
-    cleanly** rather than leave a half-wired field.
-  946 workspace tests. **DO NOT COMMIT.**
+    cleanly** rather than leave a half-wired field. **SUPERSEDED — both the premise and the gap are
+    closed, and the bullets below are the current state:** it turned out no caller-supplied text was
+    on this path at all (the published reason was a `&'static str` label), and the payload is now
+    published carrying **both** the caller's escaped reason and the controller's label.
+  - **The cancellation payload is now published, and the reason it was not is the interesting part.**
+    A cancelled run's terminal event carried **no payload**, so a client following the stream learned
+    that a run stopped without learning **why** — while the same client reading `GET /runs/{id}` got
+    the code from the row. The three ways a run stops have three different operator responses (the
+    caller asked, the provider stopped it, the supervisor ended it), which is exactly why "it was
+    cancelled" is not a sufficient terminal event. It now carries `{"reason":…}` from a closed set:
+    `cancelled_before_start`, `cancelled_during_step`, `cancelled_after_output`,
+    `cancelled_before_acceptance`, `cancelled_during_delivery`, and
+    `provider_reported_call_cancelled`.
+  - **The recorded blocker was false, and it was the second time in three rounds.** The note said the
+    reason "is caller-supplied text, so putting it in a public event needs escaping, and hand-rolling
+    that would be the ad-hoc string manipulation the architecture forbids" — with the corollary that
+    closing it "needs a serializer at this layer or a sanitised reason at the boundary." Checked
+    against the code, every clause is wrong: the reason a cancellation publishes is `Step::reason`, a
+    **`&'static str` literal from a closed set**, while the genuinely caller-supplied cancel reason is
+    held on the HTTP layer's `CancellationScope` and **never reaches this layer at all**. So nothing
+    needs escaping, no serializer is needed, and `jarvis_protocol::run::cancelled_payload` already
+    took a `&str` and escaped it with `serde_json::json!` — meaning even if caller text had been on
+    the wire, the fix was to pass it through rather than to hand-roll anything. **The lesson is now
+    recorded rather than the fix alone**: a "this needs escaping" claim is a claim about *which value*
+    is on the wire, and it has to name that value. The previous round's false blocker was the same
+    shape — "blocked on axum's sse feature" when that feature does not exist — so both are recorded
+    together, because the pattern is the finding. **And the claim above was itself half wrong, which
+    the next bullet records: the caller's reason was on this path after all, and it was reaching
+    nothing.**
+  - **A second, smaller defect fixed while wiring it:** the pre-acceptance failure path passed its
+    **failure** label (`deadline_exceeded`/`provider_refused`) as a cancellation's event reason. No
+    payload carried it, so it was invisible; publishing a reason is what made it wrong rather than
+    merely untidy. A cancellation now uses a cancellation label on every path.
+  - **The caller's reason now reaches the terminal event, which means I had to correct my own previous
+    round.** That round published the controller's closed-set **label** and recorded, as a finding, that
+    the caller's text "never reaches this layer" — so no escaping was needed and the round was a clean
+    win. **That was false, and checking it was the round's work.** `CancellationScope::cancel_reason()`
+    exists precisely so the caller's reason is reachable, and the contract's own sentence says *"The
+    reason travels to the terminal event"* — meaning **their** reason. Worse, the caller's reason was
+    reaching **nothing** at all: nothing in the controller read it, and no durable row held it, so a
+    cancelled run's record could not answer the question the cancel endpoint had already asked the
+    caller. The payload is now `{"reason":<caller text>,"label":<controller label>}` — the caller's
+    escaped text, and the label a client can branch on without escaping concerns. Observed on the wire:
+    `"payload":{"label":"cancelled_during_delivery","reason":"operator stopped it: see ticket #42"}`,
+    with the `:` and `#` surviving intact.
+  - **A broken escaper silently reproduces the exact bug this round fixed, and that is how it was
+    found.** Deleting the `"` escape from `escape_json_string` leaves the whole unit suite green and
+    fails only the end-to-end assertion — and what the wire showed was not garbled text but
+    `"payload":null`. `render_event` in `http/runs.rs` parses a stored payload with
+    `.and_then(…ok()).unwrap_or(serde_json::Value::Null)`, a deliberate choice to hand a client a
+    detectable `null` rather than an invented object. The consequence here is that an escaping defect
+    degrades *exactly* to the symptom being fixed: a terminal event that says a run stopped and nothing
+    about why. Two lessons, both already in this file's history — a masking layer turns a corruption
+    into an absence, and the assertion that catches it is the one that reads the **round-tripped value**
+    rather than searching the raw frame for a substring. A `contains` check on the unescaped text would
+    have failed on a *correct* implementation; one on the escaped text would have passed for a payload
+    that dropped the newline.
+  - **The test was made deterministic rather than tolerant, which forced a design fact into the open.**
+    Its earlier version used the scripted provider and asserted "cancelled **or** completed", because a
+    scripted run reaches its terminal as fast as the executor yields, so the cancel raced it and the
+    cancellation branch — the entire point of the test — was usually the one skipped. Switching to
+    `GatedProvider` (which blocks *between* frames, a state a scripted provider cannot occupy) exposed
+    why the race existed: the controller re-checks the scope at a state transition and **once after the
+    stream drains**, so a cancel that lands while frames are being consumed is decided by that second
+    check. With the gate, the cancelled terminal is now *required* (`!stream.contains("run.completed")`
+    is asserted), so a regression that made cancellation unreachable can no longer be satisfied by the
+    fallback branch.
+  - **The escaper is hand-written and proven rather than trusted.** `jarvis-application` has no JSON
+    dependency, so the caller's text is escaped by `escape_json_string`, following the same pattern the
+    CLI and the diagnostics manifest already use. Unlike those, it is **cross-checked against
+    `serde_json`** over adversarial input — every character JSON requires escaped, the short forms, a
+    control character with none, a boundary character, raw non-ASCII, and a backslash-before-quote case
+    that breaks a naive order — plus a round-trip parse. That is possible because `serde_json` is a
+    **dev**-dependency here: the test can reach the oracle the library cannot, which is exactly what
+    makes the assertion a measurement of the escaper instead of a restatement of it. **Falsified** by
+    forgetting to escape the backslash, which fails with the offending input named.
+  - **An internal cancellation publishes no reason, deliberately.** Where a cancellation arrives as a
+    `ProviderError` rather than from a scope, nothing knows who asked, so the label is published alone —
+    inventing a reason for a cancellation nobody requested would attribute a decision to somebody who
+    did not make it.
+  - **The lesson, recorded because it was learned twice in three rounds**: "this needs escaping" and
+    "blocked on a dependency" are claims about a *specific value* or *specific feature*, and they have to
+    name it. This payload contains one value that needs no escaping and one that does; my previous round
+    got both wrong while presenting the conclusion confidently. 1136 workspace tests (+1). **DO NOT
+    COMMIT.**
 - [x] `BRN-019` Publish the `run.usage` event, so the contract's required first-slice event type
   exists at all. Found by grepping the contract's **minimum event type list** against the code.
   **The gap was structural, not a missing line.** `run.usage` is one of the contract's minimum

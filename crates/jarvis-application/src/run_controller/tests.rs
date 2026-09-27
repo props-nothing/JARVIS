@@ -25,6 +25,63 @@ use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
 
 use super::{ControllerError, MAX_TRANSCRIPT_MESSAGES, RunController};
+
+/// The controller's own escaper, exercised against `serde_json`.
+///
+/// `serde_json` is a **dev**-dependency here, which is exactly why it can be used as the oracle for
+/// the hand-written escaper the production path carries: the test can reach it, the library cannot.
+/// That asymmetry is the whole point — the assertion is a measurement of the hand-written function
+/// rather than a restatement of what it does.
+///
+/// The inputs are chosen to be adversarial rather than representative: every character JSON requires
+/// to be escaped, the short-form escapes, a control character with no short form, and a non-ASCII
+/// character that must be passed through **unescaped** (JSON permits raw UTF-8, and escaping it would
+/// be correct-but-different output a client would still read — so leaving it alone is the behaviour to
+/// pin, not an accident).
+#[test]
+fn the_hand_written_escaper_agrees_with_serde_json_on_adversarial_input() {
+    use super::escape_json_string;
+    for candidate in [
+        "",
+        "plain",
+        // The two characters that end a JSON string or start an escape.
+        "quote\"inside",
+        "back\\slash",
+        // The short forms.
+        "new\nline",
+        "carriage\rreturn",
+        "tab\there",
+        "backspace\u{8}here",
+        "form\u{c}feed",
+        // A control character with no short form, which must be `\uXXXX`.
+        "bell\u{7}here",
+        // The range boundary: `0x1f` has no short form; `0x20` (space) is not a control character and
+        // must survive unescaped.
+        "\u{1f}",
+        " ",
+        // Non-ASCII, which JSON permits raw.
+        "héllo — ünïcode",
+        // Everything at once, so an escaper that handled the cases individually but mis-ordered the
+        // checks still fails.
+        "\"\\\n\r\t\u{8}\u{c}\u{7}\u{1f} héllo",
+        // A character that looks like an escape sequence but is not.
+        "\\n is not a newline",
+        // The sequences that break a naive implementation which forgets to escape the backslash first.
+        "\\\"",
+    ] {
+        let mine = format!("\"{}\"", escape_json_string(candidate));
+        let theirs = serde_json::to_string(candidate).expect("serde_json serializes a string");
+        assert_eq!(
+            mine, theirs,
+            "the hand-written escaper must agree with serde_json for {candidate:?}",
+        );
+        // And the result must actually parse back to the input, which is the property a client
+        // depends on: a payload it cannot read is the defect this escaper exists to prevent.
+        let parsed: String = serde_json::from_str(&mine).expect("the escaped value parses");
+        assert_eq!(parsed, candidate, "an escaped value must round-trip");
+    }
+}
+
 use crate::cancellation::CancellationScope;
 use crate::model::{ModelProvider, ModelStream, OpenResult, ProviderError, ScriptedProvider};
 use crate::repository::conversation::{ConversationRepository, NewConversation, NewMessage};

@@ -353,13 +353,26 @@ struct RunRef {
 /// at the write. The two are different vocabularies on purpose: `reason` is a short operator label
 /// that is safe to reword, while the outcome is a namespaced code a client switches on. Deriving
 /// one from the other would let a cosmetic edit to a log label silently change a stable identifier.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Step {
     from: RunState,
     to: RunState,
     event_type: &'static str,
     reason: &'static str,
     outcome: Option<TerminalOutcome>,
+    /// The **requester's** reason for a cancellation, when one was recorded.
+    ///
+    /// Distinct from [`reason`](Self::reason), and the distinction is the whole point of this field:
+    /// `reason` is the controller's own closed-set label saying *which code path* cancelled the run,
+    /// while this is the caller's text saying *why they asked*. The contract is explicit that both
+    /// reach the terminal event — "The reason travels to the terminal event" — and until this the
+    /// caller's reason reached nothing at all: it lived on the `CancellationScope` and was never
+    /// persisted, so a cancelled run's durable record could not answer the question the caller had
+    /// already been asked. It is `Option` because an internal cancellation (the provider reporting
+    /// its own cancellation, the supervisor ending a run) has no requester and must not invent one,
+    /// and it is **owned** because the caller's text comes from a scope rather than a literal — which
+    /// is also why this is the one field on `Step` that can contain text needing escaping.
+    requester_reason: Option<String>,
 }
 
 impl Step {
@@ -376,6 +389,7 @@ impl Step {
             event_type,
             reason,
             outcome: None,
+            requester_reason: None,
         }
     }
 
@@ -399,7 +413,55 @@ impl Step {
             event_type,
             reason,
             outcome: Some(TerminalOutcome::failed(code)),
+            requester_reason: None,
         }
+    }
+
+    /// Builds the public payload for a cancellation.
+    ///
+    /// **This is a closed-set payload, and it is the same shape the failure payload has.** The reason
+    /// it was withheld for several rounds is worth recording, because the reasoning was wrong and the
+    /// wrongness was expensive: the note said the cancellation's reason "is caller-supplied text, so a
+    /// public event needs escaping; hand-rolling a JSON escaper is the ad-hoc string manipulation the
+    /// architecture forbids, and adding `serde_json` as a real dependency is a research-gate change."
+    ///
+    /// Every part of that is false here. The reason a cancellation actually publishes is
+    /// [`Step::reason`], which is a **`&'static str` literal from a closed set** — `cancelled_before_start`,
+    /// `cancelled_during_step`, `cancelled_after_output`, `cancelled_before_acceptance`,
+    /// `provider_reported_call_cancelled`, `cancelled_during_delivery` — so there is nothing to escape,
+    /// exactly as with the failure code. The genuinely caller-supplied cancel reason lives on the
+    /// `CancellationScope` in the HTTP layer and never reaches this layer at all; it is not the value
+    /// being published. So no serializer is needed, no dependency gate applies, and the payload is
+    /// built the same way as the failure's.
+    ///
+    /// That distinction — a **closed-set operator label** versus **caller-supplied text** — is what
+    /// should have been checked before the gap was written down. The generalisation worth keeping: a
+    /// "this needs escaping" claim is a claim about *which value* is on the wire, and it has to name
+    /// that value rather than assume it.
+    const fn cancelled_from(from: RunState, reason: &'static str) -> Self {
+        Self {
+            from,
+            to: RunState::Cancelled,
+            event_type: "run.cancelled",
+            reason,
+            // No `outcome`: `outcome` is a *failure* code, and the contract maps the three terminal
+            // states one-to-one — `run.cancelled` is not a failure. The published payload is derived
+            // from `reason` and `requester_reason` in `payload` instead, so this stays what it is.
+            outcome: None,
+            requester_reason: None,
+        }
+    }
+
+    /// Attaches the requester's reason, which the terminal event publishes alongside the label.
+    ///
+    /// A builder rather than an argument on every constructor, because only the cancellation paths
+    /// have a requester: a failure has nobody who asked for it, and threading an `Option` through
+    /// every `Step` construction would make three constructors carry a value that is structurally
+    /// absent for all of them.
+    #[must_use]
+    fn with_requester_reason(mut self, reason: Option<String>) -> Self {
+        self.requester_reason = reason;
+        self
     }
 
     /// Returns the public payload this step's event carries, when it carries one.
@@ -415,21 +477,86 @@ impl Step {
     /// by resending anything — the retry policy is consulted *before* a failure is written, so a
     /// run that arrives here has already had its retry decision made.
     ///
+    /// A **cancellation** carries two reasons, and the pair is the point:
+    ///
+    /// - **`reason`** is the controller's own closed-set label saying *which code path* cancelled the
+    ///   run — `cancelled_before_start`, `cancelled_during_step`, `provider_reported_call_cancelled`,
+    ///   and so on. It needs no escaping and cannot be forged, so it is what a client branches on.
+    /// - **`requester_reason`** is the *caller's* text, present only when a caller actually asked for
+    ///   the cancellation. The contract requires it ("The reason travels to the terminal event"), and
+    ///   it was reaching **nothing** before this: it lived on the `CancellationScope` and was never
+    ///   persisted, so the durable record could not answer the question the caller had already been
+    ///   asked. This is the value that genuinely needs escaping.
+    ///
+    /// The `label` field keeps both discoverable: a client that switches on a known key is unaffected,
+    /// and the human-readable reason is there for an operator. An internal cancellation (the provider
+    /// reporting its own, the supervisor ending a run) has no requester and publishes only the label,
+    /// because inventing a reason for a cancellation nobody requested would attribute a decision to
+    /// somebody who did not make it.
+    ///
     /// Built by hand rather than through a serializer, following
     /// [`crate::recovery::recovery_payload`] — the application layer has `serde_json` only as a
-    /// dev-dependency, and adding it as a real dependency is a research-gate change. The
-    /// justification is the same one that function records: every value here comes from a
-    /// **closed set** — a `&'static str` code from the controller's own error list and a literal
-    /// boolean — so no escaping is required and no caller text can reach the document.
+    /// dev-dependency. That is safe here for the same reason it is safe there, with **one value held
+    /// to a higher standard**: the code and the label come from closed sets, and the requester's text
+    /// is escaped by [`escape_json_string`], which is proven against `serde_json` by a cross-check
+    /// test over adversarial inputs rather than trusted because it looks right.
     ///
-    /// A **cancellation** deliberately carries no payload yet, and that is a named gap rather than
-    /// an oversight: its reason is caller-supplied text, so it *does* need escaping, and
-    /// hand-rolling that would be the ad-hoc string manipulation the architecture forbids. Closing
-    /// it needs a serializer at this layer or a sanitised reason at the boundary.
+    /// The generalisable lesson, recorded because it was learned twice: "this needs escaping" is a
+    /// claim about *which value* is on the wire, and it has to name that value. This payload contains
+    /// both a value that does not need escaping and one that does.
     fn payload(&self) -> Option<String> {
-        self.outcome
-            .map(|TerminalOutcome { code }| format!("{{\"code\":\"{code}\",\"retryable\":false}}"))
+        if let Some(TerminalOutcome { code }) = self.outcome {
+            return Some(format!("{{\"code\":\"{code}\",\"retryable\":false}}"));
+        }
+        // Only the cancellation's own event type gets a cancellation payload: a client that saw a
+        // `cancelled` reason on any other event would be reading a reason for something that did not
+        // happen.
+        if self.to == RunState::Cancelled && self.event_type == "run.cancelled" {
+            return Some(match &self.requester_reason {
+                Some(requester) => format!(
+                    "{{\"reason\":\"{}\",\"label\":\"{}\"}}",
+                    escape_json_string(requester),
+                    self.reason,
+                ),
+                None => format!("{{\"reason\":\"{}\"}}", self.reason),
+            });
+        }
+        None
     }
+}
+
+/// Renders `value` as the **contents** of a JSON string, escaped.
+///
+/// A hand-written escaper because the application layer has no JSON dependency, and it is the same
+/// function shape the CLI and the diagnostics manifest already use for the same reason. It is
+/// **verified against `serde_json` by a cross-check test over adversarial inputs** rather than
+/// trusted: a value that merely *looks* escaped and is not is exactly the defect that produces an
+/// event a client cannot parse, and the test is what makes the claim about this function a
+/// measurement instead of an opinion.
+///
+/// The escapes are the ones JSON requires: `"` and `\`, the five short forms for the characters that
+/// have them, and `\uXXXX` for every other control character. A control character is escaped rather
+/// than dropped, so the document stays valid without silently altering what the caller wrote — an
+/// operator reading a cancellation reason needs the bytes the caller sent, not a cleaned-up version.
+fn escape_json_string(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            control if control < '\u{20}' => {
+                let _ = write!(out, "\\u{:04x}", u32::from(control));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// What one model-call attempt produced.
@@ -730,12 +857,8 @@ impl RunController {
             if !stored.state.is_terminal() {
                 self.finish(
                     run,
-                    Step::new(
-                        stored.state,
-                        RunState::Cancelled,
-                        "run.cancelled",
-                        "cancelled_before_start",
-                    ),
+                    Step::cancelled_from(stored.state, "cancelled_before_start")
+                        .with_requester_reason(cancel.cancel_reason()),
                 )
                 .await?;
             }
@@ -1031,21 +1154,28 @@ impl RunController {
         step: Step,
         cancel: &CancellationScope,
     ) -> Result<(), ControllerError> {
+        // Captured **before** the step is consumed, because `self.step` moves it and the cancellation
+        // path below still needs to know where the run landed. This was a compile error rather than a
+        // design choice, and it is worth noting that it was the *compiler* that made the ordering
+        // explicit: a value needed after a move cannot be reached by accident.
+        let landed_in = step.to;
         self.step(run, step).await?;
         if !cancel.is_cancelled() {
             return Ok(());
         }
-        // `step.to` is where the run now is, and every working state has a `Cancelled`
+        // `landed_in` is where the run now is, and every working state has a `Cancelled`
         // edge. `Waiting` is the one exception a caller could reach here, and it has one
         // too, so this is total over the states a step can land in.
+        //
+        // The **requester's** reason is read off the scope and published, because the scope is where
+        // the caller's text lives and this is the last point that holds it: the transition itself can
+        // only carry a closed-set label, so a reason that is not attached here is a reason the durable
+        // record loses.
+        let requester_reason = cancel.cancel_reason();
         self.finish(
             run,
-            Step::new(
-                step.to,
-                RunState::Cancelled,
-                "run.cancelled",
-                "cancelled_during_step",
-            ),
+            Step::cancelled_from(landed_in, "cancelled_during_step")
+                .with_requester_reason(requester_reason),
         )
         .await?;
         Err(ControllerError::Cancelled)
@@ -1277,12 +1407,8 @@ impl RunController {
         if turn.cancel.is_cancelled() {
             self.finish(
                 run,
-                Step::new(
-                    RunState::AwaitingModel,
-                    RunState::Cancelled,
-                    "run.cancelled",
-                    "cancelled_after_output",
-                ),
+                Step::cancelled_from(RunState::AwaitingModel, "cancelled_after_output")
+                    .with_requester_reason(turn.cancel.cancel_reason()),
             )
             .await?;
             // The attempt is closed as cancelled rather than completed: the output was
@@ -1346,12 +1472,7 @@ impl RunController {
             ),
             Some(FinishReason::Cancelled) => (
                 ModelCallState::Cancelled,
-                Step::new(
-                    RunState::AwaitingModel,
-                    RunState::Cancelled,
-                    "run.cancelled",
-                    "provider_reported_call_cancelled",
-                ),
+                Step::cancelled_from(RunState::AwaitingModel, "provider_reported_call_cancelled"),
                 ControllerError::Cancelled,
             ),
             _ => return Ok(()),
@@ -1540,12 +1661,8 @@ impl RunController {
         if cancel.is_cancelled() {
             self.finish(
                 run,
-                Step::new(
-                    RunState::Responding,
-                    RunState::Cancelled,
-                    "run.cancelled",
-                    "cancelled_during_delivery",
-                ),
+                Step::cancelled_from(RunState::Responding, "cancelled_during_delivery")
+                    .with_requester_reason(cancel.cancel_reason()),
             )
             .await?;
             // The answer is **not** stored: a cancelled run's output is not its outcome, and
@@ -1886,17 +2003,22 @@ impl RunController {
 
         // A cancellation is a terminal transition too, and it is deliberately *not* a failure:
         // `Step::failed` would record `run.failed`'s semantics on a cancelled run, so the
-        // cancellation keeps the plain constructor and its outcome stays absent. The contract maps
-        // the three terminal states one-to-one, and `run.cancelled` is not a failure code.
+        // cancellation uses `cancelled_from`, whose outcome stays absent while its **reason** is
+        // published as the event's payload. The contract maps the three terminal states one-to-one,
+        // and `run.cancelled` is not a failure code.
         if cancelled {
+            // `reason` here is the *failure* label (`deadline_exceeded`/`provider_refused`), which is
+            // wrong for a cancellation and was previously published on the event as the reason even
+            // though no payload carried it. The cancellation's own closed-set reason is used instead,
+            // so the event's reason and its payload agree about why the run stopped.
             self.finish(
                 run,
-                Step::new(
-                    RunState::AwaitingModel,
-                    RunState::Cancelled,
-                    "run.cancelled",
-                    reason,
-                ),
+                // No requester reason: this cancellation arrives as a `ProviderError` rather than
+                // from a scope, so nothing here knows who asked — and the reason a provider reports
+                // its own cancellation is the provider's, not a caller's. Publishing a label with no
+                // requester is the accurate answer, and the alternative would be attributing a
+                // decision to somebody who did not make it.
+                Step::cancelled_from(RunState::AwaitingModel, "cancelled_before_acceptance"),
             )
             .await?;
         } else {

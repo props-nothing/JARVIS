@@ -156,6 +156,12 @@ pub struct ApiState {
     /// interval would make its test take as long as the interval. `ApiState::new` uses
     /// [`DEFAULT_KEEPALIVE_INTERVAL`], which is what a daemon serves.
     pub keepalive_interval: Duration,
+    /// How long a follow waits to hand one piece of a stream to a follower before disconnecting it.
+    ///
+    /// Configurable for the same reason the keepalive interval is: this bound is only observable by
+    /// *waiting*, so a production value would make its test take as long as the bound. `ApiState::new`
+    /// uses [`DEFAULT_STREAM_OVERRUN_TIMEOUT`], which is what a daemon serves.
+    pub stream_overrun_timeout: Duration,
 }
 
 /// How often a live event stream emits a keepalive comment.
@@ -166,6 +172,22 @@ pub struct ApiState {
 /// is thinking — not streaming — does not look like a dead peer. Fifteen seconds is well inside every
 /// common idle timeout while being far too slow to be traffic.
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long the daemon waits to hand one piece of a stream to one follower before concluding that
+/// follower has stopped keeping up.
+///
+/// This is the bound that makes "per-client buffers are bounded" mean something. The follow channel's
+/// depth is a **memory** bound: it stops the channel growing, but it does so by parking the follow
+/// task — and a parked task is indistinguishable from a slow run, because the connection stays open,
+/// the client is told nothing, and the run's events simply accumulate in the store. The contract's own
+/// sentence says a slow consumer "is disconnected", so there has to be a moment at which the daemon
+/// concludes the follower is not keeping up and says so.
+///
+/// Measured on **delivery**, not on the run: a follower that is up to date never waits on a send, so
+/// this can only fire while the follower is behind. Chosen far above any plausible local scheduling
+/// delay and far below a client's own patience — its purpose is a diagnosis, not a timeout for slow
+/// work.
+pub const DEFAULT_STREAM_OVERRUN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The model candidates a daemon can route a call to.
 ///
@@ -263,6 +285,7 @@ impl ApiState {
             inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            stream_overrun_timeout: DEFAULT_STREAM_OVERRUN_TIMEOUT,
         }
     }
 
@@ -273,6 +296,16 @@ impl ApiState {
     #[must_use]
     pub const fn with_keepalive_interval(mut self, interval: Duration) -> Self {
         self.keepalive_interval = interval;
+        self
+    }
+
+    /// Overrides how long a follow waits on a stalled follower before disconnecting it.
+    ///
+    /// Same builder pattern and same reason as [`Self::with_keepalive_interval`]: the production
+    /// value is what a daemon serves, and only a test that must *observe* an overrun sets its own.
+    #[must_use]
+    pub const fn with_stream_overrun_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_overrun_timeout = timeout;
         self
     }
 
@@ -993,10 +1026,11 @@ const CODES_CARRIED_BY_ERROR_TYPES: [&str; 2] =
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiState, AuthenticatedClient, ProviderInventory, REQUEST_ID_HEADER, Readiness,
-        authority_of, router,
+        ApiState, AuthenticatedClient, DEFAULT_STREAM_OVERRUN_TIMEOUT, ProviderInventory,
+        REQUEST_ID_HEADER, Readiness, authority_of, router,
     };
     use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
+    use crate::http::runs::FOLLOW_CHANNEL_DEPTH;
     use crate::http::runs::context_for;
     use crate::storage::repositories::SqliteRepositories;
     use axum::body::Body;
@@ -1695,6 +1729,17 @@ mod tests {
         /// what makes "the run has published some output and has not finished" an observable state,
         /// which is the only state in which the two handlers differ.
         Gated,
+        /// Publishes many deltas rapidly, so a follower that never reads cannot keep up.
+        ///
+        /// The one provider a stream bound can be tested with. A provider that publishes a handful of
+        /// events never fills the follow channel, so a stalled consumer is indistinguishable from one
+        /// that has simply caught up — there is nothing waiting to be delivered, and the bound is
+        /// measured on delivery. This one publishes more frames than the channel can hold, so the
+        /// follow task is genuinely stuck on a send that no reader is collecting.
+        Flooding {
+            /// How many deltas to publish, each its own durable event.
+            deltas: usize,
+        },
     }
 
     /// The two signals a [`FixtureProvider::Gated`] run uses to coordinate with its test.
@@ -1841,6 +1886,21 @@ mod tests {
         kind: FixtureProvider,
         gate: Gate,
     ) -> (axum::Router, String, Arc<SqliteRepositories>) {
+        runs_fixture_with_bounds(tag, kind, gate, DEFAULT_STREAM_OVERRUN_TIMEOUT).await
+    }
+
+    /// The fixture with every bound stated explicitly.
+    ///
+    /// The overrun bound is a parameter rather than a constant read inside, because it is the one
+    /// bound a test must *compress* to observe at all — and because leaving it at the production value
+    /// everywhere else is what lets the other stream tests assert a negative ("no overrun was signalled
+    /// to a follower that read") against the value a daemon actually runs.
+    async fn runs_fixture_with_bounds(
+        tag: &str,
+        kind: FixtureProvider,
+        gate: Gate,
+        overrun: Duration,
+    ) -> (axum::Router, String, Arc<SqliteRepositories>) {
         use crate::storage::repositories::SqliteRepositories;
         use crate::storage::{Database, migrate};
         use jarvis_application::live_events::StreamDeltaSink;
@@ -1881,6 +1941,20 @@ mod tests {
             // failure leaves the run live so another attempt can be made, and the fixture's
             // purpose is to reach a terminal `Failed` with a code.
             FixtureProvider::Refuses => Arc::new(answering.fail_on_open(ProviderError::Refused)),
+            FixtureProvider::Flooding { deltas } => {
+                // One delta per script step, so each becomes its own durable event and therefore its
+                // own frame: the point is to exceed the follow channel's depth, which is counted in
+                // *frames*, so a single large delta would fill one slot and prove nothing.
+                let mut provider = jarvis_application::model::ScriptedProvider::new(model.clone());
+                for index in 0..deltas {
+                    provider = provider.emit_text("out-1", &format!("chunk-{index} "));
+                }
+                Arc::new(provider.emit(ModelStreamEventKind::CallCompleted {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    refused: false,
+                }))
+            }
             FixtureProvider::Gated => Arc::new(GatedProvider {
                 models: vec![model.clone()],
                 gate: gate.clone(),
@@ -1924,7 +1998,8 @@ mod tests {
             // The fixture is the only place a test can compress it, and every other assertion about a
             // stream is unaffected — a keepalive is a comment with no `id:`, so it is invisible to a
             // check on event frames.
-            .with_keepalive_interval(KEEPALIVE_TEST_INTERVAL),
+            .with_keepalive_interval(KEEPALIVE_TEST_INTERVAL)
+            .with_stream_overrun_timeout(overrun),
         );
         (
             router(state),
@@ -1932,6 +2007,43 @@ mod tests {
             repositories,
         )
     }
+
+    /// The same fixture with a **compressed** overrun bound, for the one test that must observe one.
+    ///
+    /// Every other stream test keeps the production bound, so the claim "a follower that reads is
+    /// never told it fell behind" stays a claim about the real value rather than about a value
+    /// compressed until it cannot fire. Paired with [`FixtureProvider::Flooding`], because an
+    /// ordinary run never fills the follow channel and so never waits on a send at all.
+    async fn runs_fixture_with_overrun(
+        tag: &str,
+        deltas: usize,
+        overrun: Duration,
+    ) -> (axum::Router, String, Arc<SqliteRepositories>) {
+        runs_fixture_with_bounds(
+            tag,
+            FixtureProvider::Flooding { deltas },
+            Gate::new(),
+            overrun,
+        )
+        .await
+    }
+
+    /// How large the overrun test's flood is, and how long its bound is.
+    ///
+    /// The count has to clear **two** buffers, and the second one is the reason it is this big rather
+    /// than merely larger than the channel. The follow channel holds [`FOLLOW_CHANNEL_DEPTH`] frames,
+    /// and the *operating system* holds whatever the daemon has already written and the peer has not
+    /// collected — tens of kilobytes at least, and not measurable portably. A flood smaller than both
+    /// is delivered in full before any send blocks, so the follower never stalls and the run simply
+    /// completes. This was tried at 64 frames (about 8 KiB) first and failed exactly that way, with a
+    /// `200 OK` and a normal completion.
+    ///
+    /// The floor is asserted rather than trusted, because the failure of setting it too low is a test
+    /// that passes against the defect: the earlier version did not.
+    const OVERRUN_TEST_DELTAS: usize = 4096;
+    /// Short, because the bound is only observable by waiting for it, and far longer than a send to an
+    /// empty channel could take — so it cannot fire for a follower that is keeping up.
+    const OVERRUN_TEST_TIMEOUT: Duration = Duration::from_millis(50);
 
     /// The `sequence` values of every `data:` frame in an SSE body, in the order delivered.
     ///
@@ -2833,6 +2945,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_follower_that_stops_reading_is_told_its_stream_overran() {
+        // **The contract sentence this closes:** "Per-client buffers are bounded. A slow consumer is
+        // disconnected; it can replay from its last delivered event while retention permits." The
+        // buffer was bounded — a full channel parks the follow task — but a *parked* follower was told
+        // nothing, and a client that has stopped reading cannot distinguish a silent daemon from a run
+        // with nothing to say. It simply sat there. The bound existed; the disconnect did not.
+        //
+        // **Why this needs a flooding provider and a raw socket.** The bound is measured on *delivery*,
+        // so it can only fire while the follow task is genuinely stuck on a send — which needs more
+        // frames than the channel holds, and a reader that never collects any. `send` would otherwise
+        // buffer the whole flood and the daemon would deliver it on the client's next read, which is
+        // exactly the behaviour that hid this: every existing test reads the body, so every existing
+        // test is a follower that keeps up.
+        // **The flood must exceed the follow channel's depth**, or the follower keeps up and the bound
+        // is never reached. Expressed as a compile-time check over the two constants so it cannot
+        // drift, rather than as an assertion two constants would let a reader skip past.
+        const _: () = assert!(OVERRUN_TEST_DELTAS > FOLLOW_CHANNEL_DEPTH,);
+        let (app, token, _repositories) =
+            runs_fixture_with_overrun("runs-overrun", OVERRUN_TEST_DELTAS, OVERRUN_TEST_TIMEOUT)
+                .await;
+        let run_id = create_run(&app, &token, "flood").await;
+        let path = format!("/api/v1/runs/{run_id}/events");
+        // **The body is never polled during the window that matters, and that is the whole test.**
+        // A client that reads its body is a client that keeps up, so `to_bytes` — what every other
+        // stream test here uses — is exactly the wrong tool: it drains the stream as fast as the daemon
+        // can produce, so the send never blocks and the bound is never reached. Letting the response
+        // sit unpolled for several bounds is what a client that has stopped reading looks like from
+        // the daemon's side.
+        //
+        // Driven through the router rather than a real socket deliberately. A TCP peer adds the
+        // operating system's own send and receive buffers, which are large, unmeasured here, and
+        // between the daemon and the channel — so the flooding provider has to outrun a bound it
+        // cannot see. Polling the body directly removes that layer and leaves the bound this test is
+        // actually about.
+        let request = Request::builder()
+            .method("GET")
+            .uri(&path)
+            // The authority the fixture declares, which is the one its `Host` check accepts. A request
+            // with no `Host` is refused outright, so omitting it would test `api.host_not_allowed`
+            // rather than the stream.
+            .header("host", "127.0.0.1:43127")
+            .header("authorization", format!("Bearer {token}"))
+            .header("jarvis-api-version", "1")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .expect("builds");
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+
+        // Nobody polls. The follow task fills the channel, blocks on the send that cannot complete,
+        // and reaches its bound — repeatedly, so the absence of a decision is not something a slower
+        // scheduler could explain.
+        tokio::time::sleep(OVERRUN_TEST_TIMEOUT * 20).await;
+
+        // Now read what the daemon left behind. Bounded per chunk, so a stream that never ends fails
+        // the assertion below rather than hanging the suite — the round-16 lesson about a test that
+        // hangs being a passing test, badly.
+        let mut delivered = String::new();
+        while let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(OVERRUN_TEST_TIMEOUT, next_chunk(&mut body)).await
+        {
+            delivered.push_str(&String::from_utf8_lossy(&chunk));
+        }
+
+        assert!(
+            delivered.contains("event: stream.overrun"),
+            "a follower that stopped reading must be told its stream overran, not left silent: {delivered}",
+        );
+        // **The signal carries a code, and it must be the contract's.** A client cannot act on a
+        // message; it acts on a code.
+        assert!(
+            delivered.contains(r#""code":"stream.overrun""#),
+            "the signal must name the contract's code: {delivered}",
+        );
+        // **It is not a terminal event, and this is the assertion that stops the worst outcome.**
+        // A client that read this as the run ending would report a working run as finished — which is
+        // precisely what the signal exists to prevent, and it is why the daemon sends it with no
+        // terminal beside it.
+        for terminal in [
+            "event: run.completed",
+            "event: run.failed",
+            "event: run.cancelled",
+        ] {
+            assert!(
+                !delivered.contains(terminal),
+                "an overrun is not a run outcome, so the stream must not report {terminal}: {delivered}",
+            );
+        }
+        // The signal is the **last** frame: everything the daemon did deliver precedes it, which is
+        // what makes "resume from the last event id you saw" actionable. Read by scanning backwards
+        // rather than forward, so the answer does not depend on the frame before it.
+        let last_event = delivered
+            .rfind("\n\nevent: ")
+            .and_then(|at| delivered[at + 2..].lines().next())
+            .unwrap_or_default();
+        assert_eq!(
+            last_event, "event: stream.overrun",
+            "the signal must come after every delivered frame: {delivered}",
+        );
+        // And it carries no `id:`, so a client that resumes on it is sent back to the last genuine
+        // event rather than to a position that never existed.
+        let signal_frame = delivered
+            .split("\n\n")
+            .find(|frame| frame.contains("event: stream.overrun"))
+            .expect("the signal frame is present");
+        assert!(
+            !signal_frame.contains("id:"),
+            "the signal must not carry a position: {signal_frame}",
+        );
+        // The frames that did arrive are a **prefix** of the run's stream, with no gap: the daemon
+        // stopped delivering rather than skipping ahead, which is the property that makes resuming
+        // safe. Asserted on the sequences rather than on a count, because a count is satisfiable by
+        // any set.
+        let sequences = sequence_numbers(&delivered);
+        assert!(
+            !sequences.is_empty(),
+            "the daemon must have delivered something before giving up: {delivered}",
+        );
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+            "the delivered frames must be contiguous from the start, because a skipped event would \
+             be lost rather than deferred: {delivered}",
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-overrun"));
+    }
+
+    /// Reads the next chunk from a response body stream, or `None` when it ends.
+    ///
+    /// Hand-written over `futures_core`, which this crate has, rather than pulling in `StreamExt`:
+    /// the workspace's dependency set has `futures-core` for the `Stream` trait and no combinator
+    /// crate, and one `poll_fn` is not a reason to add one.
+    async fn next_chunk(
+        stream: &mut axum::body::BodyDataStream,
+    ) -> Option<Result<axum::body::Bytes, axum::Error>> {
+        use futures_core::Stream as _;
+        std::future::poll_fn(|context| Pin::new(&mut *stream).poll_next(context)).await
+    }
+
+    #[tokio::test]
     async fn a_finished_run_emits_no_keepalive_before_its_events() {
         // The ordering rule, and the reason the first tick is consumed rather than allowed to fire: a
         // fresh `tokio::time::interval` completes immediately, so a stream that did not consume it
@@ -3230,6 +3488,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_stored_cancellation_payload_matches_the_protocol_builders_shape() {
+        // The same cross-check as the failure payload's, for the same reason: the application layer
+        // hand-builds this shape because it has no JSON *dependency*, and `jarvis-protocol` cannot be
+        // depended on from there, so there are **two** definitions of one wire shape. Without this
+        // test, editing one would silently disagree with the other and a client parsing the shape
+        // would see a field only one producer emits.
+        //
+        // **The caller's text is asserted to be the part that needs escaping.** The labels are a
+        // closed set of `&'static str`, which is what makes publishing them safe with no escaper; the
+        // reason is the caller's own words and is the only field here that a person can put a quote
+        // or a backslash into. Asserting the whole pair over an adversarial reason is what holds
+        // that claim to the values, rather than to a comment.
+        let escaped_reason = "quote \" and backslash \\ and newline \n";
+        // `serde_json::to_string` on a `&str` yields the fully quoted and escaped literal, which is
+        // the oracle for this half of the payload. Its object keys are in `BTreeMap` order, so the
+        // hand-built literal puts `label` first for the byte comparison.
+        let escaped_body = serde_json::to_string(escaped_reason).expect("a JSON string");
+        for label in [
+            "cancelled_before_start",
+            "cancelled_during_step",
+            "cancelled_after_output",
+            "cancelled_before_acceptance",
+            "provider_reported_call_cancelled",
+            "cancelled_during_delivery",
+        ] {
+            let hand_built = format!("{{\"label\":\"{label}\",\"reason\":{escaped_body}}}");
+            let from_protocol = serde_json::to_string(&jarvis_protocol::run::cancelled_payload(
+                escaped_reason,
+                label,
+            ))
+            .expect("the builder serializes");
+            assert_eq!(
+                hand_built, from_protocol,
+                "the hand-built cancellation payload and the protocol's builder must agree",
+            );
+        }
+        // The no-requester form publishes the label alone, and must not grow a fabricated reason.
+        for label in [
+            "provider_reported_call_cancelled",
+            "cancelled_before_acceptance",
+        ] {
+            let hand_built = format!("{{\"reason\":\"{label}\"}}");
+            let from_protocol = serde_json::to_string(
+                &jarvis_protocol::run::cancelled_payload_without_requester(label),
+            )
+            .expect("the builder serializes");
+            assert_eq!(
+                hand_built, from_protocol,
+                "an unrequested cancellation publishes the label and nothing else",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_publishes_why_it_was_cancelled() {
+        // **The end-to-end half, and the assertion the round was for.** A cancellation's terminal
+        // event carried **no payload at all**, so a client following the stream learned that a run
+        // stopped without learning why — while the same client reading `GET /runs/{id}` got the code
+        // from the row. The three reasons have three different operator responses (the caller asked,
+        // the provider stopped it, the supervisor ended it), which is exactly why "it was cancelled"
+        // is not a sufficient terminal event.
+        //
+        // Driven through the real handler over the real surface, so this asserts the payload is
+        // durable and rendered rather than only that a function returns a string.
+        //
+        // **The gated provider is what makes the cancellation branch reachable at all, and the
+        // previous version of this test proved it the hard way.** It used the scripted provider and
+        // asserted either outcome, because a scripted run reaches `completed` as fast as the executor
+        // yields — so the cancel raced it and the cancellation half, the half this test exists for,
+        // was the branch that usually did *not* run. The controller checks the scope at two points
+        // (after each state transition, and once after the stream drains), and a scripted run can pass
+        // both before an HTTP cancel is even parsed. `GatedProvider` blocks *between* frames once the
+        // caller has been told it is mid-answer, which is a state a scripted provider can never sit
+        // in, so the cancel is delivered to a run that is genuinely live.
+        //
+        // The reason is **adversarial on purpose**: it carries a quote, a backslash, and a newline,
+        // which are exactly the three characters that make this field the one needing an escaper. A
+        // reason like `operator` would pass even if nothing escaped.
+        let gate = Gate::new();
+        let (app, token, _repositories) =
+            runs_fixture_with_gate("runs-cancel-payload", FixtureProvider::Gated, gate.clone())
+                .await;
+        let run_id = create_run(&app, &token, "hello").await;
+        gate.reached.notified().await;
+
+        let requester_reason = "operator stopped it: \"hold\" C:\\srv\\now\nsecond line";
+        let cancel_body = serde_json::json!({ "reason": requester_reason }).to_string();
+        let cancel_headers = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "application/json".to_owned()),
+            ("idempotency-key", format!("key-{}", uuid::Uuid::now_v7())),
+        ];
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/runs/{run_id}/cancel"),
+            &cancel_headers,
+            &cancel_body,
+        )
+        .await;
+        assert!(
+            status == StatusCode::ACCEPTED || status == StatusCode::OK,
+            "a cancel of a live run must be accepted: {status} {body}",
+        );
+
+        // Release the provider so the blocked frame arrives and the controller reaches the
+        // after-the-drain check, which is where a cancel that raced the terminal is decided.
+        gate.release.notify_one();
+
+        let mut stream = String::new();
+        let headers: Vec<(&str, String)> = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("accept", "text/event-stream".to_owned()),
+        ];
+        for _ in 0..200 {
+            let (_, current) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &headers,
+                "",
+            )
+            .await;
+            stream = current;
+            if stream.contains("event: run.completed") || stream.contains("event: run.cancelled") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // **The cancellation branch is required, not one of two acceptable outcomes.** Asserting the
+        // terminal is `run.cancelled` is what makes the rest of this test meaningful: the previous
+        // version fell back to asserting a `completed` run, so a regression that made cancellation
+        // impossible would have silently satisfied it.
+        assert!(
+            !stream.contains("event: run.completed"),
+            "a cancelled run must not report success: {stream}",
+        );
+        assert!(
+            stream.contains("event: run.cancelled"),
+            "the cancel was accepted, so the run must terminate as cancelled: {stream}",
+        );
+
+        // A closed-set label, which a client can branch on without caring how it is escaped.
+        assert!(
+            stream.contains(r#""label":"cancelled_during_step""#)
+                || stream.contains(r#""label":"cancelled_after_output""#)
+                || stream.contains(r#""label":"cancelled_during_delivery""#)
+                || stream.contains(r#""label":"cancelled_before_start""#),
+            "the label must be one of the closed set of cancellation labels: {stream}",
+        );
+
+        // **The caller's own words, escaped, and this is the half the contract's sentence requires**
+        // ("The reason travels to the terminal event" — meaning theirs). Parsing the frame rather than
+        // searching the raw text is deliberate: a `contains` check on the *unescaped* text would fail
+        // even on a correct implementation, and one on the *escaped* text would pass for a payload
+        // that dropped the newline. Round-tripping through `serde_json` asserts the value a client
+        // actually reconstructs.
+        let payload = stream
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .find(|value| value["payload"]["label"].is_string())
+            .map(|value| value["payload"].clone())
+            .expect("the cancelled run's terminal event carries a payload");
+        assert_eq!(
+            payload["reason"].as_str(),
+            Some(requester_reason),
+            "a cancelled run must record the exact reason its caller gave, after a round trip: {payload}",
+        );
+    }
+
+    #[tokio::test]
     async fn a_command_with_a_non_json_media_type_is_refused_in_the_shared_envelope() {
         // The contract's minimum-code table lists `415 request.media_type_unsupported`, and before
         // this no handler returned it. Two different halves had to be fixed, and the split is the
@@ -3510,10 +3943,11 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let rest = line.strip_prefix("| ")?.trim_start();
-                // A status cell is exactly three digits, and the next cell is the code in
-                // backticks. Anything else on the line is a different table.
+                // A status cell is three digits, or `n/a` for a code delivered in an event stream
+                // rather than as a status. The next cell is the code in backticks. Anything else on
+                // the line is a different table.
                 let (status, rest) = rest.split_once(" | ")?;
-                if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+                if !is_status_cell(status) {
                     return None;
                 }
                 // The code sits between the first pair of backticks.
@@ -3668,6 +4102,22 @@ mod tests {
         (produced, modules)
     }
 
+    /// Whether a table row's first cell names an HTTP status.
+    ///
+    /// Three digits for a code a route returns, or the literal `n/a` for a code the surface delivers
+    /// **inside** an event stream. The second form exists because one contract code has no status to
+    /// carry: by the time a stream's overrun signal is sent, the response has already begun, so the
+    /// code travels in the frame rather than in a status line. Excluding it from the table instead
+    /// would break the table's own invariant — that it lists every code the surface produces — for a
+    /// code a client is required to handle.
+    ///
+    /// One predicate shared by both table readers, rather than the same shape check written twice:
+    /// two copies are how the code comparison and the flag comparison come to disagree about which
+    /// rows they see.
+    fn is_status_cell(cell: &str) -> bool {
+        cell == "n/a" || (cell.len() == 3 && cell.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+
     /// Reads the table's third cell — the `Retryable` column — for each listed code.
     ///
     /// Extracted from the table test so the code comparison and the flag comparison are separate
@@ -3680,7 +4130,7 @@ mod tests {
             .filter_map(|line| {
                 let rest = line.strip_prefix("| ")?.trim_start();
                 let (status, rest) = rest.split_once(" | ")?;
-                if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+                if !is_status_cell(status) {
                     return None;
                 }
                 let (_, after) = rest.split_once('`')?;

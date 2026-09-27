@@ -334,9 +334,38 @@ fn the_three_terminal_event_types_are_exactly_the_ones_the_contract_lists() {
         super::event_type::OUTPUT_TEXT_DELTA,
         super::event_type::USAGE,
         super::event_type::RESPONDING,
+        // The overrun signal most needs this check of anything here: it is the one event that ends a
+        // *stream* while the run continues, so a client that read it as a terminal outcome would
+        // report a working run as finished — the exact failure the signal exists to prevent.
+        super::event_type::STREAM_OVERRUN,
     ] {
         assert!(!terminals.contains(&name), "{name} is not terminal");
     }
+}
+
+#[test]
+fn the_overrun_signal_is_a_documented_code_and_not_a_terminal_event() {
+    // Two claims about the same frame, asserted against the document rather than against the
+    // constants, because a frame whose code the contract does not publish is a signal a client cannot
+    // key on and a frame the contract reads as terminal is one a client must not treat as informational.
+    let contract =
+        std::fs::read_to_string(repository_root().join("docs/contracts/local-control-api.md"))
+            .expect("the contract reads");
+    assert!(
+        contract.contains(super::STREAM_OVERRUN_CODE),
+        "the contract must publish {}",
+        super::STREAM_OVERRUN_CODE,
+    );
+    // The contract states the terminal set once, as three names. Asserting the code is not among them
+    // is what stops a later edit from documenting this as a way a run ends.
+    let terminal_line = contract
+        .lines()
+        .find(|line| line.contains("Exactly one terminal event"))
+        .expect("the contract must still state the terminal rule");
+    assert!(
+        !terminal_line.contains("stream.overrun"),
+        "the overrun signal must not be documented as a run terminal: {terminal_line}",
+    );
 }
 
 /// Collects the backticked names a sentence in a contract document lists.

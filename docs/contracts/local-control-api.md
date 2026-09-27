@@ -316,10 +316,24 @@ caller was told the cancel was accepted.
 
 The reason travels to the terminal event: the scope a cancel signals carries it, because the scope
 is what the controller already holds and a reason stored beside the signal could disagree with it.
-The event payload for a cancellation is **not yet emitted**, and that is a named gap — the reason is
-caller-supplied text, so putting it in a public event needs escaping, and hand-rolling that would be
-the ad-hoc string manipulation the architecture forbids. A **failed** run's terminal event does carry
-its code, because every value there comes from a closed set.
+**Both the caller's reason and the controller's own label reach the terminal event**, and the pair is
+deliberate: the **label** is a closed-set value the controller owns (`cancelled_before_start`,
+`cancelled_during_step`, `provider_reported_call_cancelled`, and so on) that a client can branch on
+without escaping concerns, while the caller's **text** is the answer to the question the cancel asked
+them. An earlier revision published only the label, reasoning that the caller's text "never reaches
+this layer" — which was **false**: `CancellationScope::cancel_reason()` exists for exactly this, and
+the caller's reason was reaching **nothing** at all, so a cancelled run's durable record could not
+answer the question the caller had already been asked. The payload is now
+`{"reason":<caller text>,"label":<controller label>}`, with the caller's text escaped by a
+hand-written escaper that a cross-check test **proves against `serde_json`** over adversarial input
+rather than trusting. An internal cancellation (the provider reporting its own, the supervisor ending
+a run) has no requester and publishes only the label, because inventing a reason for a cancellation
+nobody requested would attribute a decision to somebody who did not make it.
+
+The generalisable lesson, worth stating because it was learned twice in three rounds: "this needs
+escaping" — and "blocked on a dependency" — are claims about a *specific value* or *specific feature*.
+They have to name it. This payload contains one value that needs no escaping and one that does, and
+the earlier revision got the wrong answer for both.
 
 ## Run Event Stream
 
@@ -355,12 +369,26 @@ Rules:
   publishes one durable event per streamed output chunk, so a long answer exceeds one page routinely.
   A client whose last-seen event was past that page was refused as though the event were gone.
 - Keepalives are SSE comments and do not consume sequence numbers.
+- A stream may end with **one** `stream.overrun` event instead of a run event. It carries no `id:` and
+  consumes no sequence number, and it means the daemon could not hand the stream to this client fast
+  enough. The run is **untouched** — nothing was cancelled and nothing was skipped, because delivery
+  is bounded by bytes written rather than by a position — so the client's obligation is to reconnect
+  with the `Last-Event-ID` it last received, not to report the run as finished. A client must not
+  treat this event as a terminal outcome: reporting a working run as ended is the failure the signal
+  exists to prevent, which is why its name is `stream.*` and not `run.*`.
 - Exactly one terminal event is persisted: `run.completed`, `run.failed`, or
   `run.cancelled`. The server closes after delivering the terminal event.
 - A **failed** terminal event's payload carries `{"code":…,"retryable":false}`, so a client that
   only follows the stream learns why the run stopped. Its code is the same one the run's own row
   reports, so a streaming client and a polling client cannot be told different reasons. A
-  `completed` event carries no payload, and a `cancelled` one does not yet — see *Cancellation*.
+  **cancelled** terminal event carries `{"reason":…,"label":…}` when the cancellation came from a
+  caller — the caller's escaped text and the controller's **closed-set** label
+  (`cancelled_before_start`, `cancelled_during_step`, `cancelled_after_output`,
+  `cancelled_before_acceptance`, `cancelled_during_delivery`, and
+  `provider_reported_call_cancelled`) — because the three ways a run stops have three different
+  operator responses: the caller asked, the provider stopped it, or the supervisor ended it. A
+  cancellation that arrived as a provider error rather than from a cancel scope has no requester
+  and carries the label alone. A `completed` event carries no payload.
 - A client disconnect never cancels a durable run. Cancellation uses the command
   endpoint.
 - Per-client buffers are bounded. A slow consumer is disconnected; it can replay
@@ -424,8 +452,15 @@ Minimum codes:
 | 422 | `request.semantic_invalid` | no |
 | 426 | `api.version_unsupported` | no |
 | 429 | `request.rate_limited` | yes, after declared delay |
+| n/a | `stream.overrun` | yes, immediately |
 | 503 | `service.not_ready` | yes |
 | 500 | `internal.failure` | conditionally |
+
+The `n/a` status is not a missing value. It marks the one code the surface delivers **inside** an event
+stream rather than as a status line: by the time `stream.overrun` is sent the response has already
+begun with `200`, so there is no status left to carry it. It is listed here because a client must
+handle it, and a table that omitted it would be claiming to list every code the surface produces while
+leaving one out — the same defect this table's completeness check exists to catch.
 
 Every code above except one is produced by a control on this surface, and every code the surface
 produces is listed above — a property a test holds, not a claim this document makes about itself.The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
