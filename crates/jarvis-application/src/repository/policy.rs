@@ -39,8 +39,11 @@ use crate::repository::{RepositoryError, RepositoryFuture};
 /// human-authored label and still finite.
 pub const MAX_POLICY_NAME_BYTES: usize = 200;
 
-/// The longest accepted exception reason.
-pub const MAX_EXCEPTION_REASON_BYTES: usize = 1_024;
+// The reason bound is **not** declared here. It is a property of the exception record, enforced
+// where the record is built — `jarvis_domain::model::exception::PolicyException::grant` — and a
+// second `MAX_EXCEPTION_REASON_BYTES` beside this one was a definition nothing referenced, so the
+// documented bound and the enforced one were two numbers a test could not compare. The domain owns
+// it; a reader looking for it should follow the record, not this module.
 
 /// One immutable policy version to store.
 ///

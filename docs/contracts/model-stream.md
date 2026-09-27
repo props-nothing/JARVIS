@@ -129,6 +129,14 @@ final usage if available, provider request/continuation references, and safety/
 refusal metadata. A stream ending without a terminal event is an interrupted
 call, not success.
 
+Of the two provider references, **only the request reference is persisted today.** The
+provider request id is captured from any frame's `provider_metadata` and written to
+`model_calls.provider_request_id` with the outcome. The continuation reference is carried on the
+frame and on the port's outcome, but the controller writes `None`: nothing resumes a provider call
+yet, so a stored value would be a column no operation reads. It is recorded as an open gap rather
+than wired to a value nothing consumes, because "a field carried but never used" is the shape that
+made `route_decision_id` and `provider_request_id` read as features before they had producers.
+
 ## Usage
 
 Usage tracks provider-reported and estimated values separately:
@@ -233,6 +241,7 @@ not a struct, so an adapter in another crate can implement it.
 | the finish reason the provider reported is recorded on the call | the terminal frame's reason is captured on the drained turn and written with the outcome, then read back | `the_finish_reason_the_provider_reported_is_recorded_on_the_call`, `a_call_records_the_finish_reason_it_was_completed_with`; removing the capture records `None` for a `Length` stop, and removing the adapter's parse makes the column unreadable |
 | an unmodelled provider reason stays visible | `FinishReason::Other` retains the raw provider value rather than mapping it to `Stop` | `an_unmodelled_finish_reason_is_recorded_rather_than_flattened` |
 | usage and a finish reason on one terminal are both recorded | one `call.completed` arm captures both, because two arms would let the first match win | `the_usage_on_a_terminal_frame_and_its_finish_reason_are_both_recorded` |
+| the provider's own request id reaches the call's row | the frame fold reads `provider_metadata.request_id` off any frame and writes it with the outcome, then reads it back | `the_providers_request_id_is_recorded_on_the_call`, `a_model_call_attempt_records_and_loads`; removing the frame-fold capture records `None`, and removing the write records `None` through the port |
 | a failure is retryable in exactly one place | `ProviderError::retryable` is the only decider | `only_transient_failures_are_retryable` |
 | an adapter outside this crate can implement the port | the returned stream is a trait, and the test defines one without module internals | `an_adapter_can_implement_the_port_without_this_modules_internals` |
 

@@ -316,6 +316,7 @@ impl InMemoryRepositories {
                     usage: call.usage.clone(),
                     estimated_cost_microunits: call.estimated_cost_microunits,
                     finish_reason: call.finish_reason.clone(),
+                    provider_request_id: call.provider_request_id.clone(),
                 })
                 .collect())
         })
@@ -361,6 +362,11 @@ pub struct RecordedUsage {
     /// *creation* request: the finish reason is part of the attempt's outcome, so a test that
     /// asserted it on the new-call record would be asserting a field that cannot exist there.
     pub finish_reason: Option<FinishReason>,
+    /// The provider's own request identifier, as recorded with the outcome.
+    ///
+    /// Read here for the same reason as the finish reason: it is an outcome field, and this is
+    /// the accessor that projects the recorded outcome rather than the creation request.
+    pub provider_request_id: Option<String>,
 }
 
 impl RunRepository for InMemoryRepositories {
@@ -1065,6 +1071,8 @@ impl ModelCallRepository for InMemoryRepositories {
                 row.state = outcome.state;
                 row.provider_request_id
                     .clone_from(&outcome.provider_request_id);
+                // The continuation reference has no reader on this port yet, so it is
+                // deliberately not stored: a field nothing reads would read as a feature.
                 row.completed_at = outcome.completed_at;
                 // The usage and its lifted cost are stored together, from one source, so a
                 // ceiling check and the cost query cannot read different amounts for the

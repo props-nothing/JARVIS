@@ -2901,6 +2901,60 @@ async fn the_finish_reason_the_provider_reported_is_recorded_on_the_call() {
 }
 
 #[tokio::test]
+async fn the_providers_request_id_is_recorded_on_the_call() {
+    // `model_calls.provider_request_id` is a schema column, a line in the schema document, a
+    // typed field on the port's outcome, and an adapter bind — and the controller wrote `None`
+    // on **every** path while `capture` ignored the frame's `provider_metadata` entirely. So the
+    // column was `NULL` on every row, and an operator with a provider-side reference had no way
+    // to correlate it with a JARVIS call. Asserted on the **stored** value, because the port
+    // field, the column, and the bind all existed: asserting the argument the controller passed
+    // would have been circular.
+    //
+    // The scripted provider echoes the server-derived request id on its start frame's metadata,
+    // so the expected value is exactly the trusted context's request id — which is also what
+    // makes "the trusted identity reached the adapter *and* the record" one assertion.
+    let fixture = fixture(Arc::new(
+        ScriptedProvider::new(model())
+            .emit_text("out-1", "hello")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            }),
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(
+        recorded[0].provider_request_id.as_deref(),
+        Some(context().request_id.to_string().as_str()),
+        "the provider's request id must reach the call's own row",
+    );
+    // And it survives a read through the port, so the column is neither write-only nor readable
+    // only through the double.
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    let stored = fixture
+        .repositories
+        .load_attempt(context().workspace_id, calls[0].0.id)
+        .await
+        .expect("the attempt loads");
+    assert_eq!(
+        stored.provider_request_id.as_deref(),
+        Some(context().request_id.to_string().as_str()),
+    );
+}
+
+#[tokio::test]
 async fn an_unmodelled_finish_reason_is_recorded_rather_than_flattened() {
     // The reason the domain keeps `Other { provider_value }`: a provider that reports something
     // this build does not model must stay **visible**, because mapping it to `Stop` would make an

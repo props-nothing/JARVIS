@@ -35,6 +35,10 @@ import process from "node:process";
 const READY_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
 const SHUTDOWN_TIMEOUT_MS = 20_000;
+/** How long to wait for a run to reach a terminal state before calling it stuck. */
+const RUN_TIMEOUT_MS = 20_000;
+/** The run states that mean a run will change no further. */
+const TERMINALS = new Set(["completed", "failed", "cancelled"]);
 /** The API major this harness speaks. A mismatch is refused, so it is sent explicitly. */
 const API_MAJOR = 1;
 
@@ -203,6 +207,46 @@ async function readRunRuntime(profile, runId) {
   if (typeof runId !== "string") {
     return null;
   }
+  return await withDatabase(profile, (database) =>
+    database
+      .prepare("SELECT runtime_id, runtime_version FROM agent_runs WHERE id = ?")
+      .get(runId),
+  );
+}
+
+/**
+ * Reads the provider request id off a run's completed model call.
+ *
+ * The run resource is a closed set and does not expose a model call at all, so the only way to
+ * assert that the provider's own identifier reached durable state is to read the column — which is
+ * exactly the assertion an earlier round needed and could not make: `provider_request_id` was a
+ * schema column, a line in the schema document, and a read on the port, while the controller wrote
+ * `None` on **every** path. Every API-level check passed while the column was `NULL` on every row.
+ */
+async function readProviderRequestId(profile, runId) {
+  if (typeof runId !== "string") {
+    return null;
+  }
+  return await withDatabase(profile, (database) =>
+    database
+      .prepare(
+        "SELECT provider_request_id FROM model_calls WHERE run_id = ? " +
+          "ORDER BY started_at DESC LIMIT 1",
+      )
+      .get(runId),
+  );
+}
+
+/**
+ * Runs `read` against the profile's database, opened **read-only**.
+ *
+ * The connection handling is shared so every database assertion in this journey opens the file the
+ * same way: read-only, so a check can never be the thing that changes what it observes, and closed
+ * in a `finally` so a failing check cannot leave the file locked for the next one. Node's built-in
+ * `node:sqlite` is imported dynamically so a Node without the module fails with a sentence naming
+ * the requirement rather than an unhandled module-resolution error at load time.
+ */
+async function withDatabase(profile, read) {
   const path = join(profile, "data", "db", "jarvis.sqlite");
   if (!existsSync(path)) {
     throw new Error(`the profile has no database at ${path}`);
@@ -215,10 +259,7 @@ async function readRunRuntime(profile, runId) {
   }
   const database = new DatabaseSync(path, { readOnly: true });
   try {
-    const row = database
-      .prepare("SELECT runtime_id, runtime_version FROM agent_runs WHERE id = ?")
-      .get(runId);
-    return row ?? null;
+    return read(database) ?? null;
   } finally {
     database.close();
   }
@@ -285,6 +326,35 @@ function request(record, credential, method, path, body, extraHeaders = {}) {
     }
     call.end();
   });
+}
+
+/** Reads one run's view. */
+async function readRun(record, credential, runId) {
+  const response = await request(record, credential, "GET", `/api/v1/runs/${runId}`);
+  if (response.status !== 200) {
+    throw new Error(`reading run ${runId} failed with ${response.status}: ${response.text}`);
+  }
+  return response.json;
+}
+
+/**
+ * Waits until a run reaches a terminal state, and returns it.
+ *
+ * The controller drives a run on a **detached task**, so a run is created before it is executed:
+ * polling rather than sleeping is what makes "the run reached a terminal state" an observation
+ * instead of a guess. Bounded, so a genuinely stuck run fails here rather than hanging the runner.
+ */
+async function waitForTerminal(record, credential, runId) {
+  const deadline = Date.now() + RUN_TIMEOUT_MS;
+  let last;
+  while (Date.now() < deadline) {
+    last = await readRun(record, credential, runId);
+    if (TERMINALS.has(last.state)) {
+      return last;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error(`the run never reached a terminal state: ${JSON.stringify(last)}`);
 }
 
 /** Every `model.*` code the contract fixes. A response must not invent one outside this set. */
@@ -736,6 +806,34 @@ async function main() {
       fail(`the row must record the executing build's version, got ${recorded.runtime_version}`);
     } else {
       pass(`the run records the runtime that executed it: ${recorded.runtime_id} ${recorded.runtime_version}`);
+    }
+
+    // The provider's own request id is **recorded on the call**, not only carried on a frame. The
+    // column existed, the schema document said the port that stores it reads it back, and the
+    // controller wrote `None` on every path — because the frame fold read a frame's *kind* and the
+    // id lives in the frame's metadata. Read straight out of the profile's database: no API route
+    // exposes a model call, so an assertion over the wire could not see this at all.
+    //
+    // Waited for terminal first, because the run executes on a detached task: reading the call
+    // immediately after the create would race the controller and report `null` for a value that is
+    // about to be written — a harness artifact, not a defect.
+    const settled = await waitForTerminal(record, credential, governed.json.run_id);
+    if (settled.state !== "completed") {
+      fail(`the run must complete before its call can be read, got ${settled.state}`);
+    }
+    const provider = await readProviderRequestId(profile, governed.json.run_id);
+    if (provider === null) {
+      fail("the completed run must have a model call readable from the profile database", profile);
+    } else if (
+      typeof provider.provider_request_id !== "string" ||
+      provider.provider_request_id === ""
+    ) {
+      fail(
+        "the call must record the provider's own request id, got " +
+          JSON.stringify(provider.provider_request_id),
+      );
+    } else {
+      pass(`the model call records the provider request id: ${provider.provider_request_id}`);
     }
 
     // Narrow the ceiling to `public`, below the objective's `internal` label, so the same create

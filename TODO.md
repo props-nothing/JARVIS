@@ -2670,6 +2670,49 @@ Foundation TODO remains incomplete.
     completeness check, and the scan and the retryable-column reader are extracted helpers so the test
     reads as an assertion rather than as a scanner.
   1003 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-042` Record the provider's own request id on the call, which the schema document claimed
+  was read back but which no layer ever wrote. Found by following `provider_request_id` from the
+  schema into the code — the sweep that found `BRN-017`'s `finish_reason` and `BRN-012`'s
+  `error_code`.
+  - **The defect.** `model_calls.provider_request_id` is a schema column, a line in
+    `docs/data/schema.md`, a typed field on the port's `ModelCallOutcome`, an adapter bind, and part
+    of the port's `StoredModelCall` read — and the controller wrote `None` on **every** path. The
+    provider's id reaches a frame's `provider_metadata` (the scripted provider echoes the
+    server-derived request id onto its start frame, exactly what `the_trusted_request_identity_reaches_the_adapter`
+    asserts), and the controller's frame fold, `capture`, ignored `provider_metadata` entirely: its
+    only argument was the frame's **kind**, so metadata attached to a frame had nowhere to go. The
+    document's own sentence — "both are read back by the same port that writes them" — was true of
+    the *read* and false of the *write*, which is the shape that hides: the round trip looked
+    complete because every layer but the producer had the field.
+  - Fix: `DrainedTurn` and `RecordedOutcome` gained `provider_request_id`; `capture` now takes the
+    whole `ModelStreamEvent` (not its `&ModelStreamEventKind`) and reads `provider_metadata.request_id`
+    off any frame; it is written with the outcome on every **non-refused** terminal path — the
+    completion, the post-output cancellation, and the tool-fabric refusal — because those are the
+    paths on which a provider accepted the call, which is what the identifier names. A refusal
+    *before* acceptance (`fail_open`/`fail_after_acceptance`/`finish_expired`) keeps the plain
+    recorder: no provider id was ever reported, so recording one would invent it.
+  - **The residual is named, not wired.** `continuation_ref` is still passed as `None`: nothing
+    resumes a provider call, so a stored value would be a column no operation reads — the
+    permissive direction of the very defect this fixes. Recorded in `model-stream.md`.
+  - **Falsified in both halves, each compiling:** making `record_call_outcome_with` send `None`
+    fails `the_providers_request_id_is_recorded_on_the_call` with `left: None`; emptying the
+    `capture` body of its `provider_request_id` assignment fails the same test the same way, which
+    is what proves the fold, and not only the write, is on the path. The adapter's own round trip
+    was already held by `a_model_call_attempt_records_and_loads`, so the missing producer was the
+    only gap. And the value is verified end to end: `tests/e2e/policy-surface.mjs` now waits for the
+    run to settle and reads `model_calls.provider_request_id` out of the profile's database, where a
+    real daemon records the provider id — the assertion an API check cannot make, because no route
+    exposes a model call.
+  - **Two stale claims found while sweeping, and corrected in the same change.** `docs/data/schema.md`'s
+    "Not done" paragraph said `model_route_decisions`, `model_data_policies`, and
+    `model_policy_exceptions` "are not created, because routing and the data policy are `BRN-010`" —
+    all three have been created (`000004`, `000005`) and written since `BRN-010` was implemented, and
+    the paragraph named `BRN-005` (the run *state machine*) as the owner of the `agent_steps` port
+    that never existed. And `MAX_EXCEPTION_REASON_BYTES` was declared **twice** — enforced in
+    `jarvis_domain::model::exception`, and duplicated in `jarvis_application::repository::policy`
+    where nothing referenced it — so the app copy is deleted and the domain's single definition
+    stands.
+  1004 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

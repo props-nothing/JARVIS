@@ -199,9 +199,13 @@ UNIQUE(logical_call_id, attempt)
 ```
 
 `route_decision_id` names the authorization that permitted the call, `finish_reason` is the
-provider's own account of why it stopped, and both are **read back** by the same port that writes
-them — a column no `SELECT` names is a value that can be written and never observed, which is how
-both of these were once stored as `NULL` on every row.
+provider's own account of why it stopped, and `provider_request_id` is the provider's own
+identifier, which is what correlates a JARVIS call with a provider-side record. All three are
+**read back** by the same port that writes them — a column no `SELECT` names is a value that can be
+written and never observed, which is how each of these was once stored as `NULL` on every row. The
+provider id is attached to a stream frame's metadata rather than to a specific event kind, so the
+write was missing in a different place from the other two: the controller's frame fold never read
+`provider_metadata` at all.
 
 Prompt/output content uses protected artifact/content references under retention
 policy rather than being duplicated in telemetry rows.
@@ -356,15 +360,24 @@ state or role the domain does not recognize is `Corrupted`, never "absent",
 because treating it as absent would convert a migration problem into apparent data
 loss.
 
-**Not done**: `agent_steps` has a migration and a schema, but no port or adapter
-yet, so no step is persisted (that is `BRN-005`'s controller work). `sessions`,
-`users`, `workspaces`, and `client_credentials` remain schema-only — local
-single-owner enrollment still uses the Foundation credential file. The
-`model_route_decisions`, `model_data_policies`, and `model_policy_exceptions`
-tables are not created, because routing and the data policy are `BRN-010`. No
-PostgreSQL implementation exists (that is `PRD-001`), and the schema-version bump
-has not been exercised as an upgrade from a populated version-1 database, which
-`docs/data/migrations.md` requires and belongs to `PRD-009`.
+**Still schema-only:** `agent_steps` has a migration and a schema but **no port or adapter**, so no
+step is persisted — the `agent_steps` columns above have no writer. That is a real gap rather than a
+mislabel: `BRN-005` built the run *state machine*, which is a different object, and the step record
+arrives with tool-fabric work. `sessions`, `users`, `workspaces`, and `client_credentials` remain
+schema-only — local single-owner enrollment still uses the Foundation credential file. No PostgreSQL
+implementation exists (that is `PRD-001`), and the schema-version bump has not been exercised as an
+upgrade from a populated version-1 database, which `docs/data/migrations.md` requires and belongs to
+`PRD-009`.
+
+**Corrected from an earlier note that said otherwise:** `model_data_policies`,
+`model_policy_exceptions`, and `model_route_decisions` **are** created and written.
+`000004_model_data_policy.sql` created the first and third and a placeholder second, and
+`000005_model_policy_exceptions.sql` replaced that placeholder with the implemented shape;
+`PolicyService` writes a policy version, `RunService::select_route` persists a route decision, and
+the exception lifecycle has a port and an adapter. The paragraph that stood here claimed all three
+"are not created, because routing and the data policy are `BRN-010`" long after `BRN-010` was
+implemented — a claim the gate cannot see, because it checks links and identifiers rather than
+whether a sentence is still true.
 
 ## Tools, Policy, and Approvals
 

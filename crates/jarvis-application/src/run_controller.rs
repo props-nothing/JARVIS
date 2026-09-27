@@ -53,8 +53,9 @@ use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, Workspac
 use jarvis_domain::model::identity::ModelRef;
 use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::model::stream::{
-    FinishReason, InputItem, InputItems, ModelCallRequest, ModelStreamEventKind, ModelStreamState,
-    PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome, Usage,
+    FinishReason, InputItem, InputItems, ModelCallRequest, ModelStreamEvent, ModelStreamEventKind,
+    ModelStreamState, PortableSettings, Role, RouteRequirements, StreamAdmission, StreamOutcome,
+    Usage,
 };
 use jarvis_domain::run::budget::{BudgetLimit, BudgetStatus, RunBudget, RunRoute};
 use jarvis_domain::run::lifecycle::RunTransition;
@@ -455,6 +456,16 @@ struct RecordedOutcome {
     finish_reason: Option<FinishReason>,
     /// When the first output arrived, when it did.
     first_output_at: Option<UtcTimestamp>,
+    /// The provider's own request identifier, when it reported one.
+    ///
+    /// Recorded with the outcome rather than in a second write, for the same reason the usage
+    /// and the finish reason are: a call whose provider id is stored separately from its
+    /// terminal would have a window in which a finished call has no correlatable provider
+    /// reference. **The controller wrote `None` here on every path while the schema document
+    /// claimed the port that stores the column reads it back** — the provider id reached the
+    /// start frame's metadata and then stopped, exactly the shape `finish_reason` had before
+    /// `BRN-017`.
+    provider_request_id: Option<String>,
 }
 
 /// Everything one model turn needs besides the run it belongs to.
@@ -505,6 +516,14 @@ struct DrainedTurn {
     /// finished". The domain retains an unmodelled provider reason as `FinishReason::Other`
     /// precisely so a new reason stays visible instead of being flattened into a clean one.
     finish_reason: Option<FinishReason>,
+    /// The provider's own request identifier, from any frame that carried provider metadata.
+    ///
+    /// A fact about the request that only the provider can supply, and the one value a support
+    /// enquiry needs: the schema and the port both carry `provider_request_id`, and the contract
+    /// lists "provider request/continuation references" as part of a completed call. Without
+    /// this the column stayed `NULL` on every run row while the document claimed the port that
+    /// stores it reads it back — the same "a writer nothing feeds" shape `finish_reason` had.
+    provider_request_id: Option<String>,
 }
 
 /// Drives one durable run to a terminal state.
@@ -1143,12 +1162,15 @@ impl RunController {
             // The attempt is closed as cancelled rather than completed: the output was
             // produced, but recording it as a successful call would say the call's result
             // was the run's outcome, and the run's outcome is that the caller stopped it.
+            // The provider id is carried through: the call happened, and a support enquiry
+            // about a cancelled run needs exactly that correlation.
             self.record_call_outcome_with(
                 run,
                 call_id,
                 ModelCallState::Cancelled,
                 RecordedOutcome {
                     usage: usage_of(&drained),
+                    provider_request_id: drained.provider_request_id.clone(),
                     ..RecordedOutcome::default()
                 },
             )
@@ -1194,6 +1216,7 @@ impl RunController {
                 ModelCallState::Failed,
                 RecordedOutcome {
                     usage,
+                    provider_request_id: drained.provider_request_id,
                     ..RecordedOutcome::default()
                 },
             )
@@ -1228,6 +1251,10 @@ impl RunController {
         // by its own token limit must not be indistinguishable from one the model finished.
         let completed_at = self.now()?;
         let finish_reason = drained.finish_reason.clone();
+        // Captured before `drained` is moved into `complete_run` below, and from the same
+        // value the completion records, so the row and the answer cannot name different
+        // provider calls.
+        let provider_request_id = drained.provider_request_id.clone();
         self.record_call_outcome_with(
             run,
             call_id,
@@ -1236,6 +1263,7 @@ impl RunController {
                 usage: usage.clone(),
                 finish_reason,
                 first_output_at: None,
+                provider_request_id,
             },
         )
         .await?;
@@ -1449,7 +1477,7 @@ impl RunController {
                 // Everything else is recorded by folding the frame into the turn, which keeps
                 // this loop about *draining a stream* rather than about which frame carries
                 // which field. `capture` is where the pattern-ordering rule lives.
-                other => capture(&mut drained, other),
+                _ => capture(&mut drained, &event),
             }
         }
 
@@ -1756,7 +1784,7 @@ impl RunController {
                 call_id,
                 ModelCallOutcome {
                     state,
-                    provider_request_id: None,
+                    provider_request_id: recorded.provider_request_id,
                     continuation_ref: None,
                     usage: recorded.usage,
                     estimated_cost_microunits,
@@ -1999,8 +2027,20 @@ fn usage_payload(usage: &Usage, call_id: Option<ModelCallId>) -> String {
 /// `refused` is deliberately not folded into the finish reason: the normalized vocabulary already
 /// has `FinishReason::Refusal`, so the flag and the reason agree here rather than becoming two
 /// conflicting spellings of one fact.
-fn capture(drained: &mut DrainedTurn, kind: &ModelStreamEventKind) {
-    match kind {
+///
+/// The whole [`ModelStreamEvent`] is taken rather than only its `kind`, because a provider's
+/// request id lives in the frame's `provider_metadata` beside the payload rather than on a
+/// particular kind. Reading only the kind is exactly what dropped that value: the one frame a real
+/// adapter attaches it to is the start frame, whose kind this turn otherwise does not need.
+fn capture(drained: &mut DrainedTurn, event: &ModelStreamEvent) {
+    if let Some(request_id) = event
+        .provider_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.request_id.as_ref())
+    {
+        drained.provider_request_id = Some(request_id.clone());
+    }
+    match &event.kind {
         ModelStreamEventKind::ToolCallAdded { tool_name, .. } => {
             drained.tool_intent.get_or_insert_with(|| tool_name.clone());
         }
