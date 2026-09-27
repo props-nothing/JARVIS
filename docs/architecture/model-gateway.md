@@ -107,7 +107,9 @@ call.cancelled
 
 Adapters must produce exactly one terminal event and preserve provider request
 IDs, finish reasons, usage, safety/refusal metadata, and retry hints in typed
-metadata.
+metadata. **Preserved is not the same as read:** the safety flag reached the
+controller and was discarded at the frame fold, so a refusal was stored as an
+ordinary finish (`BRN-047`).
 
 **Implemented evidence (`BRN-007`).** `jarvis_domain::model::stream::ModelStreamEvent`
 is the envelope and `ModelStreamEventKind` the payload, and the list above is the

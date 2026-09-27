@@ -2856,6 +2856,38 @@ Foundation TODO remains incomplete.
     `too_many_lines` budget, which is what surfaced the size of what the completion path was doing
     unconditionally.
   1012 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-047` Stop storing a provider's refusal as an ordinary finish. Found by asking what the
+  `refused` flag on `call.completed` does, after `BRN-042`/`BRN-043`/`BRN-046` had each taught that a
+  field is only real once something reads it — and this one had a producer and no **reader**.
+  - **The defect (a value carried and discarded).** The contract says `call.completed` includes
+    "finish reason … and safety/refusal metadata", and the `refused` flag exists because a provider
+    reports a **declined request** as an ordinary completion: the reason is `stop` and the refusal
+    lives only in the flag. The controller's `capture` folded the reason and dropped the flag, so
+    `FinishReason::Refusal` had **no producer anywhere in the workspace** and a refused answer was
+    recorded exactly like a finished one. Two consequences, one visible and one latent: a caller
+    reading the call could not tell "the model answered" from "the model declined", and the refusal
+    count the observability architecture requires under *Models and Runtimes* could not be computed
+    from any stored value, because the fact was gone before it reached the database. `capture`'s own
+    doc comment claimed the opposite — "the flag and the reason agree here rather than becoming two
+    conflicting spellings of one fact" — which is false for exactly the provider shape the flag was
+    added for, and is the kind of claim no gate checks.
+  - Fix: `completed_reason(provider_reason, refused)` resolves the two into one finish reason, and it
+    **upgrades a plain `Stop` and nothing else**. A provider that names `ContentFilter` or `Length`
+    has already made a more specific statement than "the model refused" — a provider-side filter
+    stopping the output is a different fact from the model choosing to decline — so overwriting those
+    would trade one discarded fact for another. `FinishReason::ContentFilter` is now produced through
+    that same fold, which is the first producer it has had.
+  - **Falsified in both directions, each compiling.** Ignoring the flag leaves the stored reason
+    `Some(Stop)` where `Some(Refusal)` is required. Letting the flag overwrite unconditionally records
+    `Refusal` for a `ContentFilter` stop the provider named. The refusal test scripts
+    `refused: true` **beside** `FinishReason::Stop` rather than scripting `FinishReason::Refusal`,
+    because the latter would assert only that the controller records the reason it was handed — a
+    weaker claim that passes while the flag is discarded.
+  - **Not done, and named rather than implied:** the refusal is recorded but nothing *acts* on it —
+    `model-gateway.md` says a content refusal must not be retried, which the post-acceptance rule
+    already enforces, but no metric or event counts refusals yet. That is the observability half
+    (`OBS-*`), and the input now exists.
+  1014 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

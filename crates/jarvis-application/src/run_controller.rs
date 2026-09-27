@@ -2208,9 +2208,10 @@ fn usage_payload(usage: &Usage, call_id: Option<ModelCallId>) -> String {
 /// `ToolCallAdded` records the **first** intent and keeps draining, because abandoning a stream
 /// early would leave the provider's view and JARVIS's disagreeing about whether the call finished.
 ///
-/// `refused` is deliberately not folded into the finish reason: the normalized vocabulary already
-/// has `FinishReason::Refusal`, so the flag and the reason agree here rather than becoming two
-/// conflicting spellings of one fact.
+/// A `call.completed` frame carries **both** the reason the provider stopped and a **safety flag**,
+/// and the two are not interchangeable: a provider reports a declined request as an ordinary
+/// completion whose reason is `stop`, so reading the reason alone records "the model finished its
+/// answer" for a request the model refused. [`completed_reason`] is where the flag is folded in.
 ///
 /// The whole [`ModelStreamEvent`] is taken rather than only its `kind`, because a provider's
 /// request id lives in the frame's `provider_metadata` beside the payload rather than on a
@@ -2239,9 +2240,9 @@ fn capture(drained: &mut DrainedTurn, event: &ModelStreamEvent) {
         ModelStreamEventKind::CallCompleted {
             finish_reason,
             usage,
-            ..
+            refused,
         } => {
-            drained.finish_reason = Some(finish_reason.clone());
+            drained.finish_reason = Some(completed_reason(finish_reason, *refused));
             if let Some(usage) = usage {
                 drained.usage = Some(usage.clone());
                 drained.usage_reported = true;
@@ -2272,6 +2273,30 @@ fn capture(drained: &mut DrainedTurn, event: &ModelStreamEvent) {
         // Output text is published as it arrives, and every other frame is either metadata this
         // turn does not need or a kind the state machine has already refused.
         _ => {}
+    }
+}
+
+/// Resolves the finish reason for a `call.completed` frame from the provider's own reason and its
+/// safety flag.
+///
+/// The contract says `call.completed` carries "safety/refusal metadata", and the flag exists
+/// precisely because a provider can report a **refusal** while naming an ordinary completion: a
+/// declined request comes back with the safety flag set and the stop named `stop`. Reading the
+/// reason alone therefore recorded "the model finished its answer" for a request the model
+/// declined — which is why `FinishReason::Refusal` had **no producer anywhere in the workspace**,
+/// and why the refusal count the observability contract requires under *Models and Runtimes*
+/// could not be computed from any stored value: the fact was on the wire and folded away.
+///
+/// The flag **upgrades a plain `Stop` and nothing else**. Any other reason is already a more
+/// specific statement from the provider — `ContentFilter` says the provider's own filter stopped
+/// the output, which is a different fact from the model choosing to refuse, and `Length` says the
+/// output was truncated rather than declined — so overwriting those would discard what the provider
+/// did report.
+fn completed_reason(provider_reason: &FinishReason, refused: bool) -> FinishReason {
+    if refused && matches!(provider_reason, FinishReason::Stop) {
+        FinishReason::Refusal
+    } else {
+        provider_reason.clone()
     }
 }
 

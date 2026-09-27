@@ -2988,6 +2988,20 @@ async fn a_provider_that_declares_a_model_and_then_refuses_it_fails_the_run_term
 
 /// A provider that answers and then reports `reason` as its finish reason.
 fn answering_with_reason(text: &str, reason: FinishReason) -> Arc<dyn ModelProvider> {
+    answering_with_reason_and_flag(text, reason, false)
+}
+
+/// The same script, with the terminal's **safety flag** set or clear.
+///
+/// The flag is a separate input rather than a second finish reason because that is how a provider
+/// reports a refusal: `refused: true` beside `finish_reason: stop`. A test that folds the two — by
+/// scripting `FinishReason::Refusal` directly — would assert the *recording* of a reason the
+/// controller was handed, and would pass while the controller discarded the flag entirely.
+fn answering_with_reason_and_flag(
+    text: &str,
+    reason: FinishReason,
+    refused: bool,
+) -> Arc<dyn ModelProvider> {
     Arc::new(
         ScriptedProvider::new(model())
             .emit(ModelStreamEventKind::OutputItemAdded {
@@ -2997,7 +3011,7 @@ fn answering_with_reason(text: &str, reason: FinishReason) -> Arc<dyn ModelProvi
             .emit(ModelStreamEventKind::CallCompleted {
                 finish_reason: reason,
                 usage: None,
-                refused: false,
+                refused,
             }),
     )
 }
@@ -3038,6 +3052,72 @@ async fn the_finish_reason_the_provider_reported_is_recorded_on_the_call() {
         .await
         .expect("the attempt loads");
     assert_eq!(stored.finish_reason, Some(FinishReason::Length));
+}
+
+#[tokio::test]
+async fn a_refused_completion_is_recorded_as_a_refusal_rather_than_a_finish() {
+    // The contract says `call.completed` carries "safety/refusal metadata", and the flag exists
+    // because a provider reports a declined request as an **ordinary completion**: the reason is
+    // `stop` and the refusal lives only in the flag. `capture` folded the reason and dropped the
+    // flag, so `FinishReason::Refusal` had **no producer anywhere in the workspace** and a refused
+    // answer was recorded exactly like a finished one — which also made the refusal count the
+    // observability contract requires under *Models and Runtimes* impossible to compute from any
+    // stored value, because the fact was discarded at the fold.
+    //
+    // `refused: true` beside `FinishReason::Stop` is the point: scripted as `FinishReason::Refusal`
+    // this would assert only that the controller records the reason it was handed, which is a
+    // different and weaker claim.
+    let fixture = fixture(answering_with_reason_and_flag(
+        "I can't help with that.",
+        FinishReason::Stop,
+        true,
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("a refusal is a completed call, not a failed run");
+
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    let stored = fixture
+        .repositories
+        .load_attempt(context().workspace_id, calls[0].0.id)
+        .await
+        .expect("the attempt loads");
+    assert_eq!(
+        stored.finish_reason,
+        Some(FinishReason::Refusal),
+        "a flag a provider set must not be dropped, or a refusal cannot be told from an answer",
+    );
+}
+
+#[tokio::test]
+async fn a_safety_flag_does_not_overwrite_a_specific_finish_reason() {
+    // The flag upgrades a plain `Stop` and nothing else. A provider that says its **own** content
+    // filter stopped the output has already made a more specific statement than "the model
+    // refused" — a provider-side filter is a different fact from the model choosing to decline —
+    // and overwriting it would trade one discarded fact for another.
+    let fixture = fixture(answering_with_reason_and_flag(
+        "partial",
+        FinishReason::ContentFilter,
+        true,
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(
+        recorded[0].finish_reason,
+        Some(FinishReason::ContentFilter),
+        "a specific provider reason must survive the safety flag",
+    );
 }
 
 /// A provider whose stream ends with a terminal `call.failed` frame.

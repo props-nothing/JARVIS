@@ -537,6 +537,20 @@ with `answer: Some("partial")`, and without the cancelled arm the cancelled run 
 cancelled test asserts the exact settled state rather than "the run returned an error", which is what
 makes it detect a collapse of the two arms into one — the failed run's own test does not.
 
+**A provider's refusal was stored as an ordinary finish (`BRN-047`).** `call.completed` carries a
+safety flag beside the finish reason, and the two are not interchangeable: a provider reports a
+declined request as a normal completion whose reason is `stop`, with the refusal carried only in the
+flag. The controller's frame fold read the reason and dropped the flag, so `FinishReason::Refusal` had
+**no producer anywhere in the workspace** and a refused answer was recorded exactly like a finished
+one. That also made the refusal count the observability architecture requires under *Models and
+Runtimes* impossible to compute from any stored value — the fact was on the wire and folded away,
+which is the `BRN-042`/`BRN-043` shape one layer further out (there the value had no producer; here it
+had a producer and no reader). The fold now resolves both into one reason, and it **upgrades a plain
+`stop` and nothing else**: a provider that names `content_filter` or `length` has already made a more
+specific statement, so overwriting those would trade one discarded fact for another. Falsified in both
+directions, each compiling: ignoring the flag leaves the stored reason `Stop`, and letting the flag
+overwrite unconditionally records `Refusal` for a `ContentFilter` stop the provider named.
+
 ## Durable Run Record
 
 A run minimally tracks:

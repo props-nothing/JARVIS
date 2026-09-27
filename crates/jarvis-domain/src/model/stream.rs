@@ -678,6 +678,12 @@ pub enum FinishReason {
     /// A provider content filter stopped the output.
     ContentFilter,
     /// The model refused.
+    ///
+    /// Distinct from [`ContentFilter`](Self::ContentFilter): this is the model *choosing* to
+    /// decline, while a content filter is the provider's own machinery stopping output. A provider
+    /// reports the two differently — a refusal arrives as an ordinary completion whose safety flag
+    /// is set and whose reason is `stop` — so a reader that keeps only the reason records a refusal
+    /// as a finished answer.
     Refusal,
     /// The provider reported an error after the stream opened.
     ProviderError,

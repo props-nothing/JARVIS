@@ -129,6 +129,15 @@ final usage if available, provider request/continuation references, and safety/
 refusal metadata. A stream ending without a terminal event is an interrupted
 call, not success.
 
+**The safety flag and the finish reason are not interchangeable.** A provider
+reports a declined request as an ordinary completion — the reason is `stop` and
+the refusal is carried only in the flag — so a reader that keeps the reason and
+discards the flag records "the model finished its answer" for a request the model
+declined. The JARVIS controller resolves the two into one finish reason
+(`FinishReason::Refusal`) and does so while keeping a more specific reason: the
+flag upgrades a plain `stop`, and a provider that names `content_filter` or
+`length` has already said something the flag cannot improve on.
+
 Of the two provider references, **only the request reference is persisted today.** The
 provider request id is captured from any frame's `provider_metadata` and written to
 `model_calls.provider_request_id` with the outcome. The continuation reference is carried on the
@@ -239,6 +248,8 @@ not a struct, so an adapter in another crate can implement it.
 | the stream reports the model that was asked for | the start frame echoes `request.model` rather than the provider's first served model | `the_start_frame_names_the_requested_model_rather_than_the_first_served_one` |
 | the routed model is what the controller sends | `RunController::build_request` sets it from the run's stored route | `the_request_names_the_routed_model_so_the_provider_cannot_substitute` |
 | the finish reason the provider reported is recorded on the call | the terminal frame's reason is captured on the drained turn and written with the outcome, then read back | `the_finish_reason_the_provider_reported_is_recorded_on_the_call`, `a_call_records_the_finish_reason_it_was_completed_with`; removing the capture records `None` for a `Length` stop, and removing the adapter's parse makes the column unreadable |
+| the safety/refusal flag on a completion is not dropped | `completed_reason` folds the terminal's `refused` flag into the reason, so `FinishReason::Refusal` has a producer | `a_refused_completion_is_recorded_as_a_refusal_rather_than_a_finish`; ignoring the flag leaves the stored reason `Stop`, so a refused answer reads exactly like a finished one |
+| the flag upgrades a plain `stop` and nothing else | `completed_reason` only rewrites `FinishReason::Stop` | `a_safety_flag_does_not_overwrite_a_specific_finish_reason`; letting the flag overwrite unconditionally records `Refusal` for a `ContentFilter` stop the provider named |
 | a non-answer terminal never becomes a delivered answer | the frame fold maps `call.failed`/`call.cancelled` onto a finish reason, and `settle_provider_terminal` settles the run and its call **before** the completion path records usage and stores the answer | `a_call_that_ends_failed_does_not_complete_the_run`, `a_call_the_provider_reports_cancelled_does_not_complete_the_run`; removing **either** capture arm leaves that run `Completed` with the abandoned partial text as its stored answer |
 | the three terminals map onto three distinct outcomes | one arm each: `call.completed` completes, `call.failed` fails, `call.cancelled` cancels; the cancelled arm records `RunState::Cancelled` with a `Cancelled` call outcome | `a_call_the_provider_reports_cancelled_does_not_complete_the_run` asserts the exact state, so collapsing the cancelled arm onto the failed one fails it — the failed run's own test does **not** detect that collapse, which is why the assertion is on the state rather than on "the run returned an error" |
 | an unmodelled provider reason stays visible | `FinishReason::Other` retains the raw provider value rather than mapping it to `Stop` | `an_unmodelled_finish_reason_is_recorded_rather_than_flattened` |
