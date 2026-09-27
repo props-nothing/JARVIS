@@ -4127,15 +4127,98 @@ Dependencies: Milestone 2 exit gate.
     meaning, and the first version left the field public and normalised `0` in `reserve`, so a caller
     could put one in afterwards.
   - 30 ledger tests. 1318 workspace tests. All gates green. **DO NOT COMMIT.**
-  **Not done, and named:** the ledger is **in memory only** — there is no repository port or SQLite
-  adapter, so "durable" means the shape is durable and serialization-tested rather than that a row
-  exists. Nothing calls it: there is no executor, and the controller still refuses a tool intent with
-  `run.tools_not_implemented`. `possibly_effecting_without_outcome` is a scan a startup pass *would*
-  walk; no such pass is wired into `jarvisd`. There is no attempt-count ceiling (the retry budget is
-  `BRN-008`'s), no per-call deadline in the row, and no outbox event per transition — that is `AUT-004`
-  and `ACC-044`, whose test asserts state and outbox never diverge. And the reservation is atomic only
-  within one process's memory: the adapter that makes it atomic across processes is part of the
-  persistence work, not of this module.
+  **The persistence gap is now closed.** `000009_tool_call_ledger.sql` adds `tool_call_records` and
+  `tool_call_transitions`, and
+  `jarvis_infrastructure::storage::tool_call_repository::SqliteToolCallRepository` implements
+  `jarvis_application::repository::tool_call::ToolCallRepository` over a real migrated database — 22
+  contract tests. The named sentence this slice exists to make true is the module's own:
+  *"the reservation is atomic only within one process's memory: the adapter that makes it atomic across
+  processes is part of the persistence work"*.
+  - **The reservation is now one statement whose outcome is the verdict.**
+    `reserve` performs a single `INSERT` against the unique index
+    `(workspace_id, principal_id, tool_identity_json, idempotency_key)` and classifies the result: a
+    unique violation means **the row that won is read** and classified *after* the constraint fired,
+    when it is durable. There is no read-then-decide-then-insert window, which is what an in-memory map
+    cannot close. `two_connections_racing_the_same_key_produce_one_grant` reserves from **two separate
+    connections on one file database** — two independent SQLite sessions, the closest reproduction of
+    two processes on one host. A version using two repositories over one pool would pass for a
+    read-then-write adapter, so it would not test the property at all.
+  - **The unique index is over serialized identity *text*, so its soundness rests on a serializer.**
+    `ToolIdentity` is a struct of fields serde writes in declaration order, which makes equal identities
+    byte-identical — and a representation that could reorder (a map, or a set field) would make the index
+    silently stop deduplicating while still existing. `equal_identities_serialize_identically_...`
+    asserts the determinism **and** that two independently constructed equal identities collide in the
+    store, because an assumption a uniqueness guarantee rests on is not one to believe.
+  - **⚠ A stored row is *validated*, not replayed, and the reason is the state machine.** The approval
+    reader walks the transition table because an approval's version is derivable from its final state.
+    Here it is **not**: `REQUESTED -> VALIDATED -> RESERVED -> EXECUTING -> SUCCEEDED` and the same path
+    through `WAITING_APPROVAL` both end `SUCCEEDED` at versions 6 and 7, so the version records how many
+    transitions *actually* happened and no final state implies it. The guarantees therefore come from
+    validation in `LedgerEntry::restore`, which the adapter maps to the column it concerns:
+    a non-zero attempt, a version at least the first, a terminal row with an outcome, and **a state that
+    requires a dispatch recording one**.
+  - **The dispatch invariant is the one with teeth.** A stored `SUCCEEDED` with a `NULL` dispatch column
+    claims an effect happened without the dispatch that caused it, and reading it as harmless is exactly
+    the inversion `TLS-006` fixed: `may_have_effected()` answering `false` for a dispatched call is what
+    retries a call whose effect may have landed. `a_dispatched_row_with_no_dispatch_instant_is_corruption_not_harmless`
+    asserts the refusal.
+  - **Seven mutations, all killed, and the first attempt at the test helper was itself wrong.** The
+    helpers originally walked `REQUESTED -> EXECUTING` directly, which is **not an edge** — the test failed
+    for a reason that was about the helper rather than the adapter. They now derive a path by
+    breadth-first search over the domain's own `can_transition_to`, so a helper cannot disagree with the
+    machine it exercises. That is the same rule as a test restating a constant.
+  - The migration test asserts the half specific to this slice: **the unique index actually refuses a
+    duplicate**. The fixture's first version generated a fresh `principal_id` per row, so the two rows
+    differed in a *key* column and the insert rightly succeeded — the assertion caught the fixture's own
+    mistake, which is why it is written as an insert rather than as a catalog query.
+  - 22 ledger-adapter tests, 10 migration tests. **DO NOT COMMIT.**
+  **The recovery pass now exists, and it is wired into startup.** `jarvis_application::tool_recovery`
+  calls the classification and the work list that had **no caller**, and `jarvisd` runs it before
+  readiness beside the run pass. What it fixes is concrete: a call that reached the provider and then lost
+  its daemon stayed `EXECUTING` for ever, and the next attempt's reservation found it and answered
+  `InFlight` — **telling a caller to wait on a process that is gone**. The pass converts that dead
+  in-flight call into a `RECONCILING` work item, which is the state that says "the outcome is unknown and
+  must be established before this is repeated", so a duplicate is reported as `Unsettled` rather than
+  `InFlight`. A call that never dispatched ends `CANCELLED`: nothing can have effected, and leaving it
+  non-terminal would make a later reservation wait on it.
+  - **⚠ The classification's own target was an illegal edge, and nothing noticed because nothing called
+    it.** `classify_interrupted` answers `Reconcile` for a row found in `RECONCILING` as well as one found
+    in `EXECUTING` — correctly, since both may have effected — but `RECONCILING -> RECONCILING` is not an
+    edge: the table refuses a no-op so a second consume cannot record progress while the effect stays
+    single. Its own test drove the `EXECUTING` case, where the edge is legal, so the case was unasserted.
+    `InterruptedCallAction::needs_write` now states the one question a writer has to ask, and the domain
+    suite **still passes with the fix reverted** — which is the measurement that shows the defect was
+    latent rather than live. Reverting it fails five application tests.
+  - **⚠ A mutation found a hung startup path, and it was two defects behind one another.** Making
+    `needs_write` always `false` did not fail — it **hung**. The cause was that the pass paged over a set
+    containing **its own output**: converting an `EXECUTING` row produces a `RECONCILING` row that the
+    work list still returns, so "did this page change anything" never became false, and a store with more
+    than one page of stranded calls reported `incomplete_store` for ever — which the daemon turns into a
+    **refusal to start on every restart**. Two corrections followed: the drain signal is rows *converted*
+    rather than rows *examined* (a full page of already-reconciling rows is work finished, not a stall,
+    while a full page whose every write was refused is the genuine stall), and the pass now pages
+    `awaiting_conversion`, which selects `EXECUTING` alone so the set strictly shrinks. The second defect
+    was a *silent stranding*: with the old predicate, a second page could hold only already-converted rows
+    and the rest were unreachable — measured as **500 of 505 converted**, not a hang.
+  - **Two scans, each with one meaning.** `possibly_effecting` is the outstanding-work list a caller
+    reports and a provider read walks; `awaiting_conversion` is the conversion input. One method whose
+    meaning depended on the caller is what produced the defect above.
+  - **`bounded` is the probe row, not an inference.** The adapter reads one row more than the page size,
+    so "there is more" is distinguishable from "that was all" — the same technique the run recovery page
+    records, and for the same reason: this bound hides the **newest** rows.
+  - **12 recovery tests, 23 ledger-adapter tests** (one of which drives the pass against a **migrated
+    database** rather than a double), **+1 migration assertion**. Four mutations, all killed — including
+    the probe row and the illegal-edge fix. **DO NOT COMMIT.**
+  **Still not done, and named:** nothing *else* calls the ledger — there is no executor, and the
+  controller still refuses a tool intent with `run.tools_not_implemented`. **The pass does not reconcile
+  and does not retry**: reconciliation means reading the provider to establish whether an effect landed,
+  which needs a tool invocation this build does not have. So it converts a dead in-flight call into a work
+  item and leaves the provider read to the slice that can make one. There is no attempt-count ceiling (the
+  retry budget is `BRN-008`'s), no per-call deadline in the row, and no outbox event per transition — that
+  is `AUT-004` and `ACC-044`, whose test asserts state and outbox never diverge. The design's
+  `arguments_ref`, `result_ref`, `step_id`, and `runtime_call_ref` columns are not in the as-built table
+  because each needs an artifact store, a step writer, or an external runtime, none of which exists — so
+  the row records the *reservation and its outcome* and not the call's payload.
 - [~] `TLS-007` Implement safe reference filesystem read and write-plan tools. **The authorization half
   is done; the enforcement half is not, and cannot be without a dependency decision — the `~` is the
   honest state.**

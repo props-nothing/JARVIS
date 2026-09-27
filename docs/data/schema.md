@@ -489,6 +489,46 @@ UNIQUE(workspace_id, tool_definition_id, idempotency_key)
 The uniqueness scope may include connector account/operation after tool-specific
 idempotency analysis.
 
+**As built (`000009`), named `tool_call_records`**, and the name difference is the one
+deliberate divergence. The design above is named for the *call* and carries `step_id`,
+`runtime_call_ref`, `arguments_ref`, and `result_ref` — every one of which needs an artifact store,
+a step writer, or an external runtime, none of which exists. What was built is what `TLS-006`'s
+domain module actually owns:
+
+```text
+id, call_id, workspace_id, principal_id, run_id,
+tool_identity_json, idempotency_key, attempt, operation,
+state, version, dispatched_at, outcome, no_effect_confirmed,
+created_at, updated_at
+UNIQUE(workspace_id, principal_id, tool_identity_json, idempotency_key)
+```
+
+- **One row per *attempt*, not per call**, which is why the name is `tool_call_records`. An
+  invocation that is retried has several rows sharing one reservation key, and the attempt number
+  distinguishes them — a table keyed by the call could not represent "the same reservation asked for
+  twice", which is the only thing this table exists to decide.
+- **The unique index is over the serialized identity text**, so it only holds because the domain's
+  serializer is deterministic for a struct of fields. A representation whose serialization could
+  reorder — a map, or a set field — would make the index silently stop deduplicating while still
+  existing. The adapter asserts the determinism rather than assuming it.
+- **`principal_id` is in the key**, unlike the design's `UNIQUE(workspace_id, tool_definition_id,
+  idempotency_key)`. A key without it would let one principal's retry collide with another's fresh
+  call, and the consequence here is a second side effect rather than a leaked identifier.
+- **`dispatched_at` is stored rather than derived from `state`.** This is the `TLS-006` defect in
+  column form: `may_have_effected()` answering "no" for a call that reached `EXECUTING` and then
+  `FAILED` is exactly what retries a call whose effect may have landed. The reader refuses a state
+  that requires a dispatch without one.
+- **`outcome` is `NULL` for an unknown outcome**, which is a different fact from "it failed". A
+  terminal row with no outcome is refused rather than defaulted, because defaulting it would let an
+  unknown outcome read as a recorded failure a caller may retry.
+- **The design's `approval_id` is not here.** The link exists in the other direction —
+  `approvals.tool_call_id`, added by `000008` — and a duplicate foreign key on this side would be a
+  second copy of one relationship that could disagree with the first.
+
+Nothing writes a `tool_calls` row: there is still no executor, and the controller refuses a tool
+intent with `run.tools_not_implemented`. The adapter is exercised by contract tests over a real
+migrated database.
+
 ### `approvals`
 
 ```text
@@ -555,6 +595,53 @@ adds on top of the schema, because both are decisions the columns alone do not s
   decision, so its absence means the row was not written by the domain.
 - An approval in another workspace is `storage.not_found`, **indistinguishable from one that does not
   exist**, following the rule the local control API states for runs.
+
+### `tool_call_transitions`
+
+```text
+id, record_id, workspace_id, from_state, to_state,
+prior_version, version, outcome, occurred_at
+```
+
+One row per applied ledger transition, written **in the same transaction** as the state change. For a
+tool call the trail is load-bearing rather than decorative: it is the durable answer to "was this call
+ever dispatched", which is the single fact a later retry decision turns on. A state change that
+committed without its trail row would leave the state and the audit of it disagreeing.
+
+**As built (`jarvis_infrastructure::storage::tool_call_repository`)**, three rules the adapter adds
+because the columns alone do not state them:
+
+- **The reservation is one statement.** `reserve` performs a single `INSERT` against the unique index
+  and takes its verdict from that statement's outcome — a unique violation means the row that won is
+  read and classified *after* the constraint fired, when it is durable. There is no read-then-decide
+  window, which is what makes the reservation atomic **across processes** rather than only within one
+  daemon's memory. The tests reserve from two separate connections on one file database, because two
+  repositories over one pool would pass for a read-then-write adapter.
+- **A stored row is *validated*, not replayed**, and that difference from `approvals` is forced by the
+  state machine. An approval's version is derivable from its final state; a ledger's is not, because
+  `REQUESTED -> VALIDATED -> RESERVED -> EXECUTING -> SUCCEEDED` and the same path through
+  `WAITING_APPROVAL` both end `SUCCEEDED` at different versions. So the reader asserts the invariants
+  the rows must satisfy instead: a non-zero attempt, a version at least the first, a terminal row with
+  an outcome, and **a state that requires a dispatch recording one**.
+- **A row in another workspace is `storage.not_found`**, while the reconciliation scan is deliberately
+  **unscoped** — a scan filtered by workspace would leave other workspaces' stranded effects stranded
+  with no symptom.
+
+**Startup recovery (`jarvis_application::tool_recovery`, run by `jarvisd` before readiness)** converts a
+dead in-flight call into a work item. A call that reached the provider and then lost its daemon stayed
+`EXECUTING`, and the next attempt's reservation answered `InFlight` — telling a caller to wait on a
+process that is gone. The pass moves it to `RECONCILING`, so a duplicate is reported as `Unsettled` and a
+caller is told to reconcile rather than wait. Two rules there are consequences of the storage shape:
+
+- **The scan a caller reports is not the scan the pass pages.** `possibly_effecting` returns
+  `executing` **and** `reconciling` rows with no outcome — the outstanding work. Paging it would re-read
+  the pass's own output, since converting an `EXECUTING` row produces a `RECONCILING` row that the same
+  predicate returns; with the ordering tied on `updated_at`, a later page can hold only converted rows and
+  the rest become unreachable. `awaiting_conversion` selects `executing` alone, so the set strictly
+  shrinks and the paging terminates.
+- **`bounded` comes from a probe row, not from `len() == limit`.** The adapter reads one row more than the
+  page size, so "there is more" is distinguishable from "that was all" — and this bound hides the
+  **newest** rows, which is why the distinction decides whether recovery can finish.
 
 
 ## Memory, Entities, and Context

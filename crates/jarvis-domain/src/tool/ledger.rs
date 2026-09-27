@@ -68,6 +68,32 @@ impl ToolCallVersion {
         Self(value)
     }
 
+    /// Wraps a stored value, refusing one below [`Self::FIRST`].
+    ///
+    /// A separate constructor from [`Self::new`] because the two have different callers with different
+    /// obligations: `new` is for a value JARVIS computed, which is at least one by construction, while
+    /// this is for a value that came out of a column. A version of zero would make the optimistic check
+    /// meaningless — it matches an uninitialised field — so the reader refuses it rather than wrapping
+    /// it, and the distinction is visible in the signature instead of in a comment at each call site.
+    ///
+    /// The counterpart of `ApprovalVersion`'s reader-side check, and it exists here for the same
+    /// reason: the writer cannot produce a zero, so a stored zero is a migration fault rather than a
+    /// fresh row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ToolCallVersionConflict`] for zero, with `expected` and `actual` both
+    /// zero because there is no meaningful "expected" for a value read from storage.
+    pub fn from_stored(value: u64) -> Result<Self, DomainError> {
+        if value < Self::FIRST.0 {
+            return Err(DomainError::ToolCallVersionConflict {
+                expected: Self::FIRST,
+                actual: Self(value),
+            });
+        }
+        Ok(Self(value))
+    }
+
     /// Returns the inner value.
     #[must_use]
     pub const fn get(self) -> u64 {
@@ -181,6 +207,22 @@ impl ToolCallState {
     #[must_use]
     pub const fn is_unsettled(self) -> bool {
         matches!(self, Self::Reconciling)
+    }
+
+    /// Returns whether this state can be reached without the call ever being dispatched.
+    ///
+    /// **The invariant a stored row is checked against.** `EXECUTING` is recorded *before* an external
+    /// effect, so a call cannot reach success or failure without having passed through it — a row saying
+    /// `SUCCEEDED` with no recorded dispatch is a row claiming an effect nobody performed, which is the
+    /// worst thing a ledger can say. `CANCELLED` is deliberately **reachable** both ways (a call can be
+    /// cancelled before or after dispatch), so it is not in the excluded set: the invariant is about
+    /// which states *require* a dispatch, not about which ones permit one.
+    #[must_use]
+    pub const fn is_reachable_without_dispatch(self) -> bool {
+        !matches!(
+            self,
+            Self::Executing | Self::Reconciling | Self::Succeeded | Self::Failed
+        )
     }
 
     /// Returns whether a transition from `self` to `to` is legal.
@@ -362,6 +404,41 @@ pub enum LedgerOperation {
     Read,
 }
 
+impl LedgerOperation {
+    /// Every operation, in a fixed order.
+    ///
+    /// An explicit list rather than a `strum`-style derive, because the parse below is what makes a
+    /// stored value total: a variant added to the enum and not to this list fails
+    /// `every_operation_has_a_spelling_and_parses`, which is the same technique
+    /// `ToolCallState::ALL` uses.
+    pub const ALL: &'static [Self] = &[Self::Execute, Self::Reconcile, Self::Read];
+
+    /// Returns the spelling JARVIS stores.
+    #[must_use]
+    pub const fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Reconcile => "reconcile",
+            Self::Read => "read",
+        }
+    }
+
+    /// Parses the stored spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ToolDefinitionInvalid`] naming `operation` for any other value. An
+    /// unrecognised operation must not be read as `Execute`, which is the fail-open direction: a row
+    /// opened for a read would look like one that dispatches.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|operation| operation.as_contract_str() == value)
+            .ok_or(DomainError::ToolDefinitionInvalid { field: "operation" })
+    }
+}
+
 /// One durable ledger row.
 ///
 /// The state is **private** behind [`LedgerEntry::apply`], exactly as `RunLifecycle`'s and
@@ -496,6 +573,17 @@ impl LedgerEntry {
         self.dispatched_at.is_some()
     }
 
+    /// Returns when the call was dispatched, if it ever was.
+    ///
+    /// The timestamp itself, not only the boolean, because it is a **persisted column**: an adapter that
+    /// could read `was_dispatched` but not the instant would have to invent one, and a dispatch recorded
+    /// at a made-up time is a worse row than one with no dispatch at all. The pairing of the two
+    /// accessors is deliberate — `was_dispatched` is what a decision reads, this is what storage writes.
+    #[must_use]
+    pub const fn dispatched_at(&self) -> Option<UtcTimestamp> {
+        self.dispatched_at
+    }
+
     /// Returns whether this row may have produced an effect.
     ///
     /// Two facts combined, and the combination is the point: a call that was dispatched may have
@@ -607,6 +695,109 @@ impl LedgerEntry {
             Some(ToolErrorClass::ProviderError),
             occurred_at,
         )
+    }
+}
+
+/// The recorded facts a [`LedgerEntry`] is restored from.
+///
+/// A struct rather than thirteen parameters, for the reason `ApprovalRequestParts` and `BRN-008`'s
+/// controller record: several of these are identifiers of the same shape, and a positional call would
+/// make a principal/call transposition possible — in the one type that decides whether a side effect
+/// may be repeated.
+#[derive(Debug, Clone)]
+pub struct LedgerEntryParts {
+    /// The row's own identity.
+    pub id: ToolCallRecordId,
+    /// The canonical call identifier, stable across attempts.
+    pub call_id: ToolCallId,
+    /// Which attempt this row records, counting from 1.
+    pub attempt: u32,
+    /// The run the call belongs to.
+    pub run: RunId,
+    /// The reservation key.
+    pub key: ReservationKey,
+    /// The logical operation this row was opened for.
+    pub operation: LedgerOperation,
+    /// The recorded state.
+    pub state: ToolCallState,
+    /// The recorded version.
+    pub version: ToolCallVersion,
+    /// When the row was created.
+    pub created_at: UtcTimestamp,
+    /// When the row last changed.
+    pub updated_at: UtcTimestamp,
+    /// When the call was dispatched, if it ever was.
+    pub dispatched_at: Option<UtcTimestamp>,
+    /// The recorded error class, if one was recorded.
+    pub outcome: Option<ToolErrorClass>,
+    /// Whether the outcome is known to have had no effect.
+    pub no_effect_confirmed: bool,
+}
+
+impl LedgerEntry {
+    /// Restores a row from recorded facts, validating the invariants those facts must satisfy.
+    ///
+    /// **A restoration rather than a replay, and that difference from `DurableApproval` is forced by the
+    /// state machine rather than chosen for convenience.** An approval's version *is* derivable from its
+    /// final state — there is a canonical path from `PENDING` to each state — so its reader walks the
+    /// transition table and cross-checks the version, which is what makes an unreachable stored state
+    /// detectable. Here there is **no such path**: `REQUESTED -> VALIDATED -> RESERVED -> EXECUTING ->
+    /// SUCCEEDED` and `REQUESTED -> WAITING_APPROVAL -> APPROVED -> RESERVED -> EXECUTING -> SUCCEEDED`
+    /// are both legal and both end `SUCCEEDED`, at versions 6 and 7. The version therefore records how
+    /// many transitions *actually* happened, which no final state implies, and the recorded row is a
+    /// history rather than a position.
+    ///
+    /// So the reader cannot replay, and the guarantees come from **validation instead**:
+    ///
+    /// - the version is at least [`ToolCallVersion::FIRST`], refused by
+    ///   [`ToolCallVersion::from_stored`];
+    /// - the attempt is at least one, because "attempt zero" has no meaning;
+    /// - a terminal row carries an outcome, because `apply` always records one for a terminal
+    ///   transition and a row that claims to have finished without saying what happened is not readable;
+    /// - **a row with no recorded dispatch cannot be in a state that requires one.** This is the
+    ///   invariant with teeth, and its counterpart of the approval reader's unreachable-state check: a
+    ///   stored `SUCCEEDED` with a `NULL` dispatch column is a claim that an effect happened without the
+    ///   dispatch that would have caused it. `docs/architecture/storage-data.md` and `ACC-025` both turn
+    ///   on dispatch being recorded, so a row that lost it must be refused rather than read as harmless —
+    ///   remembering that `may_have_effected()` answering `false` for a dispatched call is exactly the
+    ///   defect that duplicates an effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ToolDefinitionInvalid`] naming `attempt` for a zero attempt,
+    /// [`DomainError::ToolCallStateConflict`] for a terminal state with no outcome, and
+    /// [`DomainError::ToolDefinitionInvalid`] naming `dispatched_at` for a state that requires a dispatch
+    /// the row does not record.
+    pub fn restore(parts: LedgerEntryParts) -> Result<Self, DomainError> {
+        if parts.attempt == 0 {
+            return Err(DomainError::ToolDefinitionInvalid { field: "attempt" });
+        }
+        if parts.state.is_terminal() && parts.outcome.is_none() {
+            return Err(DomainError::ToolCallStateConflict {
+                from: parts.state,
+                to: parts.state,
+            });
+        }
+        if parts.dispatched_at.is_none() && !parts.state.is_reachable_without_dispatch() {
+            return Err(DomainError::ToolDefinitionInvalid {
+                field: "dispatched_at",
+            });
+        }
+        Ok(Self {
+            id: parts.id,
+            call_id: parts.call_id,
+            attempt: parts.attempt,
+            run: parts.run,
+            key: parts.key,
+            operation: parts.operation,
+            state: parts.state,
+            version: parts.version,
+            created_at: parts.created_at,
+            updated_at: parts.updated_at,
+            dispatched_at: parts.dispatched_at,
+            outcome: parts.outcome,
+            no_effect_confirmed: parts.no_effect_confirmed,
+        })
     }
 }
 
@@ -873,12 +1064,47 @@ pub enum InterruptedCallAction {
 
 impl InterruptedCallAction {
     /// The state the row must be moved to.
+    ///
+    /// **Three arms, and the third is a correction.** `RECONCILING -> RECONCILING` is not a legal
+    /// edge: the table refuses a no-op transition so that a second consume of a spent call cannot
+    /// record progress while the effect stays single. But `classify_interrupted` answers
+    /// `Reconcile` for a row found in `RECONCILING` as well as one found in `EXECUTING` — correctly,
+    /// because both may have effected — so the recovery write must **hold** the state it is already
+    /// in rather than transition to it.
+    ///
+    /// This was latent rather than live only because nothing applied the classification: the pass
+    /// that would have applied it did not exist, so a legal-looking `target_state` was never handed
+    /// to `apply`. Its own test drove the **`EXECUTING`** case, where the edge is legal, so the
+    /// `RECONCILING` case was unasserted — which is why [`Self::needs_write`] exists beside it: a
+    /// caller that had to compare `was_in` with `target_state` itself would be re-deriving this
+    /// rule at every call site.
     #[must_use]
     pub const fn target_state(self) -> ToolCallState {
         match self {
             Self::SafeToRetry { .. } => ToolCallState::Cancelled,
             Self::Reconcile { .. } => ToolCallState::Reconciling,
         }
+    }
+
+    /// Returns whether the row needs a transition written, rather than being already correct.
+    ///
+    /// The one question a recovery pass has to ask before it writes, stated once here because the
+    /// answer is "no" for exactly one case and a caller left to work that out would either write an
+    /// illegal edge or skip a row that needed one. A row already in `RECONCILING` is the case: the
+    /// classification's target equals the state it is in, and the store's table refuses a transition
+    /// to the same state.
+    ///
+    /// **`Reconcile` and `SafeToRetry` are answered the same way** — both need a write — so the
+    /// method does not distinguish them: what differs is the *reason*, which
+    /// [`Self::reason`] carries, not whether there is work to do.
+    #[must_use]
+    pub const fn needs_write(self) -> bool {
+        !matches!(
+            self,
+            Self::Reconcile {
+                was_in: ToolCallState::Reconciling
+            }
+        )
     }
 
     /// The stable reason recorded with the recovery transition.

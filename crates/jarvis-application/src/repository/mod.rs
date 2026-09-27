@@ -25,6 +25,7 @@ pub mod conversation;
 pub mod model_call;
 pub mod policy;
 pub mod run;
+pub mod tool_call;
 
 use std::fmt;
 use std::future::Future;

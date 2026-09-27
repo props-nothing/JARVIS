@@ -15,3 +15,4 @@ pub mod request_context;
 pub mod run_controller;
 pub mod run_service;
 pub mod testing;
+pub mod tool_recovery;

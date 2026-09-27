@@ -379,6 +379,13 @@ async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
         return ExitCode::from(EXIT_ATTENTION);
     };
 
+    // The run is named on **stderr**, so the answer on stdout stays exactly the model's text — a caller
+    // redirecting stdout gets nothing but the answer — while an operator who needs to follow, diagnose,
+    // or cancel the run afterwards has its identifier. `jarvis runs show <id>` and `runs events <id>`
+    // take it, and until this the identifier existed only in a response body the CLI did not print, so
+    // the run a question created could not be named by the person who asked it.
+    eprintln!("run {run_id}");
+
     follow_run(&state, &run_id).await
 }
 

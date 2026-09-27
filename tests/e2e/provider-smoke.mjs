@@ -30,6 +30,14 @@
 //   - `jarvis ask` prints that answer and exits 0, which exercises the client's SSE reader against a
 //     real chunked stream — the path where a framing defect shows up as a truncated answer.
 //
+// The last two are **two separate runs**, because `jarvis ask` creates its own run: the check compares
+// the CLI's stdout against the text **that run** recorded, not against the run above and not against
+// the literal phrase the prompt asked for. Requiring the literal made this gate turn on whether a
+// model obeys an instruction — a provider is a replaceable adapter, and an answer of
+// `JARVIS CLI SMpackage OK` was observed failing a harness whose daemon-side checks had all passed.
+// Comparing against the run's own durable text is the property JARVIS owns, and it is strictly
+// stronger for the framing defect this gate is about.
+//
 // ## Configuration
 //
 // Environment variables, all optional:
@@ -148,20 +156,56 @@ async function readCredential(profile) {
   throw new Error("the daemon never issued a client credential");
 }
 
-/** Runs a command to completion, returning its exit code and combined output. */
+/** Runs a command to completion, returning its exit code and each stream separately. */
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, { ...options, shell: false });
-    let output = "";
+    let out = "";
+    let err = "";
     child.stdout?.on("data", (chunk) => {
-      output += chunk.toString();
+      out += chunk.toString();
     });
     child.stderr?.on("data", (chunk) => {
-      output += chunk.toString();
+      err += chunk.toString();
     });
-    child.on("error", (error) => resolve({ code: -1, output: `${output}${error.message}` }));
-    child.on("close", (code) => resolve({ code, output }));
+    child.on("error", (error) => resolve({ code: -1, out: `${out}${error.message}`, err }));
+    child.on("close", (code) => resolve({ code, out, err }));
   });
+}
+
+/** Reassembles the answer from a run's own `output_text.delta` frames in an SSE body. */
+function answer_from(body) {
+  const lines = body.split("\n");
+  let text = "";
+  for (let index = 0; index < lines.length; index += 1) {
+    // The delta is under the frame's `payload`, not at the top level: the `data:` object is the
+    // run-event envelope (contract version, event id, run id, sequence, occurred at, payload), so
+    // reading `event.delta` finds nothing while looking entirely plausible — which is exactly the
+    // failure this helper had on its first version.
+    if (lines[index].trim() !== "event: run.output_text.delta") continue;
+    const data = lines[index + 1];
+    if (!data?.startsWith("data: ")) continue;
+    try {
+      const delta = JSON.parse(data.slice("data: ".length))?.payload?.delta;
+      if (typeof delta === "string") text += delta;
+    } catch {
+      // A frame that does not parse contributes nothing; the caller asserts non-empty.
+    }
+  }
+  return text;
+}
+
+/** Fetches a run's event stream as text. */
+async function stream_of(baseUrl, credential, runId) {
+  const response = await fetch(`${baseUrl}/api/v1/runs/${runId}/events`, {
+    headers: {
+      authorization: `Bearer ${credential}`,
+      "jarvis-api-version": "1",
+      accept: "text/event-stream",
+    },
+    signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
+  });
+  return response.text();
 }
 
 const profile = await mkdtemp(join(tmpdir(), "jarvis-provider-smoke-"));
@@ -276,15 +320,7 @@ try {
         // The model's own text, read back from the durable events. This is the assertion that makes
         // the harness a proof about the provider: the scripted provider's fixed acknowledgement cannot
         // satisfy it, because the text is the model's answer to this prompt.
-        const events = await fetch(`${discovery.base_url}/api/v1/runs/${runId}/events`, {
-          headers: {
-            authorization: `Bearer ${credential}`,
-            "jarvis-api-version": "1",
-            accept: "text/event-stream",
-          },
-          signal: AbortSignal.timeout(RUN_TIMEOUT_MS),
-        });
-        const streamed = await events.text();
+        const streamed = await stream_of(discovery.base_url, credential, runId);
         if (!streamed.includes("event: run.output_text.delta")) {
           fail("the run published no output delta", streamed.slice(0, 600));
         } else if (/scripted provider/i.test(streamed)) {
@@ -299,15 +335,50 @@ try {
         // The CLI's own reader, over the real chunked stream. This is the half a daemon-side assertion
         // cannot cover: `jarvis ask` decodes the response itself, so a framing defect on either side
         // shows up as a truncated answer or a non-zero exit.
+        //
+        // **Two runs, not one, and the change is a correctness fix.** `jarvis ask` creates its own run,
+        // so comparing its output against the run above would compare two different model answers. It
+        // names the run it created, which is what a caller needs anyway to follow or diagnose a question
+        // afterwards, and **that** run's durable text is what the CLI's stdout is compared against.
         const asked = await run(cliBin, ["ask", "Reply with exactly: JARVIS CLI SMOKE OK", "--profile", profile], {
           env: environment,
         });
         if (asked.code !== 0) {
-          fail(`jarvis ask exited ${asked.code}`, asked.output.slice(0, 600));
-        } else if (!/JARVIS CLI SMOKE OK/.test(asked.output)) {
-          fail("jarvis ask did not print the model's answer", asked.output.slice(0, 600));
+          fail(`jarvis ask exited ${asked.code}`, asked.err.slice(0, 600));
         } else {
-          pass("jarvis ask printed the model's answer and exited 0");
+          const named = asked.err.match(/run\s+(0[0-9a-f-]{20,})/i);
+          if (!named) {
+            fail("jarvis ask did not name the run it created", asked.err.slice(0, 600));
+          } else {
+            const askedRun = named[1];
+            const askedStream = await stream_of(discovery.base_url, credential, askedRun);
+            const recorded = answer_from(askedStream);
+            if (recorded.trim().length === 0) {
+              const types = askedStream
+                .split("\n")
+                .filter((line) => line.startsWith("event: "))
+                .join(",");
+              fail(
+                "the CLI's own run recorded no output text",
+                `run ${askedRun}, ${askedStream.length} bytes, events [${types}], stderr: ${asked.err.slice(0, 300)}`,
+              );
+            } else if (asked.out.trim() !== recorded.trim()) {
+              // Equality rather than "contains", because the chunked-framing defect this asserts
+              // against produced truncated and interleaved output rather than missing words — and
+              // because the assertion is about JARVIS's own property (the client renders what the
+              // daemon recorded), not about the model obeying an instruction. The prompt asks for a
+              // fixed phrase, but a model that answers `JARVIS CLI SMpackage OK` is still a correct
+              // end-to-end run, and a provider is a replaceable adapter whose compliance a JARVIS gate
+              // must not turn on. That exact non-compliance was observed and failed this harness while
+              // the daemon-side checks all passed.
+              fail(
+                "jarvis ask did not print the text its run recorded",
+                `recorded: ${JSON.stringify(recorded.trim().slice(0, 300))}\n      printed:  ${JSON.stringify(asked.out.trim().slice(0, 300))}`,
+              );
+            } else {
+              pass("jarvis ask printed its own run's recorded answer and exited 0");
+            }
+          }
         }
       }
     }

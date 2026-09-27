@@ -509,6 +509,38 @@ pub async fn start(
     }
     let recovery = report.summary;
 
+    // **The tool-call pass runs in the same window as the run pass, and for the same reason.** A call
+    // that reached the provider and then lost its daemon stayed `EXECUTING` for ever, and the next
+    // attempt's reservation found it and answered `InFlight` — telling a caller to wait on a process that
+    // is gone. Recovery converts that dead in-flight call into a `RECONCILING` work item, which is the
+    // state that says "the outcome is unknown and must be established before this is repeated".
+    //
+    // It cannot run before the run pass, because the two are independent and ordering them would imply a
+    // dependency that does not exist. It runs before readiness for the reason the run pass does: readiness
+    // is defined as "recovery classification completed", and a client reaching a daemon that has not
+    // settled its stranded calls would be told to wait on them.
+    //
+    // The ledger repository is its own value because the ledger port is implemented by
+    // `SqliteToolCallRepository` rather than by `SqliteRepositories` — a separate struct so the tool-call
+    // storage can be handed to a caller without the whole repository bundle, and built over the same pool
+    // so both see one database.
+    let ledger: Arc<dyn jarvis_application::repository::tool_call::ToolCallRepository> = Arc::new(
+        crate::storage::tool_call_repository::SqliteToolCallRepository::new(
+            database.pool().clone(),
+        ),
+    );
+    let tool_report = jarvis_application::tool_recovery::reconcile_tool_calls(
+        &ledger,
+        crate::time::SystemClock::new()
+            .now()
+            .map_err(|_| StartupError::Recovery)?,
+    )
+    .await
+    .map_err(|_| StartupError::Recovery)?;
+    if tool_report.incomplete_store {
+        return Err(StartupError::Recovery);
+    }
+
     // 5. Publish discovery before readiness, so a ready daemon is always
     // discoverable.
     let record = jarvis_protocol::DiscoveryFile {

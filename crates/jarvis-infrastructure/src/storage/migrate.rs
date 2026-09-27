@@ -503,6 +503,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upgrade_adds_the_ledger_tables_with_its_unique_reservation_index() {
+        // `000009` also **adds tables**, so the same two half assertions apply as `000008`: the new
+        // tables exist and are usable, **and** a row written before the upgrade survives. The third
+        // assertion is the one specific to this migration and the reason the adapter exists at all —
+        // **the unique index over the four key columns** — because a table without it would accept two
+        // reservations of one key and the whole slice would be a table that looks right and enforces
+        // nothing.
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-migrate-ledger-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("the temp directory is creatable");
+        let path = directory.join("jarvis.sqlite");
+
+        seed_version_five(&path).await;
+        let workspace = seed_version_five_rows(&path).await;
+
+        let database = Database::open(&path)
+            .await
+            .expect("the file database reopens");
+        run(database.pool()).await.expect("the upgrade applies");
+
+        let after = read_compatibility(database.pool())
+            .await
+            .expect("compatibility readable");
+        assert_eq!(after.schema_version, TARGET_SCHEMA_VERSION);
+        assert_eq!(
+            after.min_reader_version, 1,
+            "adding tables must not raise the minimum reader: an older binary reads none of them",
+        );
+
+        for table in ["tool_call_records", "tool_call_transitions"] {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(database.pool())
+            .await
+            .expect("the catalog is readable");
+            assert_eq!(present, 1, "the {table} table must exist after the upgrade");
+        }
+
+        // The pre-existing run survives, which is the half that catches a migration that rebuilt or
+        // dropped something it should not have.
+        let runs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE workspace_id = ?")
+                .bind(workspace.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("the pre-upgrade run is readable");
+        assert_eq!(
+            runs, 1,
+            "the pre-existing run must survive an additive migration"
+        );
+
+        let run_id: String = sqlx::query_scalar("SELECT id FROM agent_runs LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("the run id is readable");
+        // A real row, with every `NOT NULL` column populated — so the tables are usable rather than
+        // merely present. `no_effect_confirmed` and `attempt` are written explicitly, because `attempt`
+        // having no normalising default here is what makes a stored zero a value the writer cannot
+        // produce rather than a plausible first attempt.
+        //
+        // A closure rather than two inline statements, because the pair differs only in the identifier and
+        // the duplication is what a reader would have to compare by eye to see that the second is the
+        // first with one value changed — which is the whole assertion.
+        //
+        // **`principal_id` is fixed while the row identifier and the `call_id` change**, and that is the
+        // difference between testing the index and not testing it. The unique key is
+        // `(workspace_id, principal_id, tool_identity_json, idempotency_key)`, so a fixture that
+        // generated a fresh principal per row would produce two rows that differ in a *key* column and
+        // the insert would rightly succeed. The first version did exactly that, and the assertion caught
+        // it — which is the test doing its job on its own fixture.
+        let principal = uuid::Uuid::now_v7().to_string();
+        let insert = |record: String, state: &'static str| {
+            let run = run_id.clone();
+            let workspace = workspace.to_string();
+            let pool = database.pool().clone();
+            let principal = principal.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO tool_call_records (id, call_id, workspace_id, principal_id, run_id, \
+                     tool_identity_json, idempotency_key, attempt, operation, state, version, \
+                     dispatched_at, outcome, no_effect_confirmed, created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, '{}', 'k', 1, 'execute', ?, 1, NULL, NULL, 0, \
+                             '2026-09-27T12:00:00Z', '2026-09-27T12:00:00Z')",
+                )
+                .bind(record)
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(workspace)
+                .bind(principal)
+                .bind(run)
+                .bind(state)
+                .execute(&pool)
+                .await
+            }
+        };
+        insert(uuid::Uuid::now_v7().to_string(), "requested")
+            .await
+            .expect("a ledger row is writable after the upgrade");
+
+        // **The unique index is the point.** A second row with the same four key columns must be
+        // refused, because that refusal is what makes a reservation atomic across processes. Written as
+        // an insert rather than as a catalog query: the property is about what the writer can do.
+        let duplicate = insert(uuid::Uuid::now_v7().to_string(), "requested").await;
+        assert!(
+            duplicate.is_err(),
+            "a second row with the same workspace, principal, identity and idempotency key must be \
+             refused, or two processes could both take one reservation",
+        );
+
+        // And a row with no state is refused, which is the assertion that the column has no default.
+        let refused = sqlx::query(
+            "INSERT INTO tool_call_records (id, call_id, workspace_id, principal_id, run_id, \
+             tool_identity_json, idempotency_key, attempt, operation, version, no_effect_confirmed, \
+             created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, '{}', 'k2', 1, 'execute', 1, 0, \
+                     '2026-09-27T12:00:00Z', '2026-09-27T12:00:00Z')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(workspace.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(run_id)
+        .execute(database.pool())
+        .await;
+        assert!(
+            refused.is_err(),
+            "a ledger row with no state must be refused: the column has no default, so an unset \
+             lifecycle position cannot look like a fresh request",
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
     async fn a_database_from_a_supported_prior_version_upgrades_in_place() {
         // `AGENTS.md` requires "test migrations from supported prior versions", and `000006` is the
         // first migration here that **alters a table which can already hold rows**: the four before
