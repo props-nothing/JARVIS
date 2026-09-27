@@ -524,6 +524,20 @@ struct DrainedTurn {
     /// this the column stayed `NULL` on every run row while the document claimed the port that
     /// stores it reads it back — the same "a writer nothing feeds" shape `finish_reason` had.
     provider_request_id: Option<String>,
+    /// When the first output delta of this call arrived, observed from the controller's own clock.
+    ///
+    /// The instant is JARVIS's, not the provider's: it is the moment the first output was **seen
+    /// here**, which is what a time-to-first-token interval is measured against — a provider's own
+    /// stamp would describe its side of a network JARVIS does not control, so the two would not be
+    /// comparable across providers.
+    ///
+    /// **This was the last "wired but with no producer" column.**
+    /// [`ModelCallOutcome::first_output_at`](crate::repository::model_call::ModelCallOutcome)
+    /// carried it, the adapter bound it, and the read returned it, while every controller path
+    /// passed `None` — so the column was absent on every row and the roadmap's "measured time to
+    /// first token" had nothing to measure. Set once, on the first `output.text.delta`, so a later
+    /// delta cannot move it: the first output is what "time to first token" means.
+    first_output_at: Option<UtcTimestamp>,
 }
 
 /// Drives one durable run to a terminal state.
@@ -1046,6 +1060,9 @@ impl RunController {
                         self.finish_expired(
                             run,
                             None,
+                            // No stream was drained on this path — the backoff elapsed before a
+                            // retry began — so no output was produced and there is no instant.
+                            None,
                             "deadline_exceeded",
                             ControllerError::DeadlineExceeded.code(),
                         )
@@ -1115,7 +1132,8 @@ impl RunController {
         let mut stream = match opened {
             // The bound elapsed before the provider answered.
             None => {
-                self.finish_deadline_exceeded(run, Some(call_id)).await?;
+                self.finish_deadline_exceeded(run, Some(call_id), None)
+                    .await?;
                 return Err(ControllerError::DeadlineExceeded);
             }
             Some(Ok(stream)) => stream,
@@ -1171,6 +1189,9 @@ impl RunController {
                 RecordedOutcome {
                     usage: usage_of(&drained),
                     provider_request_id: drained.provider_request_id.clone(),
+                    // Carried through: the output happened, so the time-to-first-token interval
+                    // this call produced is a real measurement even though the caller stopped it.
+                    first_output_at: drained.first_output_at,
                     ..RecordedOutcome::default()
                 },
             )
@@ -1217,6 +1238,7 @@ impl RunController {
                 RecordedOutcome {
                     usage,
                     provider_request_id: drained.provider_request_id,
+                    first_output_at: drained.first_output_at,
                     ..RecordedOutcome::default()
                 },
             )
@@ -1238,6 +1260,7 @@ impl RunController {
             self.finish_expired(
                 run,
                 Some(call_id),
+                drained.first_output_at,
                 "consumption_budget_exceeded",
                 ControllerError::BudgetExceeded { limit }.code(),
             )
@@ -1255,6 +1278,7 @@ impl RunController {
         // value the completion records, so the row and the answer cannot name different
         // provider calls.
         let provider_request_id = drained.provider_request_id.clone();
+        let first_output_at = drained.first_output_at;
         self.record_call_outcome_with(
             run,
             call_id,
@@ -1262,7 +1286,7 @@ impl RunController {
             RecordedOutcome {
                 usage: usage.clone(),
                 finish_reason,
-                first_output_at: None,
+                first_output_at,
                 provider_request_id,
             },
         )
@@ -1424,13 +1448,18 @@ impl RunController {
 
             // The bound elapsed while waiting for a frame.
             let Some(frame) = next else {
-                self.finish_deadline_exceeded(run, Some(call_id)).await?;
+                self.finish_deadline_exceeded(run, Some(call_id), drained.first_output_at)
+                    .await?;
                 return Ok(Err(ControllerError::DeadlineExceeded));
             };
             let event = match frame {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
-                Err(error) => return self.fail_after_acceptance(run, call_id, error).await,
+                Err(error) => {
+                    return self
+                        .fail_after_acceptance(run, call_id, drained.first_output_at, error)
+                        .await;
+                }
             };
             match state.accept(&event) {
                 Ok(StreamAdmission::Accepted) => {}
@@ -1472,6 +1501,12 @@ impl RunController {
                         )
                         .await
                         .map_err(|_| ControllerError::OutputNotPersisted)?;
+                    // Recorded once, from the **first** delta, because the instant of the first
+                    // output is what a time-to-first-token interval measures. `get_or_insert`
+                    // rather than an assignment so a later delta cannot move it, and the same
+                    // `occurred_at` the durable event carries so the column and the event cannot
+                    // name different instants for the same token.
+                    drained.first_output_at.get_or_insert(occurred_at);
                     drained.answer.push_str(delta);
                 }
                 // Everything else is recorded by folding the frame into the turn, which keeps
@@ -1674,6 +1709,7 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: ModelCallId,
+        first_output_at: Option<UtcTimestamp>,
         error: ProviderError,
     ) -> Result<Result<DrainedTurn, ControllerError>, ControllerError> {
         self.finish(
@@ -1686,8 +1722,20 @@ impl RunController {
             ),
         )
         .await?;
-        self.record_call_outcome(run, call_id, ModelCallState::Failed)
-            .await?;
+        // The first-output instant is carried through: the provider accepted the call and may have
+        // emitted tokens before it failed, so the interval it produced is a real measurement rather
+        // than nothing. Passing `None` unconditionally would have recorded "no output" for a call
+        // that had sent three tokens.
+        self.record_call_outcome_with(
+            run,
+            call_id,
+            ModelCallState::Failed,
+            RecordedOutcome {
+                first_output_at,
+                ..RecordedOutcome::default()
+            },
+        )
+        .await?;
         // The inner `Err` is the *stream's* failure, which is what the caller reports; the
         // outer `Ok` says draining itself worked. Collapsing them would make "the store
         // broke" and "the provider failed mid-stream" the same value.
@@ -1709,10 +1757,12 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
+        first_output_at: Option<UtcTimestamp>,
     ) -> Result<(), ControllerError> {
         self.finish_expired(
             run,
             call_id,
+            first_output_at,
             "deadline_exceeded",
             ControllerError::DeadlineExceeded.code(),
         )
@@ -1727,6 +1777,7 @@ impl RunController {
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
+        first_output_at: Option<UtcTimestamp>,
         reason: &'static str,
         code: &'static str,
     ) -> Result<(), ControllerError> {
@@ -1739,8 +1790,18 @@ impl RunController {
             // The attempt is closed as failed rather than left pending: a call that was
             // abandoned mid-stream is finished, and a pending row would make a later
             // reconciliation pass read it as still outstanding.
-            self.record_call_outcome(run, call_id, ModelCallState::Failed)
-                .await?;
+            // The first-output instant is carried through, because a call abandoned *after*
+            // emitting tokens still produced them.
+            self.record_call_outcome_with(
+                run,
+                call_id,
+                ModelCallState::Failed,
+                RecordedOutcome {
+                    first_output_at,
+                    ..RecordedOutcome::default()
+                },
+            )
+            .await?;
         }
         Ok(())
     }

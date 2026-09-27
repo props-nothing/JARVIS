@@ -1609,10 +1609,11 @@ Foundation TODO remains incomplete.
   **Falsified in both halves:** removing the capture records `None` for a `Length` stop (and fails
   three tests), and removing the adapter's parse makes the column unreadable while the write still
   binds it — the exact write-with-no-read shape the round is about.
-  **Not done, and named:** `first_output_at` is recorded by the controller and read by the adapter
+  **Not done, and named:** `first_output_at` was recorded by the controller and read by the adapter
   with **no producer of the instant** yet, because nothing in this build measures
   time-to-first-token — that measurement is `BRN-011`'s subject, so the honest state is a wired
-  column and an absent producer rather than a dressed-up feature.
+  column and an absent producer rather than a dressed-up feature. **That producer now exists;
+  see `BRN-043`.**
   940 workspace tests. **DO NOT COMMIT.**
 - [x] `BRN-018` Fix the cancellation path: an unenforced bound, a digest that folded only lengths,
   and a terminal event that carried nothing. Three defects on one path, found by following a
@@ -2713,6 +2714,49 @@ Foundation TODO remains incomplete.
     where nothing referenced it — so the app copy is deleted and the domain's single definition
     stands.
   1004 workspace tests (+1). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-043` Produce the time-to-first-token instant the controller recorded but never measured,
+  which was the last "wired but with no producer" column. Found by following `first_output_at` from
+  the port into the controller — the sweep that found `BRN-017`'s `finish_reason` and `BRN-042`'s
+  `provider_request_id`.
+  - **The defect.** `ModelCallOutcome::first_output_at` existed on the application port, was bound
+    by the SQLite adapter's `UPDATE`, was parsed by the adapter's `SELECT`, and was projected by the
+    in-memory double — while **every controller path passed `None`**. So `model_calls.first_output_at`
+    was `NULL` on every row, and the roadmap deliverable "measured incremental-delivery capability
+    per model (time to first token and token spread)" had nothing to measure. `BRN-017` had named
+    this precisely: "a wired column and an absent producer rather than a dressed-up feature", and
+    left it to `BRN-011`. It is the same class as `finish_reason` (a value no layer produced) and the
+    inverse of `BRN-012` (a column never written), and it is the last instance of the class because
+    it is the last field the port carries with no producer.
+  - Fix: `DrainedTurn` gained `first_output_at`, set with `get_or_insert` on the first
+    `output.text.delta` — read from the **same** `occurred_at` the durable `run.output_text.delta`
+    event carries, so the row and the event cannot name different instants for one token. It is
+    written with the outcome on every path that produced output, including the ones that then
+    **failed**: the post-output cancellation, the tool-fabric refusal, a mid-stream provider failure
+    (`fail_after_acceptance`), the consumption-ceiling failure, and a mid-stream deadline
+    (`finish_expired`). A call that emitted three tokens and then timed out produced a real
+    first-token interval, and recording `None` for it would say no output arrived. The
+    pre-acceptance paths (a refused `open`, an elapsed backoff) pass `None` explicitly, because
+    there the column is genuinely empty — and the explicit `None` at those two sites is what makes
+    the distinction visible rather than incidental.
+  - **The instant is JARVIS's, not the provider's.** It is observed from the controller's own clock
+    at the moment the first output is *seen here*, which is what an interval is measured against; a
+    provider-supplied stamp would describe its side of a network JARVIS does not control, so two
+    providers' numbers would not be comparable.
+  - **Falsified in both halves, each compiling:** replacing `get_or_insert` with a plain assignment
+    (last-wins) fails with `left: 2026-09-22T12:00:00.5Z, right: 2026-09-22T12:00:00Z` — a clock
+    that jumps **between** two deltas distinguishes "first" from "last", which a fixed clock cannot;
+    and shadowing the value back to `None` fails the same test, proving the producer and not only the
+    storage. The test asserts the stored value read back through the port, not the argument the
+    controller passed, because the port field and the bind both existed already. And the value is
+    verified end to end: `tests/e2e/policy-surface.mjs` reads `model_calls.first_output_at` out of the
+    profile's database after the run settles, where a real daemon records it — the assertion no API
+    route can make, because none exposes a model call.
+  - **What this does and does not close.** It produces the *input* `BRN-011` needs. It does **not**
+    measure chunk spread, does not aggregate a capability per model, and does not enforce anything on
+    a route — so `BRN-011` stays open, and the roadmap's "measured … per model" is nearer but not
+    done. Recorded rather than implied, because a produced instant reads like the measurement it is
+    only the first half of.
+  1006 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
 - [ ] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

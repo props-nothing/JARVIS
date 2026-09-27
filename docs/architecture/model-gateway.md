@@ -44,6 +44,14 @@ A model descriptor records independently verified support for:
 Capabilities have provenance and last-verified dates. Provider marketing names
 are not capability evidence.
 
+**Partly wired (`BRN-043`).** The `first_output_at` half of the time-to-first-token measurement now
+has a producer: the controller observes its own clock at the **first** `output.text.delta` and records
+it on the call's `first_output_at` with the outcome, so a call that emitted output and then failed or
+timed out still carries a real interval. This is the **input** the descriptor above needs, not the
+measurement: nothing yet aggregates a first-token figure per model, nothing measures token spread,
+and nothing reads either back to constrain a route. The list item above therefore remains
+`UNVERIFIED` for a real model — the scripted provider's numbers are not provider behaviour.
+
 ## Normalized Request
 
 A model call contains:

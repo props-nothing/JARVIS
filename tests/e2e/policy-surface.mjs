@@ -238,6 +238,29 @@ async function readProviderRequestId(profile, runId) {
 }
 
 /**
+ * Reads the first-output instant off a run's completed model call.
+ *
+ * The same class as the provider id above and the last instance of it: `first_output_at` was a
+ * schema column, on the port's outcome, bound by the adapter, and read back — while every controller
+ * path wrote `None`, so it was `NULL` on every row and the roadmap's time-to-first-token measurement
+ * had no input. The run resource does not expose a model call, so this is the only place the value
+ * can be observed.
+ */
+async function readFirstOutputAt(profile, runId) {
+  if (typeof runId !== "string") {
+    return null;
+  }
+  return await withDatabase(profile, (database) =>
+    database
+      .prepare(
+        "SELECT first_output_at FROM model_calls WHERE run_id = ? " +
+          "ORDER BY started_at DESC LIMIT 1",
+      )
+      .get(runId),
+  );
+}
+
+/**
  * Runs `read` against the profile's database, opened **read-only**.
  *
  * The connection handling is shared so every database assertion in this journey opens the file the
@@ -834,6 +857,25 @@ async function main() {
       );
     } else {
       pass(`the model call records the provider request id: ${provider.provider_request_id}`);
+    }
+
+    // And the first-output instant, which the same round wired: `first_output_at` was `NULL` on
+    // every row because the controller passed `None` on every path. A completed run that produced
+    // output must carry it, or the roadmap's time-to-first-token measurement has no input. Read
+    // from the same settled run, so this cannot race the controller.
+    const firstOutput = await readFirstOutputAt(profile, governed.json.run_id);
+    if (firstOutput === null) {
+      fail("the completed run must have a model call readable from the profile database", profile);
+    } else if (
+      typeof firstOutput.first_output_at !== "string" ||
+      firstOutput.first_output_at === ""
+    ) {
+      fail(
+        "the call must record when its first output arrived, got " +
+          JSON.stringify(firstOutput.first_output_at),
+      );
+    } else {
+      pass(`the model call records its first output at: ${firstOutput.first_output_at}`);
     }
 
     // Narrow the ceiling to `public`, below the objective's `internal` label, so the same create

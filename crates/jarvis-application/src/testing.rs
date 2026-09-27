@@ -317,6 +317,7 @@ impl InMemoryRepositories {
                     estimated_cost_microunits: call.estimated_cost_microunits,
                     finish_reason: call.finish_reason.clone(),
                     provider_request_id: call.provider_request_id.clone(),
+                    first_output_at: call.first_output_at,
                 })
                 .collect())
         })
@@ -367,6 +368,13 @@ pub struct RecordedUsage {
     /// Read here for the same reason as the finish reason: it is an outcome field, and this is
     /// the accessor that projects the recorded outcome rather than the creation request.
     pub provider_request_id: Option<String>,
+    /// When the first output delta of the call arrived, as recorded with the outcome.
+    ///
+    /// The read half of the "wired but with no producer" column: `first_output_at` existed on the
+    /// port, in the adapter's bind, and in this projection while the controller passed `None` on
+    /// every path, so the column was absent on every row and no time-to-first-token interval could
+    /// be computed. Projected here so a test can assert the stored instant.
+    pub first_output_at: Option<UtcTimestamp>,
 }
 
 impl RunRepository for InMemoryRepositories {

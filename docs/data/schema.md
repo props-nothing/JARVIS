@@ -207,6 +207,15 @@ provider id is attached to a stream frame's metadata rather than to a specific e
 write was missing in a different place from the other two: the controller's frame fold never read
 `provider_metadata` at all.
 
+`first_output_at` is the instant the **first** output delta arrived, observed from JARVIS's own
+clock so it is comparable across providers, and it is what a time-to-first-token interval is
+computed from. It was the last column in this group to gain a producer: the port, the bind, the
+`SELECT`, and the double all carried it while every controller path wrote `None`, so the column was
+`NULL` on every row and nothing could measure the interval the roadmap asks for. A call that emits
+output and then fails still records it, because the tokens were really produced; a call refused
+before the provider accepted it does not, which is why those two paths pass `None` explicitly rather
+than by omission.
+
 Prompt/output content uses protected artifact/content references under retention
 policy rather than being duplicated in telemetry rows.
 

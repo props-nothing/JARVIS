@@ -77,11 +77,19 @@ struct Fixture {
 }
 
 fn fixture(provider: Arc<dyn ModelProvider>) -> Fixture {
+    fixture_with_clock(provider, Arc::new(ManualClock::new(now())))
+}
+
+/// A fixture whose clock the test controls.
+///
+/// Separate from [`fixture`] because most tests want the clock fixed, and one needs to **move** it
+/// mid-stream: proving that `first_output_at` is the instant of the *first* delta rather than the
+/// last requires the two to be different, which a fixed clock cannot express.
+fn fixture_with_clock(provider: Arc<dyn ModelProvider>, clock: Arc<ManualClock>) -> Fixture {
     let repositories = Arc::new(InMemoryRepositories::new());
     let runs: Arc<dyn RunRepository> = repositories.clone();
     let conversations: Arc<dyn ConversationRepository> = repositories.clone();
     let model_calls: Arc<dyn ModelCallRepository> = repositories.clone();
-    let clock = Arc::new(ManualClock::new(now()));
     let controller = RunController::new(
         runs,
         conversations,
@@ -2951,6 +2959,187 @@ async fn the_providers_request_id_is_recorded_on_the_call() {
     assert_eq!(
         stored.provider_request_id.as_deref(),
         Some(context().request_id.to_string().as_str()),
+    );
+}
+
+/// Two output deltas with a clock that jumps between them.
+///
+/// The point is that the two instants are **different**, which a fixed clock cannot express: the
+/// interval this column records is between the call starting and the *first* token, so a test that
+/// cannot move the clock cannot tell "the first delta" from "the last delta".
+struct TwoDeltasAcrossAClockJump {
+    models: Vec<ModelRef>,
+    clock: Arc<ManualClock>,
+    /// The instant the clock is moved to *between* the two deltas.
+    later: UtcTimestamp,
+}
+
+impl ModelProvider for TwoDeltasAcrossAClockJump {
+    fn models(&self) -> &[ModelRef] {
+        &self.models
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        Box::pin(async move {
+            /// Emits a start, one delta, a clock jump, a second delta, then a terminal.
+            struct Scripted {
+                call_id: jarvis_domain::ids::ModelCallId,
+                clock: Arc<ManualClock>,
+                later: UtcTimestamp,
+                step: u64,
+            }
+
+            impl ModelStream for Scripted {
+                fn next_event(
+                    &mut self,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    Option<jarvis_domain::model::stream::ModelStreamEvent>,
+                                    ProviderError,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > {
+                    Box::pin(async move {
+                        self.step += 1;
+                        let kind = match self.step {
+                            1 => ModelStreamEventKind::CallStarted { model: None },
+                            2 => ModelStreamEventKind::OutputTextDelta {
+                                item_id: "out-1".to_owned(),
+                                delta: "first".to_owned(),
+                            },
+                            3 => {
+                                // The clock advances *after* the first delta, so the second
+                                // delta is stamped differently. The recorded instant must be
+                                // the first one.
+                                self.clock.set(self.later);
+                                ModelStreamEventKind::OutputTextDelta {
+                                    item_id: "out-1".to_owned(),
+                                    delta: "second".to_owned(),
+                                }
+                            }
+                            4 => ModelStreamEventKind::CallCompleted {
+                                finish_reason: FinishReason::Stop,
+                                usage: None,
+                                refused: false,
+                            },
+                            _ => return Ok(None),
+                        };
+                        Ok(Some(jarvis_domain::model::stream::ModelStreamEvent {
+                            call_id: self.call_id,
+                            event_id: jarvis_domain::ids::ModelStreamEventId::from_uuid(
+                                Uuid::now_v7(),
+                            ),
+                            sequence: jarvis_domain::model::stream::Sequence::new(self.step),
+                            kind,
+                            provider_metadata: None,
+                        }))
+                    })
+                }
+            }
+
+            Ok(Box::new(Scripted {
+                call_id: request.call_id,
+                clock: Arc::clone(&self.clock),
+                later: self.later,
+                step: 0,
+            }) as Box<dyn ModelStream + Send + 'a>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_first_output_instant_is_recorded_when_the_first_delta_arrives() {
+    // `first_output_at` was the last "wired but with no producer" column: the port carried it, the
+    // adapter bound it, and the read returned it, while every controller path passed `None` — so
+    // the column was absent on every row and the roadmap's "measured time to first token" had
+    // nothing to measure. Asserted on the **stored** value, because the port field existed.
+    //
+    // The clock moves **between** the two deltas, so this also pins the rule that the recorded
+    // instant is the first one: a `last`-wins implementation would record `later`.
+    let later = UtcTimestamp::parse("2026-09-22T12:00:00.500Z").expect("valid");
+    let clock = Arc::new(ManualClock::new(now()));
+    let fixture = fixture_with_clock(
+        Arc::new(TwoDeltasAcrossAClockJump {
+            models: vec![model()],
+            clock: Arc::clone(&clock),
+            later,
+        }),
+        clock,
+    );
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let instant = recorded[0]
+        .first_output_at
+        .expect("a call that emitted output must record when its first token arrived");
+    assert_eq!(
+        instant,
+        now(),
+        "the interval is measured to the FIRST token, not the last",
+    );
+    assert_ne!(instant, later);
+    // And it survives a read through the port, so the column is neither write-only nor readable
+    // only through the double.
+    let calls = fixture
+        .repositories
+        .recorded_calls()
+        .expect("the calls are readable");
+    let stored = fixture
+        .repositories
+        .load_attempt(context().workspace_id, calls[0].0.id)
+        .await
+        .expect("the attempt loads");
+    assert!(
+        stored.started_at <= instant,
+        "the instant is after the start"
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_produced_no_output_records_no_first_output_instant() {
+    // The negative direction, and the one a bare `Some(now)` would get wrong: a call that emitted
+    // nothing has no time-to-first-token to record, and recording the completion instant as one
+    // would describe a first token that never arrived.
+    let fixture = fixture(Arc::new(ScriptedProvider::new(model()).emit(
+        ModelStreamEventKind::CallCompleted {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            refused: false,
+        },
+    )));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes with no output");
+
+    let recorded = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the outcomes are readable");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(
+        recorded[0].first_output_at.is_none(),
+        "a call with no output has no first-output instant",
     );
 }
 
