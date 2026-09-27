@@ -243,7 +243,12 @@ impl fmt::Display for TransitionActor {
 /// Free text rather than a closed enum, because reasons are diagnostic detail that
 /// grows with the product, but bounded and validated so an unbounded
 /// caller-supplied string never reaches an audit row or an operator line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Deserialize` goes through [`Self::new`]**, found by the same audit that fixed
+/// `WorkspaceRelativePath`: a transition reason is written by a caller and read back from an audit row,
+/// so a derived impl would let an over-long or NUL-carrying reason into the record through the reader —
+/// the path an operator's own tooling would take, and the one the bound exists to protect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct TransitionReason(String);
 
@@ -266,6 +271,13 @@ impl TransitionReason {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for TransitionReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 

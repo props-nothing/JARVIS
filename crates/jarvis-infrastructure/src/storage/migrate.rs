@@ -391,6 +391,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upgrade_adds_the_approval_tables_without_touching_what_is_there() {
+        // `000008` **adds tables**, which is the case an older reader survives: nothing it names changed
+        // shape, so the minimum reader stays at 1 — the opposite of `000007`, which rebuilt a table and
+        // needed the population it did. The test therefore asserts two halves: the new tables exist and
+        // are usable, **and** a row written before the upgrade is still readable afterwards. A migration
+        // that added tables while breaking an existing one would pass the first half alone.
+        let directory =
+            std::env::temp_dir().join(format!("jarvis-migrate-approvals-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("the temp directory is creatable");
+        let path = directory.join("jarvis.sqlite");
+
+        seed_version_five(&path).await;
+        let workspace = seed_version_five_rows(&path).await;
+
+        let database = Database::open(&path)
+            .await
+            .expect("the file database reopens");
+        run(database.pool()).await.expect("the upgrade applies");
+
+        let after = read_compatibility(database.pool())
+            .await
+            .expect("compatibility readable");
+        assert_eq!(after.schema_version, TARGET_SCHEMA_VERSION);
+        assert_eq!(
+            after.min_reader_version, 1,
+            "adding tables must not raise the minimum reader: an older binary reads none of them",
+        );
+
+        // Both tables exist, asserted by reading the catalog rather than by trusting the file.
+        for table in ["approvals", "approval_transitions"] {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(database.pool())
+            .await
+            .expect("the catalog is readable");
+            assert_eq!(present, 1, "the {table} table must exist after the upgrade");
+        }
+
+        // **The row written before the upgrade is still there**, which is the half that would catch a
+        // migration that rebuilt or dropped something it should not have.
+        let runs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE workspace_id = ?")
+                .bind(workspace.to_string())
+                .fetch_one(database.pool())
+                .await
+                .expect("the pre-upgrade run is readable");
+        assert_eq!(
+            runs, 1,
+            "the pre-existing run must survive an additive migration"
+        );
+
+        // And the new tables accept a real row, so they are not merely present but usable — a table
+        // created with a column list the writer cannot satisfy would pass an existence check and fail on
+        // first use. The approval is written with every `NOT NULL` column populated, which is also what
+        // makes `state` having no default a write-time error rather than a silent `pending`.
+        sqlx::query(
+            "INSERT INTO approvals (id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+             tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
+             allowed_channels_json, expires_at, scope, state, version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, '{}', 'sha256:00', 'high', '[]', 's', '[]', '[\"cli\"]', \
+                     '2026-09-27T12:10:00Z', 'one_shot', 'pending', 1, \
+                     '2026-09-27T12:00:00Z', '2026-09-27T12:00:00Z')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(workspace.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(
+            sqlx::query_scalar::<_, String>("SELECT id FROM agent_runs LIMIT 1")
+                .fetch_one(database.pool())
+                .await
+                .expect("the run id is readable"),
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(database.pool())
+        .await
+        .expect("an approval row is writable after the upgrade");
+
+        // And a row with no state is refused, which is the assertion that the column has no default.
+        // Written as a second insert rather than as a schema query because the property is about what
+        // the writer can do, not about what the catalog says.
+        let refused = sqlx::query(
+            "INSERT INTO approvals (id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+             tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
+             allowed_channels_json, expires_at, scope, version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, '{}', 'sha256:00', 'high', '[]', 's', '[]', '[\"cli\"]', \
+                     '2026-09-27T12:10:00Z', 'one_shot', 1, \
+                     '2026-09-27T12:00:00Z', '2026-09-27T12:00:00Z')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(workspace.to_string())
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(
+            sqlx::query_scalar::<_, String>("SELECT id FROM agent_runs LIMIT 1")
+                .fetch_one(database.pool())
+                .await
+                .expect("the run id is readable"),
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .execute(database.pool())
+        .await;
+        assert!(
+            refused.is_err(),
+            "an approval with no state must be refused: the column has no default, so an unset \
+             lifecycle position cannot look like a pending request",
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
     async fn a_database_from_a_supported_prior_version_upgrades_in_place() {
         // `AGENTS.md` requires "test migrations from supported prior versions", and `000006` is the
         // first migration here that **alters a table which can already hold rows**: the four before

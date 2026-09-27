@@ -501,6 +501,62 @@ created_at
 
 One-shot consumption and tool reservation occur atomically.
 
+**As built (`000008`)**, which differs from the design above in four ways the implementation decided:
+
+```text
+id, workspace_id, requesting_principal_id, run_id, tool_call_id,
+tool_identity_json, action_fingerprint, risk, effects_json, summary,
+preview_json, allowed_channels_json, expires_at, scope, state, version,
+decided_by, decided_via, decided_at, created_at, updated_at
+```
+
+- **`tool_identity_json` rather than a `tool_definition_id`** and separate source columns. An approval
+  binds the whole identity tuple — capability, source, provenance, schema fingerprint — and the domain
+  type's serialization is the canonical spelling of it, already round-trip tested. Splitting it would
+  create a second definition of what the identity is, and the first thing to drift would be the
+  fingerprint's algorithm prefix.
+- **`deciding_principal_id` is `decided_by` plus `decided_via`**: which principal, and which channel.
+  The contract lists `allowed_channels` so a decision can be checked against them, and a record that
+  did not store the channel used would make the check one-directional — JARVIS could refuse a
+  disallowed channel going in and never say, afterwards, which one a decision came from. `assurance` is
+  not stored: it belongs to `TLS-013`'s channel-assurance work and would be a column with no writer.
+- **`summary` and `preview_json` are stored verbatim**, because they are the *record* of what the user
+  was shown and agreed to. Rebuilding them from the tool would show a preview the user never saw, whose
+  definition may since have changed.
+- **`state` has no default.** A row whose state was unset would be one whose lifecycle position nobody
+  chose, and defaulting to `pending` is the fail-open direction — a pending approval is one a later
+  pass may decide. `NOT NULL` with no default makes that a write error instead of a plausible row.
+
+### `approval_transitions`
+
+```text
+id, approval_id, workspace_id, from_state, to_state,
+prior_version, version, actor_kind, actor_json, occurred_at
+```
+
+One row per applied transition, written **in the same transaction** as the state change, so the trail
+cannot disagree with the state it describes — the architecture's "persist state before publishing an
+event that claims the transition happened" rule applied to a decision. `actor_kind` is separate from
+`actor_json` so a query can count decisions without parsing, and it is what makes "time is not a
+decider" visible: an `expired` actor has no principal.
+
+**As built (`jarvis_infrastructure::storage::approval_repository`)**, the two reading rules the adapter
+adds on top of the schema, because both are decisions the columns alone do not state:
+
+- **A stored state is *walked*, not assigned.** The reader rebuilds the record through the domain's
+  request path and then drives the domain's own transition table from `pending` to the state the row
+  claims. A row claiming a state the table cannot reach — `pending -> consumed`, which would be a spent
+  approval nobody ever granted — is `storage.row_corrupted` rather than a reconstruction. The version is
+  derived by that walk and cross-checked against the stored `version`, so a row whose state and version
+  disagree is refused: its transition count is not one its state explains.
+- **A decision instant is read, never invented.** `decided_at` is the transition's own instant for a
+  decision state and the row's `updated_at` for a non-decision one, and a decision row with no recorded
+  instant is corruption rather than a default — `DurableApproval::apply` always writes one for a
+  decision, so its absence means the row was not written by the domain.
+- An approval in another workspace is `storage.not_found`, **indistinguishable from one that does not
+  exist**, following the rule the local control API states for runs.
+
+
 ## Memory, Entities, and Context
 
 ### `memories`

@@ -67,7 +67,11 @@ fn usable_text(value: &str, max: usize) -> bool {
 /// owner's job. The name differs because the meaning does — these are arguments rather than a
 /// requested output schema — and one type serving both would let a caller pass a schema where
 /// arguments are required.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Deserialize` goes through [`Self::new`]** so the byte bound and the NUL rule hold for values that
+/// arrive over the wire as well as for values this crate builds. A derived impl would have accepted an
+/// oversized argument document from a client, which is the bound's whole purpose defeated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ToolArguments(String);
 
@@ -102,6 +106,13 @@ impl ToolArguments {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         false
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolArguments {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -150,7 +161,9 @@ pub enum ContentBlock {
 /// unreachable: no single block could exceed 64 KiB, so a result that legitimately returned a 100 KiB
 /// file would have been refused with `tool.limit_exceeded` and the operator's bound would not have
 /// explained why. Two bounds need two types, or the stricter one silently governs both.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Deserialize` goes through [`Self::new`]** for the same reason as [`ToolArguments`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ResultPayload(String);
 
@@ -186,6 +199,13 @@ impl ResultPayload {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         false
+    }
+}
+
+impl<'de> Deserialize<'de> for ResultPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 

@@ -24,6 +24,7 @@
 //! library code" while it was. Time now enters through `domain::clock::Clock` and the
 //! `SystemClock` adapter everywhere.
 
+pub mod approval_repository;
 pub mod backup;
 pub mod connection;
 pub mod error;

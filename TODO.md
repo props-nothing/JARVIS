@@ -3551,6 +3551,44 @@ Foundation TODO remains incomplete.
     already enforces, but no metric or event counts refusals yet. That is the observability half
     (`OBS-*`), and the input now exists.
   1014 workspace tests (+2). Both doc gates green; all three journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-049` Make every validated newtype enforce its own rules **on the way in**, because a
+  derived `Deserialize` bypasses the constructor and the invariant was only true for values this
+  crate built. Found by a **systematic audit of every `#[serde(transparent)]` newtype**, prompted by
+  one instance fixed during the filesystem round.
+  - **The defect.** `#[serde(transparent)]` on a validated newtype derives a deserializer that calls
+    `String::deserialize` (or `Vec::deserialize`) and wraps the result **directly**, never going
+    through `Self::new`. So the byte bound, the NUL rule, and the non-emptiness invariant held for
+    values the crate constructed and were **bypassed for values that arrived over the wire** — which
+    is the direction an attacker chooses. Every downstream caller assumed otherwise, and one of them
+    says so in code: `authorize_path` **skips** the shape check for a `WorkspaceRelativePath` because
+    it believes the value is already normalized.
+  - **Nine instances, four of them written before the audit existed.** `Scope`,
+    `ServerConfigId`, `ListVersion`, `ToolArguments`, `ResultPayload`, `AllowedChannels`,
+    `JsonText`, `TransitionReason`, and `WorkspaceRelativePath`. The consequence differed by type,
+    and the worst was `AllowedChannels`: the constructor refuses an empty channel set to make
+    "an approval that can never be decided" unrepresentable — and the derived deserializer restored
+    precisely that state for any value arriving from storage or a client.
+  - **Each is now hand-written to go through its constructor**, and
+    `wire_validation_tests` asserts the shape that was missing for every one of them: the valid value
+    round-trips, and **the value the constructor refuses is refused on the way in**. A test that only
+    sent valid values in is what let this survive, since the constructor's own tests exercised the
+    only path that was correct.
+  - **Falsified two ways**, both by replacing a deserializer's validation with a direct wrap: the
+    `Scope` case fails on a control character, and the `AllowedChannels` case fails on `[]` with the
+    unreachable state restored.
+  - **`ToolArguments` and `ResultPayload` are asserted to keep *different* bounds on the wire**, since
+    those types exist because one bound had silently governed both before. A single shared
+    deserializer would have been that same defect at the boundary.
+  - 8 wire-validation tests. **DO NOT COMMIT.**
+  **The sweep is now complete, and the result is that the defect was confined to `jarvis-domain`.** The
+  other three crates carry exactly **one** `#[serde(transparent)]` newtype between them —
+  `CredentialVerifier` in `jarvis-infrastructure` — and it has **no invariant to bypass**: it is a
+  `[u8; 32]` whose constructor is infallible (`from_bytes` accepts any 32 bytes), so a derived
+  deserializer is correct for it and a hand-written one would add nothing. That is worth recording
+  rather than leaving as "not swept", because the absence of an invariant is the reason it is safe, not
+  an oversight — and it is the distinction that decides whether a newtype needs a custom deserializer at
+  all: **a bound, a non-emptiness rule, or a canonical-form rule needs one; a fixed-width value with no
+  rule does not.**
 - [x] `BRN-048` Make code-page round-trip damage in a text file fail a gate, because it is
   invisible to every one of them while it sits in a committed file. Found by **scanning the bytes**
   of every tracked text file for the `C3 A2` sequence the earlier rounds had recorded as a hazard,
@@ -3977,11 +4015,65 @@ Dependencies: Milestone 2 exit gate.
     so implementing it now would be integration code with no evidence note — which `AGENTS.md` forbids
     outright. It needs a research round of its own, and inventing a canonicalization would put an
     unreviewed one underneath every approval in the product.
-    Also not done: nothing persists these records, so "durable" means the *shape* is durable and
-    serialization-tested rather than that a row exists — the repository port is not written, and there
-    is no approval list/decide API (`TLS-013`) or channel-assurance check (`ACC-027`). The `preview` is
+    **Persistence is now done**, which was the other named gap. `000008_approvals.sql` adds `approvals`
+    and `approval_transitions`, `jarvis_application::repository::approval::ApprovalRepository` is the
+    port, and the schema document records the as-built shape and the four ways it differs from the
+    original design — `tool_identity_json` over split columns, `decided_by` plus `decided_via` over one
+    principal, the summary and preview stored **verbatim** because they are the record of what the user
+    was shown, and `state` with **no default** because a defaulted `pending` is the fail-open direction.
+    `an_upgrade_adds_the_approval_tables_without_touching_what_is_there` asserts both halves of an
+    additive migration: the tables exist **and** a pre-existing row survives, because a migration that
+    added tables while breaking an existing one would pass the first half alone. It also asserts the
+    `NOT NULL`-without-default property by attempting a state-less insert, since that is a fact about
+    what the writer can do rather than about what the catalog says.
+    Also not done: there is no
+    approval list/decide API (`TLS-013`) or channel-assurance check (`ACC-027`). The `preview` is
     structured but **not redacted**: the contract requires it redacted, and only a tool's producer knows
     which of its values is sensitive, so redaction belongs where a tool builds its own preview.
+    **The SQLite adapter is now built**, which was the last named gap in this item:
+    `jarvis_infrastructure::storage::approval_repository::SqliteApprovalRepository` implements the port
+    over `Database::open_in_memory()` in the 21 tests below, and a decision writes its state change and
+    its `approval_transitions` row in **one transaction**, so the trail cannot describe a decision that
+    is not durable or omit one that is.
+    - **The reader walks the state machine rather than assigning the stored state.** `stored_approval`
+      rebuilds through `DurableApproval::request` and then drives `PENDING -> ... -> stored_state`, so a
+      row claiming `PENDING -> CONSUMED` is `storage.row_corrupted` rather than a reconstruction. That
+      distinction is the whole point: assigning the fields would accept the row and hand back a *spent*
+      approval that was never approved, which is the worst possible reconstruction of a decision. The
+      walk derives the version, and the derived value is cross-checked against the stored `version`
+      column, because a row whose state and version disagree records a transition count its state does
+      not explain. **Removing that cross-check compiled and passed every test** — no other case used an
+      inconsistent pair — so `a_stored_version_the_walk_cannot_derive_is_corruption` exists to make the
+      comparison reachable, which is the same "reads as enforcement while enforcing nothing" shape
+      `TLS-005`'s absorbing guard had.
+    - **⚠ The adapter read the state and the identifier it *generated*, and two mutations found it.**
+      `stored_approval` built the value through `DurableApproval::request`, which mints a v7
+      identifier, and returned it without overwriting the generated one — so every `load` handed back a
+      record whose identity was newly minted, and a caller that loaded an approval and then decided it
+      named a row that does not exist. The round-trip test caught it because it compares the
+      **identifier** as well as the fields, and `assert_eq!(loaded, requested)` would have failed for
+      that reason while reading as a field mismatch. The second: `AlreadyInState` was conditioned on the
+      caller's `expected` version, and both taps of a double-tap carry the same `expected`, so the
+      branch was **dead** — the repeat was refused with a version conflict, which is exactly the lie the
+      variant exists to prevent. The condition is `stored_version == transition.version`, because that
+      version is the one the transition produces.
+    - **A decision's instant comes from the row, per step.** The first version passed the approval's own
+      `expires_at` as every step's `occurred_at`, so a stored approval decided at 12:00 was
+      reconstructed as decided at its 12:10 deadline — wrong by ten minutes, and invisible to any
+      assertion on the state or the version. `StoredDecision::instant_for` reads `decided_at` for a
+      decision and the row's `updated_at` otherwise, and refuses a decision row with no recorded instant
+      rather than defaulting, because `apply` always writes one.
+    - **`DecideOutcome::AlreadyInState` carries no version, and that is a correction.** It held the
+      version the caller stated, which the adapter bound from `expected` — always equal to the input and
+      therefore never wrong in a way a test could see. The two ways to make it informative are both
+      false statements, so the field is gone rather than filled with a guess.
+    - **Every reconstruction arm is covered, not just the two the round trips reach.** Six states are
+      asserted through one table test, because an arm naming the wrong actor or the wrong path length
+      would produce a different state or version — `invalidated` is the interesting one, two steps from
+      `PENDING`, so a reader that put every terminal state one step away would refuse the row or land on
+      version 2. Seven mutations were run against the reader and the writer; six were killed, and the
+      one that survived is the version cross-check named above, which is why that test exists.
+    - 21 approval-adapter tests. **DO NOT COMMIT.**
 - [x] `TLS-006` Implement idempotent tool-call ledger and execution state machine. Owns
   `jarvis_domain::tool::ledger`.
   Evidence: the eleven contract states with their transition table, a reservation keyed by **all five
@@ -4044,7 +4136,65 @@ Dependencies: Milestone 2 exit gate.
   and `ACC-044`, whose test asserts state and outbox never diverge. And the reservation is atomic only
   within one process's memory: the adapter that makes it atomic across processes is part of the
   persistence work, not of this module.
-- [ ] `TLS-007` Implement safe reference filesystem read and write-plan tools.
+- [~] `TLS-007` Implement safe reference filesystem read and write-plan tools. **The authorization half
+  is done; the enforcement half is not, and cannot be without a dependency decision — the `~` is the
+  honest state.**
+  Evidence: `jarvis_domain::tool::path_grant` implements the security architecture's filesystem rule —
+  *"Canonicalize paths and defend against traversal, symlink/junction/reparse-point races, alternate
+  data streams, reserved names, and case differences"* and *"File grants are rooted and mode-specific:
+  read, create, modify, delete"*. It is a **pure function of values**, so the rules are exhaustively
+  testable without a filesystem and the adapter that performs a read has no policy of its own to get
+  wrong.
+  - **The mistake the module is written around: containment compared as a string prefix.**
+    `/data/notsecret` starts with `/data/note` and is a sibling directory, so a prefix test authorizes a
+    path the grant never covered — at the authorization layer that is a **read of a file the user never
+    granted**. Containment is compared segment by segment, which is only sound because a value cannot
+    exist in un-normalized form. The falsification removes the segment comparison and **six tests fail**,
+    including `a_sibling_sharing_a_string_prefix_is_refused_by_authorization`.
+  - **`..` is refused rather than resolved.** Resolving is possible and would give the right answer for a
+    purely lexical path, but it discards the fact that the caller asked to leave the directory — and once
+    symlinks exist the lexical answer and the filesystem's answer differ. Refusing keeps the decision
+    independent of the filesystem, which is what makes it testable at all. The specific reason
+    (`Traversal`) is reported, because `OutsideEveryRoot` would invite the user to grant access, which is
+    not the missing thing.
+  - **The case comparison is an input, because the filesystem decides it.** Whether `/Data` and `/data`
+    are one directory is a fact this layer cannot see. Assuming case-insensitive refuses legitimate paths
+    on Linux; assuming case-sensitive lets a Windows path evade a grant by changing one letter — the
+    "case differences" case the architecture names. `PathComparison` is asserted **both ways on one
+    pair**, and a case-only difference is reported as `CaseMismatch` rather than `OutsideEveryRoot`
+    because the user's fix is to correct a letter.
+  - **The longest matching root wins**, not the first: "read the whole tree, write one directory inside
+    it" is a legitimate configuration, and first-match would let the broad root's modes apply inside the
+    narrow one. Order-independence is asserted, the same property `TLS-004` requires of policy.
+  - Per-platform evasions each asserted one at a time, since each defends a different behaviour:
+    reserved device names **whatever the extension or case** (`CON`, `con.txt`, `AUX.tar.gz` — Windows
+    resolves them anywhere, so a whole-segment or exact-case check lets them through on the one platform
+    where they matter; `console.log` and `conartist.md` stay usable, so the rule is the stem not a
+    substring); the backslash, which is a separator on Windows and a filename character on Unix; a colon,
+    which introduces an alternate data stream; and a trailing dot or space, which Windows silently strips
+    — each of which makes **two strings name one file**, the defect class this project refuses for
+    identifiers.
+  - **⚠ Two defects, one found by a test and one by an assertion about the wire form.**
+    `differs_only_by_case_from` returned `true` for a path **inside** the root, so an ordinary descendant
+    was reported as a case mismatch — it needed both halves (the prefix must match ignoring case *and*
+    not match exactly), and the missing half is exactly the case that made the predicate useless.
+    **And `#[serde(transparent)]` bypassed validation**: the derived deserializer wrapped the string
+    directly, so `"data//notes"` or `"../escape"` arriving over the wire produced a value that violates
+    the type's own invariant — which everything downstream trusts, since `authorize_path` skips the shape
+    check for a value it believes is normalized. `Deserialize` is now hand-written to go through
+    `parse`, and a falsification that skips validation fails the round-trip test.
+  - 31 path tests. 1349 workspace tests. All gates green. **DO NOT COMMIT.**
+  **Not done, and it is the half that makes this safe in production: nothing opens a file.** The rules
+  are enforced on values, and the actual read must use open-relative/no-follow primitives because a
+  check-then-open has a TOCTOU race the architecture explicitly names — *"Use open-relative/no-follow
+  primitives or helper process boundaries where platform support requires them"*. This workspace denies
+  `unsafe-code` (`[workspace.lints.rust]`), so the `openat`-family syscalls are unreachable from it, and
+  `cap-std` is not a dependency. Implementing the read therefore needs a dependency decision plus its
+  research gate: an official-source and license review, and either a routine-dependency-ledger row or a
+  full evidence note. Shipping a canonicalize-then-open check while calling it safe would be worse than
+  shipping the decision alone, so the gap is named here. Also absent: symlink and reparse-point
+  detection (which needs the metadata the adapter would read), a write *plan* with approval preview, the
+  tools themselves, and any grant store — `PathGrant` values are passed in, not persisted.
 - [ ] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [ ] `TLS-010` Add MCP negotiation, auth, cancellation, malformed payload, and

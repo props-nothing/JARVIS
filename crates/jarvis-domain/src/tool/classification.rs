@@ -173,7 +173,13 @@ impl fmt::Display for Risk {
 ///
 /// Bounded text rather than a free `String` so a scope from an MCP server's manifest cannot
 /// carry control characters or unbounded length into a persisted grant.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// **`Deserialize` is hand-written to go through [`Self::new`]**, because the derived one would wrap
+/// whatever string arrived and produce a scope the constructor would have refused. That makes the
+/// bound "true for values this crate built and false for values that came over the wire", which is the
+/// direction an attacker chooses — see `WorkspaceRelativePath` in this module for the same fix and the
+/// full reasoning.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Scope(String);
 
@@ -215,6 +221,13 @@ impl Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Scope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 

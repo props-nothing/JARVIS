@@ -66,7 +66,12 @@ fn bounded_provider_string(value: &str) -> Result<String, DomainError> {
 /// JSON implementation inside the domain layer and would also mean two places
 /// decide what a valid schema is. Carrying it as bounded text keeps the bound and
 /// the `UTF-8` encoding rule in one place and leaves the meaning to its owner.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Deserialize` goes through [`Self::new`]**, found by the same audit that fixed
+/// `WorkspaceRelativePath`: a derived impl wraps whatever string arrives, so the byte bound and the NUL
+/// rule would hold for values this crate builds and not for values that came over the wire. This
+/// instance predates the tool module and is fixed here because the audit is what found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct JsonText(String);
 
@@ -91,6 +96,13 @@ impl JsonText {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 

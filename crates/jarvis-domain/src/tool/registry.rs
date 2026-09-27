@@ -44,9 +44,7 @@ pub const MAX_REGISTERED_TOOLS: usize = 4096;
 /// required test "tool-name and source-identity collision" can only be answered by comparing the
 /// trusted one: two servers both declaring `acme.files 1.0.0` are indistinguishable in
 /// `ToolSource`, and refusing the second is what stops it inheriting the first's approvals.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct ServerConfigId(String);
 
@@ -90,6 +88,13 @@ impl ServerConfigId {
 impl std::fmt::Display for ServerConfigId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ServerConfigId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -188,9 +193,7 @@ impl DiscoveryScope {
 /// counter — so the domain stores the digest of whatever the adapter normalized rather than
 /// imposing a shape on a foreign protocol. Carrying it as bounded text keeps the bound and the
 /// encoding rule in one place and leaves the meaning to the owner, exactly as `JsonText` does.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct ListVersion(String);
 
@@ -218,6 +221,13 @@ impl ListVersion {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ListVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 

@@ -32,6 +32,7 @@ pub mod discovery;
 pub mod error_class;
 pub mod identity;
 pub mod ledger;
+pub mod path_grant;
 pub mod policy;
 pub mod registry;
 
@@ -63,6 +64,10 @@ pub use ledger::{
     InterruptedCallAction, LedgerEntry, LedgerOperation, MAX_IDEMPOTENCY_KEY_BYTES,
     MAX_LEDGER_SCAN, ReservationKey, ReservationOutcome, ToolCallLedger, ToolCallState,
     ToolCallTransition, ToolCallVersion, classify_interrupted,
+};
+pub use path_grant::{
+    MAX_PATH_BYTES, MAX_PATH_SEGMENTS, PathComparison, PathDecision, PathDenial, PathGrant,
+    PathMode, WorkspaceRelativePath, authorize_path,
 };
 pub use policy::{
     ApprovalRecord, DenyRule, Grant, GrantRef, PolicyDecision, PolicyInputs, PolicyOutcome,
@@ -96,3 +101,11 @@ mod approval_tests;
 #[cfg(test)]
 #[path = "ledger_tests.rs"]
 mod ledger_tests;
+
+#[cfg(test)]
+#[path = "path_grant_tests.rs"]
+mod path_grant_tests;
+
+#[cfg(test)]
+#[path = "wire_validation_tests.rs"]
+mod wire_validation_tests;

@@ -20,6 +20,7 @@
 //! than as forbidden, because the local control API requires that "a run from
 //! another scope is indistinguishable from a missing run".
 
+pub mod approval;
 pub mod conversation;
 pub mod model_call;
 pub mod policy;

@@ -72,7 +72,7 @@ fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
 }
 
-fn workspace() -> WorkspaceId {
+pub(crate) fn workspace() -> WorkspaceId {
     WorkspaceId::from_uuid(id(1))
 }
 
@@ -127,7 +127,7 @@ fn idempotency_record() -> NewIdempotencyRecord {
     }
 }
 
-fn run_id() -> RunId {
+pub(crate) fn run_id() -> RunId {
     RunId::from_uuid(id(5))
 }
 
@@ -159,7 +159,7 @@ fn model() -> ModelRef {
 }
 
 /// Creates the conversation and run the run tests need.
-async fn seed(repositories: &SqliteRepositories) {
+pub(crate) async fn seed(repositories: &SqliteRepositories) {
     seed_conversation_only(repositories).await;
     repositories
         .create(

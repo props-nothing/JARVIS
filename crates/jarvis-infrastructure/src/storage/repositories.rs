@@ -185,18 +185,24 @@ fn parse_role(value: &str) -> Result<Role, RepositoryError> {
 }
 
 /// Parses a stored timestamp, refusing an uninterpretable value.
-fn parse_time(value: &str, column: &'static str) -> Result<UtcTimestamp, RepositoryError> {
+pub(crate) fn parse_time(
+    value: &str,
+    column: &'static str,
+) -> Result<UtcTimestamp, RepositoryError> {
     UtcTimestamp::parse(value).map_err(|_| RepositoryError::Corrupted { column })
 }
 
 /// Reads a text column, mapping a driver/shape failure to corruption.
-fn text(row: &sqlx::sqlite::SqliteRow, column: &'static str) -> Result<String, RepositoryError> {
+pub(crate) fn text(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<String, RepositoryError> {
     row.try_get(column)
         .map_err(|_| RepositoryError::Corrupted { column })
 }
 
 /// Reads a nullable text column.
-fn opt_text(
+pub(crate) fn opt_text(
     row: &sqlx::sqlite::SqliteRow,
     column: &'static str,
 ) -> Result<Option<String>, RepositoryError> {
@@ -237,7 +243,7 @@ fn opt_int(
 ///
 /// Taking the write lock at `BEGIN` makes the conflict happen where the busy handler *does*
 /// apply, so a concurrent writer waits its bounded turn instead of failing.
-async fn begin_write(
+pub(crate) async fn begin_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, RepositoryError> {
     pool.begin_with("BEGIN IMMEDIATE")
@@ -246,7 +252,10 @@ async fn begin_write(
 }
 
 /// Reads an integer column.
-fn int(row: &sqlx::sqlite::SqliteRow, column: &'static str) -> Result<i64, RepositoryError> {
+pub(crate) fn int(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &'static str,
+) -> Result<i64, RepositoryError> {
     row.try_get(column)
         .map_err(|_| RepositoryError::Corrupted { column })
 }
@@ -1776,7 +1785,7 @@ pub const fn is_client_visible(visibility: EventVisibility) -> bool {
 
 #[cfg(test)]
 #[path = "repositories_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[path = "repositories/policy.rs"]
 mod policy_store;

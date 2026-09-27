@@ -408,7 +408,12 @@ impl ApprovalPreview {
 /// A bounded set, and **never empty**: an approval with no permitted channel could never be decided,
 /// so it would sit `Pending` until it expired — the "no legal way out" shape this project keeps
 /// finding. Refusing the empty case at construction makes that unrepresentable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Deserialize` goes through [`Self::new`]**, so an empty channel set cannot arrive over the wire.
+/// A derived impl would have accepted one, restoring exactly the unreachable state the constructor
+/// exists to prevent — and a stored approval with no channel is the state most easily mistaken for a
+/// working permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct AllowedChannels(Vec<ApprovalChannel>);
 
@@ -438,6 +443,13 @@ impl AllowedChannels {
     #[must_use]
     pub fn as_slice(&self) -> &[ApprovalChannel] {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AllowedChannels {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Vec::<ApprovalChannel>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
