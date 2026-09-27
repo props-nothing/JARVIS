@@ -621,6 +621,16 @@ pub struct RunController {
     deltas: Arc<dyn StreamDeltaSink>,
     provider: Arc<dyn ModelProvider>,
     clock: Arc<dyn Clock>,
+    /// Tells a live follower that this run's durable stream has grown.
+    ///
+    /// The controller is where this belongs rather than the repository, because it is the only
+    /// place that knows **when a step is published**: every event this run appends is written
+    /// through one of three methods here (`advance`, `append_delta`, `publish_usage`), so a
+    /// notification at each of them is complete by construction. A notifying repository decorator
+    /// would be a second implementation of the storage contract that could drift from the first,
+    /// and it could not see a delta published through [`StreamDeltaSink`], which is a separate
+    /// port.
+    live: crate::live_events::RunStreamNotifier,
 }
 
 impl fmt::Debug for RunController {
@@ -652,7 +662,22 @@ impl RunController {
             deltas,
             provider,
             clock,
+            // A private notifier nobody subscribes to, so a controller built directly is identical
+            // to one built through `RunService`: notification is a no-op with no followers rather
+            // than a missing behaviour. That is what keeps a controller test and a daemon run on one
+            // code path.
+            live: crate::live_events::RunStreamNotifier::new(),
         }
+    }
+
+    /// Shares `live` so a follower and the controller that feeds it hold one notifier.
+    ///
+    /// Consuming rather than taking `&mut self`, so this cannot be called twice and leave a
+    /// controller notifying a channel no follower reads — which would be a silently absent feature.
+    #[must_use]
+    pub fn with_notifier(mut self, live: crate::live_events::RunStreamNotifier) -> Self {
+        self.live = live;
+        self
     }
 
     /// Drives `run_id` to a terminal state and reports what it produced.
@@ -1687,6 +1712,12 @@ impl RunController {
                         )
                         .await
                         .map_err(|_| ControllerError::OutputNotPersisted)?;
+                    // The third publication point, and the one a notifying repository could not
+                    // cover: a delta goes through `StreamDeltaSink` rather than `RunRepository`, so a
+                    // decorator around the repository would leave a live follower blind to exactly
+                    // the events a stream exists to deliver. Notified after the sink returns, which
+                    // its contract makes durable-before-visible.
+                    self.live.notify();
                     // Recorded once, from the **first** delta, because the instant of the first
                     // output is what a time-to-first-token interval measures. `get_or_insert`
                     // rather than an assignment so a later delta cannot move it, and the same
@@ -2114,10 +2145,18 @@ impl RunController {
             Some(outcome) => RunWrite::new(&transition, event).failed_with(outcome),
             None => RunWrite::new(&transition, event),
         };
-        self.runs
+        let stored = self
+            .runs
             .transition(run.workspace, write)
             .await
-            .map_err(ControllerError::Repository)
+            .map_err(ControllerError::Repository)?;
+        // **After** the write, never before. The contract requires the server to persist an event
+        // before making it visible on the stream, and a notification is what makes it visible: a
+        // follower woken before the row committed would read a stream that does not yet contain the
+        // state change it was told about. Notifying after the write is what makes "persist, then
+        // publish" true rather than aspirational.
+        self.live.notify();
+        Ok(stored)
     }
 
     /// Publishes a `run.usage` event reporting what a call consumed.
@@ -2156,6 +2195,9 @@ impl RunController {
             )
             .await
             .map_err(ControllerError::Repository)?;
+        // After the append, so a follower reads the usage rather than learning about an event that
+        // is not there yet.
+        self.live.notify();
         Ok(())
     }
 

@@ -1004,6 +1004,7 @@ dependencies = [
  "axum",
  "directories",
  "ed25519-dalek",
+ "futures-core",
  "getrandom",
  "http-body-util",
  "jarvis-application",

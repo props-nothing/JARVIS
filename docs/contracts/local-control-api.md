@@ -627,6 +627,13 @@ served by `jarvis_infrastructure::http::runs` over
 so the daemon and the client share one serialization definition. `jarvis ask` and
 `jarvis runs show|events|cancel` are the client half, and the path was exercised
 against a real daemon on a clean profile: a question produced an answer and exit `0`.
+**Both streaming commands now follow the run on one connection** and print each delta as it arrives,
+having previously polled with `Last-Event-ID` on a timer — which showed the answer in bursts at
+whatever the interval happened to be, and which, once the endpoint became live, also read a stream
+with a buffered helper that blocks until the run ends and truncates at a byte cap. A dropped
+connection is resumed from the last delivered event id rather than abandoned, and the resume is
+exact because this contract defines it that way ("`Last-Event-ID` resumes strictly after that
+event"), so it cannot duplicate output.
 
 Four rules this contract states are now enforced by construction rather than by
 intention:
@@ -698,16 +705,66 @@ use for the value, since it cannot request a runtime other than the native one. 
 consumer that does need it is a resume, which reads the row server-side. Recorded here
 so the next person does not read "the runtime is stored" as "a client can see it".
 
-**Not implemented, and deliberately not claimed:** the event stream delivers the
-retained public events and closes rather than following the run live. A client
-therefore reconnects with `Last-Event-ID` until it receives a terminal event, which is
-what `jarvis ask` does. Holding the connection open needs a streaming response body,
-and this crate has neither a stream crate nor `axum`'s `sse` feature in its reviewed
-dependency set; adding either is a dependency change the research gate requires
-evidence for, and hand-writing a `Stream` would be an unreviewed async state machine
-on the security-relevant path. Also outstanding: contract test 12's golden JSON/SSE
-fixtures and generated OpenAPI drift, `Idempotency-Key` scoping per principal and
-credential rather than per client, and contract test 8's disconnect case.
+**The event stream now follows the run live.** An earlier revision of this document recorded
+the opposite as a named gap: the endpoint delivered the retained public events and closed, so
+a client had to reconnect with `Last-Event-ID` until a terminal event arrived. The contract
+above was always the live behaviour — "Initial connection replays retained events from
+sequence 1, then follows live events" — so the gap was a conformance defect, not a scope
+decision.
+
+The gap's stated reason was **wrong, and checking it is what unblocked the work.** It claimed
+axum's `sse` feature was absent from the reviewed dependency set. Measured: axum 0.8.9 has
+**no `sse` feature at all** — `axum::response::sse` is unconditional — and the two crates a
+`Stream` implementation needs were already in `Cargo.lock` (`futures-core` 0.3.34 as a leaf,
+`tokio-stream` 0.1.19 through `sqlx-core`). Naming `futures-core` directly adds **no new
+crate and no version change**: the lockfile diff is one line inside `jarvis-infrastructure`'s
+own dependency list. So the change reduced to a routine dependency-name addition with a
+ledger row, and the "hand-written `Stream` would be unreviewable" half was avoided rather than
+solved — the response body is a bounded channel fed by an ordinary `async` follow task, the
+same shape the model adapter already uses for a provider's frames.
+
+Four properties of the live follow are deliberate:
+
+- **The durable store is the source of truth.** The follower's position is a *sequence*, and
+  every read is `load_events(from_sequence)`. Nothing is delivered from a channel, so a live
+  stream and a replayed one cannot disagree about content or order, and a notification that
+  arrives with nothing new is simply a read that returns nothing.
+- **A wake-up carries no payload.** It is permission to read again. That is what makes a
+  bounded buffer safe: a slow follower loses *wake-ups*, not events, so the contract's "a slow
+  consumer can replay from its last delivered event" holds without a special case.
+- **The stream ends on the durable terminal state, not on a notification.** A run that
+  finishes between two reads is seen in the read, so a last notification that never arrives
+  cannot leave a client waiting after its run is over — the failure a notification-driven exit
+  would produce.
+- **The request-level refusals are decided before the body streams.** An `Accept` that
+  excludes the media type is `400` and an unavailable resume position is `409`, both before
+  the response begins, because once it has begun a status code can no longer express a
+  decision.
+- **Keepalives are emitted, and they are comments.** The rule in *Rules* above had a
+  frame with no producer until now: `jarvis_protocol::run::keepalive_frame` existed with a
+  test asserting its shape and **nothing calling it**, so this contract required a comment the
+  daemon never sent. The follow loop now emits one per interval while it is waiting — the state
+  the comment exists for, since a run that is thinking has nothing to send. Because it is a
+  comment it carries no `id:` and consumes no sequence number, which the test asserts by
+  checking that the **event sequences stay contiguous across a stream that contains comments**;
+  modelling a keepalive as a synthetic event would send a resuming client to a position that
+  never existed. The first immediate tick is consumed, so a stream that opens with a frame is
+  not preceded by a comment telling the client nothing has happened.
+
+**The test that proves it needed a new fixture, and that is the part worth recording.** With a
+provider that finishes immediately, every event is already retained by the time a client
+connects, so a replay-and-close handler and a live one produce the **identical body** — which
+is why the pre-existing stream test passed for as long as the feature was missing. The live
+test therefore drives a **gated** provider that publishes one delta and then blocks, so
+"the run is live and unfinished" is an observable state; the assertion is that the response
+body has **not** completed while the run is live. Verified by mutation: restoring the
+replay-and-close behaviour fails that test. Its counterpart checks the other termination rule —
+a follow of an already-finished run must replay and close rather than wait for a notification
+nothing will send.
+
+Also outstanding: contract test 12's golden JSON/SSE fixtures and generated OpenAPI drift,
+`Idempotency-Key` scoping per principal and credential rather than per client, and contract
+test 8's disconnect case.
 
 ### Implemented evidence (Milestone 2, restart recovery)
 

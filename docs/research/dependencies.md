@@ -34,7 +34,8 @@ the reason the standard library or an existing dependency is insufficient.
 
 | Package | Exact version | Official source and release notes | License evidence | Purpose and enabled features | Replacement boundary | Reviewed | Revalidate | TODO |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| None eligible to date | N/A | N/A | N/A | Every Foundation dependency failed an eligibility criterion below | N/A | 2026-09-21 | At the next dependency change | `FND-000` |
+| `futures-core` | `0.3.34` | crates.io `futures-core` 0.3.34; source `rust-lang/futures-rs` (`futures-core` crate); release notes in the repository's `CHANGELOG.md` | `MIT OR Apache-2.0` (dual, standard Rust ecosystem terms); `LICENSE-APACHE` and `LICENSE-MIT` in the crate source | Supplies the `Stream` trait so the local control API's event stream can be a streaming response body, which `docs/contracts/local-control-api.md` requires ("Initial connection replays retained events from sequence 1, then follows live events"). Enabled features: **none** (`default-features = false`). The standard library has no async stream trait and the workspace does not depend on `futures-util`, so there is no smaller substitute | The trait is used only to make one response body a stream. It is replaceable by `futures-util` (a superset, already transitively present) or by `tokio-stream`, whose `Stream` is a re-export of this crate's — so replacing it changes no JARVIS contract and no operator workflow. **No new crate and no version change**: `futures-core` 0.3.34 was already resolved (a leaf of `axum`'s and `sqlx`'s trees), so the `Cargo.lock` diff adds one line inside `jarvis-infrastructure`'s dependency list | 2026-09-27 | At the next dependency change | `BRN-007` |
+| None further eligible to date | N/A | N/A | N/A | Every other Foundation dependency failed an eligibility criterion below | N/A | 2026-09-21 | At the next dependency change | `FND-000` |
 
 ## Review Rules
 

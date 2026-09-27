@@ -19,6 +19,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
@@ -148,7 +149,23 @@ pub struct ApiState {
     pub inventory: Option<Arc<ProviderInventory>>,
     /// How a run's execution is scheduled.
     pub spawner: Arc<dyn RunSpawner>,
+    /// How often an event stream emits an SSE comment while it has nothing to send.
+    ///
+    /// Configurable rather than a constant, because the interval is the one part of the live stream a
+    /// test must be able to compress: a keepalive is only observable by *waiting*, so a production
+    /// interval would make its test take as long as the interval. `ApiState::new` uses
+    /// [`DEFAULT_KEEPALIVE_INTERVAL`], which is what a daemon serves.
+    pub keepalive_interval: Duration,
 }
+
+/// How often a live event stream emits a keepalive comment.
+///
+/// Chosen against the intermediaries the local surface can sit behind rather than against the
+/// daemon's own behaviour: a proxy or an operating-system socket layer drops a connection that has
+/// been silent for long enough, and the contract requires the comment precisely so that a run which
+/// is thinking — not streaming — does not look like a dead peer. Fifteen seconds is well inside every
+/// common idle timeout while being far too slow to be traffic.
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The model candidates a daemon can route a call to.
 ///
@@ -245,7 +262,18 @@ impl ApiState {
             policies: None,
             inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
         }
+    }
+
+    /// Overrides how often an event stream emits a keepalive comment.
+    ///
+    /// A builder rather than a `new` argument, so every existing caller keeps the production value
+    /// and only a test that needs to *observe* a keepalive says so.
+    #[must_use]
+    pub const fn with_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = interval;
+        self
     }
 
     /// Attaches the run orchestration service.
@@ -979,6 +1007,7 @@ mod tests {
     use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt as _;
 
     /// The authority the test fixture pretends the daemon bound.
@@ -1658,11 +1687,159 @@ mod tests {
         Answers,
         /// Refuses to open, so a run reaches `Failed` with a code.
         Refuses,
+        /// Streams one delta, then **waits** for the test to release it before completing.
+        ///
+        /// Exists because a live follow cannot be tested with a provider that finishes
+        /// immediately: by the time a client connects, every event is already retained, so a
+        /// replay-only handler and a live one produce the *same* body. Holding the stream open is
+        /// what makes "the run has published some output and has not finished" an observable state,
+        /// which is the only state in which the two handlers differ.
+        Gated,
+    }
+
+    /// The two signals a [`FixtureProvider::Gated`] run uses to coordinate with its test.
+    ///
+    /// Two rather than one, because each answers a different question: `reached` says *the provider
+    /// is now blocked mid-answer* (so the client is genuinely waiting), and `release` says *finish
+    /// now*. A single signal could not express both, and inferring "the provider has started" from a
+    /// sleep would make the test a race rather than a check.
+    #[derive(Debug, Clone)]
+    struct Gate {
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                reached: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    /// A provider that pauses mid-stream until a test releases it.
+    ///
+    /// A hand-written stream rather than a [`ScriptedProvider`], because the scripted provider cannot
+    /// *wait*: its steps are produced as fast as the consumer asks for them, so there is no window in
+    /// which the run is live but unfinished.
+    struct GatedProvider {
+        models: Vec<jarvis_domain::model::identity::ModelRef>,
+        gate: Gate,
+    }
+
+    impl jarvis_application::model::ModelProvider for GatedProvider {
+        fn models(&self) -> &[jarvis_domain::model::identity::ModelRef] {
+            &self.models
+        }
+
+        fn endpoint_class(&self) -> jarvis_domain::model::identity::EndpointClass {
+            jarvis_domain::model::identity::EndpointClass::Local
+        }
+
+        fn open<'a>(
+            &'a self,
+            _context: &'a jarvis_application::request_context::RequestContext,
+            request: &'a jarvis_domain::model::stream::ModelCallRequest,
+            _cancel: &'a jarvis_application::cancellation::CancellationScope,
+        ) -> jarvis_application::model::OpenResult<'a> {
+            Box::pin(async move {
+                Ok(Box::new(GatedStream {
+                    call_id: request.call_id,
+                    gate: self.gate.clone(),
+                    step: 0,
+                })
+                    as Box<
+                        dyn jarvis_application::model::ModelStream + Send + 'a,
+                    >)
+            })
+        }
+    }
+
+    /// The stream [`GatedProvider`] opens: one delta, then a wait, then the terminal.
+    struct GatedStream {
+        call_id: jarvis_domain::ids::ModelCallId,
+        gate: Gate,
+        step: u64,
+    }
+
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use jarvis_domain::model::stream::{FinishReason, ModelStreamEvent, ModelStreamEventKind};
+
+    impl jarvis_application::model::ModelStream for GatedStream {
+        fn next_event(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<ModelStreamEvent>,
+                            jarvis_application::model::ProviderError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.step += 1;
+                let kind = match self.step {
+                    1 => ModelStreamEventKind::CallStarted { model: None },
+                    2 => {
+                        // `notify_one` before the wait below, so a test that has not yet started
+                        // waiting still observes it: `Notify` stores one permit rather than dropping
+                        // it, which removes a race between the provider and the test.
+                        self.gate.reached.notify_one();
+                        ModelStreamEventKind::OutputTextDelta {
+                            item_id: "out-1".to_owned(),
+                            delta: "the first chunk".to_owned(),
+                        }
+                    }
+                    3 => {
+                        // The wait happens *between* frames, so the run's durable state stays
+                        // mid-flight for as long as the test needs it to.
+                        self.gate.release.notified().await;
+                        ModelStreamEventKind::OutputItemCompleted {
+                            item_id: "out-1".to_owned(),
+                        }
+                    }
+                    4 => ModelStreamEventKind::CallCompleted {
+                        finish_reason: FinishReason::Stop,
+                        usage: None,
+                        refused: false,
+                    },
+                    _ => return Ok(None),
+                };
+                Ok(Some(ModelStreamEvent {
+                    call_id: self.call_id,
+                    event_id: jarvis_domain::ids::ModelStreamEventId::from_uuid(
+                        uuid::Uuid::now_v7(),
+                    ),
+                    sequence: jarvis_domain::model::stream::Sequence::new(self.step),
+                    kind,
+                    provider_metadata: None,
+                }))
+            })
+        }
     }
 
     async fn runs_fixture_with(
         tag: &str,
         kind: FixtureProvider,
+    ) -> (axum::Router, String, Arc<SqliteRepositories>) {
+        runs_fixture_with_gate(tag, kind, Gate::new()).await
+    }
+
+    /// The fixture with an explicit gate, for the tests that drive a gated provider.
+    ///
+    /// The gate is passed in rather than returned, because it must be in the test's hands *before*
+    /// the run starts: a test that learned about it only after a create would race the provider's
+    /// first frame.
+    async fn runs_fixture_with_gate(
+        tag: &str,
+        kind: FixtureProvider,
+        gate: Gate,
     ) -> (axum::Router, String, Arc<SqliteRepositories>) {
         use crate::storage::repositories::SqliteRepositories;
         use crate::storage::{Database, migrate};
@@ -1688,7 +1865,7 @@ mod tests {
             ProviderId::parse("scripted.local").expect("valid"),
             ModelId::parse("fixture-1").expect("valid"),
         );
-        let answering = jarvis_application::model::ScriptedProvider::new(model)
+        let answering = jarvis_application::model::ScriptedProvider::new(model.clone())
             .emit(ModelStreamEventKind::OutputItemAdded {
                 item_id: "out-1".to_owned(),
             })
@@ -1704,6 +1881,10 @@ mod tests {
             // failure leaves the run live so another attempt can be made, and the fixture's
             // purpose is to reach a terminal `Failed` with a code.
             FixtureProvider::Refuses => Arc::new(answering.fail_on_open(ProviderError::Refused)),
+            FixtureProvider::Gated => Arc::new(GatedProvider {
+                models: vec![model.clone()],
+                gate: gate.clone(),
+            }),
         };
         let service = Arc::new(RunService::new(
             RunPorts {
@@ -1737,7 +1918,13 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
             )
             .with_runs(service)
-            .with_spawner(Arc::new(TokioSpawner)),
+            .with_spawner(Arc::new(TokioSpawner))
+            // A **short** interval, because a keepalive is only observable by waiting: with the
+            // production fifteen seconds the test would take fifteen seconds to prove one comment.
+            // The fixture is the only place a test can compress it, and every other assertion about a
+            // stream is unaffected — a keepalive is a comment with no `id:`, so it is invisible to a
+            // check on event frames.
+            .with_keepalive_interval(KEEPALIVE_TEST_INTERVAL),
         );
         (
             router(state),
@@ -1745,6 +1932,30 @@ mod tests {
             repositories,
         )
     }
+
+    /// The `sequence` values of every `data:` frame in an SSE body, in the order delivered.
+    ///
+    /// A helper because two live-follow tests assert on the sequence list, and the first version
+    /// inlined it wrongly in **both** of them: `strip_prefix("data: {")` removes the opening brace, so
+    /// the remainder was never valid JSON and the filter silently produced an **empty** vector. An
+    /// empty vector equals the empty range `1..=0`, so the assertion compared two empties and passed —
+    /// a test that could not fail, found by writing the second test and giving it an explicit
+    /// non-empty precondition. Parsing the whole value and reading the field is what makes both
+    /// assertions mean something, and a shared helper means the next one cannot get it differently
+    /// wrong.
+    fn sequence_numbers(body: &str) -> Vec<u64> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .filter_map(|value| value["sequence"].as_u64())
+            .collect()
+    }
+
+    /// How often the run fixture's event streams emit a keepalive comment.
+    ///
+    /// Short enough that the keepalive test observes several within its bound, long enough that a
+    /// stream delivering events promptly never emits one by accident.
+    const KEEPALIVE_TEST_INTERVAL: Duration = Duration::from_millis(50);
 
     /// Authenticated headers for a run request.
     fn run_headers(token: &str) -> Vec<(&str, String)> {
@@ -2395,7 +2606,7 @@ mod tests {
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // Framing: an `id:`, an `event:`, a `data:` line, and a blank line terminator.
@@ -2417,6 +2628,282 @@ mod tests {
         assert!(body.contains("event: run.completed"), "{body}");
         // The delta reached the stream, which is what a streaming client is for.
         assert!(body.contains("event: run.output_text.delta"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_live_follow_holds_the_connection_open_and_delivers_events_published_after_it_opened()
+    {
+        // **The falsifying test for the live half of `BRN-007`.** The events endpoint used to
+        // deliver the retained events and close, so a client had to poll; the contract requires the
+        // opposite — "Initial connection replays retained events from sequence 1, then follows live
+        // events".
+        //
+        // A **gated** provider is what makes the difference observable, and this is the crux: with a
+        // provider that finishes immediately, every event is already retained by the time the client
+        // connects, so a replay-only handler and a live one produce the *identical* body. An
+        // ordinary run cannot tell them apart, and a test written against one would pass against
+        // both — which is exactly why the earlier stream test passed while the feature was missing.
+        // This provider publishes one delta and then waits, so the run is genuinely live and
+        // unfinished while the response is being read.
+        let gate = Gate::new();
+        let (app, token, _repositories) =
+            runs_fixture_with_gate("runs-live", FixtureProvider::Gated, gate.clone()).await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        // Wait until the provider has produced its delta and is blocked, so the run is
+        // mid-delivery when the stream is opened.
+        gate.reached.notified().await;
+
+        let path = format!("/api/v1/runs/{run_id}/events");
+        // The header names are written as literals here rather than taken from `run_headers`, which
+        // returns `&str` borrowed from the token: a spawned task outlives this scope, so the task
+        // needs owned values and `'static` names. Writing the four names out is clearer than mapping
+        // borrowed ones, and this is the only test that needs them owned.
+        let headers: Vec<(&'static str, String)> = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "application/json".to_owned()),
+            ("idempotency-key", format!("key-{}", uuid::Uuid::now_v7())),
+        ];
+        let reader = tokio::spawn({
+            let app = app.clone();
+            async move { send(&app, "GET", &path, &headers, "").await }
+        });
+        // The body must **not** complete while the run is live. A replay-and-close handler finishes
+        // here, so this assertion is the one that fails against that implementation.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !reader.is_finished(),
+            "a live follow must hold the connection open while the run is unfinished: a body that \
+             completed here is a replay-and-close handler, which is the defect this test catches",
+        );
+
+        // Release the provider, so the run completes and the stream must close on its own.
+        gate.release.notify_one();
+        let (status, body) = reader.await.expect("the reader task joins");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The delta was delivered on the stream, and the terminal event closed it. Asserting the
+        // delta is what shows the follow delivered output published *around* the connection rather
+        // than only what a prior read had already returned.
+        assert!(
+            body.contains("event: run.output_text.delta"),
+            "the live follow must deliver the output delta: {body}",
+        );
+        assert!(
+            body.contains("the first chunk"),
+            "the delta's payload must reach the client: {body}",
+        );
+        assert!(body.contains("event: run.completed"), "{body}");
+        // Exactly one terminal event, which is the contract's rule and the stream's exit condition.
+        let terminals = ["run.completed", "run.failed", "run.cancelled"]
+            .iter()
+            .map(|kind| body.matches(kind).count())
+            .sum::<usize>();
+        assert_eq!(terminals, 1, "{body}");
+
+        // Sequences are contiguous from 1 across the replay/live boundary, which is what a client
+        // resumes from: a gap here would be a stream a client could not follow. Parsed rather than
+        // pattern-matched, so the numbers are actually compared.
+        let sequences: Vec<u64> = sequence_numbers(&body);
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+            "the live stream must keep one contiguous sequence across replay and live frames: {body}",
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-live"));
+    }
+
+    #[tokio::test]
+    async fn a_live_follow_never_replays_the_page_it_already_sent() {
+        // **The regression test for a defect the disconnect journey found, not a unit test.** The
+        // follower's read position was initialised from the *resume* sequence rather than from the
+        // page it had just rendered, so the second read returned the same page: every replayed event
+        // was delivered twice, the stream restarted at sequence 1 in the middle of the body, and the
+        // run published two terminal events. A stream that only replayed and closed performed exactly
+        // one read, so it could not exhibit this — the defect existed only once the follow loop
+        // existed, and only an assertion that reads a *whole* live stream can see it.
+        //
+        // The assertion is the sequence list, because that is what makes a duplicate identifiable:
+        // counting events would pass a stream that delivered the right *number* in the wrong order,
+        // and checking the terminal count alone would pass a stream that duplicated a middle frame.
+        let gate = Gate::new();
+        let (app, token, _repositories) =
+            runs_fixture_with_gate("runs-no-replay", FixtureProvider::Gated, gate.clone()).await;
+        let run_id = create_run(&app, &token, "hello").await;
+        gate.reached.notified().await;
+
+        let path = format!("/api/v1/runs/{run_id}/events");
+        let headers: Vec<(&'static str, String)> = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("accept", "text/event-stream".to_owned()),
+        ];
+        let reader = tokio::spawn({
+            let app = app.clone();
+            async move { send(&app, "GET", &path, &headers, "").await }
+        });
+        gate.release.notify_one();
+        let (status, body) = reader.await.expect("the reader task joins");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let sequences = sequence_numbers(&body);
+        assert!(
+            !sequences.is_empty(),
+            "the stream delivered nothing: {body}"
+        );
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+            "a live follow must deliver each event exactly once, in order: {body}",
+        );
+        let terminals = [
+            "event: run.completed",
+            "event: run.failed",
+            "event: run.cancelled",
+        ]
+        .iter()
+        .map(|kind| body.matches(kind).count())
+        .sum::<usize>();
+        assert_eq!(terminals, 1, "a run publishes one terminal event: {body}");
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-no-replay"));
+    }
+
+    #[tokio::test]
+    async fn a_live_follow_emits_keepalives_while_it_has_nothing_to_send() {
+        // The contract requires it: "Keepalives are SSE comments and do not consume sequence numbers."
+        // Until this, `jarvis_protocol::run::keepalive_frame` existed with a test asserting its shape
+        // and **no caller** — a frame the product could describe and never send, which is the shape
+        // this repository treats as an unimplemented feature rather than a helper.
+        //
+        // The gated provider is what makes this observable, for the same reason it is needed
+        // elsewhere: a run that streams continuously is never silent, so the only state in which a
+        // keepalive exists is one where the run is *thinking*. The provider blocks mid-answer, so the
+        // follower waits with nothing to send.
+        let gate = Gate::new();
+        let (app, token, _repositories) =
+            runs_fixture_with_gate("runs-keepalive", FixtureProvider::Gated, gate.clone()).await;
+        let run_id = create_run(&app, &token, "hello").await;
+        gate.reached.notified().await;
+
+        let path = format!("/api/v1/runs/{run_id}/events");
+        let headers: Vec<(&'static str, String)> = vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("accept", "text/event-stream".to_owned()),
+        ];
+        let reader = tokio::spawn({
+            let app = app.clone();
+            async move { send(&app, "GET", &path, &headers, "").await }
+        });
+
+        // Several keepalive intervals must pass while the run is thinking, so the absence of a
+        // comment would be a silence the stream held for as long as the interval describes.
+        tokio::time::sleep(KEEPALIVE_TEST_INTERVAL * 4).await;
+        gate.release.notify_one();
+        let (status, body) = reader.await.expect("the reader task joins");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        assert!(
+            body.contains(": keepalive"),
+            "a waiting stream must emit keepalive comments: {body}",
+        );
+        // **The property that matters, not the phrasing.** A keepalive is a comment, so it must carry
+        // no `id:` — otherwise a client resuming from `Last-Event-ID` would be sent to a position
+        // that never existed, and a comment would have consumed a sequence number, which the contract
+        // forbids outright.
+        for comment in body.lines().filter(|line| line.starts_with(": keepalive")) {
+            assert_eq!(
+                comment, ": keepalive",
+                "a keepalive is a bare comment: {comment}"
+            );
+        }
+        // And the sequence numbers are still contiguous, which is the same rule stated the way a
+        // client experiences it: a comment that consumed a position would leave a gap here.
+        let sequences = sequence_numbers(&body);
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+            "keepalives must not consume sequence numbers: {body}",
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-keepalive"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_emits_no_keepalive_before_its_events() {
+        // The ordering rule, and the reason the first tick is consumed rather than allowed to fire: a
+        // fresh `tokio::time::interval` completes immediately, so a stream that did not consume it
+        // would emit a comment as its **first** output — a keepalive meaning "nothing has happened"
+        // sent to a client that had just connected, before it had been told the run exists.
+        let (app, token) = runs_fixture("runs-no-leading-keepalive").await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}/events"),
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.starts_with(": "),
+            "the stream must begin with an event, not a comment: {body}",
+        );
+        assert!(body.contains("event: run.received"), "{body}");
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-no-leading-keepalive"));
+    }
+
+    #[tokio::test]
+    async fn a_late_follow_of_a_finished_run_replays_and_closes_without_waiting() {
+        // The other half of the termination rule, and the one a naive live follow gets wrong: a run
+        // that finished **before** the client connected has nothing to wait for, so the stream must
+        // deliver the retained events and close. A follow that always waited for a notification
+        // would hold this connection open forever, because no further event will ever be published.
+        let (app, token) = runs_fixture("runs-late-stream").await;
+        let run_id = create_run(&app, &token, "hello").await;
+
+        // Drive the run to a terminal state through a polling read, so the follow below does not
+        // race the provider.
+        for _ in 0..200 {
+            let (_, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &run_headers(&token),
+                "",
+            )
+            .await;
+            if body.contains("event: run.completed") || body.contains("event: run.failed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Now a *fresh* follow of the finished run, bounded: it must complete, not hang.
+        let live = tokio::time::timeout(
+            Duration::from_secs(5),
+            send(
+                &app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}/events"),
+                &run_headers(&token),
+                "",
+            ),
+        )
+        .await
+        .expect("a follow of a finished run must close rather than wait for a notification");
+        let (status, body) = live;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("event: run.completed"), "{body}");
+        assert!(body.contains("event: run.received"), "{body}");
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-late-stream"));
     }
 
     #[tokio::test]
@@ -2487,7 +2974,7 @@ mod tests {
             if body.contains("event: run.completed") || body.contains("event: run.failed") {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(body.contains("event: run.completed"), "{body}");
 
@@ -3689,7 +4176,7 @@ mod tests {
                 observed = Some(state);
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let observed = observed.expect("a cancelled run must reach a terminal state");
         // The command was accepted as `202`, so the run was live when it arrived and the

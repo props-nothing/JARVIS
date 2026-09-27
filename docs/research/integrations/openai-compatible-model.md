@@ -220,6 +220,18 @@ the official guide explicitly warns that different conditions share a status.
 - Tool side effects: none. This adapter performs one outbound read-only call. It
   exposes no tool and executes no model-proposed action; tool calls appear as
   `tool.call.*` events and remain subject to the canonical tool pipeline.
+  **This sentence was false for one round, and it was false in the dangerous direction.**
+  The adapter recognized `tool_calls` and emitted **nothing**, so a model-proposed action did not
+  appear as an event at all: it vanished, and the run could reach `completed` with an empty answer.
+  The reasoning behind the omission was that "the tool fabric does not exist, so a tool call must not
+  be proposed" — but proposing is exactly what the fabric will judge, and the controller *already*
+  had a typed terminal refusal with **no other way to reach it**. Dropping the event did not prevent
+  the proposal; it removed the only thing that made the refusal accurate. A silent success on a
+  dropped intent is strictly worse than a typed refusal, because the model asked to *do* something
+  and JARVIS reported that it finished. The translation now emits
+  `tool.call.added` / `tool.call.arguments.delta` / `tool.call.completed`, which is what this bullet
+  always claimed — and emitting them is still not a grant: the events are proposals and the
+  deterministic layer decides.
 - Required approvals: none at call time. The provider entry itself is operator
   configuration.
 - Redaction rules: the key never appears in a log, an error, a diagnostic bundle, or
@@ -343,10 +355,13 @@ layers that are separately testable:
   tests, including a frame split across two reads, CRLF framing, a multi-line
   payload, the `[DONE]` sentinel, comments and non-`data` fields, and an oversized
   frame.
-- `translate.rs` maps one parsed chunk onto normalized events. Pure; 15 tests,
+- `translate.rs` maps one parsed chunk onto normalized events. Pure; 20 tests,
   including the role-only first chunk, the empty-`choices` usage chunk, an
   unmodelled `finish_reason`, content after the terminal, a second choice, a
-  mid-stream error, and the "unknown is not zero" rule on every counter.
+  mid-stream error, the "unknown is not zero" rule on every counter, and the **tool-call
+  path** — announcement, argument fragments, the completion carrying the accumulated
+  arguments, two concurrent calls kept apart by index, an unnamed call not announced, and
+  a call arriving after the terminal being dropped and counted.
 - `mod.rs` owns the socket, the HTTP/1.1 exchange, chunked decoding, error mapping,
   and the credential. Its request builder refuses a model the adapter does not
   serve, a requested output schema, unsupported settings, an artifact reference, and
@@ -427,16 +442,48 @@ so the test falsifies the wiring rather than describing it.
 
 ### Gated Live Tests
 
+- [x] **One representative streamed call, against a real model.** `tests/e2e/provider-smoke.mjs`
+  streams a real answer end to end and is **OBSERVED**, not documented: a daemon configured for
+  Ollama on `127.0.0.1:11434/v1`, a run created through the real control API, the model's own text
+  durable in the run's events, and `jarvis ask` printing that answer and exiting 0. The harness is
+  gated on a **reachable loopback endpoint** rather than on a secret, because no cloud endpoint is
+  reachable from this build at all (see the transport decision above) — and the gate is **reported**:
+  a run with no endpoint prints its skip and says nothing was proved, rather than printing a pass it
+  did not earn.
 - [ ] Authentication and capability discovery: an unauthenticated call maps to
-  `Authentication`, proving the mapping rather than assuming it.
-- [ ] One representative streamed call. Opt-in via environment variable, skips
-  clearly when unset, and **never** spends money on a cloud endpoint without an
-  explicit test account.
+  `Authentication`, proving the mapping rather than assuming it. Not covered by the smoke test,
+  because the endpoint it targets takes no credential — the mapping is covered by the socket-level
+  contract test with a scripted `401`.
 - [ ] Cancellation/timeout: cancel mid-stream and assert `call.cancelled` with the
   run's terminal, not the provider's `finish_reason`.
 - [ ] Rate-limit or simulated backoff: a local stub returning `429` with
   `Retry-After` proves the delay is honoured.
-- [ ] Cleanup leaves no external resources: this adapter creates none.
+- [x] Cleanup leaves no external resources: this adapter creates none, and the harness removes its
+  profile.
+
+### Two things the real endpoint forced, and they are general
+
+**A base path.** The completion route is `/chat/completions` only when the server is rooted at the
+origin. Ollama serves it under `/v1`, as do vLLM, LM Studio, and most gateways — so the adapter posted
+to a path that 404s on a real server while every fixture passed, because a fixture's server is built
+to the adapter's assumption. `[model.provider].base_path` is validated as a **path**, not accepted as a
+URL: absolute, no traversal, no query or fragment, no interior whitespace or control characters, which
+is what keeps the "a key cannot end up in the endpoint" property that the host/port split exists for.
+The bare `/chat/completions` default means no existing configuration changed.
+
+**A model-name mapping, and this one is a genuine namespace problem rather than an Ollama quirk.**
+A JARVIS model id is a lowercase dotted slug — one spelling per identity, which is what makes a
+routing decision, a persisted row, and a diagnostic comparable. A provider names models however it
+likes: Ollama's `glm-5.3-flash:cloud`, a versioned `model@2026-01`, a namespaced `org/model`. **A
+colon cannot appear in a JARVIS model id**, so the adapter could only address a model whose provider
+name happened to already be legal — which silently excludes real endpoints, including every Ollama
+cloud model. `[model.provider].model_names` maps a served model's JARVIS id to the string the provider
+expects, and a mapping keyed on a model the endpoint does not serve is **refused at composition**,
+because it would never be used and the operator would believe it had been. The routed model is still
+exactly one this adapter serves; the mapping changes only how it is spelled on the wire.
+
+Neither was visible from the contract or from a fixture. Both surfaced the moment a real server
+answered — which is the argument for this test existing at all.
 
 ## Operational Readiness
 
@@ -472,9 +519,18 @@ so the test falsifies the wiring rather than describing it.
   (`OC-C004`). The adapter is designed not to depend on the answer, and the
   fixture capture settles it.
 - Which specific OpenAI-compatible server will the gated smoke test target, and does
-  that server conform? A third-party server is an external product in its own right,
-  so if it deviates from this contract it needs its own note. This note scopes
-  itself to the contract, and the capture is what proves the chosen server conforms.
+  that server conform? **Answered for one server.** The smoke test targets **Ollama** on
+  loopback, because it is the endpoint this build can reach and it needs no credential. Its
+  OpenAI-compatible route is `/v1/chat/completions`, and it names models with a tag
+  (`glm-5.3-flash:cloud`) that a JARVIS model id cannot express — which is why the adapter gained
+  a base path and a name mapping. A **different** server remains its own contract question: it is an
+  external product, so a server that deviates needs its own note, and the smoke test taking its
+  host, port, path, and model from the environment is what makes pointing it at another server a
+  configuration rather than a code change.
+- The **`[DONE]` question is now observed for this server.** Ollama's stream terminated on a
+  non-null `finish_reason`, which is the case the adapter relies on — so `OC-C004`'s
+  `finish_reason` half is `OBSERVED` for Ollama while its `[DONE]` half stays open, because the
+  harness does not inspect the sentinel and a capture would.
 - When the cloud path is enabled, which TLS stack is reviewed, and does the
   adapter then need to distinguish residency domains from ordinary hostnames?
 
@@ -485,3 +541,5 @@ so the test falsifies the wiring rather than describing it.
 | 2026-09-27 | Initial research; gate passed for the loopback, plaintext Chat Completions streaming contract. Records the per-endpoint retention finding that constrains the data policy, the refusal-is-HTTP-200 trap, the closed set of `finish_reason` values, and the absence of any TLS implementation in the workspace as the reason the first slice is loopback-only | `llms.txt` root/API/reference indexes, Chat Completions streaming-events page, streaming guide, API overview, data-controls guide, error-codes guide, rate-limits guide, and a lockfile inspection |
 | 2026-09-27 | The adapter is implemented at `crates/jarvis-infrastructure/src/model_providers/openai_compatible/` (three layers: SSE reassembly, chunk translation, transport + status mapping) with a loopback socket-level contract test at `tests/openai_compatible_stream.rs`. Adds the "Implemented (this slice)" section and its two socket-only findings; records that the refusal flag is folded by the run controller rather than the translator. **No real capture yet**, so every behavioural claim stays `DOCUMENTED` and `OC-C004` stays open. The manifest's `implementation_paths` gained the underscore spellings, because a module directory cannot contain a hyphen and the hyphen-only globs matched no real path | The adapter and its tests; `Cargo.lock` (still no TLS crate); the changed-file documentation gate run against each new path |
 | 2026-09-27 | The adapter is **composed into the daemon**. `jarvis_infrastructure::model_providers::resolve` maps a configuration document plus a secret resolver to the provider a daemon calls; `jarvisd` composes it before startup and refuses a configuration it cannot serve rather than falling back to the scripted provider. Config schema 1 → 2 for the optional `[model.provider]` table (version 1 still readable). Proven end to end at `tests/daemon_provider_composition.rs` — a real daemon, a real socket, a local fake server, and a run through the real control API — and confirmed by mutation. Adds the "Composed into the daemon" section; corrects the Operational Readiness items for setup, disable/unload, migration, and credential rotation, which the composition changes | The composition module and its tests; the daemon-level composition test; the config loader tests for both supported versions |
+| 2026-09-27 | **A real provider run is verified end to end — Milestone 2's exit gate.** `tests/e2e/provider-smoke.mjs` drives a daemon configured for **Ollama on loopback** and asserts the model's own text is durable in the run's events and that `jarvis ask` prints it and exits 0. The gate is a reachable endpoint rather than a secret, and a skip is **reported** as "nothing was proved" rather than as a pass. The real endpoint forced two additions that no fixture could reveal: `[model.provider].base_path` (Ollama serves `/v1/chat/completions`, not `/chat/completions`) and `[model.provider].model_names` (a JARVIS model id cannot contain the `:` in `glm-5.3-flash:cloud`, so without a mapping the adapter cannot name an Ollama cloud model at all). Both are validated where they are used and both leave the default configuration byte-identical | A live `jarvis ask` against `127.0.0.1:11434` returning `JARVIS OLLAMA OK` with exit 0; the smoke harness run twice (live and gated); the adapter's path and model-name validation tests |
+| 2026-09-27 | **Tool calls are translated, reversing a decision that was wrong in the dangerous direction.** The Security Analysis above claimed "tool calls appear as `tool.call.*` events and remain subject to the canonical tool pipeline" while `translate.rs` recognized `tool_calls` and emitted nothing — so the note described behaviour the adapter did not have, and the omission produced a **silent success** rather than a refusal: the controller's typed `run.tools_not_implemented` terminal was reachable only through the scripted provider, so a real model that asked to call a tool yielded a stream with no delta and no tool event and the run could reach `completed` with an empty answer. Now emits `tool.call.added`, `tool.call.arguments.delta`, and `tool.call.completed` (the last carrying the accumulated arguments, because a fragment is not parseable JSON), keyed by the protocol's `index` because later fragments carry neither the id nor the name. Emitting is not a grant: the events are proposals the deterministic layer judges | Five translator tests, falsified by restoring the silent drop; the controller's existing tool-intent tests; the adapter's own code against its security section |

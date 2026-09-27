@@ -8,7 +8,7 @@
 //! binary does not support fails closed and is never rewritten, because an older
 //! binary must not modify state whose writer version it does not understand.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -112,8 +112,30 @@ pub struct ProviderSection {
     pub host: String,
     /// The endpoint port.
     pub port: u16,
+    /// The prefix the completion route is mounted under, when the server uses one.
+    ///
+    /// Absent means `/chat/completions` at the origin. Present means the route is mounted under a
+    /// prefix — `"/v1"` for Ollama, vLLM, LM Studio, and most gateways. Not validated here: the
+    /// adapter owns that rule, for the same reason it owns the host rule, so there is one
+    /// implementation and one error code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
     /// The models this endpoint serves. At least one is required.
     pub models: Vec<String>,
+    /// Maps a served model's JARVIS identifier to the name the provider's API expects.
+    ///
+    /// Needed because the two namespaces genuinely differ. A JARVIS model id is a lowercase dotted
+    /// slug — one spelling per identity, which is what makes a routing decision and a persisted row
+    /// comparable — while a provider may name a model with characters that grammar excludes:
+    /// Ollama's `glm-5.3-flash:cloud`, a versioned `model@2026-01`, a namespaced `org/model`. Without
+    /// this mapping the adapter can only address a model whose provider name happens to already be a
+    /// legal JARVIS id, which silently excludes real endpoints.
+    ///
+    /// An entry whose key is not one of `models` is refused at composition, because a mapping for a
+    /// model the endpoint does not serve is a configuration mistake that would otherwise be invisible:
+    /// the mapped name would never be used, and the operator would believe it had been.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_names: BTreeMap<String, String>,
 }
 
 /// Model routing policy selection.

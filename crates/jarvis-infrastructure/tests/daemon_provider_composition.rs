@@ -380,7 +380,9 @@ async fn a_configuration_the_adapter_refuses_stops_the_daemon_from_being_wired_t
         id: "local.fake".to_owned(),
         host: "api.example.com".to_owned(),
         port: 443,
+        base_path: None,
         models: vec!["fake-model".to_owned()],
+        model_names: std::collections::BTreeMap::new(),
     };
     let mut document =
         Config::from_toml("schema_version = 2\n\n[model]\npolicy_id = \"default\"\n")

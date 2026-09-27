@@ -21,9 +21,12 @@
 //!   controller's twelve, and the projection is total over the non-terminal states,
 //!   which is what the domain deliberately deferred to this boundary.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -406,19 +409,29 @@ pub async fn cancel_run(
 
 /// Handles `GET /api/v1/runs/{run_id}/events`.
 ///
-/// **Partial, and labelled as such.** This delivers the retained public events as SSE
-/// frames and then closes; a client follows a run by reconnecting with `Last-Event-ID`
-/// until it receives a terminal event. A run's *live* follow — holding the connection
-/// open and pushing each new event as it is published — is **not implemented**: a
-/// streaming response body needs a `Stream` implementation, and this crate has neither
-/// a stream crate nor `axum`'s `sse` feature in its reviewed dependency set. Adding
-/// either is a dependency change the integration research gate requires evidence for,
-/// and hand-writing a `Stream` would be an unreviewed async state machine on the
-/// security-relevant path. The gap is recorded in `BRN-007`.
+/// This delivers the retained public events as SSE frames and then **follows the run live**:
+/// the contract requires that an "initial connection replays retained events from sequence 1,
+/// then follows live events", and the response body is a stream that ends after the terminal
+/// event rather than a body written once.
 ///
-/// Everything else the contract requires of the stream is honoured: ordered frames,
-/// exactly one terminal event, a `409` rather than a silent gap for an unavailable
-/// resume position, and nothing but a real event consuming a `sequence`.
+/// The live half is built from three parts, and the division is what makes it robust:
+///
+/// - **The durable store is the source of truth.** The stream's position is a *sequence number*,
+///   and every read is `load_events(from_sequence)`. Nothing is delivered from a channel, so a
+///   live stream and a replayed one cannot disagree about content or order.
+/// - **The wake-up carries no payload.** `RunService::subscribe` yields a notification, not an
+///   event: several deltas may publish between two reads (so one read delivers a batch) and a
+///   notification may arrive with nothing new (so the read returns nothing). Both are handled by
+///   the same idempotent "read from the position" step, which is why a slow or lagging follower
+///   catches up rather than losing output — the contract's own requirement that a slow consumer
+///   "can replay from its last delivered event".
+/// - **The stream ends on the durable terminal state, not on the notification.** A run that
+///   finishes between two reads is seen in the read, so a last notification that never arrives
+///   cannot leave a client waiting after its run is over.
+///
+/// The request-level refusals are decided **before** the body streams: an `Accept` that excludes
+/// the media type is `400`, and an unavailable resume position is `409`. That ordering is not
+/// cosmetic — once the response has begun, a status code can no longer express a decision.
 pub async fn run_events(
     State(state): State<Arc<ApiState>>,
     client: AuthenticatedClient,
@@ -463,52 +476,293 @@ pub async fn run_events(
         },
     };
 
-    match service.events(&context, run, from_sequence).await {
+    // The subscription is taken **before** the first read, so an event published between the read
+    // and the subscribe cannot be missed. The next read is by *sequence*, not by arrival, so anything
+    // published in the window is still read — and taking the subscription first means the notification
+    // for it is not missed either. Taking it after the first read would leave a window in which a
+    // wake-up is sent before there is a receiver for it.
+    let subscription = match service.subscribe(&context, run).await {
+        Ok(subscription) => subscription,
+        Err(error) => return service_error_response(request_id, &error),
+    };
+
+    // Everything up to the first frame is decided *before* the body begins, so a refusal still has a
+    // status code to travel in.
+    //
+    // **The follower's position is derived from the replayed page, not from `from_sequence`.** That
+    // is a real defect fix, and the reason is worth recording because the bug was invisible to a unit
+    // test: initialising the position to `from_sequence` meant the *next* read returned the same page
+    // again, so every replayed event was delivered twice and the run's stream replayed from sequence
+    // 1 in the middle of the body. Two terminal events, and a sequence list of
+    // `[1..7, 1..7]` — which is exactly what the disconnect journey reported, because it counts
+    // terminals and checks contiguity by sequence. A stream that only ever *replayed and closed* could
+    // not exhibit this: it performed one read and never advanced past it.
+    //
+    // The position is therefore the page's own last sequence plus one, and for an empty page it falls
+    // back to `from_sequence` — the run may have nothing after the resume point yet, and the next read
+    // must start where the request asked rather than at 1.
+    let (initial, position) = match service.events(&context, run, from_sequence).await {
         Ok(page) => {
-            let mut body = String::new();
-            for event in &page.events {
-                // A stored payload is already-redacted public detail, so it is passed
-                // through unchanged. A missing or unparseable payload becomes `null`
-                // rather than an invented object, because a client can detect `null` and
-                // cannot detect a plausible-looking substitute.
-                let payload = event
-                    .payload_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str(json).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                let frame = RunEventFrame {
-                    contract_version: RUN_CONTRACT_VERSION.to_owned(),
-                    event_id: event.id.to_string(),
-                    run_id: event.run_id.to_string(),
-                    sequence: event.sequence,
-                    occurred_at: event.occurred_at.to_string(),
-                    payload,
-                };
-                let Ok(data) = serde_json::to_string(&frame) else {
-                    return internal_failure(request_id);
-                };
-                body.push_str(
-                    &SseEvent {
-                        id: frame.event_id.clone(),
-                        event_type: event.event_type.clone(),
-                        data,
-                    }
-                    .render(),
-                );
+            let next = page
+                .events
+                .last()
+                .map_or(from_sequence, |event| event.sequence.saturating_add(1));
+            match render_page(&page) {
+                Ok(frames) => (frames, next),
+                Err(()) => return internal_failure(request_id),
             }
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "text/event-stream"),
-                    // A stream that may be cached is a stream a client can be shown
-                    // stale output from.
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                body,
-            )
-                .into_response()
         }
-        Err(error) => service_error_response(request_id, &error),
+        Err(error) => return service_error_response(request_id, &error),
+    };
+
+    let follower = LiveFollow {
+        service: Arc::clone(service),
+        context,
+        run,
+        next_sequence: position,
+        subscription,
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            // A stream that may be cached is a stream a client can be shown stale output from.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(follow_stream(follower, initial, state.keepalive_interval)),
+    )
+        .into_response()
+}
+
+/// Renders one page of stored events into complete SSE frames.
+///
+/// # Errors
+///
+/// Returns `Err(())` when a frame cannot be serialized, which is a programming error rather than a
+/// condition: the payloads are already-validated JSON and the identifiers are UUID text.
+fn render_page(
+    page: &jarvis_application::repository::run::RunEventPage,
+) -> Result<Vec<String>, ()> {
+    let mut frames = Vec::with_capacity(page.events.len());
+    for event in &page.events {
+        frames.push(render_event(event)?);
+    }
+    Ok(frames)
+}
+
+/// Renders one stored event as a complete SSE frame.
+///
+/// Uses [`SseEvent::render`], the same function the protocol crate's framing test asserts, so the
+/// live path and the wire type cannot produce two spellings of one frame — which is why this handler
+/// never builds a frame string itself.
+///
+/// # Errors
+///
+/// Returns `Err(())` when the frame cannot be serialized.
+fn render_event(
+    event: &jarvis_application::repository::run::StoredActivityEvent,
+) -> Result<String, ()> {
+    // A stored payload is already-redacted public detail, so it is passed through unchanged. A
+    // missing or unparseable payload becomes `null` rather than an invented object, because a client
+    // can detect `null` and cannot detect a plausible-looking substitute.
+    let payload = event
+        .payload_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let frame = RunEventFrame {
+        contract_version: RUN_CONTRACT_VERSION.to_owned(),
+        event_id: event.id.to_string(),
+        run_id: event.run_id.to_string(),
+        sequence: event.sequence,
+        occurred_at: event.occurred_at.to_string(),
+        payload,
+    };
+    let data = serde_json::to_string(&frame).map_err(|_| ())?;
+    Ok(SseEvent {
+        id: frame.event_id,
+        event_type: event.event_type.clone(),
+        data,
+    }
+    .render())
+}
+
+/// The state a live follow carries while it works.
+///
+/// The read position lives here rather than in the response body, because it is the *follower's*
+/// state: it is a sequence number, and it is what makes a live stream and a replayed one agree about
+/// where the client is.
+struct LiveFollow {
+    service: Arc<RunService>,
+    context: RequestContext,
+    run: RunId,
+    /// The next sequence to read, which is where the last delivered event left off.
+    next_sequence: u64,
+    /// Wake-ups that a run's stream has grown.
+    subscription: jarvis_application::live_events::LiveSubscription,
+}
+
+impl LiveFollow {
+    /// Reads the next batch of frames after the current position.
+    ///
+    /// Returns `Ok(frames)` plus whether the run has reached a durable terminal state, or `Err(())`
+    /// when a frame cannot be rendered. The position advances past every event considered —
+    /// including one that failed to render — because re-reading it would repeat the defect rather
+    /// than recover from it.
+    async fn read(&mut self) -> Result<(Vec<String>, bool), ()> {
+        let page = self
+            .service
+            .events(&self.context, self.run, self.next_sequence)
+            .await
+            .map_err(|_| ())?;
+        let mut frames = Vec::with_capacity(page.events.len());
+        for event in &page.events {
+            self.next_sequence = event.sequence.saturating_add(1);
+            frames.push(render_event(event)?);
+        }
+        // The terminal condition comes from the run's **durable state**, not from a string match on
+        // the last frame: the state is the fact, and an event type is one projection of it.
+        Ok((frames, page.terminal_state.is_some()))
+    }
+}
+
+/// The depth of the channel between the follow task and the response body.
+///
+/// Bounded, like every other buffer in this workspace. A full channel applies backpressure to the
+/// *follow task* rather than dropping frames, which is the correct direction: the run itself is
+/// unaffected — its events are durable — so a slow client slows only its own delivery, and the
+/// contract's "a slow consumer can replay from its last delivered event" holds because the store
+/// still has everything the channel had not yet handed over.
+const FOLLOW_CHANNEL_DEPTH: usize = 32;
+
+/// Builds the response body that follows a run to its terminal event.
+///
+/// A task feeding a bounded channel, with the body draining it — the same shape
+/// [`AdapterStream`](jarvis_application::model::AdapterStream) uses for a provider's frames, and for
+/// the same reason: the follow loop is ordinary `async` code, so it never needs a hand-written
+/// `poll` that owns a future borrowing the state it must also reach. That self-reference is what
+/// makes a manual `Stream` implementation hard to review, and it is avoided here rather than
+/// solved.
+///
+/// **A keepalive comment is emitted while the loop waits**, which is the one thing in this loop that
+/// happens on a timer. The contract requires it ("Keepalives are SSE comments and do not consume
+/// sequence numbers") and it is load-bearing rather than decorative: a run that is *thinking* has no
+/// events to send, and a connection that stays silent for long enough is dropped by whatever sits
+/// between the daemon and the client — a proxy, or the operating system. The comment is a **comment**,
+/// so it carries no `id:` and a client's parser skips it, which is exactly why it cannot be a
+/// synthetic event: a client resuming from `Last-Event-ID` would be sent back to a position that
+/// never existed.
+///
+/// The task **always** closes the channel, on every exit path, because the response body ends when
+/// the channel closes: a task that left it open would hold a client's connection open forever.
+fn follow_stream(
+    follower: LiveFollow,
+    initial: Vec<String>,
+    keepalive: Duration,
+) -> impl futures_core::Stream<Item = Result<Bytes, std::convert::Infallible>> {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(FOLLOW_CHANNEL_DEPTH);
+
+    tokio::spawn(async move {
+        // The initial page is sent first, so a replayed run's frames are delivered before the task
+        // waits on anything — and a run that is already terminal closes the channel on the first
+        // iteration below without waiting for a notification that will never come.
+        for frame in initial {
+            if sender.send(Bytes::from(frame)).await.is_err() {
+                // The client went away. Nothing to clean up: a disconnect never cancels a durable
+                // run, and the run's events remain in the store for a later follower.
+                return;
+            }
+        }
+
+        let mut follower = follower;
+        // Created once, before the loop, so the interval is measured between keepalives rather than
+        // restarted by each read. A per-iteration timer would be reset by every wake-up, and a run
+        // publishing steadily would then never emit one — which is harmless, but it would also mean
+        // a run publishing *slowly* emitted keepalives at a rate the interval does not describe.
+        let mut ticker = tokio::time::interval(keepalive);
+        // A missed tick's worth of waiting must not be repaid as a burst, which is what the default
+        // `Burst` behaviour does: a delayed loop would emit several comments at once, which is
+        // traffic with no purpose. `Delay` reschedules from now, so the steady state is one comment
+        // per interval however late the loop was.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately, so it is consumed here: without this the stream would
+        // emit a keepalive as its first output, before any event, which a client could observe and
+        // which would be a comment that says nothing happened to a client that had just connected.
+        ticker.tick().await;
+
+        loop {
+            match follower.read().await {
+                Ok((frames, terminal)) => {
+                    for frame in frames {
+                        if sender.send(Bytes::from(frame)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if terminal {
+                        // The contract: "the server closes after delivering the terminal event".
+                        return;
+                    }
+                }
+                Err(()) => {
+                    // A read that fails after the response has begun cannot become a status code, so
+                    // the stream ends. The client reconnects with `Last-Event-ID` and receives a
+                    // `409` if the position is genuinely gone, which is the contract's own recovery
+                    // path rather than a silent gap.
+                    return;
+                }
+            }
+            // The wait is a `select` rather than a plain `wake().await` because the keepalive must
+            // fire **while** the follower is waiting: a notification cannot arrive during a run that
+            // is thinking, so a loop that only awaited one would be silent for the whole gap it
+            // exists to cover. `biased` puts the notification first, so an event that arrives at the
+            // same moment as a tick is delivered rather than preceded by a comment.
+            tokio::select! {
+                biased;
+                live = follower.subscription.wake() => {
+                    // A wake-up carries no payload, so it is permission to read again rather than an
+                    // event. A receiver whose publisher is gone reports `false`, which ends the
+                    // connection: waiting forever for an update nothing can send is the one outcome
+                    // to avoid.
+                    if !live {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if sender
+                        .send(Bytes::from(jarvis_protocol::run::keepalive_frame()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    ReceiverStream { receiver }
+}
+
+/// The response body: a stream over frames the follow task has rendered.
+///
+/// Implements `futures_core::Stream` by delegating to the channel's own `poll_recv`, so no future is
+/// stored and no waker is at risk of being dropped. `Ready(None)` means the follow task closed the
+/// channel, which is how the body learns the run is over.
+struct ReceiverStream {
+    receiver: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl futures_core::Stream for ReceiverStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // `Infallible` as the error type: a frame is already-rendered text, so there is no per-item
+        // failure to report — the only way this ends is the channel closing.
+        self.receiver.poll_recv(context).map(|item| item.map(Ok))
     }
 }
 

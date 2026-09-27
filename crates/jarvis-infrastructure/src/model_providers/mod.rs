@@ -131,7 +131,22 @@ fn compose_adapter(
     for name in &section.models {
         model_ids.push(ModelId::parse(name).map_err(|_| ProviderResolutionError::InvalidModelId)?);
     }
-    OpenAiCompatibleProvider::new(provider_id, &section.host, section.port, api_key, model_ids)
+    let adapter =
+        OpenAiCompatibleProvider::new(provider_id, &section.host, section.port, api_key, model_ids)
+            .map_err(ProviderResolutionError::Adapter)?;
+    // The base path is applied through the adapter's own validator rather than checked here, so
+    // there is one implementation of "is this a safe path" and one error code for a bad one — the
+    // same reasoning that keeps the host rule in the adapter.
+    let adapter = match &section.base_path {
+        Some(base_path) => adapter
+            .with_base_path(base_path)
+            .map_err(ProviderResolutionError::Adapter)?,
+        None => adapter,
+    };
+    // The wire names are applied through the adapter's own validator too, so one place decides what a
+    // provider-side name may contain.
+    adapter
+        .with_wire_names(&section.model_names)
         .map_err(ProviderResolutionError::Adapter)
 }
 

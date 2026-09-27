@@ -55,9 +55,21 @@ pub mod translate;
 use sse::{FrameRead, SseBuffer, SseFrame};
 use translate::{ChunkTranslator, Translated};
 
-/// The path appended to the configured base. Fixed rather than configurable, so a typo in
-/// configuration cannot silently post to a different endpoint.
+/// The path appended to the configured base when none is given.
+///
+/// A default rather than a constant the adapter is stuck with: the Chat Completions route is
+/// `/chat/completions` only when the server is rooted at the origin, and a great many compatible
+/// servers mount it under a prefix — `http://127.0.0.1:11434/v1/chat/completions` on Ollama, and a
+/// `/v1` prefix on vLLM, LM Studio, and most gateways. Making it configurable is what lets those be
+/// used at all; validating it as a **path** rather than accepting a URL is what keeps the
+/// "a key cannot end up in the endpoint" property that the host/port split exists for.
 pub const COMPLETIONS_PATH: &str = "/chat/completions";
+
+/// The longest accepted base path.
+///
+/// Bounded because it is operator input that reaches a request line, and an unbounded value there is
+/// a request-smuggling surface rather than a configuration convenience.
+pub const MAX_PATH_BYTES: usize = 256;
 
 /// The largest response body this adapter will read.
 ///
@@ -122,6 +134,16 @@ pub struct OpenAiCompatibleProvider {
     port: u16,
     api_key: BearerKey,
     endpoint_class: EndpointClass,
+    /// The prefix the completion route is mounted under, normalized and without a trailing slash.
+    ///
+    /// Stored validated rather than raw, so no request can be built from an unvalidated value: the
+    /// only way in is [`OpenAiCompatibleProvider::with_base_path`], which refuses anything unsafe.
+    base_path: String,
+    /// JARVIS model id to provider wire name, for models whose two names differ.
+    ///
+    /// Keyed by the model id string. A model absent from this map is sent under its own id, which is
+    /// the common case and keeps every existing configuration byte-identical.
+    wire_names: std::collections::BTreeMap<String, String>,
     /// How long one exchange may take, including the body.
     ///
     /// The adapter's own outer bound. The run controller passes a tighter per-frame deadline through
@@ -166,6 +188,22 @@ pub enum ConfigError {
     NoModels,
     /// The endpoint was given as a URL carrying a scheme, path, query, or userinfo.
     UrlShaped,
+    /// The configured base path is not a usable absolute path.
+    ///
+    /// Refused rather than normalised, and for the same reason the host is: a value that needs
+    /// repairing is a value whose meaning is uncertain, and "normalised into something safe" is how a
+    /// configuration typo becomes a request to an endpoint nobody intended. The rules are the ones
+    /// that make the value safe to put in a request line — absolute, no traversal, no query, no
+    /// fragment, no whitespace or control characters, and bounded.
+    InvalidPath,
+    /// A provider-side model name is unusable, or maps a model this endpoint does not serve.
+    ///
+    /// The name reaches a JSON body rather than a request line, so the rules are narrower than the
+    /// path's: bounded, non-blank, no control character. An entry keyed on a model the adapter does
+    /// not serve is refused because the mapping would never be used and the operator would believe it
+    /// had been — the same reasoning that makes an unserved routed model a refusal rather than a
+    /// silent substitution.
+    InvalidModelName,
 }
 
 impl ConfigError {
@@ -177,6 +215,8 @@ impl ConfigError {
             Self::InvalidCredential => "model.adapter_credential_invalid",
             Self::NoModels => "model.adapter_no_models",
             Self::UrlShaped => "model.adapter_endpoint_url_shaped",
+            Self::InvalidPath => "model.adapter_path_invalid",
+            Self::InvalidModelName => "model.adapter_model_name_invalid",
         }
     }
 }
@@ -247,7 +287,69 @@ impl OpenAiCompatibleProvider {
             api_key: BearerKey(trimmed.to_owned()),
             endpoint_class: EndpointClass::Local,
             timeout: std::time::Duration::from_secs(120),
+            base_path: String::new(),
+            wire_names: std::collections::BTreeMap::new(),
         })
+    }
+
+    /// Supplies the provider-side names for models whose JARVIS id differs from the API's name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidModelName`] for a name that is not usable or that maps a model
+    /// this adapter does not serve.
+    pub fn with_wire_names(
+        mut self,
+        names: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, ConfigError> {
+        for (model_id, wire_name) in names {
+            // A mapping for an unserved model is refused rather than ignored: it would never be used,
+            // and the operator would have no way to tell that their mapping had no effect.
+            if !self
+                .models
+                .iter()
+                .any(|served| served.model_id.as_str() == model_id)
+            {
+                return Err(ConfigError::InvalidModelName);
+            }
+            if !is_usable_model_name(wire_name) {
+                return Err(ConfigError::InvalidModelName);
+            }
+            let _previous = self.wire_names.insert(model_id.clone(), wire_name.clone());
+        }
+        Ok(self)
+    }
+
+    /// Returns the name this adapter sends for `model`.
+    ///
+    /// A model with no mapping is sent under its own id, which is the common case: the two namespaces
+    /// coincide whenever a provider names models the way JARVIS does.
+    #[must_use]
+    pub fn wire_name_for(&self, model: &ModelRef) -> String {
+        self.wire_names
+            .get(model.model_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| model.model_id.as_str().to_owned())
+    }
+
+    /// Sets the base path the completion route is mounted under.
+    ///
+    /// `""` (the default) posts to `/chat/completions`; `"/v1"` posts to `/v1/chat/completions`,
+    /// which is what Ollama, vLLM, LM Studio, and most gateways serve. Trailing slashes are trimmed so
+    /// `"/v1/"` and `"/v1"` are one value rather than two spellings that could disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidPath`] for a value that is not a safe absolute path.
+    pub fn with_base_path(mut self, base_path: &str) -> Result<Self, ConfigError> {
+        self.base_path = validate_base_path(base_path)?;
+        Ok(self)
+    }
+
+    /// Returns the full request path, base and route together.
+    #[must_use]
+    pub fn completions_path(&self) -> String {
+        format!("{}{COMPLETIONS_PATH}", self.base_path)
     }
 
     /// Sets the outer transport timeout.
@@ -361,7 +463,13 @@ impl OpenAiCompatibleProvider {
         }
 
         let mut body = serde_json::json!({
-            "model": request.model.model_id.to_string(),
+            // The **provider's** name for the model, which is its own id unless the configuration
+            // mapped it. The two namespaces genuinely differ for real endpoints — Ollama's
+            // `glm-5.3-flash:cloud` cannot be a JARVIS model id, because a JARVIS id is a lowercase
+            // dotted slug — so the id this adapter routes on and the string the provider is asked for
+            // are separate values. The routed model is still exactly one this adapter serves; the
+            // mapping changes only how it is spelled on the wire.
+            "model": self.wire_name_for(&request.model),
             "messages": messages,
             "stream": true,
             // Requested so the final chunk carries the usage block. Without it the provider reports
@@ -450,6 +558,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             let plan = ExchangePlan {
                 host: self.host.clone(),
                 port: self.port,
+                path: self.completions_path(),
                 body: serde_json::to_string(&body).map_err(|_| ProviderError::InvalidRequest)?,
                 // The credential is moved into the plan rather than borrowed, so the task owns the
                 // only copy and no reference to it outlives this call.
@@ -484,6 +593,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 struct ExchangePlan {
     host: String,
     port: u16,
+    /// The full request path, base and route together, already validated.
+    path: String,
     body: String,
     credential: String,
     timeout: std::time::Duration,
@@ -540,13 +651,14 @@ async fn exchange(
         // hard to send the credential anywhere but this peer. The credential is a **header value**,
         // never a URL component, so it cannot appear in a URL-shaped log line.
         let request = format!(
-            "POST {COMPLETIONS_PATH} HTTP/1.1\r\n\
+            "POST {path} HTTP/1.1\r\n\
              Host: {host}:{port}\r\n\
              Authorization: Bearer {credential}\r\n\
              Content-Type: application/json\r\n\
              Accept: text/event-stream\r\n\
              Content-Length: {length}\r\n\
              Connection: close\r\n\r\n{body}",
+            path = plan.path,
             host = plan.host,
             port = plan.port,
             credential = plan.credential,
@@ -818,6 +930,75 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Validates a provider-side model name.
+///
+/// The rules are narrower than the path's, because a model name reaches a **JSON body** rather than a
+/// request line: `serde_json` escapes whatever it is given, so the smuggling surface that makes the
+/// path rules strict does not apply. What remains is the pair that would make a request meaningless
+/// or unbounded: blank-or-oversized, and a control character that has no place in a name. Everything
+/// else a provider is known to use — `:` in `glm-5.3-flash:cloud`, `/` in `org/model`, `@` in
+/// `model@2026-01` — is **allowed**, because excluding them would exclude the real endpoints this
+/// mapping exists to reach.
+fn is_usable_model_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= MAX_MODEL_NAME_BYTES
+        && !trimmed.chars().any(char::is_control)
+}
+
+/// The longest accepted provider-side model name.
+///
+/// Bounded because it is operator input placed in a request body, and an unbounded value there is an
+/// unbounded request — the same reason every other operator value here has a ceiling. Generous
+/// relative to any real model name; this is a defect bound, not a policy.
+pub const MAX_MODEL_NAME_BYTES: usize = 192;
+
+/// Validates an operator-supplied base path for the completion route.
+///
+/// The rules are the ones that make the value safe to place in a request line, and each rejects a
+/// specific way a path could change the request's meaning:
+///
+/// - **A relative value is refused.** A bare `"v1"` is not a path, and an omitted call is the
+///   first-class spelling of "the origin", so there is nothing to accept.
+/// - **`..` and `.` segments are refused**, because a path that climbs is how a request reaches a
+///   route the adapter was not configured for.
+/// - **`?` and `#` are refused**, because they would end the request target and begin a query or a
+///   fragment: everything after them reaches the server as something other than a path, which is how
+///   a value ends up somewhere the adapter did not put it.
+/// - **Interior whitespace, control characters, and `\\` are refused**, because a space ends the
+///   request target and a CR or LF injects a header. This is the request-smuggling surface that makes
+///   "let the operator type a path" unsafe without validation, and it is why the value is refused
+///   rather than escaped: an escaped path is a different path, and the operator meant the one they
+///   typed.
+///
+/// **Leading and trailing whitespace is stripped, and so is a trailing slash**, because neither can
+/// reach a request line once stripped and both have one obvious meaning. My first version of this
+/// function documented the whitespace rule as "any whitespace is refused" while the code trimmed
+/// first — so `"/v1\t"` was accepted, and my own test is what surfaced the disagreement. The
+/// distinction the code actually draws is the one that matters: whitespace *inside* the path changes
+/// where the request target ends, and whitespace around it does not.
+///
+/// Returns the normalised value, stripped and without a trailing slash, so one path has one spelling.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidPath`] for a value failing any rule above.
+fn validate_base_path(base_path: &str) -> Result<String, ConfigError> {
+    let trimmed = base_path.trim();
+    if trimmed.len() > MAX_PATH_BYTES || !trimmed.starts_with('/') {
+        return Err(ConfigError::InvalidPath);
+    }
+    let unsafe_value = trimmed.contains(['?', '#', '\\', '\r', '\n', '\0'])
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".");
+    if unsafe_value {
+        return Err(ConfigError::InvalidPath);
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
 /// The largest response head this reader will accept.
 pub const MAX_HEAD_BYTES: usize = 16 << 10;
 
@@ -975,8 +1156,8 @@ pub fn map_status(status: u16, body: &str) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, MAX_TOOLS, OpenAiCompatibleProvider, map_status, message_text, pump_body,
-        role_name,
+        COMPLETIONS_PATH, ConfigError, MAX_PATH_BYTES, MAX_TOOLS, OpenAiCompatibleProvider,
+        map_status, message_text, pump_body, role_name, validate_base_path,
     };
     use jarvis_application::model::ProviderError;
     use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
@@ -991,6 +1172,85 @@ mod tests {
             vec![ModelId::parse("test-model").expect("valid")],
         )
         .expect("the fixture configures")
+    }
+
+    #[test]
+    fn an_unset_base_path_posts_to_the_origin_route() {
+        // The default keeps every existing configuration posting to exactly what it posted to before,
+        // so making the path configurable is not a change to the common case.
+        assert_eq!(provider().completions_path(), COMPLETIONS_PATH);
+        assert_eq!(COMPLETIONS_PATH, "/chat/completions");
+    }
+
+    #[test]
+    fn a_base_path_is_appended_before_the_route() {
+        // The case that makes the option exist: Ollama serves the Chat Completions route under
+        // `/v1`, so without a base path the adapter cannot reach it at all.
+        let provider = provider()
+            .with_base_path("/v1")
+            .expect("a relative-free absolute path is accepted");
+        assert_eq!(provider.completions_path(), "/v1/chat/completions");
+        // A trailing slash is one spelling of the same path, not a second value.
+        let trailing = provider
+            .with_base_path("/v1/")
+            .expect("a trailing slash is normalised");
+        assert_eq!(trailing.completions_path(), "/v1/chat/completions");
+    }
+
+    #[test]
+    fn a_base_path_that_could_change_the_request_is_refused() {
+        // Each of these changes what the request *is* rather than only which route it names, so the
+        // value is refused instead of escaped: an escaped path is a different path, and the operator
+        // meant the one they typed.
+        for refused in [
+            // Not a path at all.
+            "v1",
+            "",
+            // A path that climbs, which is how a request reaches a route it was not configured for.
+            "/../admin",
+            "/v1/../../admin",
+            "/.",
+            // A query or fragment would end the request target, so what follows reaches the server as
+            // something other than a path.
+            "/v1?key=abc",
+            "/v1#frag",
+            // A space ends the request target; CR and LF inject a header. This is the smuggling
+            // surface. Interior whitespace only: leading and trailing whitespace is stripped first,
+            // so it cannot reach the request line and is a normalisation rather than a refusal.
+            "/v1 extra",
+            "/v1\r\nHost: evil.example",
+            "/v1\tx",
+            // A backslash is a path separator on one platform and a literal on another, so accepting
+            // it would let one configuration mean two routes.
+            "/v1\\admin",
+            // Bounded, because it reaches a request line.
+            &format!("/{}", "a".repeat(MAX_PATH_BYTES)),
+        ] {
+            let result = provider().with_base_path(refused);
+            assert!(
+                matches!(result, Err(ConfigError::InvalidPath)),
+                "{refused:?} must be refused",
+            );
+        }
+        assert_eq!(
+            ConfigError::InvalidPath.code(),
+            "model.adapter_path_invalid",
+        );
+    }
+
+    #[test]
+    fn the_path_validator_accepts_a_nested_prefix_and_normalises_it() {
+        // A gateway mounted under a deeper prefix is the same case as `/v1`, so it must work — and
+        // the normalised form is what a caller sees, so there is one spelling to compare.
+        assert_eq!(
+            validate_base_path("/openai/v1").expect("accepted"),
+            "/openai/v1"
+        );
+        assert_eq!(validate_base_path("/v1/").expect("accepted"), "/v1");
+        assert_eq!(validate_base_path("/v1//").expect("accepted"), "/v1");
+        // Surrounding whitespace cannot reach the request line once stripped, so it is normalised
+        // rather than refused — the distinction the doc comment above records getting wrong first.
+        assert_eq!(validate_base_path("  /v1\t").expect("accepted"), "/v1");
     }
 
     #[test]

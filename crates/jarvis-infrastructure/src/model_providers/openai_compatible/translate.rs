@@ -68,6 +68,36 @@ pub struct ChunkTranslator {
     late_deltas_ignored: u64,
     /// The provider's model identifier, reported on the first chunk that carries one.
     model: Option<String>,
+    /// The tool calls this stream has announced, keyed by the provider's index for each.
+    ///
+    /// Keyed by index because that is how this protocol identifies a tool call **within a stream**:
+    /// a fragment carries an `index` and, on its first chunk only, an `id`. Later argument fragments
+    /// for the same call repeat the index and omit both the id and the name, so the index is the only
+    /// value that ties a fragment to the call it continues. The provider's `id` is kept per index and
+    /// used as the **canonical** call identifier, because it is the value a later transcript
+    /// continuation must echo.
+    tool_calls: std::collections::BTreeMap<u64, AnnouncedToolCall>,
+}
+
+/// One tool call a provider has announced, and how much of its argument text has arrived.
+#[derive(Debug, Clone)]
+struct AnnouncedToolCall {
+    /// The provider's own call id, adopted verbatim as the canonical identifier.
+    call_id: String,
+    /// The tool the model wants to call.
+    name: String,
+    /// The argument text accumulated so far.
+    ///
+    /// Accumulated because the protocol streams it in fragments, and `tool.call.completed` carries
+    /// the **complete raw arguments** — the value the fabric will parse and validate. Sending only
+    /// the last fragment would hand the validator a JSON fragment, which is not JSON.
+    arguments: String,
+    /// Whether `tool.call.added` has been emitted for this call.
+    ///
+    /// Separate from "a name is present", because the protocol emits the name and the id together on
+    /// the first fragment for an index — so a fragment that is *only* arguments (which is every
+    /// fragment after the first) must not re-announce the call.
+    announced: bool,
 }
 
 impl ChunkTranslator {
@@ -81,6 +111,7 @@ impl ChunkTranslator {
             terminal_emitted: false,
             late_deltas_ignored: 0,
             model: None,
+            tool_calls: std::collections::BTreeMap::new(),
         }
     }
 
@@ -175,6 +206,22 @@ impl ChunkTranslator {
             }
 
             if let Some(delta) = choice.get("delta").filter(|value| value.is_object()) {
+                // **Tool calls are translated, and that reversed an earlier decision.** This adapter
+                // used to recognize `tool_calls` and emit nothing, reasoning that the tool fabric does
+                // not exist so a tool call must not be "proposed". That was wrong in the dangerous
+                // direction, and it took building one to see it: the controller *does* have a typed,
+                // terminal outcome for a tool intent and **no other way to reach it**, so dropping the
+                // event did not prevent a proposal — it removed the only thing that made the refusal
+                // accurate. A real model that asked to call a tool produced a stream with no delta and
+                // no tool event, so the run could reach `completed` with an empty answer. A silent
+                // success on a dropped intent is strictly worse than a typed refusal, because the model
+                // asked to *do* something and JARVIS reported that it finished.
+                //
+                // Emitting the event is also not a grant: `tool.call.added` is a proposal the
+                // deterministic layer judges, which is what "discovery never grants execution" means.
+                // The argument text is carried through unparsed for the same reason — the adapter
+                // transports, the fabric validates.
+                self.push_tool_calls(&mut events, delta);
                 if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
                     && !text.is_empty()
                 {
@@ -189,10 +236,16 @@ impl ChunkTranslator {
                         self.push_delta(&mut events, refusal);
                     }
                 }
-                // `role`, `tool_calls`, and `function_call` are recognized and not translated. Tool
-                // calling is explicitly out of this slice's scope (the evidence note records it),
-                // and silently emitting a tool-call event for a tool the adapter never advertised
-                // would propose an action the run could not resolve.
+                // `role` is recognized and not translated: the normalized stream has no role event,
+                // and an assistant role adds nothing a client acts on.
+                // `function_call` is the legacy singular spelling of `tool_calls`. It is **not**
+                // translated, and the asymmetry is deliberate: it appears in the same position in the
+                // same shape, so a caller reading only "a tool call arrived" cannot tell which
+                // grammar the endpoint speaks, and the legacy form carries a bare `name`/`arguments`
+                // pair with no `index` or `id` — so it cannot supply the canonical call identifier
+                // that a continuation needs. Translating it would emit a tool call with a
+                // synthesized id that no later request could reference. It is recorded here as a
+                // known limitation rather than silently half-handled.
             }
 
             if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
@@ -221,6 +274,102 @@ impl ChunkTranslator {
             Translated::Ignored
         } else {
             Translated::Events(events)
+        }
+    }
+
+    /// Appends the events for any tool calls in one `delta`.
+    ///
+    /// The protocol's shape is worth stating because it is what the keying follows: a stream's
+    /// `tool_calls` array is a list of `{index, id?, type?, function: {name?, arguments?}}`
+    /// fragments. The **first** fragment for an index carries the `id` and the `name`; every later
+    /// fragment repeats only the index and carries an `arguments` string, which is the text so far
+    /// **for that call** and is what the provider would resend whole if it resends at all. The index
+    /// is therefore the only value tying a fragment to its call, which is why the state is keyed by
+    /// it, and the provider's `id` is adopted verbatim as the canonical call identifier because it is
+    /// the value a later transcript continuation has to echo.
+    fn push_tool_calls(
+        &mut self,
+        events: &mut Vec<ModelStreamEventKind>,
+        delta: &serde_json::Value,
+    ) {
+        let Some(calls) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return;
+        };
+        // A tool call after the terminal is dropped for the same reason a content delta is: the call
+        // has been declared finished, and accepting a further intent would let a hostile endpoint
+        // propose an action after the run recorded its outcome.
+        if self.terminal_emitted {
+            self.late_deltas_ignored = self
+                .late_deltas_ignored
+                .saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX));
+            return;
+        }
+        for (position, call) in calls.iter().enumerate() {
+            // An absent index is tolerated the way an absent choice index is: a minimal compatible
+            // server may omit it, and with one call there is no ambiguity to resolve. The position in
+            // the array is the fallback, so two calls cannot collide on one key.
+            let index = call
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(position as u64);
+            let function = call.get("function");
+            let name = function
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty());
+            let arguments = function
+                .and_then(|function| function.get("arguments"))
+                .and_then(serde_json::Value::as_str);
+
+            let entry = self
+                .tool_calls
+                .entry(index)
+                .or_insert_with(|| AnnouncedToolCall {
+                    // A call whose first fragment carries no id still needs a stable identifier, and the
+                    // provider's own is the only one available. Deriving it from the index makes it
+                    // distinct within the stream and reproducible for the same stream, which is what a
+                    // replayed transcript needs; a fabricated value would collide across two streams.
+                    call_id: format!("tool-{index}"),
+                    name: String::new(),
+                    arguments: String::new(),
+                    announced: false,
+                });
+            if let Some(id) = call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                id.clone_into(&mut entry.call_id);
+            }
+            if let Some(name) = name {
+                name.clone_into(&mut entry.name);
+            }
+
+            // The call is announced once, on the fragment that names it. A fragment carrying neither
+            // a name nor an id — which is every argument continuation — must not re-announce it, and
+            // a call whose name never arrived is not announced at all: an unnamed intent cannot be
+            // judged by the layer that decides, so proposing it would be proposing an action with no
+            // action in it.
+            if !entry.announced && !entry.name.is_empty() {
+                entry.announced = true;
+                let (call_id, tool_name) = (entry.call_id.clone(), entry.name.clone());
+                events.push(ModelStreamEventKind::ToolCallAdded { call_id, tool_name });
+            }
+
+            if let Some(arguments) = arguments.filter(|arguments| !arguments.is_empty()) {
+                let call_id = entry.call_id.clone();
+                // Accumulated as well as streamed: the completed event carries the whole text, and a
+                // fragment alone is not parseable JSON, so a consumer that read only the deltas could
+                // not validate the call.
+                entry.arguments.push_str(arguments);
+                events.push(ModelStreamEventKind::ToolCallArgumentsDelta {
+                    call_id,
+                    delta: arguments.to_owned(),
+                });
+            }
         }
     }
 
@@ -262,6 +411,21 @@ impl ChunkTranslator {
         // does, which is the ordering the normalized stream documents.
         if let Some(item_id) = self.item_id.clone() {
             events.push(ModelStreamEventKind::OutputItemCompleted { item_id });
+        }
+        // Any announced tool call is completed before the terminal, because a call the model proposed
+        // must be judged by the layer that decides — and the terminal is what ends the stream, so a
+        // completion after it would never be read. Emitted unconditionally on announcement rather than
+        // only when the provider's finish reason says `tool_calls`: the reason is the provider's claim
+        // about *why* it stopped, while the announcement is the fact that it proposed something, and
+        // trusting the claim would drop a call from an endpoint that reports a bare `stop` beside it.
+        for call in self.tool_calls.values() {
+            if !call.announced {
+                continue;
+            }
+            events.push(ModelStreamEventKind::ToolCallCompleted {
+                call_id: call.call_id.clone(),
+                arguments: call.arguments.clone(),
+            });
         }
         events.push(ModelStreamEventKind::CallCompleted {
             finish_reason,
@@ -376,8 +540,219 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_is_translated_through_announcement_arguments_and_completion() {
+        // **The regression test for a hole this adapter had, and it is the dangerous kind.** Tool
+        // calls used to be recognized and dropped, on the reasoning that the tool fabric does not
+        // exist. That reasoning was backwards: the controller has a typed terminal outcome for a tool
+        // intent and no other way to reach it, so dropping the event removed the only thing that made
+        // the refusal accurate — a real model that asked to call a tool produced a stream with no
+        // delta and no tool event, and the run could reach `completed` with an empty answer. A silent
+        // success on a dropped intent is worse than a typed refusal.
+        //
+        // The three frames below are the protocol's real shape, and the shape is what the keying
+        // follows: the first fragment carries the index, the id, and the name; later fragments carry
+        // **only the index and an argument fragment**, so a translator that keyed on the id or the
+        // name would lose every fragment after the first.
+        let mut translator = ChunkTranslator::new();
+        let announced = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"fs.read","arguments":""}}]},"finish_reason":null}]}"#,
+        ))));
+        assert_eq!(
+            announced,
+            vec![ModelStreamEventKind::ToolCallAdded {
+                call_id: "call_abc123".to_owned(),
+                tool_name: "fs.read".to_owned(),
+            }],
+            "the first fragment announces the call",
+        );
+
+        // Two argument fragments for the same call, neither repeating the id or the name.
+        let first_arguments = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]},"finish_reason":null}]}"#,
+        ))));
+        assert_eq!(
+            first_arguments,
+            vec![ModelStreamEventKind::ToolCallArgumentsDelta {
+                call_id: "call_abc123".to_owned(),
+                delta: "{\"pa".to_owned(),
+            }],
+            "an argument fragment must not re-announce the call",
+        );
+        let second_arguments = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"/etc/hosts\"}"}}]},"finish_reason":null}]}"#,
+        ))));
+        assert_eq!(
+            second_arguments,
+            vec![ModelStreamEventKind::ToolCallArgumentsDelta {
+                call_id: "call_abc123".to_owned(),
+                delta: "th\":\"/etc/hosts\"}".to_owned(),
+            }],
+        );
+
+        // The terminal completes the call with the **whole** argument text, because a fragment alone is
+        // not parseable JSON — the fabric validates the arguments, so it needs the complete value.
+        let terminal = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ))));
+        assert_eq!(
+            terminal,
+            vec![
+                ModelStreamEventKind::ToolCallCompleted {
+                    call_id: "call_abc123".to_owned(),
+                    arguments: "{\"path\":\"/etc/hosts\"}".to_owned(),
+                },
+                ModelStreamEventKind::CallCompleted {
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                    refused: false,
+                },
+            ],
+            "the completion carries the accumulated arguments, and the terminal follows it",
+        );
+    }
+
+    #[test]
+    fn a_tool_call_is_completed_even_when_the_provider_reports_a_plain_stop() {
+        // The finish reason is the provider's claim about *why* it stopped; the announcement is the
+        // fact that it proposed something. Trusting the claim would drop a call from an endpoint that
+        // reports a bare `stop` beside it — and this protocol permits exactly that, which is why the
+        // completion is emitted on announcement rather than on the reason.
+        let mut translator = ChunkTranslator::new();
+        let _ = translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell.run","arguments":"{\"cmd\":\"ls\"}"}}]},"finish_reason":null}]}"#,
+        )));
+        let terminal = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ))));
+        assert!(
+            terminal.iter().any(|kind| matches!(
+                kind,
+                ModelStreamEventKind::ToolCallCompleted { call_id, arguments }
+                    if call_id == "call_1" && arguments == "{\"cmd\":\"ls\"}"
+            )),
+            "a proposed call must be completed whatever reason is reported: {terminal:?}",
+        );
+    }
+
+    #[test]
+    fn a_tool_call_with_no_name_is_not_announced() {
+        // An unnamed intent cannot be judged — there is no action to decide about — so it is not
+        // proposed at all rather than proposed with an empty name, which the fabric would have to
+        // special-case. Its argument fragments are still streamed, because the call was real and a
+        // consumer reading only the deltas should see them.
+        let mut translator = ChunkTranslator::new();
+        let events = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":null}]}"#,
+        ))));
+        assert!(
+            !events
+                .iter()
+                .any(|kind| matches!(kind, ModelStreamEventKind::ToolCallAdded { .. })),
+            "an unnamed call must not be announced: {events:?}",
+        );
+        assert_eq!(
+            events,
+            vec![ModelStreamEventKind::ToolCallArgumentsDelta {
+                call_id: "tool-0".to_owned(),
+                delta: "{}".to_owned(),
+            }],
+            "the argument fragment is still carried, under the derived identifier",
+        );
+    }
+
+    #[test]
+    fn two_concurrent_tool_calls_are_kept_apart_by_their_index() {
+        // A model may propose several calls in one answer, and the protocol distinguishes them only by
+        // `index` — the id and name appear on each one's first fragment, but the *arguments* that
+        // follow carry neither. Keying on anything else would merge them into one call with two
+        // names' worth of arguments, so this asserts the separation rather than trusting it.
+        let mut translator = ChunkTranslator::new();
+        let announced = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"fs.read","arguments":""}},{"index":1,"id":"call_b","function":{"name":"fs.write","arguments":""}}]},"finish_reason":null}]}"#,
+        ))));
+        assert_eq!(
+            announced,
+            vec![
+                ModelStreamEventKind::ToolCallAdded {
+                    call_id: "call_a".to_owned(),
+                    tool_name: "fs.read".to_owned(),
+                },
+                ModelStreamEventKind::ToolCallAdded {
+                    call_id: "call_b".to_owned(),
+                    tool_name: "fs.write".to_owned(),
+                },
+            ],
+        );
+
+        // Interleaved argument fragments, which is what a real stream does. The argument text is
+        // written literally rather than built with a format string, because the first version of this
+        // test embedded it through `{delta:?}` — which quotes and escapes the value, so the JSON held
+        // an escaped string and the assertion compared against something else entirely.
+        for (index, call_id, arguments) in [
+            (1_u64, "call_b", r#"{"b":1}"#),
+            (0_u64, "call_a", r#"{"a":1}"#),
+        ] {
+            let document = format!(
+                r#"{{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":{index},"function":{{"arguments":{}}}}}]}},"finish_reason":null}}]}}"#,
+                serde_json::Value::String(arguments.to_owned()),
+            );
+            let events = kinds(translator.translate(Some(&chunk(&document))));
+            assert_eq!(
+                events,
+                vec![ModelStreamEventKind::ToolCallArgumentsDelta {
+                    call_id: call_id.to_owned(),
+                    delta: arguments.to_owned(),
+                }],
+                "an argument fragment must reach the call its index names",
+            );
+        }
+
+        let terminal = kinds(translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ))));
+        let completed: Vec<(&str, &str)> = terminal
+            .iter()
+            .filter_map(|kind| match kind {
+                ModelStreamEventKind::ToolCallCompleted { call_id, arguments } => {
+                    Some((call_id.as_str(), arguments.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed,
+            vec![("call_a", r#"{"a":1}"#), ("call_b", r#"{"b":1}"#)],
+            "each call is completed with only its own arguments: {terminal:?}",
+        );
+    }
+
+    #[test]
+    fn a_tool_call_after_the_terminal_is_dropped_like_late_content() {
+        // The same rule as late content, and for the same reason: the call has been declared finished,
+        // so accepting a further intent would let a hostile endpoint propose an action after the run
+        // recorded its outcome.
+        let mut translator = ChunkTranslator::new();
+        let _ = translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )));
+        let late = translator.translate(Some(&chunk(
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_late","function":{"name":"shell.run","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        )));
+        // `Ignored` rather than `Events([])`, because the chunk produced nothing at all — which is how
+        // this translator reports "nothing to say", and is why the assertion is on the variant rather
+        // than on a length.
+        assert!(
+            matches!(late, Translated::Ignored),
+            "a late tool call must produce nothing, got {late:?}",
+        );
+        assert!(
+            translator.late_deltas_ignored() > 0,
+            "a dropped late call must be counted rather than silently discarded",
+        );
+    }
+
+    #[test]
     fn a_content_delta_mints_the_item_once_and_then_streams() {
-        // The item is opened before its first delta and only once, because this contract carries no
         // per-item identifier: a client that received deltas for an item it was never told about
         // could not attribute them.
         let mut translator = ChunkTranslator::new();

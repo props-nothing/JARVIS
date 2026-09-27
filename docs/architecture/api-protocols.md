@@ -151,15 +151,77 @@ its own. Three points from the rules above are now enforced by construction:
 - **Client disconnect does not cancel a run.** The run is driven by a background task
   owned by `jarvis_application::run_service`, so its lifetime is not tied to the
   connection; cancellation is the explicit command endpoint.
+- **The connection is now held open.** The events endpoint replays the retained events
+  from sequence 1 and then pushes each new one as it is published, which is what the
+  rules above assume — "heartbeats are comments", "slow clients have bounded buffers" —
+  and none of them is meaningful on a connection that already closed.
 
-**Not implemented:** the connection is not held open. The events endpoint delivers the
-retained events and closes, so a client follows a run by reconnecting until it receives
-a terminal event. Holding one connection open needs a streaming response body, and
-`axum`'s `sse` feature is not in this repository's reviewed dependency set; adding it is
-a research-gate change rather than a convenience. Keepalives, slow-consumer
-disconnection, and bounded per-client buffers are therefore not implemented either,
-because they are properties of a long-lived connection. Generated OpenAPI and golden
-fixtures are also outstanding.
+**How the live half is built, and why it is not a queue.** The durable event store stays
+the single source of truth: a follower's position is a **sequence number** and every read
+is `load_events(from_sequence)`. The notification that wakes a follower carries **no
+payload** — it is permission to read again — and that is the property that makes a bounded
+buffer safe. A slow follower therefore loses *wake-ups*, not events: it reads from its
+position and catches up, which is exactly the contract's "a slow consumer is disconnected;
+it can replay from its last delivered event" without a special case. Delivery from the
+notification would instead make the buffer a queue whose overflow is data loss.
+
+Two consequences are worth stating because they are the failure modes:
+
+- **The stream ends on the durable terminal state, not on a notification.** A run that
+  finishes between two reads is seen in the read, so a notification that never arrives — or
+  arrives after the terminal — cannot leave a client holding an open connection for a run
+  that is over.
+- **The body's own shape is not hand-written `poll` logic.** The response is a bounded
+  channel fed by an ordinary `async` follow task, with a thin `Stream` implementation that
+  delegates to the channel's `poll_recv`. A `Stream` that polled a future borrowing the
+  state it must also reach would need unsafe code or a self-referential type; that hazard is
+  avoided rather than solved, using the same task-plus-channel shape the model adapter
+  already uses for a provider's frames.
+
+**Keepalives are emitted while the follower waits.** The rule above — "heartbeats are
+comments or typed keepalive events, never fake output" — had a producer-less frame until
+now: `jarvis_protocol::run::keepalive_frame` existed with a test asserting its shape and no
+caller, so the product could describe a comment it never sent. The follow loop now emits one
+per interval **only while it is waiting**, which is the state the comment exists for: a run
+that is thinking has nothing to send, and a connection silent for long enough is dropped by
+whatever sits between the daemon and the client. Two properties make it safe rather than
+merely present:
+
+- **It is a comment, so it carries no `id:` and consumes no sequence number.** That is what
+  the contract requires, and it is why a keepalive cannot be modelled as a synthetic event:
+  a client resuming from `Last-Event-ID` would be sent to a position that never existed. The
+  test asserts the *contiguity of the event sequences* across a stream containing comments,
+  which is the same rule stated the way a client experiences it.
+- **The timer starts at the follow loop, not at each wake-up**, and its first immediate tick
+  is consumed. A per-iteration timer would be reset by every event, and a stream that did not
+  consume the first tick would emit a comment as its **first** output — a keepalive meaning
+  "nothing has happened" sent to a client that had just connected, ahead of the event telling
+  it the run exists. Missed ticks are not repaid as a burst, because a delayed loop emitting
+  several comments at once is traffic with no purpose.
+
+**Not implemented:** an explicit slow-consumer *disconnect* with `stream.overrun` is not
+implemented, so a slow client is backpressured rather than told it fell behind. Generated OpenAPI and
+golden fixtures are also outstanding.
+
+**The client streams, and it resumes.** The reference client (`jarvis`) follows a run on **one
+connection**, printing each delta as it arrives rather than reconnecting on a timer — which matters
+because a polling client shows the answer in bursts at whatever the interval was, and the interval is
+not a property of the model. Two consequences of holding the connection for the run's lifetime are
+worth recording, because both were absent while the endpoint replayed and closed:
+
+- **The parser must be incremental.** A streamed body arrives in pieces that respect no framing
+  boundary, so a piece can end in the middle of a `data:` line — normal for any frame larger than the
+  socket buffer. A parser over a whole body would have to buffer the entire stream, which defeats the
+  purpose, and one that expected whole frames would drop or truncate the frame it split. The client's
+  parser therefore accumulates an incomplete frame and is asserted against **every split point** of a
+  fixture frame, since a parser that happened to tolerate a split at a newline would look correct
+  against a single hand-picked case.
+- **A dropped connection is resumed, not abandoned.** One long-lived connection is exposed to failures
+  a 50 ms poll never was — a daemon restart, a socket reset — and the failure mode would be a follow
+  that had already printed half an answer and then stopped. The client keeps the last delivered event
+  id and reconnects with it, which the contract makes exact ("`Last-Event-ID` resumes strictly after
+  that event"), so a resume cannot duplicate output. Attempts are bounded, and a failure with no
+  position to resume from is not retried at all: the retry would be the same failure.
 
 ## Generated Contracts
 

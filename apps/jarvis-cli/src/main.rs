@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use jarvis_infrastructure::auth::ClientCredentialPath;
 use jarvis_infrastructure::client::{
     ClientError, Discovered, discover, get_authenticated, get_with_status, post_authenticated,
-    read_credential,
+    read_credential, stream_response,
 };
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
 use jarvis_infrastructure::diagnostics::{
@@ -52,6 +52,14 @@ const EVENT_STREAM_MEDIA_TYPE: &str = "text/event-stream";
 const EXIT_OK: u8 = 0;
 /// Exit code for a usage or environment problem the operator must fix.
 const EXIT_ATTENTION: u8 = 1;
+
+/// How many times a run's stream may be re-established before the follow gives up.
+///
+/// Bounded because the alternative is a command that never returns: a daemon restarting in a loop
+/// would otherwise be followed forever. Three attempts covers the realistic case the bound exists for
+/// — a daemon that restarted once — while failing fast enough that a persistent fault surfaces as an
+/// error rather than as a hang.
+const STREAM_ATTEMPTS: u32 = 3;
 
 /// Builds the extra headers the event-stream route takes.
 ///
@@ -376,67 +384,109 @@ async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
 
 /// Follows a run's events until it reaches a terminal state, printing its answer.
 async fn follow_run(state: &ClientState, run_id: &str) -> ExitCode {
-    // The stream is polled rather than held open, because this build serves the events
-    // endpoint as a bounded replay rather than a live follow. The loop is what a client
-    // does against that shape: reconnect with `Last-Event-ID` until a terminal event
-    // arrives. It is bounded so a run that never finishes cannot hang the command.
+    // **One connection, held open, with deltas printed as they arrive.** This used to poll: the loop
+    // reconnected every 50 ms with `Last-Event-ID` and printed everything the daemon had retained so
+    // far, which was the only way to follow a run while the events endpoint delivered a bounded replay
+    // and closed. The endpoint now follows the run live, so polling is no longer required — and it was
+    // never equivalent, because the answer appeared in bursts at whatever the poll interval was
+    // rather than as the model produced it, which is the one thing a streaming client is for.
+    //
+    // The incremental parser is what makes it possible: a piece of body can end anywhere, including
+    // the middle of a `data:` line, so a parser that worked on a whole body would have to buffer the
+    // entire stream and would show nothing until the run was over.
+    //
+    // **A dropped connection is resumed, not abandoned.** The connection now lives for as long as the
+    // run does, so it is exposed to a failure a 50 ms poll never was: a daemon restart, or a socket
+    // reset, would end a follow that had already printed half an answer. The contract makes the
+    // recovery exact — `Last-Event-ID` resumes *strictly after* that event — so the last event id the
+    // parser saw is kept and used to reconnect. Resumption therefore cannot duplicate output, which is
+    // the property that makes it safe to retry a stream that has already delivered text; and it is
+    // bounded, so a daemon that keeps dropping connections fails with a message rather than looping
+    // forever.
+    let path = format!("/api/v1/runs/{run_id}/events");
     let mut last_event_id: Option<String> = None;
     let mut streamed = false;
-    for _ in 0..600 {
-        // The same function the `runs events` command uses, because this route's headers were
-        // built in **two** places — and that is how the missing media type hid: a fix in one call
-        // site would have left the other wrong, and `jarvis ask` is the command that uses this one.
+
+    for attempt in 0..STREAM_ATTEMPTS {
         let extra = event_stream_headers(last_event_id.as_deref());
-        let (status, body) = match get_with_status(
+        let mut frames = SseParser::new();
+        let mut outcome: Option<ExitCode> = None;
+        // The id of the last frame this attempt saw, kept separately from `last_event_id` so a
+        // reconnect uses what was actually delivered rather than what a previous attempt had.
+        let mut resumed_at: Option<String> = None;
+
+        let result = stream_response(
             &state.discovered,
             &state.credential,
-            &format!("/api/v1/runs/{run_id}/events"),
+            &path,
             API_MAJOR,
             &extra,
+            |piece| {
+                for frame in frames.push(piece) {
+                    if let Some(id) = frame.id.clone() {
+                        resumed_at = Some(id);
+                    }
+                    if frame.event == "run.output_text.delta"
+                        && let Some(delta) = frame.payload("delta")
+                    {
+                        print!("{delta}");
+                        // Flushed per delta, because stdout is block-buffered when it is not a
+                        // terminal and an unflushed buffer would deliver the whole answer at the end —
+                        // which is exactly the behaviour streaming exists to avoid. A failure to flush
+                        // is ignored deliberately: it means the reader went away, and stopping the
+                        // stream over that would abort a run's follow for no reason.
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        streamed = true;
+                    }
+                    if frame.event == "run.completed"
+                        || frame.event == "run.failed"
+                        || frame.event == "run.cancelled"
+                    {
+                        if streamed {
+                            println!();
+                        }
+                        outcome = Some(if frame.event == "run.completed" {
+                            ExitCode::SUCCESS
+                        } else {
+                            // A failed or cancelled run is reported by its own event, so an operator
+                            // sees what happened rather than only that the command did not succeed.
+                            eprintln!("error: {}", frame.event.replace("run.", "run "));
+                            ExitCode::from(EXIT_ATTENTION)
+                        });
+                        // `false` hangs up. A disconnect never cancels a durable run, so stopping
+                        // after the terminal event is safe and closes the connection rather than
+                        // waiting for the daemon to do it.
+                        return false;
+                    }
+                }
+                true
+            },
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return report_client_error(&error),
-        };
-        if !(200..300).contains(&status) {
-            eprintln!("error: {body}");
-            return ExitCode::from(EXIT_ATTENTION);
-        }
+        .await;
 
-        let mut terminal: Option<String> = None;
-        for frame in parse_sse(&body) {
-            if let Some(id) = frame.id.clone() {
-                last_event_id = Some(id);
-            }
-            if frame.event == "run.output_text.delta"
-                && let Some(delta) = frame.payload("delta")
-            {
-                print!("{delta}");
-                streamed = true;
-            }
-            if frame.event == "run.completed"
-                || frame.event == "run.failed"
-                || frame.event == "run.cancelled"
-            {
-                terminal = Some(frame.event);
-            }
+        if let Some(id) = resumed_at {
+            last_event_id = Some(id);
         }
-        if let Some(event) = terminal {
-            if streamed {
-                println!();
-            }
-            if event == "run.completed" {
-                return ExitCode::SUCCESS;
-            }
-            // A failed or cancelled run is reported by its own event, so an operator
-            // sees what happened rather than only that the command did not succeed.
-            eprintln!("error: {}", event.replace("run.", "run "));
-            return ExitCode::from(EXIT_ATTENTION);
+        if let Some(outcome) = outcome {
+            return outcome;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match result {
+            // A transport failure is the one error a resume can fix, and only when there is a
+            // position to resume from — a connection that failed before any event arrived has nothing
+            // to ask for, and retrying it would just be the same failure again.
+            Err(ClientError::Transport | ClientError::Timeout)
+                if attempt + 1 < STREAM_ATTEMPTS && last_event_id.is_some() => {}
+            // A clean end with no terminal event means the daemon closed the stream without saying
+            // how the run ended, which is not success — a stream that stops is not a stream that
+            // finished.
+            Ok(()) => {
+                eprintln!("error: the run's stream ended without a terminal event");
+                return ExitCode::from(EXIT_ATTENTION);
+            }
+            Err(error) => return report_client_error(&error),
+        }
     }
-    eprintln!("error: the run did not reach a terminal state in time");
+    eprintln!("error: the run's stream could not be followed to a terminal event");
     ExitCode::from(EXIT_ATTENTION)
 }
 
@@ -473,25 +523,38 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
             run_id,
             last_event_id,
         } => {
+            // **Streamed rather than buffered, and that is a correctness fix rather than a polish.**
+            // The buffered reader reads to end-of-body and caps what it keeps at `MAX_RESPONSE_BYTES`,
+            // which was correct while the endpoint delivered a bounded replay and closed. The endpoint
+            // now follows the run live, so a buffered read of it would do two wrong things at once:
+            // block until the run finished — the opposite of following it — and silently **truncate**
+            // at the cap, so a long run's later events were never shown and nothing said so. The
+            // streaming client delivers each frame as it arrives, so the same command now behaves the
+            // way the flag it takes implies.
             let extra = event_stream_headers(last_event_id.as_deref());
-            let (status, body) = match get_with_status(
+            let mut parser = SseParser::new();
+            let result = stream_response(
                 &state.discovered,
                 &state.credential,
                 &format!("/api/v1/runs/{run_id}/events"),
                 API_MAJOR,
                 &extra,
+                |piece| {
+                    for frame in parser.push(piece) {
+                        print!("{}", frame.render());
+                    }
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    // Every frame is printed, including a terminal one, and the connection is closed
+                    // by the daemon when the run ends — so this reads to end-of-stream rather than
+                    // deciding for itself when to stop.
+                    true
+                },
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => return report_client_error(&error),
-            };
-            if !(200..300).contains(&status) {
-                eprintln!("error: {body}");
-                return ExitCode::from(EXIT_ATTENTION);
+            .await;
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => report_client_error(&error),
             }
-            print!("{body}");
-            ExitCode::SUCCESS
         }
         RunsAction::Cancel { run_id } => {
             let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
@@ -535,39 +598,121 @@ impl SseFrame {
             .as_str()
             .map(str::to_owned)
     }
+
+    /// Renders this frame as it arrived on the wire.
+    ///
+    /// Used by `runs events`, whose output *is* the stream: a command that reformatted the frames
+    /// would no longer be showing the operator what the daemon sent, which is the whole point of it.
+    /// The `data:` line is emitted verbatim rather than re-serialized, so a payload this build cannot
+    /// parse still round-trips.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(id) = &self.id {
+            out.push_str("id: ");
+            out.push_str(id);
+            out.push('\n');
+        }
+        out.push_str("event: ");
+        out.push_str(&self.event);
+        out.push('\n');
+        out.push_str("data: ");
+        out.push_str(&self.data);
+        out.push_str("\n\n");
+        out
+    }
 }
 
-/// Parses SSE frames out of a response body.
+/// A complete `SSE` frame, and whether it is a keepalive.
 ///
-/// A comment line is skipped, which is what the contract requires of a keepalive: it
-/// carries no `id` and must not be mistaken for an event or consume a sequence.
-fn parse_sse(body: &str) -> Vec<SseFrame> {
-    let mut frames = Vec::new();
+/// An incremental server-sent-event parser.
+///
+/// Incomplete frames accumulate. This is the whole reason the type exists rather than a free
+/// function over a whole body: a streamed body arrives in pieces that respect no framing boundary —
+/// a piece can end in the middle of a `data:` line, which is exactly what happens when a frame is
+/// larger than the socket buffer — so a parser that expected complete frames would drop or mangle
+/// the frame it split. The buffering here is bounded by the frame it is assembling, which the server
+/// bounds in turn.
+#[derive(Debug, Default)]
+struct SseParser {
+    /// Bytes of a frame that has not yet been terminated by a blank line.
+    pending: String,
+}
+
+impl SseParser {
+    /// Creates an empty parser.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one piece of body and returns every frame it completed.
+    ///
+    /// The delimiter is a **blank line**, and a trailing `\r` is stripped so both `\n\n` and
+    /// `\r\n\r\n` terminate a frame. The alternative — splitting on `\n\n` only — would leave the `\r`
+    /// inside the last field's value, so a frame would carry a payload with a stray carriage return
+    /// that the JSON parser rejects.
+    fn push(&mut self, piece: &str) -> Vec<SseFrame> {
+        self.pending.push_str(piece);
+        let mut frames = Vec::new();
+        let mut consumed = 0;
+        while let Some(at) = find_frame_end(&self.pending[consumed..]) {
+            let block = self.pending[consumed..consumed + at].to_owned();
+            consumed += at;
+            // Skip the delimiter itself.
+            let rest = &self.pending[consumed..];
+            let delimiter = if rest.starts_with("\r\n\r\n") { 4 } else { 2 };
+            consumed += delimiter;
+            if let Some(frame) = parse_frame(&block) {
+                frames.push(frame);
+            }
+        }
+        // Retain only the incomplete tail, so the buffer does not grow without bound as a long stream
+        // is consumed — a parser that kept everything would hold the whole answer in memory twice.
+        self.pending.drain(..consumed);
+        frames
+    }
+}
+
+/// Returns the byte index where a frame's block ends, if a blank line has arrived.
+fn find_frame_end(text: &str) -> Option<usize> {
+    let lf = text.find("\n\n");
+    let crlf = text.find("\r\n\r\n");
+    match (lf, crlf) {
+        // CRLF is preferred when it starts no later, because its first `\n\n` match *is* inside it and
+        // taking the LF index would leave a stray `\r` in the block.
+        (Some(lf), Some(crlf)) => Some(if crlf <= lf { crlf } else { lf }),
+        (Some(lf), None) => Some(lf),
+        (None, Some(crlf)) => Some(crlf),
+        (None, None) => None,
+    }
+}
+
+/// Parses one complete frame block, or `None` when it carries no event type.
+///
+/// A block with no `event:` line is a comment (a keepalive) or an unknown field set, and either way
+/// there is no event to report — which is what the contract requires of a keepalive.
+fn parse_frame(block: &str) -> Option<SseFrame> {
     let mut id = None;
     let mut event = None;
     let mut data = String::new();
-    for line in body.lines() {
-        if line.is_empty() {
-            if let Some(event_type) = event.take() {
-                frames.push(SseFrame {
-                    id: id.take(),
-                    event: event_type,
-                    data: std::mem::take(&mut data),
-                });
-            }
-            continue;
-        }
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
         if let Some(value) = line.strip_prefix("id: ") {
             id = Some(value.to_owned());
         } else if let Some(value) = line.strip_prefix("event: ") {
             event = Some(value.to_owned());
         } else if let Some(value) = line.strip_prefix("data: ") {
-            value.clone_into(&mut data);
+            // A multi-line payload repeats the field, and `\n` joins the pieces. Clobbering instead
+            // of appending would truncate a payload to its last line, which for a JSON object is
+            // usually invalid and so would appear as a malformed frame rather than a lost one.
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value);
         }
         // A line beginning with `:` is a comment and is deliberately ignored, so a
         // keepalive cannot be mistaken for an event.
     }
-    frames
+    event.map(|event| SseFrame { id, event, data })
 }
 
 /// Encodes a string as a JSON string literal.
@@ -1443,8 +1588,8 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, InstallAction, StatusBody, event_stream_headers, idempotency_key,
-        json_string, parse_sse, parse_status,
+        Cli, Command, InstallAction, SseFrame, SseParser, StatusBody, event_stream_headers,
+        idempotency_key, json_string, parse_status,
     };
     use clap::Parser as _;
 
@@ -1874,9 +2019,9 @@ mod tests {
             "data: {\"payload\":null}\n",
             "\n",
         );
-        let frames = parse_sse(body);
+        let mut parser = SseParser::new();
+        let frames = parser.push(body);
         assert_eq!(frames.len(), 2, "a keepalive is not an event");
-        assert_eq!(frames[0].event, "run.output_text.delta");
         assert_eq!(frames[0].payload("delta").as_deref(), Some("Hello"));
         assert_eq!(
             frames[0].id.as_deref(),
@@ -1886,6 +2031,105 @@ mod tests {
         // The terminal event's payload is not an object, so a field read yields nothing
         // rather than a fabricated value.
         assert_eq!(frames[1].payload("delta"), None);
+    }
+
+    #[test]
+    fn a_frame_split_across_pieces_is_assembled_rather_than_dropped() {
+        // **The property that makes streaming possible, and the reason the parser is incremental.**
+        // A body arrives in pieces that respect no framing boundary, so a piece can end in the middle
+        // of a `data:` line — which is exactly what happens whenever a frame is larger than the socket
+        // buffer, and therefore normal for a long answer. A parser that expected whole frames would
+        // either drop the frame or emit a truncated payload, and a truncated `data:` document is not
+        // valid JSON, so the frame would silently become nothing.
+        //
+        // The frame is deliberately split **inside the JSON**, which is the case that breaks a
+        // line-based parser: it does not see a `data: ` prefix on the second half at all.
+        let whole = concat!(
+            "id: 0195f4f1-0475-7613-a92c-edf01183e909\n",
+            "event: run.output_text.delta\n",
+            "data: {\"payload\":{\"item_id\":\"out-1\",\"delta\":\"Hello\"}}\n",
+            "\n",
+        );
+        // Every split point must work, not just one: a parser that happened to tolerate a split at a
+        // newline and fail mid-line would look correct against a single hand-picked fixture.
+        for split_at in 0..whole.len() {
+            let (first, second) = whole.split_at(split_at);
+            let mut parser = SseParser::new();
+            let from_first = parser.push(first);
+            let from_second = parser.push(second);
+            let frames: Vec<SseFrame> = from_first.into_iter().chain(from_second).collect();
+            assert_eq!(
+                frames.len(),
+                1,
+                "a split at {split_at} must yield exactly one frame",
+            );
+            assert_eq!(
+                frames[0].event, "run.output_text.delta",
+                "split at {split_at}"
+            );
+            assert_eq!(
+                frames[0].payload("delta").as_deref(),
+                Some("Hello"),
+                "a payload must survive a split at {split_at}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_frame_yields_nothing_until_it_is_terminated() {
+        // The other half of the same property: a parser that emitted a frame as soon as it saw an
+        // `event:` line would deliver a frame whose `data` had not arrived, and a caller reading the
+        // payload would get nothing and conclude the event carried none.
+        let mut parser = SseParser::new();
+        assert!(
+            parser
+                .push("event: run.completed\ndata: {\"payload\":null}\n")
+                .is_empty(),
+            "a frame without its blank-line terminator is not complete",
+        );
+        let frames = parser.push("\n");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event, "run.completed");
+    }
+
+    #[test]
+    fn a_crlf_terminated_frame_does_not_carry_a_stray_carriage_return() {
+        // A server may frame with CRLF, and splitting on `\n\n` alone would leave the `\r` from the
+        // last field's line inside its value — so a payload would end in a carriage return and the
+        // JSON parse would fail, turning a healthy frame into a malformed one.
+        let body = concat!(
+            "id: 0195f4f1\r\n",
+            "event: run.output_text.delta\r\n",
+            "data: {\"payload\":{\"delta\":\"Hi\"}}\r\n",
+            "\r\n",
+        );
+        let mut parser = SseParser::new();
+        let frames = parser.push(body);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload("delta").as_deref(), Some("Hi"));
+        assert!(
+            !frames[0].data.ends_with('\r'),
+            "the carriage return belongs to the framing: {:?}",
+            frames[0].data,
+        );
+    }
+
+    #[test]
+    fn a_frame_renders_back_to_the_framing_it_arrived_in() {
+        // `runs events` prints this, so it must produce something a client can parse — an `id` line
+        // when there is an id, an `event` line, a `data` line, and the blank terminator.
+        let mut parser = SseParser::new();
+        let frames =
+            parser.push("id: 0195f4f1\nevent: run.completed\ndata: {\"payload\":null}\n\n");
+        assert_eq!(
+            frames[0].render(),
+            "id: 0195f4f1\nevent: run.completed\ndata: {\"payload\":null}\n\n",
+        );
+        // A frame with no id omits the line rather than emitting `id: ` with an empty value, which a
+        // client resuming from it would echo as a position that does not exist.
+        let mut parser = SseParser::new();
+        let frames = parser.push("event: run.completed\ndata: {}\n\n");
+        assert_eq!(frames[0].render(), "event: run.completed\ndata: {}\n\n");
     }
 
     #[test]

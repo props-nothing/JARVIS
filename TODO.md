@@ -661,7 +661,8 @@ Foundation TODO remains incomplete.
   per-model capability inventory that `BRN-011` and `NFR-VOI-002` need is not
   collected.
 - [~] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
-  Evidence: **both halves now exist** — the research gate (previous round) and the adapter itself.
+  Evidence: **all three halves now exist** — the research gate, the adapter, and a **verified real
+  provider run**.
   `crates/jarvis-infrastructure/src/model_providers/openai_compatible/` holds it in three layers,
   chosen so every provider-shaped trap is testable without a socket: `sse.rs` reassembles frames from
   a chunked byte stream (8 tests), `translate.rs` maps one chunk onto normalized events (15 tests),
@@ -751,15 +752,74 @@ Foundation TODO remains incomplete.
     test with "the provider was called exactly once" — the server was never reached. The negative half
     is covered too: an unconfigured profile composes the scripted provider, and a configuration the
     adapter refuses stops the daemon rather than falling back.
-  - **Not done, and named:** **no capture from a real endpoint exists**, so every claim about a real
-    provider's behaviour stays `DOCUMENTED` rather than `OBSERVED` and the `[DONE]` question
-    (`OC-C004`) is still open — the note's Contract Fixtures section is unchecked and says so. The
-    daemon is composed but **not yet exercised against a real provider by any journey**: the e2e
-    journeys still run on the scripted default, and a gated live smoke test is `BRN-009`. Structured
-    output, tool-call translation, and portable sampling settings are refused rather than silently
-    dropped, so they are missing capabilities rather than defects. `BRN-009`'s gated provider smoke
-    test is the next step, and the Milestone 2 exit gate ("a gated real-provider smoke test streams a
-    response") is still unmet. **DO NOT COMMIT.**
+  - **A real provider run is now verified end to end, which closes Milestone 2's exit gate.** The
+    evidence note's gated live test was the last outstanding item for this TODO, and it is no longer
+    `DOCUMENTED`: `jarvis ask "Reply with exactly: JARVIS OLLAMA OK"` against a daemon configured for
+    **Ollama on loopback** printed `JARVIS OLLAMA OK` and exited 0, with the model's own text durable
+    in the run's events. `tests/e2e/provider-smoke.mjs` is the automated form, asserting the daemon is
+    wired to the configured provider rather than the scripted fallback, that the run reaches
+    `completed`, that the delta carries the model's text, and that `jarvis ask` prints it. It is gated
+    on a **reachable loopback endpoint** rather than on a secret — because no cloud endpoint is
+    reachable from this build at all, so a key would not have helped — and a skip is **reported** as
+    "nothing was proved" rather than as a pass, since a CI log that could not tell the two apart is
+    the one thing a gated test must not produce. Ollama needs no credential, so the whole transport is
+    exercised with no TLS and no dependency change.
+  - **The real endpoint forced two additions that no fixture could reveal, and both are general
+    rather than Ollama-specific.** (1) **A base path.** The completion route is `/chat/completions`
+    only when the server is rooted at the origin; Ollama serves `/v1/chat/completions`, as do vLLM, LM
+    Studio, and most gateways — so the adapter was posting to a path that 404s on a real server while
+    every fixture passed, because a fixture's server is built to the adapter's own assumption.
+    `[model.provider].base_path` is validated as a **path**, not accepted as a URL: absolute, no
+    traversal, no query or fragment, no interior whitespace or control characters — which keeps the
+    "a key cannot end up in the endpoint" property the host/port split exists for. (2) **A
+    model-name mapping, and this is a genuine namespace problem.** A JARVIS model id is a lowercase
+    dotted slug — one spelling per identity, which is what makes a routing decision, a persisted row,
+    and a diagnostic comparable — while a provider names models however it likes: Ollama's
+    `glm-5.3-flash:cloud`, `model@2026-01`, `org/model`. **A colon cannot appear in a JARVIS model
+    id**, so the adapter could only address a model whose provider name happened to already be legal,
+    which silently excluded every Ollama cloud model. `[model.provider].model_names` maps a served
+    model's id to the provider's own spelling, and a mapping for a model the endpoint does not serve is
+    **refused at composition** because it would never be used and the operator would believe it had
+    been. The routed model is still exactly one the adapter serves; the mapping changes only how it is
+    spelled on the wire. Both additions leave the default configuration byte-identical.
+  - **A third defect was found by making the stream live, and the CLI's own transport was wrong for
+    it.** `Body::from_stream` makes hyper emit `transfer-encoding: chunked`, and the hand-written Rust
+    client read the body as if the chunk framing *were* the message. It appeared to work, which is
+    what made it dangerous: every frame happened to fit in one chunk, so the size lines were skipped
+    by the SSE parser as unknown lines. A frame larger than hyper's write buffer splits across chunks,
+    and then a size line lands **inside a `data:` line** — the JSON loses its closing brace, the frame
+    parses as nothing, and **`jarvis ask` prints a truncated answer and exits 0**. Fixed with
+    `framing_of` (decided from the header, never sniffed, because a body can coincidentally begin with
+    something that looks like a chunk size) and `decode_chunked` (refuses incomplete framing rather
+    than returning a prefix the caller cannot tell from a complete body). **The wiring test mattered
+    more than the decoder test**: with the decoder correct but never called, every unit test still
+    passed, and only a socket-level test that asserts the *transport's* output caught it.
+  - **A dropped tool call was found by comparing the adapter's code against its own security
+    section, and it was a silent-success bug rather than a missing feature.** The adapter's evidence
+    note states "tool calls appear as `tool.call.*` events and remain subject to the canonical tool
+    pipeline" — but `translate.rs` *recognized* `tool_calls` and emitted **nothing**. The reasoning was
+    that the tool fabric does not exist so a tool call "must not be proposed". That is backwards, and
+    the controller's own code says why: it has a typed terminal refusal (`run.tools_not_implemented`)
+    with **no other way to reach it**, so dropping the event did not prevent a proposal — it removed
+    the only thing that made the refusal accurate. A real model that asked to call a tool produced a
+    stream with no delta and no tool event, so the run could reach `completed` with an **empty
+    answer**. A silent success on a dropped intent is strictly worse than a typed refusal, because the
+    model asked to *do* something and JARVIS reported that it finished. The translation now emits
+    `tool.call.added`, `tool.call.arguments.delta`, and `tool.call.completed`, with the completion
+    carrying the **accumulated** arguments because a fragment is not parseable JSON and the fabric
+    validates the whole value. Emitting is still not a grant — the events are proposals the
+    deterministic layer judges. Five tests, and the old behaviour is falsified by them.
+  - **Not done, and named:** **no cloud endpoint.** Everything above is loopback, because the build
+    has no TLS implementation, so a cloud provider still needs its own reviewed dependency before it
+    is reachable — the note records that, and the loopback-only refusal is what keeps the gap from
+    being a silent plaintext credential. `OC-C004`'s `[DONE]` half stays open (Ollama's stream
+    terminated on `finish_reason`, which is what the adapter relies on, but the harness does not
+    inspect the sentinel). The legacy singular `function_call` delta is **not** translated, and the
+    asymmetry is deliberate rather than an oversight: it carries no `index` and no `id`, so it cannot
+    supply the canonical call identifier a later continuation needs, and translating it would emit a
+    call with a synthesized id nothing could reference. Structured output and portable sampling
+    settings are still refused rather than silently dropped, so they are missing capabilities rather
+    than defects. **DO NOT COMMIT.**
   `docs/research/integrations/openai-compatible-model.md` moves the manifest entry
   from `REQUIRED` to `IMPLEMENTATION_READY`, which is the first time any path
   matching `crates/**/src/model_providers/openai-compatible/**` has been *reachable*
@@ -1008,8 +1068,9 @@ Foundation TODO remains incomplete.
   provides yet, which is why every ceiling this milestone *enforces* is still checked against
   the provider's reported usage instead.
 - [~] `BRN-007` Implement CLI chat plus HTTP/SSE streaming. **Partial**: the run
-  resource surface and the CLI chat path are implemented and verified end to end
-  against a real daemon; the **live** SSE follow is not, and is named below.
+  resource surface, the CLI chat path, the live SSE follow, and the CLI's single-connection
+  streaming renderer are all implemented and verified end to end; what remains named below is
+  elsewhere.
   Evidence: `jarvis_application::run_service` is the orchestration — it resolves the
   conversation, claims the idempotency key, creates the run, spawns the controller, and
   records cancellation intent — and `jarvis_infrastructure::http::runs` is the thin
@@ -1080,18 +1141,48 @@ Foundation TODO remains incomplete.
   beside it. 656 workspace tests (application 86, infrastructure 369, CLI 20). `fmt`,
   `clippy -D warnings`, `node scripts/validate-docs.mjs`, and its fail-closed tests are
   clean. **Not done, and this is why this TODO is `~`:**
-  the events endpoint delivers the **retained** public events and closes, so a client
-  follows a run by reconnecting with `Last-Event-ID` until a terminal event arrives — it
-  does **not** hold the connection open and push each new event as it is published. A
-  streaming response body needs a `Stream` implementation, and this crate has neither a
-  stream crate nor `axum`'s `sse` feature in its reviewed dependency set; adding either
-  is a dependency change the integration research gate requires evidence for, and
-  hand-writing a `Stream` would be an unreviewed async state machine on the
-  security-relevant path. Also not done: the CLI has no streaming renderer that prints
-  deltas as they arrive from one connection, `Idempotency-Key` is scoped per client
-  rather than per principal-and-credential as the contract words it, the run list and
-  the `jarvis ask` conversation-continuation option are absent, and the E2E step's
-  abrupt-restart and disconnect cases belong to `BRN-008`.
+  the events endpoint **now follows the run live** — the retained events are replayed from
+  sequence 1 and then each new event is pushed as it is published, with **keepalive comments while
+  it waits** — and the **CLI now follows it on one connection**, so this paragraph's original claim no
+  longer holds in either half.
+  **The CLI's streaming renderer is now implemented, and it closed a correctness bug rather than only
+  a missing feature.** `follow_run` used to poll: it reconnected every 50 ms with `Last-Event-ID` and
+  printed everything the daemon had retained so far, which was the only way to follow a run while the
+  endpoint delivered a bounded replay and closed. That was never equivalent to streaming — the answer
+  arrived in bursts at whatever the poll interval was rather than as the model produced it — and once
+  the endpoint became live it was **also** wrong in a second way, because `runs events` still read the
+  body with the buffered helper: a buffered read of a live follow blocks until the run *ends*, and
+  caps what it keeps at `MAX_RESPONSE_BYTES`, so a long run's later events were silently **truncated**
+  and nothing said so. Both commands now stream.
+  - **The client's own streaming path is the piece that made it possible.** `client::stream_response`
+    reads the head under a bound, then delivers decoded pieces as they arrive, with the same
+    header-decided framing detection and the same refusal to invent content as the buffered path —
+    because a stream is where a framing bug is *most* likely, not least. The decode state was extracted
+    into `BodyDecoder` once clippy's `too_many_lines` bound was hit, and the extraction is the
+    improvement rather than a workaround: the decode is now a value, so its rules are reviewable
+    without a socket.
+  - **The CLI's SSE parser became incremental, and that is load-bearing rather than tidy.** A streamed
+    body arrives in pieces that respect no framing boundary, so a piece can end mid-`data:` line —
+    which is normal for any frame larger than the socket buffer. The parser therefore accumulates and
+    is asserted against **every split point** of a frame, not one hand-picked fixture; a mutation that
+    treats each piece as a whole body fails three tests and names the split. CRLF framing is handled,
+    so a `\r` cannot end up inside the last field and turn a healthy frame into a malformed one, and a
+    multi-line payload is joined rather than clobbered.
+  - **A dropped connection is now resumed rather than abandoned.** One connection lives as long as the
+    run does, which exposes it to a failure the 50 ms poll never had — a daemon restart or a socket
+    reset would end a follow that had already printed half an answer. The last delivered event id is
+    kept and used with `Last-Event-ID`, which the contract makes exact ("resumes strictly after that
+    event"), so a resume cannot duplicate output; the attempts are bounded so a daemon restarting in a
+    loop fails with a message rather than hanging. A transport failure with **no** position to resume
+    from is not retried, because the retry would be the same failure again.
+  - **Verified**: `jarvis ask` against Ollama printed the model's multi-line answer in 2.7 s with exit
+    0; `runs events` streamed delta and terminal frames in 35 ms and terminated on its own. 1133
+    workspace tests (+4, all in the CLI's parser), `fmt`, `clippy -D warnings`, and both doc gates
+    clean.
+  **What is still not done** in the client half: `Idempotency-Key` is scoped per client rather than per
+  principal-and-credential as the contract words it, the run list and the `jarvis ask`
+  conversation-continuation option are absent, and the E2E step's abrupt-restart and
+  disconnect cases belong to `BRN-008`.
   **The golden-fixture half of contract test 12 is now done, and it found two defects.**
   `jarvis-protocol`'s `run_contract_tests` and `jarvis-domain`'s
   `model/stream_contract_tests` **read each contract document's own JSON examples** and
@@ -1117,6 +1208,100 @@ Foundation TODO remains incomplete.
   design `BRN-001` had already justified. **Still not done:** the generated `OpenAPI`
   document, and the SSE fixtures beyond framing (a full frame's `data` is asserted by the
   existing envelope test, not by a golden file).
+  **The live SSE follow is now implemented, and the reason it was not is the interesting part.**
+  The endpoint used to deliver the retained events and close, so a client had to reconnect with
+  `Last-Event-ID` until a terminal event arrived. The contract was always the live behaviour
+  ("Initial connection replays retained events from sequence 1, then follows live events"), so
+  this was a conformance defect rather than a scope decision — but the recorded justification
+  for it was **wrong on both of its two claims, and checking them is what unblocked the work**:
+  (a) it named "`axum`'s `sse` feature" as missing from the reviewed dependency set, and axum
+  0.8.9 **has no `sse` feature at all** — `axum::response::sse` is unconditional; (b) it would
+  have required adding a stream crate, and the two candidates were **already in `Cargo.lock`**
+  (`futures-core` 0.3.34 as a leaf, `tokio-stream` 0.1.19 through `sqlx-core`). Naming
+  `futures-core` directly adds **no new crate and no version change** — the lockfile diff is
+  one line inside `jarvis-infrastructure`'s own dependency list — so the change reduced to a
+  routine dependency-name addition plus a ledger row, which is the process `AGENTS.md`
+  prescribes rather than an obstacle to it. **A "blocked on dependency review" note is a claim
+  about the dependency graph, and it has to be checked against the graph, not remembered.**
+  - **The design avoids the hard half rather than solving it.** The stated worry was that a
+    hand-written `Stream` would be "an unreviewed async state machine on the security-relevant
+    path", and that is a real hazard: a `poll` that owns a future borrowing the state it must
+    also reach needs unsafe code or a self-referential type. The response body is therefore a
+    **bounded channel fed by an ordinary `async` follow task**, with a thin `Stream` impl that
+    delegates to `mpsc::Receiver::poll_recv` — exactly the shape
+    `jarvis_application::model::AdapterStream` already uses for a provider's frames. No unsafe,
+    no macro, and the follow loop is readable `await` code.
+  - **Four properties, and each one is a decision.** (1) **The durable store is the source of
+    truth**: the follower's position is a *sequence* and every read is `load_events(from)`, so a
+    live stream and a replayed one cannot disagree about content or order. (2) **A wake-up
+    carries no payload** — it is permission to read again, which is what makes a bounded buffer
+    safe: a slow follower loses *wake-ups*, not events, so "a slow consumer can replay from its
+    last delivered event" holds without a special case. (3) **The stream ends on the durable
+    terminal state, not on a notification**, so a last notification that never arrives cannot
+    leave a client waiting after its run is over. (4) **The refusals are decided before the body
+    streams** — `400` for an `Accept` mismatch and `409` for an unavailable resume position —
+    because once the response has begun a status code can no longer express a decision.
+  - **The test needed a new fixture, and that is the part worth remembering.** With a provider
+    that finishes immediately, every event is already retained by the time a client connects, so
+    a replay-and-close handler and a live one produce the **identical body** — which is why the
+    pre-existing stream test passed for as long as the feature was missing, and why it could not
+    have caught this. The new test drives a **gated** provider that publishes one delta and then
+    blocks on a `Notify`, so "the run is live and unfinished" is an observable state; the
+    assertion is that the response body has **not** completed while the run is live. **Verified
+    by mutation**: restoring the replay-and-close behaviour fails it, and the failure message
+    names the defect rather than a timeout. Its counterpart covers the other termination rule —
+    a follow of an already-finished run replays and closes instead of waiting for a notification
+    nothing will send. 1113 workspace tests (+2); `fmt`, `clippy -D warnings`, and both doc gates
+    clean, including `--changed-file` over `Cargo.toml`, `Cargo.lock`, and the evidence files.
+  - **A real defect existed only in the live path, and the E2E journey found it — not a unit test.**
+    The follower's read position was initialised from the *resume* sequence instead of from the page
+    it had just rendered, so the next read returned the same page: every replayed event was delivered
+    **twice**, the body restarted at sequence 1 in the middle, and the run appeared to publish **two
+    terminal events**. This is a shape a replay-and-close handler *cannot* exhibit, because it performs
+    exactly one read and never advances past it — so the defect was created by the new code and was
+    invisible to every existing test. `disconnect-journey.mjs` caught it through its own existing
+    assertions (terminal count, contiguous sequences) with no change to the harness, which is the
+    payoff of writing an E2E check against a *property* rather than against one implementation's
+    output. A regression test now drives a whole live stream and asserts the sequence list is
+    `1..n` exactly once; **falsified** by restoring the wrong position, which fails both live tests.
+  - **The regression test was itself vacuous at first, and writing a second test is what exposed it.**
+    Its sequence extraction used `strip_prefix("data: {")`, which removes the opening brace — so the
+    remainder never parsed as JSON, the filter produced an **empty** vector, and `assert_eq!` compared
+    two empty ranges and passed. A test that cannot fail. The second live test's explicit
+    non-empty precondition is what surfaced it, and the fix is a shared `sequence_numbers` helper that
+    parses the whole value, so the next assertion cannot be wrong in a different way.
+  - **Also found by reading the contract while implementing this:** the cancelled terminal event
+    still carries no payload, and the contract's own Cancellation section names the reason as
+    caller-supplied text needing escaping. A failed event's payload is safe because every value
+    in it comes from a closed set; a cancellation reason is free text, so **a public payload
+    cannot simply echo it** and the fix is a redaction/omission decision rather than a
+    serialization one. Left as a named gap rather than half-done, and it belongs with the
+    remaining stream work below.
+  - **Keepalives are now sent, which closed a second producer-less frame.** The contract requires
+    them ("Keepalives are SSE comments and do not consume sequence numbers") and
+    `jarvis_protocol::run::keepalive_frame` already existed **with a test asserting its shape and no
+    caller** — the product could describe a comment it never sent, which is the same shape as the
+    `LiveRunEvents`-with-no-implementer problem and the reason a "helper nothing calls" is treated
+    here as an unimplemented feature. The follow loop now runs a `select` between a wake-up and an
+    interval tick, emitting one comment per interval **only while it is waiting** — the state the
+    comment exists for, since a run that is *thinking* has nothing to send and a silent connection is
+    dropped by whatever sits between the daemon and the client. Three properties are deliberate.
+    (1) **It is a comment**: no `id:`, so no sequence number is consumed, and the test asserts the
+    *contiguity of the event sequences* across a stream containing comments — the same rule stated
+    the way a client experiences it, because a keepalive modelled as a synthetic event would send a
+    resuming client to a position that never existed. (2) **The timer lives at the loop, not at each
+    wake-up**, so the interval measures between keepalives rather than being reset by every event; and
+    **the first immediate tick is consumed**, because a live stream normally opens with a *frame* and
+    an unconsumed first tick made it open with a comment telling a client that nothing had happened
+    before it had been told the run existed. (3) **Missed ticks are not repaid as a burst**
+    (`MissedTickBehavior::Delay`), since several comments at once is traffic with no purpose.
+    **Falsified** by making a tick emit nothing: the keepalive test fails. The interval is injectable
+    (`ApiState::with_keepalive_interval`, production `DEFAULT_KEEPALIVE_INTERVAL = 15s`) because a
+    keepalive is only observable by *waiting*, so a production interval would make its test take as
+    long as the interval. 1116 workspace tests (+2); `fmt`, `clippy -D warnings`, and both doc gates
+    clean. **Still not done:** an explicit slow-consumer disconnect with `stream.overrun` (a slow
+    client is backpressured rather than told it fell behind), and the CLI still follows by
+    reconnecting rather than from one connection.
 - [ ] `BRN-008` Implement cancellation, timeout, disconnect, fallback, and daemon
   restart behavior. This TODO owns the run controller and the repositories' test
   doubles: `jarvis_application::run_controller` drives one durable run from
@@ -1342,7 +1527,29 @@ Foundation TODO remains incomplete.
   state rather than a returned error — because the first version propagated the error with `?`
   and left the run with no legal exit. See `BRN-006` for the three defects this found.
   **Not done:** no fallback, per-request retry policy, or resumption, as above.
-- [ ] `BRN-009` Add deterministic orchestration tests and gated provider smoke test.
+- [~] `BRN-009` Add deterministic orchestration tests and gated provider smoke test. **The gated
+  provider smoke test is done; the deterministic orchestration tests are substantially covered but
+  not as one named suite, which is why this stays `~`.**
+  Evidence: **the gated half now runs against a real model.** `tests/e2e/provider-smoke.mjs` starts a
+  daemon configured for Ollama on loopback, creates a run through the real control API, and asserts
+  the daemon is wired to the configured provider (not the scripted fallback), that the run reaches
+  `completed`, that the durable events carry the **model's own text** rather than the scripted
+  acknowledgement, and that `jarvis ask` prints that answer and exits 0 — which is Milestone 2's exit
+  gate, *"a gated real-provider smoke test streams a response"*, stated as an executable check. Live
+  run verified: `jarvis ask "Reply with exactly: JARVIS OLLAMA OK"` printed `JARVIS OLLAMA OK`, exit
+  0, against `127.0.0.1:11434`. The harness takes host, port, base path, and model from the
+  environment, so pointing it at another compatible server is a configuration rather than a code
+  change. **The gate is a reachable endpoint, not a secret**, because the adapter is loopback-only by
+  construction and no cloud endpoint is reachable from this build; and a skip is **reported** as
+  "nothing was proved" rather than printed as a pass, because a CI log that cannot distinguish the two
+  is exactly what a gated test must not emit. **Not this TODO's half, but found while wiring it:**
+  the real endpoint required a configurable base path and a model-name mapping (see `BRN-003`), and it
+  exposed a chunked-transfer defect in the CLI's own client. **Still outstanding:** the deterministic
+  orchestration tests exist and are extensive — cancellation mid-stream, a retryable failure leaving
+  the run live, a deadline already passed, each consumption ceiling, a refusal settling the run, and
+  the tool-intent refusal — but they are distributed across `run_controller`, `run_service`, and the
+  HTTP surface rather than gathered as the contract test 7/8 suites `BRN-009` names, and the
+  contract's disconnect/reconnect cases belong to `BRN-008`'s journey. **DO NOT COMMIT.**
 - [~] `BRN-010` Implement a visible, configurable model data-use, retention,
   locality, and telemetry policy that constrains routing and records provider
   disclosures/effective decisions. **The rules, the evidence predicates, and the

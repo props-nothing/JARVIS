@@ -15,6 +15,14 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The maximum response body the CLI will read.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// The maximum response **head** this client will buffer while reading a stream.
+///
+/// Separate from the body bound because the two bound different things: the head is read before any
+/// content can be delivered, so an unbounded head is a peer that can hold the connection open by
+/// sending an endless status line. Sixteen kilobytes is what the adapter's own head reader allows, on
+/// the same reasoning.
+pub const MAX_HEAD_BYTES: usize = 16 * 1024;
+
 /// The maximum number of bytes this client reads from a discovery file.
 ///
 /// This is the constant `diagnostics` documented — "the maximum number of bytes this process reads
@@ -57,6 +65,48 @@ pub enum ClientError {
     MalformedResponse,
     /// A transport-level failure.
     Transport,
+}
+
+/// Whether a response body is framed by `Transfer-Encoding: chunked`.
+///
+/// Decided from the **header**, never by looking at the bytes. A body could coincidentally begin
+/// with something that looks like a chunk size, so sniffing the content would make a JSON body
+/// starting with `abc\r\n` mis-decode as a chunked one. The header is what declares the framing, and
+/// it is the only thing that may decide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFraming {
+    /// A body with no transfer coding; the bytes are the message.
+    Identity,
+    /// A body in `chunk-size CRLF data CRLF ... 0 CRLF CRLF` form.
+    Chunked,
+}
+
+/// Decides the framing from a response's header block.
+///
+/// Matched case-insensitively and by token, because a header name is case-insensitive and a value
+/// may be a comma-separated list (`Transfer-Encoding: gzip, chunked`). The **last** coding is the
+/// one that determines the message framing, per RFC 9112, so the list is examined from the end.
+fn framing_of(head: &str) -> BodyFraming {
+    let mut chunked = false;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        // The final coding decides the framing; `chunked` must be last to be the framing it claims.
+        let last = value
+            .rsplit(',')
+            .map(str::trim)
+            .find(|token| !token.is_empty());
+        chunked = last.is_some_and(|token| token.eq_ignore_ascii_case("chunked"));
+    }
+    if chunked {
+        BodyFraming::Chunked
+    } else {
+        BodyFraming::Identity
+    }
 }
 
 impl ClientError {
@@ -421,6 +471,279 @@ pub async fn get_public(discovered: &Discovered, path: &str) -> Result<String, C
     get_with_headers(discovered, path, public_headers()).await
 }
 
+/// Streams a response body, calling `on_piece` as each piece is decoded.
+///
+/// **This exists because the buffered helpers above cannot read a live stream.** They read to
+/// end-of-body and then return, which is correct for a request that ends and wrong for the events
+/// endpoint: a live follow holds the connection open until the run terminates, so a buffered read
+/// would show nothing at all until the run was already over — turning a streaming surface into a
+/// slow blocking one. The difference is observable rather than cosmetic: `jarvis ask` prints its
+/// answer as the model produces it, instead of in one burst at the end.
+///
+/// `on_piece` is called with each decoded piece of the body and returns `false` to stop early — which
+/// is how a caller hangs up after a terminal event. Returning `false` closes the connection, and the
+/// contract is explicit that a client disconnect never cancels a durable run, so stopping early is
+/// always safe.
+///
+/// The decode is incremental on purpose. A response with `Transfer-Encoding: chunked` is framed by
+/// the server, and buffering it whole would both defeat streaming and reintroduce the framing bug the
+/// buffered path had — so the same header-decided framing and the same refusal to invent content
+/// apply here, just spread across reads.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Transport`] on a connection failure or when the published authority is not
+/// numeric loopback, [`ClientError::Timeout`] when the *head* is not received inside the bound,
+/// [`ClientError::Rejected`] for a non-success status, and [`ClientError::MalformedResponse`] for
+/// framing that cannot be trusted.
+pub async fn stream_response<F>(
+    discovered: &Discovered,
+    credential: &str,
+    path: &str,
+    api_major: u32,
+    extra_headers: &str,
+    mut on_piece: F,
+) -> Result<(), ClientError>
+where
+    F: FnMut(&str) -> bool,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let authority = discovered
+        .base_url
+        .strip_prefix("http://")
+        .ok_or(ClientError::Transport)?;
+    let (host, port) = authority.rsplit_once(':').ok_or(ClientError::Transport)?;
+    let address = dial_host(host)?;
+    let port: u16 = port.parse().map_err(|_| ClientError::Transport)?;
+
+    let mut stream = tokio::net::TcpStream::connect((address, port))
+        .await
+        .map_err(|_| ClientError::Transport)?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         {}{extra_headers}\
+         Connection: close\r\n\r\n",
+        authenticated_headers(credential, api_major),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| ClientError::Transport)?;
+
+    // The head is read under a bound so a peer that accepts and then says nothing is a timeout rather
+    // than a hang. Only the head: the body is the stream, and bounding *it* by a timeout would end a
+    // long model answer that was progressing perfectly well.
+    let mut head = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+    let head_end = loop {
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut buffer))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Transport)?;
+        if read == 0 {
+            return Err(ClientError::MalformedResponse);
+        }
+        head.extend_from_slice(&buffer[..read]);
+        if head.len() > MAX_HEAD_BYTES {
+            return Err(ClientError::MalformedResponse);
+        }
+        if let Some(at) = find_bytes(&head, b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+
+    let head_text = String::from_utf8(head[..head_end - 4].to_vec())
+        .map_err(|_| ClientError::MalformedResponse)?;
+    let status_line = head_text
+        .lines()
+        .next()
+        .ok_or(ClientError::MalformedResponse)?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or(ClientError::MalformedResponse)?;
+    let framing = framing_of(&head_text);
+
+    // Undecoded bytes still held, plus the payload bytes owed for the chunk being decoded. Both are
+    // needed because a read boundary can fall anywhere: inside a size line, inside a payload, or
+    // between a payload and its trailing CRLF.
+    let mut decode = BodyDecoder {
+        framing,
+        // Bytes of a chunk's payload that have been promised but not yet delivered. Held across reads
+        // because a chunk larger than one read must be delivered in pieces rather than dropped — which
+        // is the same defect the adapter's own chunked reader had.
+        owed: 0,
+        pending: head[head_end..].to_vec(),
+        finished: false,
+    };
+    let mut stream = stream;
+
+    if !(200..300).contains(&status) {
+        // A non-success has no stream to follow, and the caller needs the daemon's own code rather
+        // than a transport fault — the distinction decides what an operator does next. The body is
+        // read to completion first, because an error envelope is a whole message rather than a stream.
+        let mut response = std::mem::take(&mut decode.pending);
+        while read_more(&mut stream, &mut response, &mut buffer).await? {
+            if response.len() > MAX_RESPONSE_BYTES {
+                break;
+            }
+        }
+        let text = String::from_utf8(response).map_err(|_| ClientError::MalformedResponse)?;
+        let text = match framing {
+            BodyFraming::Identity => text,
+            BodyFraming::Chunked => decode_chunked(&text).ok_or(ClientError::MalformedResponse)?,
+        };
+        return Err(ClientError::Rejected {
+            status,
+            code: rejection_code(&text),
+        });
+    }
+
+    loop {
+        // Deliver everything the held bytes already allow, before reading more: a chunk that arrived
+        // whole in one read must be shown without waiting for the next.
+        while let Some(piece) = decode.next_deliverable(&mut stream, &mut buffer).await? {
+            if !on_piece(&piece) {
+                return Ok(());
+            }
+        }
+        if decode.finished {
+            return Ok(());
+        }
+        if !read_more(&mut stream, &mut decode.pending, &mut buffer).await? {
+            // End of body. A chunked response that arrives without its terminating chunk is incomplete
+            // framing, which is a `MalformedResponse` rather than a clean finish — otherwise a stream
+            // cut short would look exactly like a stream that ended.
+            return decode.finish_at_end_of_body();
+        }
+        if decode.pending.len() > MAX_RESPONSE_BYTES {
+            return Err(ClientError::MalformedResponse);
+        }
+    }
+}
+
+/// What a chunked or identity body has been told to expect but not yet delivered.
+///
+/// A type rather than a handful of locals inside [`stream_response`], because the state has to survive
+/// across reads and the function was otherwise long enough to hide that: the clippy `too_many_lines`
+/// bound is what surfaced it, and the extraction is the improvement rather than a workaround — the
+/// decode is now a value a test can drive, with no socket.
+struct BodyDecoder {
+    framing: BodyFraming,
+    /// Payload bytes still owed for the chunk currently being delivered.
+    owed: usize,
+    /// Bytes read but not yet consumed.
+    pending: Vec<u8>,
+    /// Whether the terminating chunk has been seen.
+    finished: bool,
+}
+
+impl BodyDecoder {
+    /// Returns the next piece of body to deliver, reading more if the framing requires it.
+    ///
+    /// `Ok(None)` means nothing can be delivered without more bytes — not that the body ended, which
+    /// is why the caller reads and asks again. The distinction matters: treating "nothing yet" as
+    /// "done" would end every stream that arrived in more than one read.
+    async fn next_deliverable(
+        &mut self,
+        stream: &mut tokio::net::TcpStream,
+        buffer: &mut [u8; 4096],
+    ) -> Result<Option<String>, ClientError> {
+        loop {
+            if self.framing == BodyFraming::Identity {
+                if self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let text = String::from_utf8_lossy(&self.pending).into_owned();
+                self.pending.clear();
+                return Ok(Some(text));
+            }
+            if self.owed > 0 {
+                if self.pending.len() < self.owed {
+                    return Ok(None);
+                }
+                let payload: Vec<u8> = self.pending.drain(..self.owed).collect();
+                self.owed = 0;
+                // The trailing CRLF belongs to the framing, and consuming it here is what stops a read
+                // boundary between a payload and its CRLF from leaving a stray pair in the stream. It
+                // has to arrive before this chunk can be reported complete, so a short read loops.
+                while self.pending.len() < 2 {
+                    if !read_more(stream, &mut self.pending, buffer).await? {
+                        return Err(ClientError::MalformedResponse);
+                    }
+                }
+                self.pending.drain(..2);
+                return Ok(Some(String::from_utf8_lossy(&payload).into_owned()));
+            }
+            let Some(at) = find_bytes(&self.pending, b"\r\n") else {
+                return Ok(None);
+            };
+            let size_line = String::from_utf8_lossy(&self.pending[..at]).into_owned();
+            // A chunk size may carry an extension after `;`, which is legal and unused here.
+            let size_text = size_line.split(';').next().unwrap_or(&size_line).trim();
+            let Ok(size) = usize::from_str_radix(size_text, 16) else {
+                // Framing that cannot be trusted is refused rather than skipped. A caller cannot tell
+                // a truncated body from a complete shorter one, so inventing a boundary here would
+                // turn a framing fault into a plausible-looking answer.
+                return Err(ClientError::MalformedResponse);
+            };
+            self.pending.drain(..at + 2);
+            if size == 0 {
+                self.finished = true;
+                return Ok(None);
+            }
+            self.owed = size;
+        }
+    }
+
+    /// Decides the outcome of an end-of-body that arrived without a terminating chunk.
+    ///
+    /// Only a **chunked** body can be incomplete in this way, and it is incomplete whenever a chunk was
+    /// owed or framing bytes are still held — because the protocol requires the zero-length chunk to
+    /// end the message. An identity body ends when the peer closes, which is its normal end.
+    fn finish_at_end_of_body(&self) -> Result<(), ClientError> {
+        match self.framing {
+            BodyFraming::Chunked if self.owed > 0 || !self.pending.is_empty() => {
+                Err(ClientError::MalformedResponse)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Reads more bytes into `pending`, returning whether anything arrived.
+///
+/// `false` means the peer closed. A read error is propagated rather than folded into `false`, because
+/// a closed connection and a failed one are different facts and only the first is a normal end.
+async fn read_more(
+    stream: &mut tokio::net::TcpStream,
+    pending: &mut Vec<u8>,
+    buffer: &mut [u8; 4096],
+) -> Result<bool, ClientError> {
+    use tokio::io::AsyncReadExt as _;
+    let read = stream
+        .read(buffer)
+        .await
+        .map_err(|_| ClientError::Transport)?;
+    if read == 0 {
+        return Ok(false);
+    }
+    pending.extend_from_slice(&buffer[..read]);
+    Ok(true)
+}
+
+/// Returns the index of `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// Performs one bounded loopback exchange and returns the response body.
 ///
 /// # Errors
@@ -529,8 +852,28 @@ async fn request(
         .and_then(|code| code.parse().ok())
         .ok_or(ClientError::MalformedResponse)?;
 
+    // **The body is decoded before it is interpreted, and that is a real defect fix.** A streamed
+    // response carries `Transfer-Encoding: chunked`, so its bytes are
+    // `chunk-size CRLF payload CRLF` repeated and terminated by a zero-length chunk — and this
+    // client read them as if they were the message. It appeared to work, which is what made it
+    // dangerous rather than merely wrong: `parse_sse` splits on `\n\n` and keys on line prefixes, so
+    // a size line is skipped as an unknown line **while every frame happens to land inside one
+    // chunk**. A frame larger than the writer's buffer is split across two chunks, and then the size
+    // line sits in the middle of a `data:` line — so the JSON loses its closing brace, the frame
+    // parses as nothing, and **`jarvis ask` prints a truncated answer and exits 0**. A silent partial
+    // answer is the worst possible failure for this command. The old replay-and-close handler wrote a
+    // sized body, so this only became reachable when the stream gained a chunked body; the
+    // end-to-end command was the thing that stayed green, because the fixture's frames are small.
+    let body = match framing_of(head) {
+        BodyFraming::Identity => body.to_owned(),
+        // `decode_chunked` returns `None` for framing that cannot be trusted, and that is a
+        // `MalformedResponse`: a partially decoded body would hand a caller a frame it cannot tell
+        // from a complete one, which is the same silent-truncation failure by a different route.
+        BodyFraming::Chunked => decode_chunked(body).ok_or(ClientError::MalformedResponse)?,
+    };
+
     if (200..300).contains(&status) {
-        return Ok((status, body.to_owned()));
+        return Ok((status, body));
     }
 
     // A non-success carries the daemon's machine code, which is safe to surface, and the
@@ -538,8 +881,47 @@ async fn request(
     // reused idempotency key is a different instruction to a caller than a `404`.
     Err(ClientError::Rejected {
         status,
-        code: rejection_code(body),
+        code: rejection_code(&body),
     })
+}
+
+/// Decodes a `Transfer-Encoding: chunked` body into the message it carries.
+///
+/// Returns `None` for framing that is incomplete or not well formed, rather than returning the part
+/// that decoded. A caller cannot tell a truncated body from a complete one — both are just shorter
+/// text — so a decoder that returned what it had would move a framing fault into a content fault,
+/// where it would look like an answer.
+///
+/// Hand-written for the same reason the adapter's chunked reader is: this crate has no HTTP client
+/// dependency, and the framing rules here are small and testable. It is deliberately the **same
+/// algorithm shape** as the adapter's decoder, including draining only the framing and leaving the
+/// payload, because the two were written from one reading of RFC 9112 — but they are separate
+/// functions because one decodes *outbound* responses from one specific daemon and the other decodes
+/// an arbitrary provider's stream, and a shared helper would have to live in neither crate's layer.
+fn decode_chunked(body: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut rest = body;
+    loop {
+        let (size_line, after_size) = rest.split_once("\r\n")?;
+        // A chunk size may carry an extension after `;`, which is legal and unused here.
+        let size_text = size_line.split(';').next().unwrap_or(size_line).trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        if size == 0 {
+            // The terminating chunk. Anything after it is a trailer or nothing at all, so the
+            // message is complete here.
+            return Some(decoded);
+        }
+        // The chunk's declared length is in **bytes**, and the payload may be split across an
+        // arbitrary number of TCP reads — but by this point the whole body has been buffered, so a
+        // chunk that extends past the end means the peer closed mid-chunk and the message is not
+        // complete.
+        let payload_end = size.checked_add(2)?;
+        if after_size.len() < payload_end {
+            return None;
+        }
+        decoded.push_str(&after_size[..size]);
+        rest = &after_size[payload_end..];
+    }
 }
 
 /// Reads the machine code out of an error body.
@@ -556,8 +938,103 @@ fn rejection_code(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, MAX_SOURCE_BYTES, discover, read_credential, read_discovery_bounded};
+    use super::{
+        BodyFraming, ClientError, MAX_SOURCE_BYTES, decode_chunked, discover, framing_of,
+        read_credential, read_discovery_bounded,
+    };
     use jarvis_protocol::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
+
+    #[test]
+    fn chunked_framing_is_detected_from_the_header_and_never_from_the_body() {
+        // Decided by the header, because a body could coincidentally start with something that looks
+        // like a chunk size — and a JSON body beginning `abc\r\n` would then be mis-decoded as
+        // chunked. The header is what declares the framing.
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"),
+            BodyFraming::Identity
+        );
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"),
+            BodyFraming::Chunked
+        );
+        // Case-insensitive, as a header name must be.
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nTRANSFER-ENCODING: Chunked\r\n"),
+            BodyFraming::Chunked
+        );
+        // The **last** coding decides the framing, per RFC 9112, so `chunked` only counts when it is
+        // last: `chunked, gzip` is not a message this client can frame.
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n"),
+            BodyFraming::Chunked
+        );
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n"),
+            BodyFraming::Identity
+        );
+        // A body that merely looks chunked is not.
+        assert_eq!(
+            framing_of("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n"),
+            BodyFraming::Identity
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_decodes_to_the_message_it_carries() {
+        // The ordinary case, plus the case that matters: a **frame split across two chunks**, which
+        // is what a real server does when a frame exceeds its write buffer. Reading the body as if it
+        // were the message truncates the `data:` line at the boundary, so the JSON loses its closing
+        // brace and the frame parses as nothing — a partial answer delivered as a success.
+        //
+        // The sizes are **computed from the payloads** rather than written as hex literals. My first
+        // version hardcoded them and got one wrong, which is exactly the mistake a hand-written
+        // framing test invites: a chunk size is a byte count in hex, and a wrong one is not a typo
+        // that stands out but a plausible number that makes the decoder refuse.
+        let frame = "id: x\r\nevent: y\r\n\r\n";
+        let one_chunk = format!("{:X}\r\n{frame}\r\n0\r\n\r\n", frame.len());
+        assert_eq!(decode_chunked(&one_chunk).expect("decodes"), frame);
+
+        // The same message split mid-line. The decoded result must be **identical** to the unsplit
+        // one, which is the property a byte-oriented reader cannot provide.
+        let whole =
+            "id: 0195f4f1\r\nevent: run.output_text.delta\r\ndata: {\"sequence\":5}\r\n\r\n";
+        let split_at = 20;
+        let (first_half, second_half) = whole.split_at(split_at);
+        let split = format!(
+            "{:X}\r\n{first_half}\r\n{:X}\r\n{second_half}\r\n0\r\n\r\n",
+            first_half.len(),
+            second_half.len(),
+        );
+        assert_eq!(decode_chunked(&split).expect("decodes"), whole);
+        assert_ne!(
+            decode_chunked(&split).expect("decodes"),
+            split,
+            "the decoded body is the message, not the framing",
+        );
+    }
+
+    #[test]
+    fn incomplete_or_unusable_chunk_framing_is_refused_rather_than_partly_returned() {
+        // A caller cannot distinguish a truncated body from a complete shorter one — both are just
+        // text — so the decoder refuses instead of returning what it has. Returning a prefix would
+        // turn a framing fault into a content fault, where it would look like an answer.
+        for unusable in [
+            // No size line at all.
+            "not-a-size-line",
+            // A size that is not hexadecimal.
+            "zz\r\nid: x\r\n",
+            // A chunk that promises more than the body holds: the peer closed mid-chunk.
+            "40\r\nshort\r\n",
+            // A body that ends without the terminating chunk.
+            "A\r\n0123456789\r\n",
+        ] {
+            assert_eq!(
+                decode_chunked(unusable),
+                None,
+                "{unusable:?} must be refused"
+            );
+        }
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("jarvis-fnd008-{tag}-{}", std::process::id()));
@@ -888,6 +1365,67 @@ mod tests {
                 seen,
                 format!("[::1]:{v6_port}"),
                 "the Host the server saw",
+            );
+        });
+    }
+
+    #[test]
+    fn a_chunked_response_over_a_real_socket_is_decoded_by_the_transport() {
+        // **The test the decoder unit tests could not be.** They call `decode_chunked` directly, so
+        // removing the call from `request` left every one of them green — the decoder worked and the
+        // transport never used it. A unit test on a helper proves the helper; only a socket proves
+        // the wiring, which is where the defect actually was.
+        //
+        // The server deliberately splits a frame **mid-`data:`-line across two chunks**, because
+        // that is the case that changes the outcome: with the framing treated as the message, the
+        // JSON loses its closing brace, the frame parses as nothing, and a caller receives a
+        // truncated answer. Asserting the exact body is what makes that unmissable.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("local addr").port();
+
+            let frame = "id: 0195f4f1\r\nevent: run.output_text.delta\r\ndata: {\"delta\":\"Hello\"}\r\n\r\n";
+            let split_at = 24;
+            let (first, second) = frame.split_at(split_at);
+            let chunked_body = format!(
+                "{:X}\r\n{first}\r\n{:X}\r\n{second}\r\n0\r\n\r\n",
+                first.len(),
+                second.len(),
+            );
+
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("a connection");
+                let mut buffer = [0_u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n{chunked_body}",
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+
+            let discovered = super::Discovered {
+                base_url: format!("http://127.0.0.1:{port}"),
+                instance_id: "inst-chunked".to_owned(),
+                pid: 1,
+            };
+            let body = super::get_public(&discovered, "/events")
+                .await
+                .expect("the request reaches the listener");
+            assert_eq!(
+                body, frame,
+                "the transport must decode the framing, not deliver it: a body carrying chunk \
+                 sizes truncates any frame split across two chunks",
             );
         });
     }

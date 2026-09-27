@@ -383,6 +383,11 @@ pub struct RunPorts {
 pub struct RunService {
     ports: RunPorts,
     cancellations: Arc<RunCancellationRegistry>,
+    /// Notifies live followers that a run's durable stream has grown.
+    ///
+    /// Held for the service's lifetime, which is what makes a subscription's `Closed` case
+    /// unreachable in the daemon: a follower's publisher outlives the follower.
+    live: crate::live_events::RunStreamNotifier,
 }
 
 impl std::fmt::Debug for RunService {
@@ -392,6 +397,7 @@ impl std::fmt::Debug for RunService {
         formatter
             .debug_struct("RunService")
             .field("live_runs", &self.cancellations.live_count())
+            .field("live_followers", &self.live.follower_count())
             .finish_non_exhaustive()
     }
 }
@@ -403,7 +409,26 @@ impl RunService {
         Self {
             ports,
             cancellations,
+            live: crate::live_events::RunStreamNotifier::new(),
         }
+    }
+
+    /// Subscribes a follower to run-stream wake-ups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::NotFound`] for an absent or foreign run: subscribing to a run the
+    /// caller cannot read must fail here rather than at the first read, so a client learns it cannot
+    /// follow the run instead of receiving a stream that then refuses. It is also a **scoping**
+    /// check: the load is workspace-scoped, so a subscription cannot be used to probe for another
+    /// workspace's runs.
+    pub async fn subscribe(
+        &self,
+        context: &RequestContext,
+        run: RunId,
+    ) -> Result<crate::live_events::LiveSubscription, RunServiceError> {
+        self.ports.runs.load(context.workspace_id, run).await?;
+        Ok(self.live.subscribe())
     }
 
     /// Builds a controller over this service's ports.
@@ -417,6 +442,7 @@ impl RunService {
             Arc::clone(&self.ports.provider),
             Arc::clone(&self.ports.clock),
         )
+        .with_notifier(self.live.clone())
     }
 
     /// Creates a run for `context` and returns it without waiting for it to finish.

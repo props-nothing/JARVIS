@@ -138,3 +138,54 @@ can only reach the variants a fixture produces, and the defect found in the prev
 `rejected_view` rendering `RejectionReason`'s operator prose `"locality violated"` where the
 contract specifies the code `locality_violated` — survived because the one rejection code the
 handler test reached was produced by the domain, so the test agreed with the defect.
+
+## `provider-smoke.mjs`
+
+Proves Milestone 2's exit gate — *"a gated real-provider smoke test streams a response"* — and it is
+the **only** harness that reaches a real model. Every other test here and in the workspace runs
+against the scripted provider or a fake server, so none of them shows that JARVIS can talk to a real
+OpenAI-compatible endpoint, translate its stream, and record the answer.
+
+It starts a daemon configured for a **real endpoint**, creates a run through the real control API, and
+asserts:
+
+- the daemon is wired to the **configured** provider rather than the scripted fallback, which is the
+  composition check and the reason the run is not enough on its own;
+- the run reaches `completed`, so the adapter's transport, framing, translation, and the daemon's
+  composition all worked;
+- the run's durable events carry the **model's own text**, which is what makes this a proof about the
+  provider — the scripted provider's fixed acknowledgement cannot satisfy it;
+- `jarvis ask` prints that answer and exits 0, which exercises the client's own SSE reader against a
+  real chunked stream, where a framing defect shows up as a truncated answer.
+
+### Why it is gated, and how the gate behaves
+
+It targets **Ollama on loopback** by default, because that is the endpoint this build can reach: the
+adapter refuses a non-loopback host since the workspace has no TLS implementation, so a cloud endpoint
+is not testable here at all. Ollama also needs no credential, which makes the gate "is a local server
+listening" rather than "is a secret present" — and a secret must never be needed to run a test.
+
+When no server answers, the harness prints its skip **and says nothing was proved**. That distinction
+is the point: a skip that printed a pass would make a CI log from a machine without a provider look
+identical to one that had proved the real path, which is the single failure a gated test must not
+have.
+
+Host, port, base path, and model all come from the environment (`JARVIS_SMOKE_*`), so pointing it at
+another compatible server is a configuration rather than a code change.
+
+### What this harness forced
+
+Two additions and one defect, and none was visible from the contract or from a fixture:
+
+- **A base path.** Ollama serves `/v1/chat/completions`, not `/chat/completions`, as do vLLM, LM
+  Studio, and most gateways — so the adapter was posting to a path that 404s on a real server while
+  **every fixture passed**, because a fixture's server is built to the adapter's own assumption.
+- **A model-name mapping.** A JARVIS model id is a lowercase dotted slug and cannot contain the `:` in
+  Ollama's `glm-5.3-flash:cloud`, so the adapter could not name an Ollama cloud model at all. This is
+  a real namespace difference, not an Ollama quirk: providers also use `/` and `@`.
+- **A chunked-transfer defect in the CLI's own client.** Making the event stream live made hyper
+  emit `transfer-encoding: chunked`, and the hand-written client read the framing as if it were the
+  message. It *appeared* to work because each frame fit in one chunk; a larger frame splits across
+  chunks, puts a size line inside a `data:` line, and `jarvis ask` prints a truncated answer and
+  exits 0. See `BRN-003` for why the socket-level test, not the decoder's unit tests, was what caught
+  it.

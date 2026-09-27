@@ -25,6 +25,7 @@ jarvis-protocol = { path = "crates/jarvis-protocol" }
 
 jiff = { version = "0.2.37", default-features = false, features = ["std", "serde"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+futures-core = { version = "0.3.34", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }
 directories = { version = "6.0.0" }
 getrandom = { version = "0.4.1" }
