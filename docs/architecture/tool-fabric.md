@@ -91,6 +91,20 @@ An approval request contains a safe preview and an action fingerprint over:
 Argument changes invalidate approval. Approving "send this email" does not
 approve a rewritten recipient, subject, body, attachment, or account.
 
+The fingerprint is computed rather than asserted: `jarvis_domain::tool::canonical`
+produces the RFC 8785 canonical form of a versioned envelope — a flat object whose
+values are all strings, which is what makes the JCS number-serialization algorithm
+(unspecified by the RFC) unnecessary rather than merely unimplemented — and the
+SHA-256 that turns it into a `sha256:<hex>` digest lives in
+`jarvis_infrastructure::tool_fingerprint`. The evidence note is
+[rfc8785-canonicalization.md](../research/integrations/rfc8785-canonicalization.md).
+
+The envelope covers the **effects and the risk separately from the tool identity**,
+because `ToolIdentity` fingerprints the input schema alone: a tool reclassified from
+reading to deleting keeps its identity, so a fingerprint built from the identity would
+let an approval granted for the read authorize the delete. The effects are canonicalized
+as a set, so one effect set has one fingerprint.
+
 ## Execution
 
 The executor:

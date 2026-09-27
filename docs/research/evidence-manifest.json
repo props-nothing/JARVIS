@@ -73,6 +73,20 @@
       ]
     },
     {
+      "id": "jcs-canonicalization",
+      "todos": ["TLS-005"],
+      "evidence": "docs/research/integrations/rfc8785-canonicalization.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-27",
+      "revalidate_by": "2027-03-26",
+      "implementation_paths": [
+        "crates/jarvis-domain/src/tool/canonical.rs",
+        "crates/jarvis-domain/src/tool/canonical_tests.rs",
+        "crates/jarvis-infrastructure/src/tool_fingerprint/**"
+      ]
+    },
+    {
       "id": "mcp",
       "todos": ["TLS-008", "TLS-009", "TLS-010"],
       "evidence": "docs/research/integrations/mcp.md",

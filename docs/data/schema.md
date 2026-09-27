@@ -503,10 +503,17 @@ created_at, updated_at
 UNIQUE(workspace_id, principal_id, tool_identity_json, idempotency_key)
 ```
 
-- **One row per *attempt*, not per call**, which is why the name is `tool_call_records`. An
-  invocation that is retried has several rows sharing one reservation key, and the attempt number
-  distinguishes them — a table keyed by the call could not represent "the same reservation asked for
-  twice", which is the only thing this table exists to decide.
+- **One row per reservation key, not per attempt.** The unique index is
+  `(workspace_id, principal_id, tool_identity_json, idempotency_key)`, so a second attempt at the same
+  key is *refused by the reservation* rather than stored beside the first — and the `attempt` column
+  records how many times that one row's call was tried, not which row it is. An earlier version of this
+  note claimed "an invocation that is retried has several rows sharing one reservation key, and the
+  attempt number is what distinguishes them", which the index contradicts: `attempt` is not a key
+  column, so two rows cannot share a key at all. `a_second_attempt_at_one_reservation_key_is_refused…`
+  asserts the refusal with an `attempt = 2` row, and the domain ledger is a map keyed on the whole
+  reservation key, so the same fact holds in memory. The table is named `tool_call_records` because it
+  records a reservation and its outcome, and the reservation — not the attempt — is the unit the unique
+  index deduplicates.
 - **The unique index is over the serialized identity text**, so it only holds because the domain's
   serializer is deterministic for a struct of fields. A representation whose serialization could
   reorder — a map, or a set field — would make the index silently stop deduplicating while still
@@ -541,13 +548,14 @@ created_at
 
 One-shot consumption and tool reservation occur atomically.
 
-**As built (`000008`)**, which differs from the design above in four ways the implementation decided:
+**As built (`000008`, plus `000010`'s column)**, which differs from the design above in five ways the
+implementation decided:
 
 ```text
 id, workspace_id, requesting_principal_id, run_id, tool_call_id,
 tool_identity_json, action_fingerprint, risk, effects_json, summary,
 preview_json, allowed_channels_json, expires_at, scope, state, version,
-decided_by, decided_via, decided_at, created_at, updated_at
+decided_by, decided_via, decided_assurance, decided_at, created_at, updated_at
 ```
 
 - **`tool_identity_json` rather than a `tool_definition_id`** and separate source columns. An approval
@@ -555,14 +563,26 @@ decided_by, decided_via, decided_at, created_at, updated_at
   type's serialization is the canonical spelling of it, already round-trip tested. Splitting it would
   create a second definition of what the identity is, and the first thing to drift would be the
   fingerprint's algorithm prefix.
-- **`deciding_principal_id` is `decided_by` plus `decided_via`**: which principal, and which channel.
-  The contract lists `allowed_channels` so a decision can be checked against them, and a record that
-  did not store the channel used would make the check one-directional — JARVIS could refuse a
-  disallowed channel going in and never say, afterwards, which one a decision came from. `assurance` is
-  not stored: it belongs to `TLS-013`'s channel-assurance work and would be a column with no writer.
+- **`deciding_principal_id` is `decided_by` plus `decided_via`**, and **`decided_assurance`** was added by
+  `000010`. The contract lists `allowed_channels` so a decision can be checked against them, and a record
+  that did not store the channel used would make the check one-directional — JARVIS could refuse a
+  disallowed channel going in and never say, afterwards, which one a decision came from. The assurance is
+  the contract's Audit requirement, and it is a property of the **record** rather than of one transition:
+  the first implementation stored it from each transition's actor, so a consumption's actor — which carries
+  no assurance — wrote `NULL` over the value the decision had established. `NULL` there means **not
+  recorded** (the state of a decision taken before the column existed) and is deliberately distinct from
+  `standard`; the reader refuses an unknown spelling as corruption rather than mapping it to a level. The
+  remaining `TLS-013` gap is different and still real: the record names no level a decision **requires**, so
+  a step-up approval is unrepresentable rather than merely unenforced.
 - **`summary` and `preview_json` are stored verbatim**, because they are the *record* of what the user
   was shown and agreed to. Rebuilding them from the tool would show a preview the user never saw, whose
   definition may since have changed.
+- **The decision's note is in `approval_transitions.actor_json`, not in a column of `approvals`.** A
+  decision's `comment` and a cancellation's `reason` explain *that* transition — the only two a human
+  authors — so they belong to the step rather than to the record, and a column would have to answer what
+  it holds once a later consumption or expiry overwrote it. The trail is read oldest first by
+  `(occurred_at, id)`, and the note is surfaced by the **detail** route rather than a listing, which would
+  otherwise be one trail read per row.
 - **`state` has no default.** A row whose state was unset would be one whose lifecycle position nobody
   chose, and defaulting to `pending` is the fail-open direction — a pending approval is one a later
   pass may decide. `NOT NULL` with no default makes that a write error instead of a plausible row.
@@ -595,6 +615,24 @@ adds on top of the schema, because both are decisions the columns alone do not s
   decision, so its absence means the row was not written by the domain.
 - An approval in another workspace is `storage.not_found`, **indistinguishable from one that does not
   exist**, following the rule the local control API states for runs.
+- **The fingerprint is re-validated on read.** `action_fingerprint` is stored as the contract's
+  `sha256:<hex>` text and read back through `ActionDigest::parse`, so a row whose column holds something
+  that is not a digest — a bare hash, another algorithm, uppercase hex — is `storage.row_corrupted`
+  rather than a value that is carried into a comparison and silently never matches. That is the same
+  direction the state walk takes: an uninterpretable stored value is corruption, not data loss to
+  tolerate, because the alternative is a check that quietly stops applying.
+- **The pending read's channel filter is inside the query, and the bound is a probe.** `approved`
+  channels live in a JSON array, and `pending_in` tests membership with
+  `EXISTS (SELECT 1 FROM json_each(...) WHERE value = ?)` **before** the `LIMIT` — so the page bound
+  applies to the rows the caller can actually decide. Filtering after the `LIMIT` spends the page on
+  rows the caller cannot act on and returns a short list, and since this listing serves no cursor a
+  client that receives a short list concludes there is nothing left to decide. The statement reads
+  **one row more than the bound** so `bounded` is an observation rather than an inference from
+  `len() == limit`, and it orders by `(expires_at, id)`: soonest deadline first because that is the
+  order an operator works in, and the identifier as a tie-break because an order that is not total can
+  show one row twice and hide another. `json_each` needs the JSON1 extension, which the bundled SQLite
+  provides (probed against the pinned crate: 3.51.3); a build without it fails the query loudly rather
+  than silently dropping the channel rule.
 
 ### `tool_call_transitions`
 
@@ -627,18 +665,28 @@ because the columns alone do not state them:
   **unscoped** — a scan filtered by workspace would leave other workspaces' stranded effects stranded
   with no symptom.
 
-**Startup recovery (`jarvis_application::tool_recovery`, run by `jarvisd` before readiness)** converts a
-dead in-flight call into a work item. A call that reached the provider and then lost its daemon stayed
-`EXECUTING`, and the next attempt's reservation answered `InFlight` — telling a caller to wait on a
-process that is gone. The pass moves it to `RECONCILING`, so a duplicate is reported as `Unsettled` and a
-caller is told to reconcile rather than wait. Two rules there are consequences of the storage shape:
+**Startup recovery (`jarvis_application::tool_recovery`, run by `jarvisd` before readiness)** settles
+calls a restart interrupted, in **two directions**. A call that reached the provider and then lost its
+daemon stayed `EXECUTING`, and the next attempt's reservation answered `InFlight` — telling a caller to
+wait on a process that is gone. The pass moves it to `RECONCILING`, so a duplicate is reported as
+`Unsettled` and a caller is told to reconcile rather than wait. A call that never dispatched is a
+**second** case with the same harm and a different remedy: nothing reached the provider, so it cannot
+have effected, and leaving it reserved means its dead holder keeps the key and every later retry waits on
+it for ever — so the pass ends it `CANCELLED` (with the `tool.cancelled` outcome a terminal row
+requires). Two rules there are consequences of the storage shape:
 
 - **The scan a caller reports is not the scan the pass pages.** `possibly_effecting` returns
   `executing` **and** `reconciling` rows with no outcome — the outstanding work. Paging it would re-read
-  the pass's own output, since converting an `EXECUTING` row produces a `RECONCILING` row that the same
-  predicate returns; with the ordering tied on `updated_at`, a later page can hold only converted rows and
-  the rest become unreachable. `awaiting_conversion` selects `executing` alone, so the set strictly
-  shrinks and the paging terminates.
+  the pass's own output, since settling an `EXECUTING` row produces a `RECONCILING` row that the same
+  predicate returns; with the ordering tied on `updated_at`, a later page can hold only settled rows and
+  the rest become unreachable. `awaiting_conversion` returns every non-terminal state **except
+  `reconciling`**, so the set strictly shrinks and the paging terminates. **That "except" is exactly one
+  state, and a narrower predicate is a defect rather than a tuning choice**: the pass's classification
+  answers for six non-terminal states, and an earlier version selected `executing` alone — so a stranded
+  **pre-dispatch** reservation was never settled, its dead holder kept the unique-index entry, and every
+  later retry of that key was answered `InFlight`, i.e. *wait on a process that is gone*.
+  `the_conversion_scan_covers_every_state_the_pass_can_settle` asserts the predicate against the domain's
+  own state set, because the SQL list and the Rust table compile independently.
 - **`bounded` comes from a probe row, not from `len() == limit`.** The adapter reads one row more than the
   page size, so "there is more" is distinguishable from "that was all" — and this bound hides the
   **newest** rows, which is why the distinction decides whether recovery can finish.

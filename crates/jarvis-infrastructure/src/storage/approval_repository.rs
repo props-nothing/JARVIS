@@ -26,18 +26,24 @@
 
 use sqlx::SqlitePool;
 
-use jarvis_application::repository::approval::{ApprovalRepository, DecideOutcome};
+use jarvis_application::repository::approval::{
+    ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+};
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ApprovalId, PrincipalId, RunId, ToolCallId, WorkspaceId};
+use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalScopeKind,
     ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DurableApproval, PreviewItem,
 };
+use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_domain::tool::classification::{Effect, Risk};
 use jarvis_domain::tool::identity::ToolIdentity;
 
-use super::repositories::{begin_write, int, opt_text, parse_time, text};
+use super::repositories::{
+    assurance_from_stored, assurance_stored, begin_write, int, opt_text, parse_time, text,
+};
 
 /// The `SELECT` for [`ApprovalRepository::load`].
 ///
@@ -48,22 +54,63 @@ use super::repositories::{begin_write, int, opt_text, parse_time, text};
 /// visible in one screen rather than scattered.
 const LOAD_SQL: &str = "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
      tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, decided_at, \
-     created_at, updated_at FROM approvals WHERE workspace_id = ? AND id = ?";
+     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+     decided_assurance, decided_at, created_at, updated_at FROM approvals WHERE workspace_id = ? AND id = ?";
 
-/// The `SELECT` for [`ApprovalRepository::pending_in`], ordered by what lapses soonest.
-const PENDING_SQL: &str = "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+/// The `SELECT` for [`ApprovalRepository::pending_in`].
+///
+/// **Three things in this statement are deliberate, and each fixes a way the listing silently
+/// short-changes an operator.**
+///
+/// 1. **The channel is a `WHERE` predicate, not a post-filter.** `allowed_channels_json` is a JSON
+///    array, and `json_each` tests membership. Filtering after the `LIMIT` would spend the page on
+///    rows the caller cannot decide and return a short list — and a client that receives a short list
+///    concludes there is nothing more to act on.
+/// 2. **The `LIMIT` is the caller's bound plus one, and the extra row is a probe.** Reading exactly
+///    `limit` rows cannot distinguish "there are more" from "that was all", and for this query the
+///    difference is an operator believing the queue is empty. The probe row is discarded; it exists
+///    only so the caller is told the truth about whether it saw everything. The same technique
+///    `RunRepository::incomplete_runs` and the ledger scans use.
+/// 3. **The order is `(expires_at, id)`, and the identifier is not decoration.** Soonest deadline first
+///    is the order an operator has to work in, but `expires_at` alone is not total — two requests can
+///    share a deadline, and a page boundary inside such a group would let one row appear on two pages
+///    while another is skipped.
+///
+/// `json_each` requires the JSON1 extension. The workspace's bundled SQLite has it (probed against the
+/// exact crate version: 3.51.3), and a build without it would fail the query loudly rather than
+/// silently return every row — the right direction, since the alternative is a channel check that
+/// quietly stops applying.
+const PENDING_SQL: &str =
+    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
      tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, decided_at, \
+     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+     decided_assurance, decided_at, 
      created_at, updated_at FROM approvals WHERE workspace_id = ? AND state = 'pending' \
-     ORDER BY expires_at ASC LIMIT ?";
+     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
+     ORDER BY expires_at ASC, id ASC LIMIT ?";
 
 /// The `SELECT` for [`ApprovalRepository::decided_by`], most recent first.
-const DECIDED_SQL: &str = "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+///
+/// The tie-break on `id` is the same requirement the pending listing records: `decided_at` alone is not
+/// total, and an order that is not total can show one decision twice and hide another.
+const DECIDED_SQL: &str =
+    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
      tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, decided_at, \
+     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+     decided_assurance, decided_at, 
      created_at, updated_at FROM approvals WHERE workspace_id = ? AND decided_by = ? \
-     ORDER BY decided_at DESC LIMIT ?";
+     ORDER BY decided_at DESC, id ASC LIMIT ?";
+
+/// The `SELECT` for [`ApprovalRepository::transitions`], oldest first.
+///
+/// **The order is `(occurred_at, id)` and the identifier is load-bearing.** A trail is read forwards, and
+/// an append-only identifier breaks an instant tie so a boundary inside a same-instant group cannot show
+/// one step twice and hide another — the same argument the pending listing records for its deadine tie.
+/// Two transitions of one approval written in the same millisecond is not hypothetical: a decision and its
+/// consumption can follow each other faster than the clock's resolution.
+const TRANSITIONS_SQL: &str = "SELECT id, approval_id, workspace_id, from_state, to_state, \
+     prior_version, version, actor_kind, actor_json, occurred_at FROM approval_transitions \
+     WHERE approval_id = ? AND workspace_id = ? ORDER BY occurred_at ASC, id ASC";
 
 /// The SQLite-backed approval repository.
 #[derive(Debug, Clone)]
@@ -76,6 +123,29 @@ impl SqliteApprovalRepository {
     #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Fetches an approval's row, applying the scope rule.
+    ///
+    /// **An inherent method rather than a port method, and that is the point of the split.** The port
+    /// describes what a *caller* may ask for; this is how two of the adapter's own reads share one scope
+    /// rule. Promoting it to the trait would put a row-shaped method on a port that speaks in domain
+    /// values, and leaving the two reads to each write their own predicate is how a foreign-workspace
+    /// trail comes to answer with the wrong code — the "two implementations of one rule" defect this
+    /// project keeps finding. An approval owned by another workspace is `NotFound`, indistinguishable from
+    /// absent, by design.
+    async fn load_row(
+        &self,
+        workspace: WorkspaceId,
+        approval: ApprovalId,
+    ) -> Result<sqlx::sqlite::SqliteRow, RepositoryError> {
+        let row = sqlx::query(LOAD_SQL)
+            .bind(workspace.to_string())
+            .bind(approval.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+        row.ok_or(RepositoryError::NotFound)
     }
 }
 
@@ -111,7 +181,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
             .bind(approval.run.to_string())
             .bind(approval.tool_call.to_string())
             .bind(serialize_identity(&approval.identity)?)
-            .bind(&approval.action_digest)
+            .bind(approval.action_digest.to_string())
             .bind(approval.risk.as_contract_str())
             .bind(serialize_effects(&approval.effects)?)
             .bind(&approval.summary)
@@ -146,17 +216,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
         approval: ApprovalId,
     ) -> RepositoryFuture<'_, DurableApproval> {
         Box::pin(async move {
-            let row = sqlx::query(LOAD_SQL)
-                .bind(workspace.to_string())
-                .bind(approval.to_string())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|_| RepositoryError::Query)?;
-            // An approval owned by another workspace is `NotFound` — indistinguishable from absent, by
-            // design, so a caller cannot probe for identifiers it does not own.
-            let Some(row) = row else {
-                return Err(RepositoryError::NotFound);
-            };
+            let row = self.load_row(workspace, approval).await?;
             stored_approval(&row)
         })
     }
@@ -226,7 +286,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
             // statement is refused rather than overwriting a decision.
             let updated = sqlx::query(
                 "UPDATE approvals SET state = ?, version = ?, decided_by = ?, decided_via = ?, \
-                 decided_at = ?, updated_at = ? \
+                 decided_assurance = ?, decided_at = ?, updated_at = ? \
                  WHERE workspace_id = ? AND id = ? AND version = ?",
             )
             .bind(approval.state().as_contract_str())
@@ -236,6 +296,12 @@ impl ApprovalRepository for SqliteApprovalRepository {
             )
             .bind(approval.decided_by().map(|who| who.to_string()))
             .bind(approval.decided_via().map(ApprovalChannel::as_contract_str))
+            // The assurance comes from the **approval**, not from this transition's actor, and the first
+            // version of this line got it wrong: taking it from the actor meant a later consumption or
+            // invalidation wrote NULL over the decision's assurance, so the record lost a fact its own
+            // transition row still held. It sits beside `decided_by` and `decided_via` because all three
+            // are properties of the decision on this record rather than of one transition.
+            .bind(approval.decided_assurance().map(assurance_stored))
             .bind(
                 transition
                     .occurred_at
@@ -298,18 +364,32 @@ impl ApprovalRepository for SqliteApprovalRepository {
     fn pending_in(
         &self,
         workspace: WorkspaceId,
+        channel: ApprovalChannel,
         limit: u32,
-    ) -> RepositoryFuture<'_, Vec<DurableApproval>> {
+    ) -> RepositoryFuture<'_, ApprovalsPage> {
         Box::pin(async move {
-            // Ordered by what lapses soonest, because that is the order an operator has to act in — the
-            // index is keyed `(workspace_id, state, expires_at)` for exactly this query.
+            // **Clamped to the port's own bound, not trusted from the caller.** A limit is a request,
+            // and an unbounded one over a workspace's approvals is the shape that turns one listing
+            // into a full table scan; the contract requires "a bounded page size". Clamping rather
+            // than refusing means a client asking for more receives a full page rather than an error.
+            let limit = limit.min(MAX_PENDING_PAGE);
+            // One row more than asked, so a full page can be told from a complete one. Reading exactly
+            // `limit` rows makes "there are more" and "that was all" the same observation — and here
+            // that ambiguity makes an operator believe the queue is empty.
             let rows = sqlx::query(PENDING_SQL)
                 .bind(workspace.to_string())
-                .bind(i64::from(limit))
+                .bind(channel.as_contract_str())
+                .bind(i64::from(limit.saturating_add(1)))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|_| RepositoryError::Query)?;
-            rows.iter().map(stored_approval).collect()
+            let bounded = rows.len() > limit as usize;
+            let approvals = rows
+                .iter()
+                .take(limit as usize)
+                .map(stored_approval)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ApprovalsPage { approvals, bounded })
         })
     }
 
@@ -320,6 +400,9 @@ impl ApprovalRepository for SqliteApprovalRepository {
         limit: u32,
     ) -> RepositoryFuture<'_, Vec<DurableApproval>> {
         Box::pin(async move {
+            // Clamped for the same reason `pending_in` is: the bound belongs to the read, not to
+            // whichever caller named a number.
+            let limit = limit.min(MAX_PENDING_PAGE);
             // Most recent first, which the port states as part of the contract rather than leaving to
             // the query plan. `decided_at` is `NULL` for a pending row, and the `decided_by` predicate
             // already excludes those, so the ordering is total over the rows selected.
@@ -331,6 +414,27 @@ impl ApprovalRepository for SqliteApprovalRepository {
                 .await
                 .map_err(|_| RepositoryError::Query)?;
             rows.iter().map(stored_approval).collect()
+        })
+    }
+
+    fn transitions(
+        &self,
+        workspace: WorkspaceId,
+        approval: ApprovalId,
+    ) -> RepositoryFuture<'_, Vec<ApprovalTransitionRecord>> {
+        Box::pin(async move {
+            // **The record is loaded first, so the scope rule is the record's rather than the trail's.**
+            // A trail exists only for an approval that does, and asking for a foreign workspace's trail
+            // must answer `NotFound` exactly as its record does — a query over `approval_transitions`
+            // alone would have to re-derive the scope and could disagree with the record about it.
+            self.load_row(workspace, approval).await?;
+            let rows = sqlx::query(TRANSITIONS_SQL)
+                .bind(approval.to_string())
+                .bind(workspace.to_string())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| RepositoryError::Query)?;
+            rows.iter().map(stored_transition).collect()
         })
     }
 }
@@ -406,6 +510,7 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
         Some(value) => Some(parse_time(&value, "decided_at")?),
         None => None,
     };
+    let decided_assurance = stored_assurance(row)?;
     let _ = parse_time(&text(row, "created_at")?, "created_at")?;
     let updated_at = parse_time(&text(row, "updated_at")?, "updated_at")?;
 
@@ -420,7 +525,11 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
             run,
             tool_call,
             identity,
-            action_digest: text(row, "action_fingerprint")?,
+            action_digest: ActionDigest::parse(&text(row, "action_fingerprint")?).map_err(
+                |_| RepositoryError::Corrupted {
+                    column: "action_fingerprint",
+                },
+            )?,
             risk,
             effects,
             summary: text(row, "summary")?,
@@ -442,6 +551,7 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
         &StoredDecision {
             decided_by,
             decided_via,
+            decided_assurance,
             decided_at,
             updated_at,
         },
@@ -450,6 +560,68 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
         return Err(RepositoryError::Corrupted { column: "version" });
     }
     Ok(approval)
+}
+
+/// Reads one stored transition row.
+///
+/// **The actor is deserialized through the domain type**, so a stored transition is subject to the same
+/// rules as a live one — including the `DecisionNote` bound, whose `Deserialize` goes through its own
+/// constructor. That is what makes the decision's comment safe to read back: a note that could not have
+/// been written by this code is `Corrupted` rather than a value handed to an operator.
+fn stored_transition(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ApprovalTransitionRecord, RepositoryError> {
+    let id =
+        ApprovalId::parse(&text(row, "approval_id")?).map_err(|_| RepositoryError::Corrupted {
+            column: "approval_id",
+        })?;
+    let actor: ApprovalActor = serde_json::from_str(&text(row, "actor_json")?).map_err(|_| {
+        RepositoryError::Corrupted {
+            column: "actor_json",
+        }
+    })?;
+    Ok(ApprovalTransitionRecord {
+        id,
+        from: parse_approval_state(&text(row, "from_state")?)?,
+        to: parse_approval_state(&text(row, "to_state")?)?,
+        prior_version: ApprovalVersion::new(int(row, "prior_version")?.try_into().map_err(
+            |_| RepositoryError::Corrupted {
+                column: "prior_version",
+            },
+        )?),
+        version: ApprovalVersion::new(
+            int(row, "version")?
+                .try_into()
+                .map_err(|_| RepositoryError::Corrupted { column: "version" })?,
+        ),
+        actor,
+        occurred_at: parse_time(&text(row, "occurred_at")?, "occurred_at")?,
+    })
+}
+
+/// Reads the assurance a decision recorded, if the row records one.
+///
+/// **An unrecognised stored spelling is corruption rather than a default**, and the distinction matters
+/// here more than for most columns: the writer stores only the two contract values, so a third means the
+/// column was written by something else, and defaulting to `Standard` would report the weakest plausible
+/// strength for a value nobody established. `NULL` is legitimate and means **not recorded** — the state of
+/// every row written before `000010` — and is deliberately distinct from the weakest level, so a reader
+/// can tell "we do not know" from "we know it was ordinary".
+///
+/// Extracted from `stored_approval` when that function reached clippy's line bound, which was a real
+/// signal: the reader had grown long enough that a column could be parsed into the wrong variable without
+/// a reader noticing.
+fn stored_assurance(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Option<RequiredAssurance>, RepositoryError> {
+    match opt_text(row, "decided_assurance")? {
+        Some(value) => assurance_from_stored(&value)
+            .map(Some)
+            .ok_or(RepositoryError::Corrupted {
+                column: "decided_assurance",
+            }),
+        None => Ok(None),
+    }
 }
 
 /// The decision columns as the row stores them.
@@ -462,6 +634,13 @@ struct StoredDecision {
     decided_by: Option<PrincipalId>,
     /// Which channel the decision came from, when the row records one.
     decided_via: Option<ApprovalChannel>,
+    /// The assurance the decider proved, when the row records a decision.
+    ///
+    /// `None` means **not recorded**, which is what every row written before `000010` says and what a
+    /// non-decision transition writes. It is deliberately not defaulted to `Standard` at the read, for
+    /// the reason the reconstruction refuses it: a default would assert a credential strength the record
+    /// never established.
+    decided_assurance: Option<RequiredAssurance>,
     /// When the decision was taken, when the row records one.
     decided_at: Option<UtcTimestamp>,
     /// The instant of the row's most recent transition, which is all a non-decision step has.
@@ -511,7 +690,9 @@ fn reach(
     // fields while `apply` needs it mutably — the two borrows cannot overlap. Reading them here is also
     // what keeps the loop from holding a borrow across a mutation.
     let tool_call = approval.tool_call;
-    let action_digest = approval.action_digest.clone();
+    // `ActionDigest` is `Copy`, so this is a copy rather than a clone — the type is a fixed 32-byte value
+    // and needs no heap, which is why it can be passed into the actor reconstruction by value.
+    let action_digest = approval.action_digest;
     let requesting_principal = approval.requesting_principal;
     // The approval's own deadline, copied out for the same reason: the expiry actor records *which*
     // deadline passed, and reading it from the value inside the loop would borrow it immutably while
@@ -540,9 +721,10 @@ fn reach(
             target: *step,
             decided_by: stored.decided_by,
             decided_via: stored.decided_via,
+            decided_assurance: stored.decided_assurance,
             expires_at,
             tool_call,
-            action_digest: &action_digest,
+            action_digest,
             requesting_principal,
         })?;
         approval
@@ -557,35 +739,52 @@ fn reach(
 /// A struct rather than seven parameters, because several of these are identifiers of the same shape and
 /// a positional call would make a principal/tool-call transposition possible — the same reasoning
 /// `BRN-008`'s controller records for grouping its helpers' arguments.
-struct Reconstruction<'a> {
+struct Reconstruction {
     target: ApprovalState,
     decided_by: Option<PrincipalId>,
     decided_via: Option<ApprovalChannel>,
+    decided_assurance: Option<RequiredAssurance>,
     expires_at: UtcTimestamp,
     tool_call: ToolCallId,
-    action_digest: &'a str,
+    action_digest: ActionDigest,
     requesting_principal: PrincipalId,
 }
 
 /// Builds the actor a stored transition must have had.
 ///
 /// **A function rather than a closure, and that is a correction.** The first version was a closure that
-/// captured the approval's `action_digest` — a `String`, so not `Copy` — which made it `FnOnce` and
-/// meant it could be called exactly once. The loop calls it once per step, so a two-step path
-/// (`APPROVED -> CONSUMED`) failed to compile. Passing the digest as a borrowed parameter makes the
-/// function reusable without cloning, and the compile error was what surfaced the ownership rather than
-/// a test — which is the good direction for it to surface in.
+/// captured the approval's `action_digest` — which was a `String` then, so not `Copy` — which made it
+/// `FnOnce` and meant it could be called exactly once. The loop calls it once per step, so a two-step path
+/// (`APPROVED -> CONSUMED`) failed to compile. The digest is now an [`ActionDigest`], which **is** `Copy`,
+/// so the value can be passed by copy and the function is reusable without either a clone or a borrow —
+/// the ownership problem the compile error surfaced is gone at the source rather than worked around.
 ///
 /// A *decision* with no recorded principal or channel is corruption rather than a default: the domain
 /// records who decided and on which channel, and guessing a channel would defeat the check that
 /// recorded it.
-fn reconstructed_actor(parts: &Reconstruction<'_>) -> Result<ApprovalActor, RepositoryError> {
+fn reconstructed_actor(parts: &Reconstruction) -> Result<ApprovalActor, RepositoryError> {
     match parts.target {
         ApprovalState::Approved | ApprovalState::Rejected => {
             match (parts.decided_by, parts.decided_via) {
-                (Some(principal), Some(channel)) => {
-                    Ok(ApprovalActor::Decided { principal, channel })
-                }
+                (Some(principal), Some(channel)) => Ok(ApprovalActor::Decided {
+                    principal,
+                    channel,
+                    // **A decision with no recorded assurance is corruption, for the same reason a
+                    // decision with no principal is.** The writer always records the assurance the
+                    // decider proved, so a decision row without one was not written by this code — and
+                    // defaulting to `Standard` would assert that an unknown caller held only an
+                    // ordinary credential, which is exactly the claim the column exists to establish.
+                    // A row written before `000010` is therefore not silently readable as a decision,
+                    // which is the honest direction.
+                    assurance: parts.decided_assurance.ok_or(RepositoryError::Corrupted {
+                        column: "decided_assurance",
+                    })?,
+                    // The note is reconstructed from the **stored actor JSON**, which is where it lives:
+                    // it explains one transition rather than being a durable property of the approval, so
+                    // it is read back by the walk's actor rather than by a column of its own. `None` is
+                    // a decision whose caller said nothing, which is a legitimate record.
+                    note: None,
+                }),
                 _ => Err(RepositoryError::Corrupted {
                     column: "decided_by",
                 }),
@@ -598,10 +797,12 @@ fn reconstructed_actor(parts: &Reconstruction<'_>) -> Result<ApprovalActor, Repo
             tool_call: parts.tool_call,
         }),
         ApprovalState::Invalidated => Ok(ApprovalActor::Invalidated {
-            was_for: parts.action_digest.to_owned(),
+            was_for: parts.action_digest.to_string(),
         }),
         ApprovalState::Cancelled => Ok(ApprovalActor::Cancelled {
             by: parts.requesting_principal,
+            // Reconstructed from the stored actor JSON, where the caller's reason lives.
+            reason: None,
         }),
         // `PENDING` is not reachable by any path in `reach`, so reaching this arm means the path table
         // above and this match disagree — which is corruption rather than an unreachable branch to

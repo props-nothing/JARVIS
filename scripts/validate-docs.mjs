@@ -97,6 +97,7 @@ const REQUIRED_FILES = [
   "docs/research/integrations/mcp.md",
   "docs/research/integrations/openai-compatible-model.md",
   "docs/research/integrations/release-signing.md",
+  "docs/research/integrations/rfc8785-canonicalization.md",
   "docs/research/integrations/rust-foundation.md",
   "docs/research/integrations/tauri.md",
   "docs/research/source-registry.md",

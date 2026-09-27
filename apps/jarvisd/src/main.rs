@@ -114,6 +114,21 @@ async fn run() -> ExitCode {
         );
     }
 
+    // The tool-call half of the same fact, and it had no caller: the report was computed, checked for
+    // an incomplete store, and then dropped. A **reconciled** call is an effect whose existence is
+    // unknown, and a **cancelled** one is a reservation whose holder had died — the second being
+    // invisible otherwise, because a leaked reservation makes a later retry fail with a state that
+    // looks like a busy call rather than like a crash.
+    let tool_recovery = daemon.tool_recovery();
+    if tool_recovery.changed() > 0 || !tool_recovery.failures.is_empty() {
+        tracing::warn!(
+            reconciling = tool_recovery.reconciling,
+            cancelled = tool_recovery.cancelled,
+            failures = tool_recovery.failures.len(),
+            "recovered tool calls left incomplete by the previous shutdown",
+        );
+    }
+
     tracing::info!(instance_id = daemon.instance_id(), "daemon ready");
 
     serve(daemon, config.drain_grace).await

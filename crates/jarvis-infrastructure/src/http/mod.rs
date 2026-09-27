@@ -39,6 +39,7 @@ use serde::Serialize;
 use crate::auth::ClientRegistry;
 use crate::auth::credential::CredentialError;
 
+pub mod approval;
 pub mod policy;
 pub mod runs;
 
@@ -142,6 +143,11 @@ pub struct ApiState {
     /// database, and a policy route reached without one answers `service.not_ready` — a
     /// parseable envelope — rather than being unroutable.
     pub policies: Option<Arc<PolicyService>>,
+    /// The approval surface's service, absent when no storage is configured.
+    ///
+    /// Optional for the same reason the two above are, and the routes are routable without it so a
+    /// client receives `service.not_ready` rather than the unknown-route refusal.
+    pub approvals: Option<Arc<jarvis_application::approval_service::ApprovalService>>,
     /// The candidate inventory an effective-route probe evaluates.
     ///
     /// Absent when no provider is configured, because a probe with no candidates would report
@@ -262,6 +268,7 @@ impl std::fmt::Debug for ApiState {
             .field("bound_authority", &self.bound_authority)
             .field("ready", &self.readiness.is_ready())
             .field("runs_configured", &self.runs.is_some())
+            .field("approvals_configured", &self.approvals.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -282,6 +289,7 @@ impl ApiState {
             bound_authority: authority_of(address),
             runs: None,
             policies: None,
+            approvals: None,
             inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -325,6 +333,16 @@ impl ApiState {
     ) -> Self {
         self.policies = Some(policies);
         self.inventory = Some(inventory);
+        self
+    }
+
+    /// Attaches the approval surface's service.
+    #[must_use]
+    pub fn with_approvals(
+        mut self,
+        approvals: Arc<jarvis_application::approval_service::ApprovalService>,
+    ) -> Self {
+        self.approvals = Some(approvals);
         self
     }
 
@@ -487,6 +505,21 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route(
             "/api/v1/model-data-policy/effective",
             authenticated(get(policy::read_effective_route)),
+        )
+        // The approval routes follow the same shape as the two above: always routable, and answering
+        // `service.not_ready` when no storage is configured.
+        .route("/api/v1/approvals", authenticated(get(approval::list_approvals)))
+        .route(
+            "/api/v1/approvals/{approval_id}",
+            authenticated(get(approval::read_approval)),
+        )
+        .route(
+            "/api/v1/approvals/{approval_id}/decide",
+            authenticated(post(approval::decide_approval)),
+        )
+        .route(
+            "/api/v1/approvals/{approval_id}/cancel",
+            authenticated(post(approval::cancel_approval)),
         )
         .fallback(unknown_route)
         .layer(middleware::from_fn(reject_browser_origin))
@@ -1041,7 +1074,7 @@ fn error_response(status: StatusCode, code: &str, message: &str, retryable: bool
 /// Every refusal that can reach a handler should use this rather than [`error_response`], because
 /// the contract states that an error envelope carries a `request_id` so a client reporting a fault
 /// can be correlated with the daemon's own diagnostics.
-fn error_response_for(
+pub(crate) fn error_response_for(
     request_id: Option<&str>,
     status: StatusCode,
     code: &str,
@@ -1088,7 +1121,7 @@ const CODES_CARRIED_BY_ERROR_TYPES: [&str; 2] =
     ["idempotency.conflict", "resource.version_conflict"];
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ApiState, AuthenticatedClient, DEFAULT_STREAM_OVERRUN_TIMEOUT, ProviderInventory,
         REQUEST_ID_HEADER, Readiness, authority_of, router,
@@ -1113,9 +1146,9 @@ mod tests {
     /// A fixed value rather than a real bind, because these tests assert the
     /// validation logic and must not depend on an ephemeral port. The daemon's own
     /// test asserts that the real bound address reaches this same field.
-    const TEST_AUTHORITY: &str = "127.0.0.1:43127";
+    pub(crate) const TEST_AUTHORITY: &str = "127.0.0.1:43127";
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("jarvis-fnd007-api-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

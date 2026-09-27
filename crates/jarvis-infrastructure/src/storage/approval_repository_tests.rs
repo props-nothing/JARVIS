@@ -21,12 +21,14 @@ use crate::storage::repositories::tests::{run_id, seed, workspace};
 use jarvis_application::repository::RepositoryError;
 use jarvis_application::repository::approval::{ApprovalRepository as _, DecideOutcome};
 use jarvis_domain::ids::{ApprovalId, PrincipalId, ToolCallId, WorkspaceId};
+use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
-    ApprovalScopeKind, ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
-    PreviewItem,
+    ApprovalScopeKind, ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DecisionNote,
+    DurableApproval, PreviewItem,
 };
+use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_domain::tool::classification::{Effect, Risk};
 use jarvis_domain::tool::identity::{
     SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
@@ -95,7 +97,7 @@ fn parts() -> ApprovalRequestParts {
         // unlike the run, which `000008` references and which therefore has to be seeded.
         tool_call: ToolCallId::from_uuid(uuid::Uuid::from_u128(3)),
         identity: identity(),
-        action_digest: "sha256:the-approved-action".to_owned(),
+        action_digest: ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::ExternalCommunication, Effect::Write],
         summary: "Send one email to peter@example.com".to_owned(),
@@ -126,17 +128,47 @@ fn approval() -> DurableApproval {
 }
 
 fn decide(channel: ApprovalChannel) -> ApprovalActor {
+    decide_at(channel, RequiredAssurance::Standard)
+}
+
+/// A decision actor at an explicit assurance, so a test can assert the **recorded** level.
+fn decide_at(channel: ApprovalChannel, assurance: RequiredAssurance) -> ApprovalActor {
     ApprovalActor::Decided {
         principal: principal(),
         channel,
+        assurance,
+        note: None,
+    }
+}
+
+/// A decision actor carrying an operator note, so a test can assert the note survives the trail.
+fn decide_with_note(channel: ApprovalChannel, note: &str) -> ApprovalActor {
+    ApprovalActor::Decided {
+        principal: principal(),
+        channel,
+        assurance: RequiredAssurance::Standard,
+        note: Some(DecisionNote::new(note).expect("a usable note")),
     }
 }
 
 /// Approves a stored approval, returning the applied transition.
 fn approve(approval: &mut DurableApproval, channel: ApprovalChannel) -> ApprovalTransitionRecord {
+    approve_with_note_actor(approval, decide(channel))
+}
+
+/// Approves a stored approval with an operator note attached to the actor.
+fn approve_with_note(approval: &mut DurableApproval, note: &str) -> ApprovalTransitionRecord {
+    approve_with_note_actor(approval, decide_with_note(ApprovalChannel::Cli, note))
+}
+
+/// Applies an approval with `actor`, so both helpers share one transition path.
+fn approve_with_note_actor(
+    approval: &mut DurableApproval,
+    actor: ApprovalActor,
+) -> ApprovalTransitionRecord {
     let version = approval.version();
     approval
-        .apply(ApprovalState::Approved, version, decide(channel), now())
+        .apply(ApprovalState::Approved, version, actor, now())
         .expect("PENDING -> APPROVED is legal")
 }
 
@@ -208,7 +240,7 @@ async fn a_requested_approval_round_trips_with_every_field_intact() {
     assert_eq!(loaded.preview.items().len(), 2);
     assert_eq!(loaded.allowed_channels.as_slice().len(), 2);
     assert_eq!(loaded.scope, ApprovalScopeKind::OneShot);
-    assert_eq!(loaded.action_digest, "sha256:the-approved-action");
+    assert_eq!(loaded.action_digest, ActionDigest::from_bytes([11; 32]));
     assert!(!loaded.is_decided());
 }
 
@@ -248,6 +280,275 @@ async fn an_approved_approval_round_trips_with_who_decided_and_where() {
         "the decision channel must survive, or the allowed_channels check is one-directional",
     );
     assert!(loaded.is_decided());
+}
+
+#[tokio::test]
+async fn the_assurance_a_decider_proved_round_trips_and_survives_a_later_transition() {
+    // **The contract's audit section requires the assurance recorded**, and the first implementation of
+    // this column got it wrong in a way only this second half catches: the assurance was written from
+    // each transition's actor, so a decision stored `elevated` lost it the moment the approval was
+    // consumed — the later actor carries no assurance, and the update wrote NULL over the value the
+    // decision had established. A test that only read the record straight after the decision would have
+    // passed. So both halves are asserted: the value after the decision, and the value after a further
+    // non-decision transition has been applied to the same row.
+    let (_database, approvals) = repository().await;
+    let mut requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    // The decision is applied through the **record's own** `apply` with an `Elevated` actor, so the value
+    // being stored comes from the domain rather than from the argument — which is what makes the assertion
+    // about persistence rather than about the argument being echoed back.
+    let transition = {
+        let version = requested.version();
+        requested
+            .apply(
+                ApprovalState::Approved,
+                version,
+                decide_at(ApprovalChannel::Desktop, RequiredAssurance::Elevated),
+                now(),
+            )
+            .expect("PENDING -> APPROVED is legal")
+    };
+    approvals
+        .apply_transition(
+            workspace(),
+            &transition,
+            ApprovalVersion::FIRST,
+            &decide_at(ApprovalChannel::Desktop, RequiredAssurance::Elevated),
+            &requested,
+        )
+        .await
+        .expect("the decision is stored");
+
+    let decided = approvals
+        .load(workspace(), requested.id)
+        .await
+        .expect("loads");
+    assert_eq!(
+        decided.decided_assurance(),
+        Some(RequiredAssurance::Elevated),
+        "**the assurance must be stored**, or a step-up decision is indistinguishable from an ordinary one",
+    );
+
+    // A **consumption** is the transition that exposed the defect: its actor carries no assurance, so a
+    // writer taking the value from the actor clears the column. The fixture therefore applies the decision
+    // with an `Elevated` actor, and the later consumption with the ordinary `Consumed` one.
+    let consumption = consume(&mut requested);
+    approvals
+        .apply_transition(
+            workspace(),
+            &consumption,
+            ApprovalVersion::new(2),
+            &ApprovalActor::Consumed {
+                tool_call: tool_call(),
+            },
+            &requested,
+        )
+        .await
+        .expect("the consumption is stored");
+
+    let consumed = approvals
+        .load(workspace(), requested.id)
+        .await
+        .expect("loads");
+    assert_eq!(consumed.state(), ApprovalState::Consumed);
+    assert_eq!(
+        consumed.decided_assurance(),
+        Some(RequiredAssurance::Elevated),
+        "**a later non-decision transition must not clear the assurance the decision established**",
+    );
+    assert_eq!(
+        consumed.decided_by(),
+        Some(principal()),
+        "and the same is true of the other decision facts, which is why they sit together",
+    );
+}
+
+#[tokio::test]
+async fn the_trail_returns_each_step_with_the_note_the_human_left() {
+    // **The reader the decision's `comment` and the cancellation's `reason` needed.** Both are written into
+    // `actor_json`, and until `transitions` existed nothing could read them back — so the audit trail said
+    // *that* a human decided and never *why*, which is the value the two wire fields exist to carry. A
+    // writer with no reader is the shape this project has now found five times, and the fix is the reader
+    // rather than a second writer.
+    let (_database, approvals) = repository().await;
+    let mut requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    let transition = approve_with_note(&mut requested, "checked the recipient");
+    approvals
+        .apply_transition(
+            workspace(),
+            &transition,
+            ApprovalVersion::FIRST,
+            &decide_with_note(ApprovalChannel::Cli, "checked the recipient"),
+            &requested,
+        )
+        .await
+        .expect("the decision is stored");
+
+    // A **second** step, so the trail is asserted as a sequence rather than as a single row — one row
+    // would pass against a reader that returned only the newest transition.
+    let consumption = consume(&mut requested);
+    approvals
+        .apply_transition(
+            workspace(),
+            &consumption,
+            ApprovalVersion::new(2),
+            &ApprovalActor::Consumed {
+                tool_call: tool_call(),
+            },
+            &requested,
+        )
+        .await
+        .expect("the consumption is stored");
+
+    let trail = approvals
+        .transitions(workspace(), requested.id)
+        .await
+        .expect("the trail reads");
+    assert_eq!(trail.len(), 2, "both steps are in the trail: {trail:?}");
+    // **Oldest first**, because a trail is read forwards: "pending, then approved" describes what happened
+    // while the reverse reads as a puzzle.
+    assert_eq!(trail[0].from, ApprovalState::Pending);
+    assert_eq!(trail[0].to, ApprovalState::Approved);
+    assert_eq!(trail[1].to, ApprovalState::Consumed);
+    assert_eq!(
+        trail[0].actor.note().map(DecisionNote::as_str),
+        Some("checked the recipient"),
+        "**the decision's note must be readable from the trail**, or the wire's `comment` is lost in storage",
+    );
+    // The consumption carries no note, which is correct rather than missing: a spend is not authored by a
+    // person. Asserting it keeps "no note" distinguishable from "the reader dropped one".
+    assert!(trail[1].actor.note().is_none());
+}
+
+#[tokio::test]
+async fn a_cancellations_reason_is_readable_from_the_trail() {
+    // The cancellation half, through the same accessor: the contract says a cancellation uses
+    // "`expected_version`, reason code, and `Idempotency-Key`", and the reason is what makes the trail say
+    // why a prompt was withdrawn rather than only that it was.
+    let (_database, approvals) = repository().await;
+    let mut requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    let version = requested.version();
+    let cancellation = requested
+        .apply(
+            ApprovalState::Cancelled,
+            version,
+            ApprovalActor::Cancelled {
+                by: principal(),
+                reason: Some(DecisionNote::new("superseded").expect("a usable note")),
+            },
+            now(),
+        )
+        .expect("PENDING -> CANCELLED is legal");
+    approvals
+        .apply_transition(
+            workspace(),
+            &cancellation,
+            version,
+            &cancellation.actor,
+            &requested,
+        )
+        .await
+        .expect("the cancellation is stored");
+
+    let trail = approvals
+        .transitions(workspace(), requested.id)
+        .await
+        .expect("the trail reads");
+    assert_eq!(
+        trail[0].actor.note().map(DecisionNote::as_str),
+        Some("superseded"),
+        "a cancellation's reason is readable through the same accessor as a decision's comment",
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_workspaces_trail_is_not_found_rather_than_empty() {
+    // **Scope is the record's rule, not the trail's.** A trail exists only for an approval that does, so a
+    // foreign workspace must answer `NotFound` exactly as its record does — an empty list would be a
+    // different answer, and one a caller could read as "this approval has no history". The reader loads the
+    // record first precisely so the two cannot disagree.
+    let (_database, approvals) = repository().await;
+    let requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    assert_eq!(
+        code_of(&approvals.transitions(other_workspace(), requested.id).await),
+        Some("storage.not_found"),
+        "a foreign-workspace trail must be indistinguishable from an absent one",
+    );
+}
+
+#[tokio::test]
+async fn a_decision_row_with_no_recorded_assurance_is_corruption_rather_than_a_default() {
+    // The reader-side half. A decision row without an assurance was **not written by this code** — `apply`
+    // always records one — so reading it as `Standard` would assert that an unknown caller held only an
+    // ordinary credential, which is the exact claim the column exists to establish. That is the same
+    // direction `decided_at` takes: an incomplete decision record is corruption, not a value to guess.
+    //
+    // The case is also what a row written **before** `000010` looks like, and refusing it is deliberate
+    // rather than a compatibility accident: the honest reading of a pre-migration decision is "the
+    // assurance was not recorded", and the reader says so by refusing rather than by inventing a level.
+    let (database, approvals) = repository().await;
+    let mut requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    let transition = approve(&mut requested, ApprovalChannel::Desktop);
+    approvals
+        .apply_transition(
+            workspace(),
+            &transition,
+            ApprovalVersion::FIRST,
+            &decide(ApprovalChannel::Desktop),
+            &requested,
+        )
+        .await
+        .expect("the decision is stored");
+    // Clear only the assurance, leaving the principal, the channel, and the instant a decision carries —
+    // so the refusal is attributable to this column rather than to the decision being half-written.
+    sqlx::query("UPDATE approvals SET decided_assurance = NULL WHERE id = ?")
+        .bind(requested.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("the column is cleared");
+
+    assert_eq!(
+        code_of(&approvals.load(workspace(), requested.id).await),
+        Some("storage.row_corrupted"),
+        "a decision with no recorded assurance must be corruption rather than a defaulted `Standard`",
+    );
+}
+
+#[tokio::test]
+async fn a_stored_assurance_spelling_the_contract_does_not_define_is_corruption() {
+    // The vocabulary is closed, so a third spelling means the column was written by something other than
+    // this code — and reading it as `Standard` would report a strength nobody established. Asserted
+    // separately from the NULL case because the two are different facts: `NULL` is "not recorded" while an
+    // unknown string is "recorded as something uninterpretable".
+    let (database, approvals) = repository().await;
+    let mut requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    let transition = approve(&mut requested, ApprovalChannel::Desktop);
+    approvals
+        .apply_transition(
+            workspace(),
+            &transition,
+            ApprovalVersion::FIRST,
+            &decide(ApprovalChannel::Desktop),
+            &requested,
+        )
+        .await
+        .expect("the decision is stored");
+    sqlx::query("UPDATE approvals SET decided_assurance = 'superuser' WHERE id = ?")
+        .bind(requested.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("the column is overwritten");
+
+    assert_eq!(
+        code_of(&approvals.load(workspace(), requested.id).await),
+        Some("storage.row_corrupted"),
+        "the stored vocabulary is closed, so a third spelling must be refused rather than mapped",
+    );
 }
 
 #[tokio::test]
@@ -451,18 +752,20 @@ async fn an_approval_in_another_workspace_is_not_found_rather_than_forbidden() {
     );
     assert!(
         approvals
-            .pending_in(other_workspace(), 10)
+            .pending_in(other_workspace(), ApprovalChannel::Cli, 10)
             .await
             .expect("the listing succeeds")
+            .approvals
             .is_empty(),
         "another workspace's pending queue must not include this approval",
     );
     // And the owning workspace still sees it, so the refusal is about scope rather than about the row.
     assert_eq!(
         approvals
-            .pending_in(workspace(), 10)
+            .pending_in(workspace(), ApprovalChannel::Cli, 10)
             .await
             .expect("the listing succeeds")
+            .approvals
             .len(),
         1,
     );
@@ -665,10 +968,13 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
     approvals.request(&later).await.expect("inserted");
     approvals.request(&sooner).await.expect("inserted");
 
-    let pending = approvals.pending_in(workspace(), 10).await.expect("lists");
-    assert_eq!(pending.len(), 2);
+    let pending = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 10)
+        .await
+        .expect("lists");
+    assert_eq!(pending.approvals.len(), 2);
     assert_eq!(
-        pending[0].id, sooner.id,
+        pending.approvals[0].id, sooner.id,
         "the approval that lapses soonest must come first",
     );
 
@@ -685,13 +991,16 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
         )
         .await
         .expect("stored");
-    let pending = approvals.pending_in(workspace(), 10).await.expect("lists");
+    let pending = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 10)
+        .await
+        .expect("lists");
     assert_eq!(
-        pending.len(),
+        pending.approvals.len(),
         1,
         "a decided approval leaves the pending queue"
     );
-    assert_eq!(pending[0].id, later.id);
+    assert_eq!(pending.approvals[0].id, later.id);
 }
 
 #[tokio::test]
@@ -753,24 +1062,90 @@ async fn the_decided_listing_returns_one_principals_decisions_most_recent_first(
 }
 
 #[tokio::test]
-async fn a_listing_is_bounded_by_its_limit() {
+async fn a_listing_is_bounded_by_its_limit_and_reports_whether_more_remain() {
     // The limit is a parameter rather than a default, so a caller decides how much to read — and the
-    // assertion is that it is honoured, since a listing that ignored it would be an unbounded read behind
-    // a bound-looking API.
+    // assertion is that it is honoured, since a listing that ignored it would be an unbounded read
+    // behind a bound-looking API.
+    //
+    // **Both halves are asserted, and the second is the one that matters.** A bounded full page and a
+    // complete short page are different answers, and a client that cannot tell them apart concludes the
+    // queue is empty. The probe row is why a page of exactly the limit is not reported complete.
     let (_database, approvals) = repository().await;
     for index in 0..5 {
         let mut approval = approval();
         approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(30 + index));
         approvals.request(&approval).await.expect("inserted");
     }
-    assert_eq!(
-        approvals
-            .pending_in(workspace(), 2)
-            .await
-            .expect("lists")
-            .len(),
-        2,
+    let full = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 2)
+        .await
+        .expect("lists");
+    assert_eq!(full.approvals.len(), 2, "the limit is honoured");
+    assert!(
+        full.bounded,
+        "**a full page with rows behind it must report more may remain**",
     );
+
+    // The complement on the same store: a page the store had nothing beyond is complete. Without this
+    // half the first assertion would pass for a store that always reported `bounded`.
+    let complete = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 5)
+        .await
+        .expect("lists");
+    assert_eq!(complete.approvals.len(), 5);
+    assert!(
+        !complete.bounded,
+        "five rows and a bound of five is complete"
+    );
+}
+
+#[tokio::test]
+async fn the_pending_listing_excludes_rows_the_channel_may_not_decide() {
+    // **The channel filter must run inside the query, before the bound.** This is the adapter-level
+    // half of the defect the service test records: if the filter were applied after the `LIMIT`, a page
+    // of one would be spent on a row the caller cannot decide and the caller would receive nothing.
+    //
+    // The assertion is on which row comes back, not only on the count, because a query that returned
+    // the excluded row would satisfy a count of one.
+    let (_database, approvals) = repository().await;
+    let mut desktop_only = approval();
+    desktop_only.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(40));
+    desktop_only.allowed_channels =
+        AllowedChannels::new(vec![ApprovalChannel::Desktop]).expect("a channel");
+    // Soonest to lapse, so it is the first row any unfiltered read would return.
+    desktop_only.expires_at = UtcTimestamp::parse("2026-09-27T12:05:00Z").expect("parses");
+    approvals.request(&desktop_only).await.expect("inserted");
+
+    let mut cli_only = approval();
+    cli_only.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(41));
+    cli_only.allowed_channels =
+        AllowedChannels::new(vec![ApprovalChannel::Cli]).expect("a channel");
+    cli_only.expires_at = UtcTimestamp::parse("2026-09-27T12:30:00Z").expect("parses");
+    approvals.request(&cli_only).await.expect("inserted");
+
+    let page = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 1)
+        .await
+        .expect("lists");
+    assert_eq!(page.approvals.len(), 1);
+    assert_eq!(
+        page.approvals[0].id, cli_only.id,
+        "**the page must be spent on a row the channel may decide**: the excluded row lapses sooner, so \
+         a post-filtered query would return it or nothing",
+    );
+    assert!(
+        !page.bounded,
+        "only one decidable row exists, so the store saw everything",
+    );
+
+    // The desktop caller sees the other one, which is what makes the filter a *predicate* rather than a
+    // preference — both rows exist and each channel sees exactly its own.
+    let desktop_page = approvals
+        .pending_in(workspace(), ApprovalChannel::Desktop, 1)
+        .await
+        .expect("lists");
+    assert_eq!(desktop_page.approvals.len(), 1);
+    assert_eq!(desktop_page.approvals[0].id, desktop_only.id);
 }
 
 #[tokio::test]
@@ -842,18 +1217,20 @@ async fn a_decision_row_with_no_recorded_instant_is_corruption() {
 
 /// Writes a stored state, version, and decision columns for a row.
 ///
-/// The row is shaped the way the adapter would have shaped it, including the `decided_at` a decision
-/// always carries — the reader refuses a decision without one, so a fixture that omitted it would be
-/// exercising the corruption path rather than the reconstruction.
+/// The row is shaped the way the adapter would have shaped it, including the columns a decision **always**
+/// carries — the reader refuses a decision without a `decided_at` or a `decided_assurance`, because `apply`
+/// writes both whenever a decision is taken, so a fixture that omitted either would be exercising the
+/// corruption path rather than the reconstruction.
 async fn shape_row(database: &Database, id: ApprovalId, state: &str, version: i64, decided: bool) {
     sqlx::query(
         "UPDATE approvals SET state = ?, version = ?, decided_by = ?, decided_via = ?, \
-         decided_at = ?, updated_at = ? WHERE id = ?",
+         decided_assurance = ?, decided_at = ?, updated_at = ? WHERE id = ?",
     )
     .bind(state)
     .bind(version)
     .bind(decided.then(|| principal().to_string()))
     .bind(decided.then_some("cli"))
+    .bind(decided.then_some("standard"))
     .bind(decided.then(|| now().to_string()))
     .bind(now().to_string())
     .bind(id.to_string())

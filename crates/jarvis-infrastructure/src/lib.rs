@@ -24,3 +24,4 @@ pub mod release;
 pub mod service;
 pub mod storage;
 pub mod time;
+pub mod tool_fingerprint;

@@ -163,3 +163,11 @@ and policy by canonical ID/fingerprint.
 - Tightening policy does not require a new tool ID but invalidates relevant
   standing grants/approvals.
 - Approvals always bind the actual schema fingerprint and normalized arguments.
+
+The schema fingerprint is **derived, not declared**: `schema_fingerprint_of` in
+`jarvis_infrastructure::tool_fingerprint` hashes the schema document's bytes under
+a `tool-schema:` domain prefix, so a schema change moves the identity and a value
+cannot be substituted for an action fingerprint. The document is hashed as the
+bytes supplied rather than re-serialized, because re-encoding would make the digest
+depend on a serializer's key order and number form — and then two processes would
+derive two identities for one schema.

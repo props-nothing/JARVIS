@@ -26,6 +26,7 @@
 
 pub mod approval;
 pub mod call;
+pub mod canonical;
 pub mod classification;
 pub mod definition;
 pub mod discovery;
@@ -46,6 +47,10 @@ pub use call::{
     ContentBlock, MAX_ARGUMENT_BYTES, MAX_PROVIDER_REFERENCE_BYTES, MAX_RESULT_ARTIFACTS,
     MAX_RESULT_BLOCKS, MAX_RESULT_BYTES, ResultPayload, ToolArguments, ToolCallIntent,
     ToolResultBody,
+};
+pub use canonical::{
+    ActionDigest, FINGERPRINT_FORMAT_VERSION, FingerprintError, FingerprintInput, FingerprintParts,
+    MAX_FINGERPRINT_FIELDS, MAX_FINGERPRINT_KEY_BYTES, MAX_FINGERPRINT_VALUE_BYTES,
 };
 pub use classification::{
     ApprovalHint, DataClasses, Effect, ExecutionDefaults, Idempotency, MAX_TOOL_ATTEMPTS,
@@ -89,6 +94,10 @@ mod registry_tests;
 #[cfg(test)]
 #[path = "call_tests.rs"]
 mod call_tests;
+
+#[cfg(test)]
+#[path = "canonical_tests.rs"]
+mod canonical_tests;
 
 #[cfg(test)]
 #[path = "policy_tests.rs"]

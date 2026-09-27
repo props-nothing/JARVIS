@@ -100,7 +100,7 @@ fn permissive_request<'a>(
     identity: &'a ToolIdentity,
     tool_effects: &'a BTreeSet<Effect>,
     required_scopes: &'a BTreeSet<Scope>,
-    action_digest: &'a str,
+    action_digest: super::canonical::ActionDigest,
 ) -> PolicyRequest<'a> {
     PolicyRequest {
         identity,
@@ -135,7 +135,7 @@ fn two_evaluations_of_one_request_are_identical() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     // The tool declares `Allow`, which for a read-only low-risk tool is honoured — so the outcome is
     // a definite `Allow` rather than an `Ask`. Asserting on a definite outcome is the point: two
     // evaluations agreeing on `Ask` would not show that either consulted the same inputs.
@@ -164,7 +164,7 @@ fn one_request_evaluates_the_same_regardless_of_the_order_of_the_inputs() {
     // A second grant that does **not** cover this tool, placed before and after in turn.
     let mut unrelated = grant_for(&tool_identity("fs.write@1", "acme.files", 2));
     unrelated.scopes = scopes(&["fs.write"]);
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     // A definite `Allow`, so the comparison is of a positive decision rather than of two `Ask`s.
     request.default_approval = ApprovalHint::Allow;
 
@@ -209,7 +209,7 @@ fn an_explicit_deny_rule_beats_a_grant_that_permits_the_same_action() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
     let deny_rules = vec![DenyRule {
         identity: Some(identity.clone()),
         principal: None,
@@ -245,7 +245,7 @@ fn a_deny_rule_may_name_only_an_effect_and_then_refuses_a_tool_that_has_it() {
     let mut grant = grant_for(&identity);
     grant.scopes = scopes(&["shell.exec"]);
     grant.effects = effects(&[Effect::CodeExecution]);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
     let deny_rules = vec![DenyRule {
         identity: None,
         principal: None,
@@ -276,7 +276,7 @@ fn a_deny_rule_that_names_nothing_refuses_nothing() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
     let deny_rules = vec![DenyRule {
         identity: None,
         principal: None,
@@ -314,7 +314,7 @@ fn a_grant_for_another_principal_does_not_apply() {
     let required = scopes(&["fs.read"]);
     let mut other_principals_grant = grant_for(&identity);
     other_principals_grant.principal = principal(2);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -336,7 +336,7 @@ fn a_grant_for_another_workspace_does_not_apply() {
     let required = scopes(&["fs.read"]);
     let mut other_workspace_grant = grant_for(&identity);
     other_workspace_grant.workspace = workspace(2);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -362,7 +362,7 @@ fn an_expired_grant_is_reported_as_expired_rather_than_as_absent() {
     let required = scopes(&["fs.read"]);
     let mut expired = grant_for(&identity);
     expired.expires_at = Some(instant("2026-09-27T11:59:59Z"));
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -410,7 +410,7 @@ fn a_replacement_behind_the_same_capability_is_reported_as_a_replacement() {
     let grants = vec![grant_for(&granted_identity)];
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
-    let request = permissive_request(&replacement, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&replacement, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -439,7 +439,7 @@ fn a_grant_for_a_different_capability_is_simply_absent() {
     let grants = vec![grant_for(&tool_identity("mail.send@1", "acme.mail", 5))];
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -463,7 +463,7 @@ fn a_missing_scope_refuses_even_though_the_grant_names_the_tool() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read", "fs.export"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -491,7 +491,7 @@ fn an_effect_outside_the_grant_refuses() {
     let required = scopes(&["fs.read"]);
     let mut grant = grant_for(&identity);
     grant.effects = effects(&[Effect::ReadOnly]);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -518,7 +518,7 @@ fn a_risk_above_the_ceiling_and_a_sensitivity_above_the_ceiling_are_both_reporte
     grant.effects = effects(&[Effect::CodeExecution]);
     grant.risk_ceiling = Risk::Low;
     grant.sensitivity_ceiling = Sensitivity::Internal;
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.risk = Risk::Critical;
     request.sensitivity = Sensitivity::Restricted;
 
@@ -554,7 +554,7 @@ fn a_risk_exactly_at_the_ceiling_is_permitted() {
     let mut grant = grant_for(&identity);
     grant.risk_ceiling = Risk::Moderate;
     grant.sensitivity_ceiling = Sensitivity::Internal;
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.risk = Risk::Moderate;
     request.sensitivity = Sensitivity::Internal;
 
@@ -585,7 +585,7 @@ fn a_disabled_tool_is_refused_before_any_grant_is_consulted() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.tool_enabled = false;
 
     let decision = evaluate(
@@ -610,7 +610,7 @@ fn a_passed_deadline_refuses_a_new_call() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.deadline = Some(instant("2026-09-27T11:59:59Z"));
 
     let decision = evaluate(
@@ -627,7 +627,7 @@ fn a_passed_deadline_refuses_a_new_call() {
 
     // And a deadline in the future does not refuse, so the check is about the deadline rather than
     // about having one.
-    let mut future = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut future = permissive_request(&identity, &tool_effects, &required, digest(1));
     future.deadline = Some(instant("2026-09-27T12:00:01Z"));
     assert!(
         !evaluate(
@@ -647,13 +647,27 @@ fn a_passed_deadline_refuses_a_new_call() {
 // Approvals.
 // ---------------------------------------------------------------------------------------
 
+/// A digest for a numbered fixture action.
+///
+/// A real `ActionDigest` **value** rather than a readable word, because the type validates one now: a
+/// `"digest-a"` string would have been accepted as text and refused as a digest, and the distinction is
+/// exactly what the type exists to enforce. Distinct seeds keep two actions distinct, which several of
+/// these tests depend on.
+fn digest(seed: u8) -> super::canonical::ActionDigest {
+    super::canonical::ActionDigest::from_bytes([seed; 32])
+}
+
 /// An approval that matches the read tool, principal 1, workspace 1, and one digest.
-fn approval_for(identity: &ToolIdentity, digest: &str, expires_at: &str) -> ApprovalRecord {
+fn approval_for(
+    identity: &ToolIdentity,
+    action_digest: super::canonical::ActionDigest,
+    expires_at: &str,
+) -> ApprovalRecord {
     ApprovalRecord {
         identity: identity.clone(),
         principal: principal(1),
         workspace: workspace(1),
-        action_digest: digest.to_owned(),
+        action_digest,
         expires_at: instant(expires_at),
         consumed: false,
     }
@@ -665,8 +679,8 @@ fn a_matching_approval_raises_an_ask_to_an_allow() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
-    let approvals = vec![approval_for(&identity, "digest-a", "2026-09-27T12:10:00Z")];
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    let approvals = vec![approval_for(&identity, digest(1), "2026-09-27T12:10:00Z")];
 
     let decision = evaluate(
         &request,
@@ -693,12 +707,8 @@ fn an_approval_for_a_different_action_does_not_authorize_this_one() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "the-real-action");
-    let approvals = vec![approval_for(
-        &identity,
-        "some-other-action",
-        "2026-09-27T12:10:00Z",
-    )];
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    let approvals = vec![approval_for(&identity, digest(2), "2026-09-27T12:10:00Z")];
 
     let decision = evaluate(
         &request,
@@ -731,10 +741,9 @@ fn the_fingerprint_is_checked_before_expiry_and_consumption() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "the-real-action");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
-    let mut expired_and_mismatched =
-        approval_for(&identity, "other-action", "2026-09-27T11:00:00Z");
+    let mut expired_and_mismatched = approval_for(&identity, digest(2), "2026-09-27T11:00:00Z");
     expired_and_mismatched.consumed = true;
     let decision = evaluate(
         &request,
@@ -753,7 +762,7 @@ fn the_fingerprint_is_checked_before_expiry_and_consumption() {
 
     // With the digest matching, the next check is consumption, then expiry — asserted separately so
     // each ordering is pinned rather than only the first.
-    let mut consumed = approval_for(&identity, "the-real-action", "2026-09-27T12:10:00Z");
+    let mut consumed = approval_for(&identity, digest(1), "2026-09-27T12:10:00Z");
     consumed.consumed = true;
     assert_eq!(
         evaluate(
@@ -769,7 +778,7 @@ fn the_fingerprint_is_checked_before_expiry_and_consumption() {
         Some(PolicyReason::ApprovalConsumed),
     );
 
-    let expired = approval_for(&identity, "the-real-action", "2026-09-27T11:00:00Z");
+    let expired = approval_for(&identity, digest(1), "2026-09-27T11:00:00Z");
     assert_eq!(
         evaluate(
             &request,
@@ -794,11 +803,11 @@ fn an_approval_from_another_principal_or_workspace_does_not_apply() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
-    let mut other_principal = approval_for(&identity, "digest-a", "2026-09-27T12:10:00Z");
+    let mut other_principal = approval_for(&identity, digest(1), "2026-09-27T12:10:00Z");
     other_principal.principal = principal(2);
-    let mut other_workspace = approval_for(&identity, "digest-a", "2026-09-27T12:10:00Z");
+    let mut other_workspace = approval_for(&identity, digest(1), "2026-09-27T12:10:00Z");
     other_workspace.workspace = workspace(2);
 
     for candidate in [other_principal, other_workspace] {
@@ -828,8 +837,8 @@ fn an_approval_can_never_overturn_a_deny() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
-    let approvals = vec![approval_for(&identity, "digest-a", "2026-09-27T12:10:00Z")];
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    let approvals = vec![approval_for(&identity, digest(1), "2026-09-27T12:10:00Z")];
     let deny_rules = vec![DenyRule {
         identity: Some(identity.clone()),
         principal: None,
@@ -867,7 +876,7 @@ fn a_destructive_tool_is_asked_about_even_when_it_asks_to_be_allowed() {
     let required = scopes(&["fs.read"]);
     let mut grant = grant_for(&identity);
     grant.effects = effects(&[Effect::ExternalCommunication, Effect::Write]);
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.default_approval = ApprovalHint::Allow;
     request.risk = Risk::High;
 
@@ -892,8 +901,7 @@ fn a_destructive_tool_is_asked_about_even_when_it_asks_to_be_allowed() {
     let read_effects = effects(&[Effect::ReadOnly]);
     let read_required = scopes(&["fs.read"]);
     let read_grant = grant_for(&read_tool);
-    let mut read_request =
-        permissive_request(&read_tool, &read_effects, &read_required, "digest-a");
+    let mut read_request = permissive_request(&read_tool, &read_effects, &read_required, digest(1));
     read_request.default_approval = ApprovalHint::Allow;
     let read_decision = evaluate(
         &read_request,
@@ -922,7 +930,7 @@ fn a_request_with_no_grant_anywhere_is_denied_rather_than_allowed() {
     let identity = read_identity();
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
-    let request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
 
     let decision = evaluate(
         &request,
@@ -952,7 +960,7 @@ fn a_tool_defaulting_to_deny_is_denied_when_the_grant_permits_everything() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.default_approval = ApprovalHint::Deny;
 
     let decision = evaluate(
@@ -984,7 +992,7 @@ fn an_absent_approval_is_not_a_mismatched_approval() {
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let grants = vec![grant_for(&identity)];
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.default_approval = ApprovalHint::Deny;
 
     let absent = evaluate(
@@ -1003,7 +1011,7 @@ fn an_absent_approval_is_not_a_mismatched_approval() {
     );
     assert!(absent.is_denied());
 
-    let lapsed = vec![approval_for(&identity, "digest-a", "2026-09-27T11:00:00Z")];
+    let lapsed = vec![approval_for(&identity, digest(1), "2026-09-27T11:00:00Z")];
     let mismatched = evaluate(
         &request,
         &PolicyInputs {
@@ -1020,11 +1028,7 @@ fn an_absent_approval_is_not_a_mismatched_approval() {
     );
 
     // And an approval that exists but is for another action is a third case, so all three are pinned.
-    let other_action = vec![approval_for(
-        &identity,
-        "some-other-action",
-        "2026-09-27T12:10:00Z",
-    )];
+    let other_action = vec![approval_for(&identity, digest(2), "2026-09-27T12:10:00Z")];
     assert_eq!(
         evaluate(
             &request,
@@ -1063,25 +1067,25 @@ fn every_decision_carries_at_least_one_reason() {
     let cases: Vec<(&str, PolicyRequest<'_>, Vec<Grant>, Vec<DenyRule>)> = vec![
         (
             "explicit deny",
-            permissive_request(&identity, &tool_effects, &required, "d"),
+            permissive_request(&identity, &tool_effects, &required, digest(1)),
             grants.clone(),
             vec![deny_rule],
         ),
         (
             "no grant",
-            permissive_request(&identity, &tool_effects, &required, "d"),
+            permissive_request(&identity, &tool_effects, &required, digest(1)),
             Vec::new(),
             Vec::new(),
         ),
         (
             "grant constraint",
-            permissive_request(&identity, &tool_effects, &impossible_scope, "d"),
+            permissive_request(&identity, &tool_effects, &impossible_scope, digest(1)),
             grants.clone(),
             Vec::new(),
         ),
         (
             "tool default",
-            permissive_request(&identity, &tool_effects, &required, "d"),
+            permissive_request(&identity, &tool_effects, &required, digest(1)),
             grants.clone(),
             Vec::new(),
         ),
@@ -1118,7 +1122,7 @@ fn an_ask_maps_to_approval_required_and_a_permission_refusal_to_permission_denie
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
     let ask = evaluate(
-        &permissive_request(&identity, &tool_effects, &required, "d"),
+        &permissive_request(&identity, &tool_effects, &required, digest(1)),
         &PolicyInputs {
             now: now(),
             grants: std::slice::from_ref(&grant_for(&identity)),
@@ -1130,7 +1134,7 @@ fn an_ask_maps_to_approval_required_and_a_permission_refusal_to_permission_denie
     assert_eq!(ask.error_class(), Some(ToolErrorClass::ApprovalRequired));
 
     let denied = evaluate(
-        &permissive_request(&identity, &tool_effects, &required, "d"),
+        &permissive_request(&identity, &tool_effects, &required, digest(1)),
         &PolicyInputs {
             now: now(),
             grants: &[],
@@ -1149,7 +1153,7 @@ fn an_allow_maps_to_no_error_class_at_all() {
     let identity = read_identity();
     let tool_effects = effects(&[Effect::ReadOnly]);
     let required = scopes(&["fs.read"]);
-    let mut request = permissive_request(&identity, &tool_effects, &required, "d");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.default_approval = ApprovalHint::Allow;
     let decision = evaluate(
         &request,
@@ -1175,9 +1179,9 @@ fn a_denial_caused_by_a_lapsed_approval_names_the_approval_rather_than_permissio
     let grants = vec![grant_for(&identity)];
     // A tool that denies by default, with an expired approval for its exact action. The expiry is
     // what the decision reports, so the class names the approval.
-    let mut request = permissive_request(&identity, &tool_effects, &required, "digest-a");
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
     request.default_approval = ApprovalHint::Deny;
-    let expired = approval_for(&identity, "digest-a", "2026-09-27T11:00:00Z");
+    let expired = approval_for(&identity, digest(1), "2026-09-27T11:00:00Z");
 
     let decision = evaluate(
         &request,

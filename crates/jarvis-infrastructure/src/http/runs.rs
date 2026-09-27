@@ -1156,12 +1156,15 @@ fn not_found(request_id: Option<&str>) -> Response {
 }
 
 /// The refusal for a run surface that is not configured.
-fn not_ready(request_id: Option<&str>) -> Response {
+pub(crate) fn not_ready(request_id: Option<&str>) -> Response {
     error_response_for(
         request_id,
         StatusCode::SERVICE_UNAVAILABLE,
         "service.not_ready",
-        "The run surface is not available yet.",
+        // A message that names the *surface*, because one function cannot describe two: the run and
+        // approval surfaces each report their own, so a client is told which subsystem is missing
+        // rather than a generic sentence that would send it looking at the wrong one.
+        "This surface is not available yet.",
         true,
     )
 }
@@ -1183,7 +1186,7 @@ fn internal_failure(request_id: Option<&str>) -> Response {
 }
 
 /// Serializes a value into an `application/json` response.
-fn json_response(
+pub(crate) fn json_response(
     request_id: Option<&str>,
     status: StatusCode,
     value: &impl serde::Serialize,

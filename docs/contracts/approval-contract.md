@@ -107,6 +107,13 @@ requesting identity, tool source/schema identity, effects/risk, allowed channels
 expiry, prior decision metadata, and related run. It never returns hidden tool
 arguments, credentials, or content excluded from the fingerprint.
 
+**Implemented on the wire**: `ApprovalView` carries the capability as `tool_id`, the source as
+`tool_source_kind`/`tool_source_owner`/`tool_source_version`, and the schema as `schema_fingerprint` —
+**four fields rather than one joined tuple**, so a reviewer can see which dimension changed rather than
+rendering a string they cannot take apart. That is the contract's "tool source/schema identity" made
+literal, and it is what lets a client detect the `ACC-024` case: the tool behind a name was replaced, so
+the approval on record is for a different implementation.
+
 ### Decide
 
 `decide` requires `Idempotency-Key` and the decision body above. Allowed values
@@ -124,6 +131,17 @@ Same-key/same-request retry returns the original decision. Same key with changed
 decision, fingerprint, or comment is `idempotency.conflict`. Concurrent opposite
 decisions allow one optimistic transition; the loser receives
 `approval.version_conflict` and the safe current state.
+
+**The `comment` is stored, and it is stored on the decision's own transition** — `ApprovalActor::Decided`
+carries a bounded `DecisionNote`, and a cancellation carries its `reason` the same way. It sits on the
+transition rather than in a column because it explains *that* step: a decision is the only transition a
+human authors, and a later consumption or expiry has no note, which is why the field is `None` rather
+than empty. The bound and the control-character rule are enforced by the type's own constructor *and* by
+its deserializer, so a value that arrived over the wire is held to the same rule as one this code built.
+It is returned by the **detail** route and omitted from a listing: reading it means reading the trail, and
+a listing that did so would be one trail read per row. An absent note is omitted rather than rendered as
+an empty one, because "nobody wrote a comment" and "somebody wrote nothing" are different answers — the
+second is refused at construction.
 
 An approved one-shot action is still revalidated at reservation/invocation and
 consumed atomically with the exact tool-call reservation. Approval never grants
@@ -212,6 +230,20 @@ Record request/decision/consumption identities, assurance, channel, policy,
 fingerprint, safe preview hash/summary, timestamps, and outcome. Avoid storing
 full sensitive content in the approval table; reference protected artifacts.
 
+**Implemented for the decision**: `decided_by`, `decided_via`, and `decided_assurance` are stored as their
+own columns and reported on the wire, so an operator can ask which decisions were made by a stepped-up
+caller. Two properties are deliberate. The assurance is the value the **server** resolved from the
+authenticated request — `ApprovalView` has no field for it in a decision body, so a caller cannot state
+how strong its own decision looked. And it is a property of the **record** rather than of one transition:
+recording it only inside the transition actor meant a later consumption or invalidation overwrote it, and a
+consumed approval lost an assurance its own audit row still held. `NULL` means **not recorded** — the state
+of a decision taken before the column existed — and is distinct from `standard`, because "we do not know"
+and "we know it was ordinary" are different answers; a decision row read with no assurance is corruption
+rather than a defaulted level.
+
+Not yet stored: the policy version in force at the decision, and a preview hash rather than the preview
+itself (the record stores the bounded preview verbatim, because it is the record of what the user was shown).
+
 ## Tests
 
 - concurrent approve/reject;
@@ -227,3 +259,105 @@ full sensitive content in the approval table; reference protected artifacts.
   durable resume after disconnect/restart;
 - server-derived channel/device/assurance and forged body metadata rejection;
 - generated OpenAPI/client/golden fixture drift.
+
+## Implementation Status
+
+**Implemented**: the record and its lifecycle over the wire. `jarvis_application::approval_service`
+owns list, read, decide, and cancel; `jarvis_protocol::approval` owns the wire shapes;
+`jarvis_infrastructure::http::approval` serves four of the routes below; and `jarvisd` composes the
+service over the daemon's own pool. `tests/e2e/approval-journey.mjs` proves the composition root — the
+layer handler tests, which build their own `ApiState`, are structurally blind to.
+
+What that covers, against the state machine: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`, and the
+`EXPIRED` transition a lapsed read records. The server derives the deciding principal and channel from
+the authenticated request and the wire type has **no field for either**, so a client cannot assert
+them. A repeated decision is idempotent (`applied: false`) rather than an error, and a fingerprint that
+does not match the approved one is refused before the version, because a re-approval cannot fix a
+digest that still will not match.
+
+**The listing's page bound applies to the rows the caller can decide, and that is a correctness
+requirement rather than an optimisation.** `allowed_channels` is a JSON array the store tests with
+`json_each` **in the query**, before the `LIMIT`. An earlier version applied the bound to the whole
+workspace and filtered by channel afterwards, so a page could be spent on rows the caller could not
+act on and come back short — and on a surface that serves no cursor, a client that receives a short
+list concludes there is nothing left to decide and does nothing. The store also reads **one row more
+than the bound** so `bounded` is observed rather than inferred from `len() == limit`, and orders by
+`(expires_at, id)` so a page boundary inside a deadline tie cannot show one row twice and hide
+another.
+
+**Routes served**: `GET /api/v1/approvals`, `GET /api/v1/approvals/{approval_id}`,
+`POST /api/v1/approvals/{approval_id}/decide`, `POST /api/v1/approvals/{approval_id}/cancel`.
+
+**CLI served**: `jarvis approvals list|show|approve|reject|cancel`. Each is a named subcommand, so a
+bare `jarvis approvals` can never decide anything — the same safety property `runs` and `install`
+have. `approve` and `reject` require **both** `--fingerprint` and `--version` as arguments: the daemon
+compares the digest it holds against the one the client states, so a decision naming none would be a
+decision about *something*, and a default for either would let a caller decide an action it never
+reviewed. The CLI prints the daemon's own body in both directions — its state on success so the two
+cannot disagree, and its envelope on a refusal because the stable code is what an operator acts on.
+
+**Not implemented, each named rather than implied:**
+
+- **`POST /api/v1/approval-grants/{grant_id}/revoke`.** A standing grant is a *separate* record from a
+  one-shot approval, and no standing-grant store exists — `policy_service` serves
+  model-data-policy exception grants, which are a different concept with their own lifecycle and
+  codes. Serving this route against the wrong record would be worse than not serving it.
+- **Action fingerprint computation.** Implemented. `jarvis_domain::tool::canonical` produces the
+  **RFC 8785** canonical form of a versioned envelope and `jarvis_infrastructure::tool_fingerprint`
+  hashes it with SHA-256 into a `sha256:<hex>` digest; the evidence note is
+  [rfc8785-canonicalization.md](../research/integrations/rfc8785-canonicalization.md). One limitation is
+  deliberate rather than missing: the fingerprinted document is JARVIS's **own** envelope, whose values
+  are all strings, so the JCS **number**-serialization algorithm — which RFC 8785 §3.2.2.3 declines to
+  specify — is neither implemented nor reachable. A general-purpose JCS function for third-party
+  documents is therefore absent, which is the honest boundary. The digest is a typed `ActionDigest` on
+  the wire and in the durable record, so a malformed one is refused at the trust boundary as
+  `request.invalid` rather than compared as text and reported as a mismatch. Cross-language vectors are
+  still outstanding (below).
+- **The envelope covers the contract's own input list except the two entries with no producer.**
+  `fingerprint_version`, principal, workspace, the tool capability, source identity, and schema
+  fingerprint, the normalized arguments, and — **separately from the identity** — the `effects` and
+  `risk`. The last two are not redundant: `ToolIdentity::schema_fingerprint` covers the **input schema
+  only**, so a tool reclassified from reading to deleting keeps its identity, and a fingerprint built
+  from the identity alone would keep its fingerprint too — letting an approval granted for a read
+  authorize a delete. Effects are canonicalized as a **set** (sorted, deduplicated) so one effect set
+  has one fingerprint. Still absent, because nothing produces them: "material content/artifact hashes"
+  and "target connector account/resources".
+- **Approval creation.** `ApprovalRepository::request` is the only writer and no caller exists: a
+  request comes from a policy `Ask` decision on a tool call, and there is no executor, so
+  `tests/e2e/approval-journey.mjs` seeds the row directly. The *decision* path is live; the
+  *creation* path is not.
+- **List filters and cursors.** `limit` is served and the response carries **`has_more`**, so a client
+  can tell a full page from a complete one; the channel predicate runs **inside the query** (see below).
+  The other filters — `state`, `risk`, `effect`, requesting run/tool, and the time filters — are refused
+  **by name** rather than silently ignored, because an ignored filter would return a superset of what a
+  caller asked for, and on this listing that means showing prompts the client believed it had excluded.
+  Cursors are absent: a cursor synthesized from the last row's deadline would claim a stable position
+  the listing does not yet guarantee across a concurrent decision, so `has_more` is the honest fact and
+  a cursor is the next increment.
+- **Consumption (`CONSUMED`) and invalidation (`INVALIDATED`).** Both are reached by the exact
+  tool-call reservation (`TLS-006`'s ledger) at invocation time; the ledger exists and nothing reserves
+  through it, so those two edges have no caller.
+- **The outbox/resume signal.** Decide step 6 writes "the immutable decision and outbox/resume signal
+  atomically". The transition and its audit row are written in one transaction here; the event is
+  `AUT-004`'s outbox, and a waiting run's resume belongs to that slice.
+- **Redaction of the preview.** The preview is structured and bounded, and its values are stored
+  verbatim as the record of what the user was shown — but the *producer* redacts and no producer
+  exists. `TLS-005` recorded this; the shape is unchanged.
+- **Channel assurance beyond `Standard`.** `RequestContext::assurance` is read and a guest is refused,
+  but the record has no field naming a required level, so an approval needing a step-up is
+  **unrepresentable** rather than merely unenforced. `approval.assurance_insufficient` is therefore
+  reachable only through the shared ladder, and the branch is stated in `approval_service` so adding
+  the field is a change there rather than a new rule in a new place.
+- **The detail view's remaining named inputs.** "Related run" is served as `run_id`, and the schema
+  fingerprint now is too, but the detail requirement's full list is not complete: there is no
+  `output_schema` fingerprint, no artifact or content hash (nothing produces one), and no resolution of
+  a connector account or resource (no connector adapter exists). Each is an added field when its
+  producer arrives rather than a missing rule.
+- **Generated OpenAPI and cross-language fingerprint vectors.** Neither exists; this contract's test
+  list names both. The **Rust** half of the vector requirement is now covered — the canonicalizer is
+  asserted against RFC 8785's own §3.2.3 sample order, including a key outside the basic multilingual
+  plane where a byte-wise sort and the specified UTF-16 sort disagree — but a second language's
+  implementation is the remaining increment.
+
+This section and `approval_service`'s module doc are where the absences live, deliberately: a reader of
+either should not have to reconstruct which half is real.

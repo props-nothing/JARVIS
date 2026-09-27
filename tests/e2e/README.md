@@ -139,6 +139,78 @@ can only reach the variants a fixture produces, and the defect found in the prev
 contract specifies the code `locality_violated` — survived because the one rejection code the
 handler test reached was produced by the domain, so the test agreed with the defect.
 
+## `tool-recovery-journey.mjs`
+
+Proves the **composition root** half of `TLS-006`'s startup recovery: that a real `jarvisd`
+settles tool-call reservations a previous shutdown stranded. The unit tests build their own
+repository and their own ports, so they prove the pass works when called — they cannot prove the
+daemon calls it, with the ledger repository wired to the same pool, at the right point in startup.
+
+It seeds three rows **directly into the profile's database**, because no executor exists to make a
+tool call through the API — one that is `reserved` (claimed, never dispatched), one that is
+`executing` (dispatched, outcome unknown), and one that is already terminal — then restarts the
+daemon and asserts:
+
+- the `reserved` row is settled `cancelled` with the `tool.cancelled` outcome a terminal row
+  requires, and no dispatch is recorded on it;
+- the `executing` row is moved to `reconciling` and keeps its dispatch fact;
+- the terminal row is left exactly as it was;
+- the daemon **logs** the recovery report with both counts, and a second restart changes nothing
+  and reports nothing.
+
+### What this harness found
+
+- **The conversion predicate reached two of the six states the classification answers for.** The
+  pass pages `awaiting_conversion`, whose predicate read `state = 'executing'` — but
+  `classify_interrupted` answers `SafeToRetry` for five pre-dispatch states. So a stranded
+  **pre-dispatch** reservation was never settled: its dead holder kept the unique-index entry and
+  every later retry of that key was answered `InFlight`, i.e. *wait on a process that is gone* —
+  the exact harm the pass exists to remove. Restoring the narrow predicate fails three checks here,
+  the first naming the cancelled row.
+- **A terminal target with no outcome.** `apply` records `None` for a terminal transition handed
+  `None`, and a terminal row with a `NULL` outcome is refused as corruption by the reader — so the
+  pass's cancelled write must carry `tool.cancelled`, or the row it wrote is unreadable on the next
+  start.
+- **The report was computed and dropped.** The daemon logged the run pass's summary and discarded
+  the tool-call one. Disabling the new log line fails the report check here and nothing else.
+
+## `approval-journey.mjs`
+
+Proves that the approval surface is reachable from a **real** `jarvisd`. The handler tests build their
+own `ApiState` with `.with_approvals(...)`, so they prove the handlers work when the state carries a
+service — they cannot prove the daemon composition attaches one. A daemon that never called
+`.with_approvals` would pass every handler test while answering `503 service.not_ready` to every real
+client.
+
+It seeds one pending approval **directly into the profile's database**, because no executor exists to
+create one over the API — a request comes from a policy `Ask` decision on a tool call. The seeded row
+uses the caller's own workspace and principal, read from the run the create path wrote, so the scope is
+the one the daemon resolves rather than an invented value.
+
+Sixteen checks, including the CLI's paths: the composed listing answers `200` with the approval, its
+preview, its channels and state, and reports `has_more:false`; a bounded page is spent on a row the
+caller may decide; an unsupported filter is refused rather than ignored; a decision applies and records
+the **server-derived** principal and channel; a repeat answers `applied:false`; the audit trail has
+exactly one row; a fingerprint mismatch is refused with the contract's code and changes nothing;
+`approvals show` and `approvals list` print the daemon's own bodies; a refused CLI decision prints the
+daemon's own code; and the decision survives a restart.
+
+The faithful-render check also asserts the contract's "tool source/**schema identity**": the view carries
+`tool_source_kind`, `tool_source_owner`, `tool_source_version`, and `schema_fingerprint` beside the
+capability, which is what lets a client detect the `ACC-024` case where the tool behind a name was
+replaced. The fixture gives the schema a **different** digest from the action fingerprint, so a
+projection that swapped the two would fail rather than pass by coincidence.
+
+### What this harness found
+
+- **Removing `.with_approvals(...)` from `daemon.rs` fails six of the ten checks** with
+  `503 service.not_ready`, while the entire handler suite stays green. This is the same
+  composition-root gap `BRN-014` fixed for the policy surface, and the reason a composition needs an
+  end-to-end test rather than another handler test.
+- **The fixture's deadline must be far in the future.** The handler reads the real clock, so a
+  near deadline made the first version of the HTTP handler tests exercise the expiry path instead of
+  the decision path — a test that would start failing when the calendar moved.
+
 ## `provider-smoke.mjs`
 
 Proves Milestone 2's exit gate — *"a gated real-provider smoke test streams a response"* — and it is

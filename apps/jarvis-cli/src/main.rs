@@ -110,6 +110,15 @@ enum Command {
         #[command(subcommand)]
         action: RunsAction,
     },
+    /// Inspect and decide approval requests.
+    ///
+    /// `list` and `show` are read-only; `approve`, `reject`, and `cancel` change durable state and are
+    /// therefore their own explicit actions, so a bare `jarvis approvals` can never decide anything —
+    /// the same rule `runs` follows.
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
     /// Inspect the resolved configuration without printing secret values.
     Config,
     /// List local log files.
@@ -263,6 +272,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Status => status(paths).await,
         Command::Ask { text } => ask(paths, &text).await,
         Command::Runs { action } => runs(paths, action).await,
+        Command::Approvals { action } => approvals(paths, action).await,
         Command::Config => config(paths),
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
@@ -301,6 +311,60 @@ enum RunsAction {
     Cancel {
         /// The run identifier.
         run_id: String,
+    },
+}
+
+/// Approval inspection and decision a caller can request.
+///
+/// **`approve` and `reject` take a fingerprint as a required argument**, because a decision is bound to
+/// the exact action the user reviewed: the server compares the digest it holds against the one the
+/// client states, and a decision that named no digest would be a decision about *something*. `show`
+/// prints the fingerprint, so the value the user passes is the value the daemon printed.
+#[derive(Debug, Subcommand)]
+enum ApprovalsAction {
+    /// List the approvals this client may decide.
+    List {
+        /// The page size to request. The daemon clamps it to its own bound.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Print one approval.
+    Show {
+        /// The approval identifier.
+        approval_id: String,
+    },
+    /// Approve an approval.
+    Approve {
+        /// The approval identifier.
+        approval_id: String,
+        /// The action fingerprint printed by `show` or `list`.
+        #[arg(long, value_name = "FINGERPRINT")]
+        fingerprint: String,
+        /// The version the caller believes is current.
+        #[arg(long, value_name = "N")]
+        version: u64,
+    },
+    /// Reject an approval.
+    Reject {
+        /// The approval identifier.
+        approval_id: String,
+        /// The action fingerprint printed by `show` or `list`.
+        #[arg(long, value_name = "FINGERPRINT")]
+        fingerprint: String,
+        /// The version the caller believes is current.
+        #[arg(long, value_name = "N")]
+        version: u64,
+    },
+    /// Withdraw a pending or approved-but-unused request.
+    Cancel {
+        /// The approval identifier.
+        approval_id: String,
+        /// The version the caller believes is current.
+        #[arg(long, value_name = "N")]
+        version: u64,
+        /// Why it is being withdrawn.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
     },
 }
 
@@ -909,6 +973,126 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
             println!("{body}");
             ExitCode::SUCCESS
         }
+    }
+}
+
+/// Approval inspection and decision.
+///
+/// The daemon's own response is printed rather than a re-derived summary, so the client cannot
+/// disagree with the daemon about an approval's state — the same rule `runs show` follows. A refusal
+/// prints the daemon's **own** body, because it carries the stable code and the shared envelope: a
+/// client that reported only "the daemon refused" would leave an operator unable to tell a missing
+/// approval from a wrong channel or a stale version.
+async fn approvals(paths: &ProfilePaths, action: ApprovalsAction) -> ExitCode {
+    let state = match daemon_client(paths) {
+        Ok(state) => state,
+        Err(error) => return report_client_error(&error),
+    };
+    match action {
+        ApprovalsAction::List { limit } => {
+            let path = match limit {
+                Some(limit) => format!("/api/v1/approvals?limit={limit}"),
+                None => "/api/v1/approvals".to_owned(),
+            };
+            print_daemon_response(
+                get_with_status(&state.discovered, &state.credential, &path, API_MAJOR, "").await,
+            )
+        }
+        ApprovalsAction::Show { approval_id } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/approvals/{approval_id}"),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        ApprovalsAction::Approve {
+            approval_id,
+            fingerprint,
+            version,
+        } => decide(&state, &approval_id, "approve", &fingerprint, version).await,
+        ApprovalsAction::Reject {
+            approval_id,
+            fingerprint,
+            version,
+        } => decide(&state, &approval_id, "reject", &fingerprint, version).await,
+        ApprovalsAction::Cancel {
+            approval_id,
+            version,
+            reason,
+        } => {
+            let body = match &reason {
+                Some(reason) => serde_json::json!({
+                    "expected_version": version,
+                    "reason": reason,
+                }),
+                None => serde_json::json!({ "expected_version": version }),
+            };
+            let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
+            print_daemon_response(
+                post_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    &format!("/api/v1/approvals/{approval_id}/cancel"),
+                    API_MAJOR,
+                    &headers,
+                    &body.to_string(),
+                )
+                .await,
+            )
+        }
+    }
+}
+
+/// Sends a decision and prints the daemon's answer.
+///
+/// A separate function because `approve` and `reject` differ by one verb, and writing the request
+/// twice is how the two come to differ in some other way — a fingerprint passed positionally, or a
+/// version transposed with the others.
+async fn decide(
+    state: &ClientState,
+    approval_id: &str,
+    decision: &str,
+    fingerprint: &str,
+    version: u64,
+) -> ExitCode {
+    let body = serde_json::json!({
+        "decision": decision,
+        "expected_version": version,
+        "action_fingerprint": fingerprint,
+    });
+    let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
+    print_daemon_response(
+        post_authenticated(
+            &state.discovered,
+            &state.credential,
+            &format!("/api/v1/approvals/{approval_id}/decide"),
+            API_MAJOR,
+            &headers,
+            &body.to_string(),
+        )
+        .await,
+    )
+}
+
+/// Prints a daemon response, or its refusal, as the CLI's result.
+///
+/// The body is printed verbatim in both directions: on success so the client cannot disagree with the
+/// daemon about a state, and on a refusal because the envelope carries the stable code an operator
+/// needs rather than a client-side paraphrase of it.
+fn print_daemon_response(result: Result<(u16, String), ClientError>) -> ExitCode {
+    match result {
+        Ok((status, body)) if (200..300).contains(&status) => {
+            println!("{body}");
+            ExitCode::SUCCESS
+        }
+        Ok((_, body)) => {
+            eprintln!("error: {body}");
+            ExitCode::from(EXIT_ATTENTION)
+        }
+        Err(error) => report_client_error(&error),
     }
 }
 
@@ -2431,6 +2615,7 @@ mod tests {
             (vec!["jarvis", "install"], "install"),
             (vec!["jarvis", "ask", "hello"], "ask"),
             (vec!["jarvis", "runs", "show", "abc"], "runs"),
+            (vec!["jarvis", "approvals", "list"], "approvals"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -2445,6 +2630,7 @@ mod tests {
                 Command::Install { .. } => "install",
                 Command::Ask { .. } => "ask",
                 Command::Runs { .. } => "runs",
+                Command::Approvals { .. } => "approvals",
             };
             assert_eq!(actual, expected);
         }
@@ -2706,7 +2892,8 @@ mod tests {
                     | Command::VerifyRelease { .. }
                     | Command::Install { .. }
                     | Command::Ask { .. }
-                    | Command::Runs { .. } => String::from("unexpected"),
+                    | Command::Runs { .. }
+                    | Command::Approvals { .. } => String::from("unexpected"),
                 }
             })
             .collect();
@@ -2955,6 +3142,74 @@ mod tests {
         assert!(
             Cli::try_parse_from(["jarvis", "runs", "events", "abc", "--last-event-id", "id"])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_bare_approvals_command_cannot_decide_anything() {
+        // The same safety property `runs` has: a decision is a named subcommand, so the shortest
+        // invocation lists rather than decides.
+        assert!(Cli::try_parse_from(["jarvis", "approvals"]).is_err());
+        assert!(Cli::try_parse_from(["jarvis", "approvals", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["jarvis", "approvals", "show", "abc"]).is_ok());
+    }
+
+    #[test]
+    fn an_approval_decision_requires_both_the_fingerprint_and_the_version() {
+        // **Both are required arguments, and that is the point.** The daemon compares the fingerprint
+        // it holds against the one the client states, so a decision that named none would be a decision
+        // about *something* — and the version is the precondition that makes a concurrent decision
+        // refusable. A default for either would let a caller decide an action it never reviewed.
+        for word in ["approve", "reject"] {
+            assert!(
+                Cli::try_parse_from(["jarvis", "approvals", word, "abc"]).is_err(),
+                "{word} must require its fingerprint and version",
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "jarvis",
+                    "approvals",
+                    word,
+                    "abc",
+                    "--fingerprint",
+                    "sha256:aa",
+                ])
+                .is_err(),
+                "{word} must require the version too",
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "jarvis",
+                    "approvals",
+                    word,
+                    "abc",
+                    "--fingerprint",
+                    "sha256:aa",
+                    "--version",
+                    "1",
+                ])
+                .is_ok(),
+                "{word} must parse with both",
+            );
+        }
+        // A cancellation needs the version, and its reason is optional — a withdrawal does not always
+        // have one, and requiring text would invite an empty string.
+        assert!(Cli::try_parse_from(["jarvis", "approvals", "cancel", "abc"]).is_err());
+        assert!(
+            Cli::try_parse_from(["jarvis", "approvals", "cancel", "abc", "--version", "1"]).is_ok(),
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jarvis",
+                "approvals",
+                "cancel",
+                "abc",
+                "--version",
+                "1",
+                "--reason",
+                "changed my mind",
+            ])
+            .is_ok(),
         );
     }
 }

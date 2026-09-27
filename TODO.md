@@ -3966,8 +3966,11 @@ Dependencies: Milestone 2 exit gate.
   consumer. `action_digest` is compared but **not computed**: the canonicalization and SHA-256 the
   approval contract requires (RFC 8785) is `TLS-005`'s, and inventing one here would put an
   unreviewed canonicalization under an approval fingerprint.
-- [~] `TLS-005` Implement durable approval records and action fingerprinting. **The record and its
-  lifecycle are done; the fingerprint is a type without a computation, so this stays `~`.**
+- [~] `TLS-005` Implement durable approval records and action fingerprinting. **The record, its lifecycle,
+  the persistence, and the fingerprint *computation* are done. The `~` is now for two entries in the
+  contract's fingerprint-input list that have no producer — "material content/artifact hashes" and
+  "target connector account/resources" — so the mechanism covers every fact that exists yet and cannot
+  cover two that nothing creates.**
   Evidence: `jarvis_domain::tool::approval`.
   - **The state machine is the contract's seven states with the transition table asserted cell by
     cell**, not through its happy path: `the_transition_table_permits_exactly_the_contracts_edges`
@@ -4015,6 +4018,68 @@ Dependencies: Milestone 2 exit gate.
     so implementing it now would be integration code with no evidence note — which `AGENTS.md` forbids
     outright. It needs a research round of its own, and inventing a canonicalization would put an
     unreviewed one underneath every approval in the product.
+    **The fingerprint is now computed, and the research round it needed is
+    [rfc8785-canonicalization.md](docs/research/integrations/rfc8785-canonicalization.md)**
+    (`IMPLEMENTATION_READY`, manifest entry `jcs-canonicalization`). No crate was adopted: RFC 8785 is
+    implemented directly, and the SHA-256 that turns the canonical form into a digest uses the
+    `sha2` `0.10.9` already resolved and already reviewed for this boundary. The split is
+    `jarvis_domain::tool::canonical` (the canonical form, a pure function of values) plus
+    `jarvis_infrastructure::tool_fingerprint` (the hash), because hashing is a concrete implementation
+    the domain layer must not depend on — the same division `SchemaFingerprint` records.
+    - **The one thing it refuses is numbers, and the refusal is the security decision.**
+      RFC 8785 §3.2.2.3 defers number serialization to ECMA-262 and says the algorithm "is **not**
+      included in this document"; a conformant serializer therefore needs shortest-round-trip double
+      formatting, and a subtly wrong one produces a digest that is **stable inside one build and
+      different from every other implementation** — every internal test passes while a client previewing
+      the same action is refused. Since the fingerprinted document is JARVIS's **own** envelope, every
+      value contributed is a string, so `FingerprintInput` makes a number (and a boolean, `null`, an
+      array, a nested object) **unrepresentable**. The `NaN`/`Infinity` abort the RFC requires is then
+      unreachable rather than unimplemented, and no general-purpose JCS function is exported — an
+      honest narrowing recorded in the contract's Implementation Status.
+    - **Sorting is by UTF-16 code unit, not by byte, and the test proves the difference.** §3.2.3
+      specifies code units and notes a UTF-8 sort "would differ and thus be incompatible". For ASCII the
+      two agree, so a byte-wise implementation looks correct until the first non-ASCII key — and a
+      `BTreeMap` iterates in Rust's byte-wise `Ord`, which is exactly the wrong order. The names are
+      therefore sorted explicitly. **Falsified**: substituting `left.cmp(right)` fails the RFC's own
+      §3.2.3 vector *and* the astral-plane test, printing the wrong order
+      (`…"דּ":…,"😀"` where the RFC puts the emoji before the Hebrew letter).
+    - **The escape table is asserted rather than described.** §3.2.2.2 requires the five characters with
+      short forms to *use* them and every other control character to be lowercase `\uhhhh`; the two are
+      different byte strings, so "it unescapes to the same character" is not sufficient. Only `"` and
+      `\` are escaped and **every other code point is emitted as-is**, which is the rule that is easy to
+      over-apply. **Falsified**: emitting `\u0009` for a tab fails
+      `a_control_character_uses_the_short_form_and_lowercase_hex`.
+    - **The digest is a typed value at every boundary, which closed a second hole.** `action_digest` was
+      a `String` in both the durable record and the policy request, so a fingerprint was *compared* as
+      text and nothing validated its shape. `ActionDigest` now parses the contract's `sha256:<hex>` form
+      (64 **lowercase** hex, algorithm included so a digest from another function cannot compare equal),
+      its `Deserialize` goes **through** `parse` so a value arriving over the wire is held to the same
+      rule as a stored one — the systemic defect `wire_validation_tests` records for nine other types —
+      and the handler parses it at the trust boundary. A malformed fingerprint is `request.invalid`
+      rather than `approval.fingerprint_mismatch`. **Falsified**: falling through to the comparison
+      instead of refusing reports the misleading `approval.fingerprint_mismatch` for `md5:…`, which
+      sends a user to re-approve an action whose fingerprint they never could have computed.
+    - **⚠ The first envelope omitted `effects` and `risk`, and reading the contract's own input list
+      against the implementation found it.** `ToolIdentity::schema_fingerprint` covers the **input schema
+      only**, so a tool reclassified from `read_only` to `destructive` keeps its capability, its source,
+      and its schema — and therefore kept its *fingerprint*, which meant an approval granted for the read
+      authorized the delete. The contract requires the fingerprinted object to contain "effects and
+      constraints" and the tool fabric names "effect/risk classification" in what an approval binds to,
+      so both are envelope fields. The effects list is additionally canonicalized **as a set** (sorted,
+      deduplicated through the contract spellings), because a fingerprint that varied with list order
+      would refuse an approval for the action the user actually reviewed. **Falsified twice**: omitting
+      the two fields fails 3 domain tests and 1 digest test; concatenating the spellings instead of
+      joining them fails the set-uniqueness test.
+    - `jarvis-domain` 20 canonical tests (RFC §3.2.3 vector asserted **by value**, whitespace absence,
+      the escape table, determinism, input-order independence, a one-character change, the reclassification
+      case with the identity held fixed, the effect-set canonicalization, the bounds, and the
+      wire-validation rule) and `jarvis-infrastructure` 7 (a NIST SHA-256 **known-answer** vector, that the
+      digest is over the canonical form rather than `serde_json`'s output, and the reclassification case at
+      the digest level).
+    - **Still not done:** cross-language fingerprint vectors (the Rust half is covered; a second
+      language's implementation is the increment). Two entries in the contract's input list remain
+      uncovered because nothing produces them: "material content/artifact hashes" and "target connector
+      account/resources" — each is a new digest input when the executor arrives, not a new rule.
     **Persistence is now done**, which was the other named gap. `000008_approvals.sql` adds `approvals`
     and `approval_transitions`, `jarvis_application::repository::approval::ApprovalRepository` is the
     port, and the schema document records the as-built shape and the four ways it differs from the
@@ -4196,8 +4261,10 @@ Dependencies: Milestone 2 exit gate.
     than one page of stranded calls reported `incomplete_store` for ever — which the daemon turns into a
     **refusal to start on every restart**. Two corrections followed: the drain signal is rows *converted*
     rather than rows *examined* (a full page of already-reconciling rows is work finished, not a stall,
-    while a full page whose every write was refused is the genuine stall), and the pass now pages
-    `awaiting_conversion`, which selects `EXECUTING` alone so the set strictly shrinks. The second defect
+    while a full page whose every write was refused is the genuine stall), and the pass pages
+    `awaiting_conversion`, which excludes `reconciling` so the set strictly shrinks. **The predicate's
+    original form selected `EXECUTING` alone and reached only two of the six states the classification
+    answers for — see the review correction below.** The second defect
     was a *silent stranding*: with the old predicate, a second page could hold only already-converted rows
     and the rest were unreachable — measured as **500 of 505 converted**, not a hang.
   - **Two scans, each with one meaning.** `possibly_effecting` is the outstanding-work list a caller
@@ -4209,6 +4276,40 @@ Dependencies: Milestone 2 exit gate.
   - **12 recovery tests, 23 ledger-adapter tests** (one of which drives the pass against a **migrated
     database** rather than a double), **+1 migration assertion**. Four mutations, all killed — including
     the probe row and the illegal-edge fix. **DO NOT COMMIT.**
+  **⚠ Review correction: the conversion scan reached two of the six states the classification answers
+  for, so `report.cancelled` was dead and a stranded pre-dispatch reservation was never settled.** The
+  pass pages `awaiting_conversion`, and the predicate read `state = 'executing'` — yet
+  `classify_interrupted` answers `SafeToRetry` for five pre-dispatch states (`requested`, `validated`,
+  `waiting_approval`, `approved`, `reserved`). So a call that **claimed its reservation and then lost its
+  daemon** was never offered to the pass: its dead holder kept the unique-index entry, and every later
+  retry of that key was answered `InFlight` — *waiting on a process that is gone*, which is the exact harm
+  the pass exists to remove, applied to the states it could not see. Two things hid it: the `cancelled`
+  counter was unproducible (so nothing reported the gap), and
+  `a_call_that_never_dispatched_is_cancelled_rather_than_reconciled` was **named for the behaviour and
+  asserted its absence** — its body checked `cancelled == 0`, and its comment explained that the
+  *reporting* scan omits undispatched rows, which is true of `possibly_effecting` and false of the
+  *conversion* scan the pass pages. The test encoded the bug.
+  - Fix: the predicate is every non-terminal state **except `reconciling`** — the exclusion is what keeps
+    the paging terminating, and it is exactly one state, so the classification has somewhere to be
+    applied. Every selected state still strictly shrinks (pre-dispatch → `cancelled`, terminal;
+    `executing` → `reconciling`, excluded).
+  - **A terminal target now carries its outcome.** `Cancelled` is written on the cancelled transition,
+    because `apply` records `None` when handed `None` and a terminal row with a `NULL` outcome is refused
+    as corruption by `LedgerEntry::restore` and the adapter's reader — so a pass that wrote one would
+    produce a row the next start cannot read.
+  - **The unproducible `awaiting_reconciliation` counter is deleted.** It was incremented only when
+    `was_in == Reconciling`, which the predicate excludes, so it could never be non-zero; `examined()` now
+    equals `changed()`. A producer-less field is the shape this project removes, not one to keep in case.
+  - **The predicate is asserted against the domain's own state set**:
+    `the_conversion_scan_covers_every_state_the_pass_can_settle` places a row in every non-terminal state
+    and requires the scan to return exactly the states that need a write — six — because the SQL string
+    and the Rust table compile independently and drifted once already.
+  - **`drive_to` now derives its path by breadth-first search** over `can_transition_to` rather than
+    listing edges, after a hand-written path produced `REQUESTED -> APPROVED`, which is not an edge; the
+    fixture failed for a reason about the helper, the same way round 93's did.
+  - Falsified both halves: restoring the narrow predicate fails the new adapter tests
+    (`left: 0, right: 1`, and `["executing"]` against six states); dropping the outcome fails
+    `left: None, right: Some(Cancelled)`. **DO NOT COMMIT.**
   **Still not done, and named:** nothing *else* calls the ledger — there is no executor, and the
   controller still refuses a tool intent with `run.tools_not_implemented`. **The pass does not reconcile
   and does not retry**: reconciliation means reading the provider to establish whether an effect landed,
@@ -4284,8 +4385,121 @@ Dependencies: Milestone 2 exit gate.
   conformance/Inspector tests.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
-- [ ] `TLS-013` Implement authenticated approval list, preview, decide, expire,
-  revoke, and resume use cases for API and CLI with channel assurance checks.
+- [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
+  revoke, and resume use cases for API and CLI with channel assurance checks. Owns
+  `jarvis_application::approval_service`.
+  Evidence: list, read, decide, cancel, and the expiry-on-read transition are implemented over the
+  wire, and the composition root is proven by an end-to-end journey.
+  - **The server-derived decider is structural, not remembered.** `DecideApprovalRequest` has no field
+    for the principal, channel, assurance, or time, so there is nothing for a handler to forget not to
+    read — the same argument `BRN-024` made for policy grants. The service takes a `RequestContext`,
+    which only trusted code can build, and the journey asserts the recorded `decided_by` equals the
+    principal the server resolves rather than one the caller named.
+  - **A repeat is idempotent and is checked before the version.** The contract requires "same-key/
+    same-request retry returns the original decision", and a same-request retry carries the
+    `expected_version` from the original body — so a version check first would refuse the ordinary
+    double-tap as stale and defeat the rule. The state is what the caller asked for, nothing is
+    overwritten, and `applied: false` says this call did not perform it.
+  - **Fingerprint before version.** A re-approval cannot fix a digest that still will not match, so
+    reporting "stale version" would send the user to do exactly that.
+  - **Expiry is evaluated on every read and the lapse is *recorded*.** A record that lapsed while
+    nobody was looking still reads `pending` in storage, so a refusal that did not write the `expired`
+    transition would leave a prompt nobody can decide in every later listing.
+  - **A version conflict from the store maps to `approval.version_conflict`, not to a storage code.**
+    `RepositoryError::VersionConflict` would otherwise reach a client as `storage.version_conflict`
+    under a `500` — telling it the daemon faulted when its own view was merely stale, which is the one
+    case where a retry after a re-read works. Round 57 fixed the identical conflict on the run surface.
+  - **The listing filters by the caller's channel inside the query, and the page bound follows it.**
+  - **`axum`'s `query` feature is deliberately not added**, so the listing's `limit` is parsed from the
+    URI by hand and an unknown filter is refused by name rather than silently ignored — ignoring one
+    would return a superset of what the caller asked for. Adding a dependency feature is a
+    research-gate change, not a convenience.
+  - **The listing's page bound applies to what the caller can decide.** `allowed_channels` is tested with
+    `json_each` **inside the query**, before the `LIMIT` — an earlier version applied the bound to the
+    whole workspace and filtered afterwards, so a page could be spent on rows the caller could not act
+    on and come back short; with no cursor, a client that receives a short list concludes the queue is
+    empty and does nothing. **Falsified twice**: a post-filtering service fails three tests with
+    `left: 0, right: 1`, and dropping the SQL predicate fails four adapter tests. The store reads **one
+    row more than the bound** so `bounded` is observed rather than inferred from `len() == limit`, the
+    page order is `(expires_at, id)` so a tie cannot show one row twice and hide another, and the
+    response carries `has_more`.
+  - **The page bound had two definitions and nothing held them together.** `MAX_PENDING_PAGE` (the
+    store's clamp) and `MAX_APPROVAL_PAGE` (what the listing *reports* as `max_page`) were two literals
+    holding `200` with no comparison anywhere — and neither owning crate can make one, because the
+    documented flow is `Protocol --> Domain`, so `jarvis-protocol` may not depend on
+    `jarvis-application` and application may not depend on the wire vocabulary. Raising one alone would
+    have made the daemon advertise a page size larger than the one its own query applies, so a client
+    paging by `max_page` would receive fewer rows than the response claimed and could not tell a full
+    page from a truncated one. The comparison now lives where it is expressible —
+    **`jarvis-infrastructure` depends on both** — as
+    `the_reported_page_bound_is_the_one_the_store_enforces`, the same arrangement
+    `MAX_RUN_INPUT_BYTES`/`MAX_OBJECTIVE_BYTES` uses. **Falsified**: setting `MAX_APPROVAL_PAGE` to
+    `201` fails it with `left: 201, right: 200`.
+  - `tests/e2e/approval-journey.mjs` (16 checks) seeds a pending approval directly — no executor exists
+    to create one over the API — and proves the composed surface answers, a decision records the
+    server-derived actor, a repeat reports `applied:false`, the audit trail has one row, a fingerprint
+    mismatch changes nothing, **the CLI's `show`, `list`, and a refused decision reach the same
+    daemon**, and the decision survives a restart. **Falsified: removing
+    `.with_approvals(...)` from the daemon turns every request into `503 service.not_ready` and fails
+    six checks while the whole handler suite stays green** — the composition-root defect `BRN-014`
+    fixed for the policy surface, and the reason a composition needs an end-to-end test.
+  - **The detail view now carries the tool's source and schema identity**, which the contract's detail
+    requirement names and the wire did not. `tool_id` alone is the **capability**, and `ACC-024` is the
+    rule behind the requirement: an approval binds to the *implementation*, so a client shown only
+    `mail.send@1` could not tell that the tool behind it had been replaced — the review decision detail
+    exists to support. `ApprovalView` gained `tool_source_kind`, `tool_source_owner`,
+    `tool_source_version`, and `schema_fingerprint`, **four fields rather than one joined tuple**, so a
+    reviewer sees which dimension changed. Asserted **by value through the router** for all five, and
+    falsified by projecting the source owner from the capability — which fails with
+    `left: "mail.send@1", right: "acme.mail"`.
+  - **The schema fingerprint now has a computation, which its own doc had claimed for several rounds.**
+    `SchemaFingerprint`'s doc said "`jarvis-infrastructure` provides the computation" and no such function
+    existed — the only construction path was `from_bytes`, which every caller in the product and in the
+    tests used with a hand-written seed. So a schema change could not move an identity, and the tool
+    contract's "a release that alters the input schema changes the fingerprint and therefore the identity"
+    plus `ACC-024` had nothing behind them. `tool_fingerprint::schema_fingerprint_of` is the derivation,
+    domain-separated with a `tool-schema:` prefix (trailing NUL, which no JSON document can start with) so
+    a schema fingerprint cannot collide with an action fingerprint over the same bytes. The document is
+    hashed **as the bytes given rather than re-serialized**, the same rule the arguments follow. **Falsified**:
+    removing the separator hashing fails `a_schema_fingerprint_cannot_collide_with_an_action_fingerprint`
+    and `a_schema_fingerprint_is_not_the_bare_digest_of_the_document`.
+  - **The decision's assurance is now recorded, which the contract's Audit section requires and the record
+    did not carry.** It is the fact that distinguishes a decision by a stepped-up caller from one by an
+    ordinary session — the channel says *where* a decision was made, the assurance says how strongly the
+    caller was authenticated. Taken from the **request context**, never a body field (`BRN-024`'s rule), and
+    added to `ApprovalActor::Decided` plus a `decided_assurance` column (`000010`). **The first
+    implementation of the column was wrong in a way only the second assertion caught**: the value was
+    written from each *transition's* actor, so a decision stored `elevated` lost it the moment the approval
+    was consumed — the consumption's actor carries no assurance and the update wrote NULL over it. The field
+    therefore lives on the **record** beside `decided_by` and `decided_via`, and the test asserts both halves
+    (after the decision, and after a further non-decision transition). **Falsified three ways**: taking the
+    value from the actor makes the record read back as corruption; defaulting an unrecognised spelling fails
+    the closed-vocabulary test; and two reader tests pin `NULL` (not recorded) and an unknown string
+    (uninterpretable) as **different** facts, neither of them `Standard`.
+  - **The decision's `comment` and the cancellation's `reason` are now stored and readable.** Both wire
+    types declared them with docs claiming they were stored — the cancellation's said the reason "is what
+    makes the audit trail say why a prompt was withdrawn" — and **nothing stored either**: each was
+    deserialized, bounded at one layer, and dropped. They now live on the transition the human authored
+    (`ApprovalActor::Decided::note`, `ApprovalActor::Cancelled::reason`) as a `DecisionNote` whose bound and
+    control-character rule are enforced by its constructor **and its deserializer**, and the port gained a
+    `transitions` reader because a writer with no reader is the same defect in the other direction — the
+    fifth time this project has found it. The note is returned by the **detail** route (a listing would be
+    one trail read per row) and an absent note is omitted rather than rendered as an empty one. **Falsified**:
+    stripping the note in the writer fails `the_trail_returns_each_step_with_the_note_the_human_left` with
+    "the decision's note must be readable from the trail".
+  - **Two bounds for one kind of value collapsed into one.** `MAX_CANCEL_REASON_BYTES` (512) and the new
+    note bound were the same number written twice, so the service's constant is now an alias of
+    `MAX_DECISION_NOTE_BYTES`: a decision's comment and a cancellation's reason are one kind of thing, and a
+    second literal would let one be raised alone while the domain still refused the longer value — which
+    reads to a caller as an unexplained `request.invalid`.
+  - **Not implemented, named in the contract's own Implementation Status section:** the grant-revoke
+    route (no standing-grant store), approval creation (no executor, so nothing calls `request`), list
+    filters and cursors, `CONSUMED`/`INVALIDATED` (they need a reservation through the ledger), the
+    outbox/resume signal (`AUT-004`), preview redaction (the producer redacts; there is no producer),
+    assurance beyond `Standard` (the record has no field for a required level, so a step-up approval is
+    unrepresentable), the detail view's remaining named inputs (`output_schema` fingerprint, artifact
+    and content hashes, connector account/resource resolution — each needs a producer that does not
+    exist), cross-language fingerprint vectors, and generated OpenAPI.
 - [ ] `TLS-014` Implement plugin package provenance/signature verification,
   compatibility validation, install-disabled, staged update/rollback, disable,
   data-retention choice, and removal.

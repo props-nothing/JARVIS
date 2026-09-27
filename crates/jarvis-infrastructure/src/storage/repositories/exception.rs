@@ -324,7 +324,7 @@ fn read_exception(row: &sqlx::sqlite::SqliteRow) -> Result<JarvisPolicyException
 ///
 /// Written out rather than derived from `serde`, so the stored vocabulary is visible in one place
 /// and a variant added to the domain cannot reach a database column without a decision here.
-const fn assurance_stored(assurance: RequiredAssurance) -> &'static str {
+pub(crate) const fn assurance_stored(assurance: RequiredAssurance) -> &'static str {
     match assurance {
         RequiredAssurance::Standard => "standard",
         RequiredAssurance::Elevated => "elevated",
@@ -332,7 +332,7 @@ const fn assurance_stored(assurance: RequiredAssurance) -> &'static str {
 }
 
 /// Parses the stored assurance spelling.
-fn assurance_from_stored(value: &str) -> Option<RequiredAssurance> {
+pub(crate) fn assurance_from_stored(value: &str) -> Option<RequiredAssurance> {
     match value {
         "standard" => Some(RequiredAssurance::Standard),
         "elevated" => Some(RequiredAssurance::Elevated),

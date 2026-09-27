@@ -8,11 +8,16 @@
 // a resolving one until something checks, so unresolved links are denied rather than warned.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod approval;
 pub mod discovery;
 pub mod error;
 pub mod policy;
 pub mod run;
 
+pub use approval::{
+    ApprovalDecisionResponse, ApprovalListView, ApprovalView, CancelApprovalRequest,
+    DecideApprovalRequest, MAX_APPROVAL_PAGE, PreviewRowView,
+};
 pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 pub use error::{ErrorEnvelope, ErrorResponse};
 pub use policy::{

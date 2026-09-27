@@ -41,6 +41,79 @@ pub const MAX_PREVIEW_ITEMS: usize = 64;
 /// The longest accepted preview key or value.
 pub const MAX_PREVIEW_TEXT_BYTES: usize = 1024;
 
+/// The longest accepted decision note (a decision's comment, or a cancellation's reason).
+///
+/// **Bounded because it is caller-supplied text that reaches a durable row and an operator display.** It
+/// is deliberately *not* content: the contract's decision body calls the comment "an operator comment" and
+/// its cancellation body a "reason code", so the value names *why* a human decided rather than carrying
+/// anything about the action. 512 bytes is the same bound the run cancel reason uses, because the two are
+/// the same kind of value and two bounds for one kind of thing is how one comes to be raised alone.
+pub const MAX_DECISION_NOTE_BYTES: usize = 512;
+
+/// A bounded, non-interpreted note attached to a decision or a cancellation.
+///
+/// **A type rather than a `String`, and the reason is a defect this round found.** `DecideApprovalRequest`
+/// carried a `comment` whose doc said "stored with the decision", and nothing stored it: the field was
+/// deserialized, bounded by nothing, and dropped. The same was true of the cancellation's `reason`. A type
+/// makes the value *constructible only through its own bound*, so a caller cannot pass one that was never
+/// validated and a writer cannot omit validation by forgetting to call it.
+///
+/// The text is **never interpreted** — not parsed, not matched, not rendered into a prompt — which is why it
+/// may contain a newline: an operator writing "asked Bob, he said no" may write two lines. A control
+/// character other than whitespace is refused, because the value is echoed in an operator display and a
+/// record whose note can emit terminal escapes is the one place a stored audit value could lie about
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct DecisionNote(String);
+
+impl DecisionNote {
+    /// Validates and wraps a note.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ToolDefinitionInvalid`] naming `note` when the value is empty, over
+    /// [`MAX_DECISION_NOTE_BYTES`], or contains a control character outside `\t`, `\n`, and `\r`.
+    pub fn new(value: &str) -> Result<Self, DomainError> {
+        if value.is_empty() || value.len() > MAX_DECISION_NOTE_BYTES {
+            return Err(DomainError::ToolDefinitionInvalid { field: "note" });
+        }
+        // `is_control` is true for `\t`, `\n`, and `\r` as well, so the allowed three are excluded
+        // explicitly rather than by a range comparison — a range would be unreadable and would have to be
+        // edited for every character someone later wanted to allow.
+        let has_disallowed_control = value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'));
+        if has_disallowed_control {
+            return Err(DomainError::ToolDefinitionInvalid { field: "note" });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the note's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DecisionNote {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DecisionNote {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived**, the systemic defect `wire_validation_tests`
+        // records for nine other types in this crate: a derived impl on a transparent newtype wraps the
+        // inner value directly, so a note that arrived over the wire would bypass the bound the constructor
+        // enforces — and a note is exactly the value a caller controls.
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A version counter for an approval record's optimistic concurrency.
 ///
 /// Newtyped for the same reason [`crate::run::state::RunVersion`] is: a version and a count are both
@@ -470,8 +543,15 @@ pub struct ApprovalRequestParts {
     pub tool_call: ToolCallId,
     /// The exact tool identity being invoked.
     pub identity: ToolIdentity,
-    /// A digest over the exact action, computed by the caller.
-    pub action_digest: String,
+    /// A digest over the exact action.
+    ///
+    /// **Typed rather than text, so a caller cannot contribute one that no computation produced.** The
+    /// contract requires the fingerprint to be "computed" over a versioned object with an explicit
+    /// algorithm prefix; accepting a bare `String` here meant a malformed or differently-typed digest was
+    /// stored and later *compared*, which is a check that silently stops applying. The computation is
+    /// [`crate::tool::canonical`](super::canonical)'s plus `jarvis_infrastructure`'s, and the value is built
+    /// through [`ActionDigest::parse`](super::canonical::ActionDigest::parse) or from bytes.
+    pub action_digest: super::canonical::ActionDigest,
     /// The tool's risk, as a label for the prompt.
     pub risk: super::classification::Risk,
     /// The tool's effects, for the prompt.
@@ -507,9 +587,9 @@ pub struct DurableApproval {
     pub tool_call: ToolCallId,
     /// The exact tool identity, including source and schema fingerprint.
     pub identity: ToolIdentity,
-    /// A digest over the exact action. See [`ApprovalRecord`](super::policy::ApprovalRecord) for why
-    /// the *computation* is not here.
-    pub action_digest: String,
+    /// A digest over the exact action. See [`ApprovalRecord`](super::policy::ApprovalRecord) for why the
+    /// *computation* is not here.
+    pub action_digest: super::canonical::ActionDigest,
     /// The tool's risk at the time of asking, recorded so a later prompt shows what was decided.
     pub risk: super::classification::Risk,
     /// The tool's effects at the time of asking.
@@ -532,6 +612,16 @@ pub struct DurableApproval {
     decided_by: Option<PrincipalId>,
     /// Which channel the decision came from.
     decided_via: Option<ApprovalChannel>,
+    /// The assurance the decider **proved**, once a decision exists.
+    ///
+    /// **A field on the record rather than only on the actor, and the distinction is a defect this
+    /// round found.** The contract's audit section requires "request/decision/consumption identities,
+    /// assurance, channel ...", so the assurance is a property of the *decision on this record*. Recording
+    /// it only inside the transition actor meant a later non-decision transition — a consumption, an
+    /// invalidation, an expiry — overwrote the column with NULL, and the reconstructed record then had no
+    /// assurance while its own transition row still carried one. The two live together here, exactly as
+    /// the principal and the channel do.
+    decided_assurance: Option<crate::model::exception::RequiredAssurance>,
     /// When the decision was made.
     decided_at: Option<UtcTimestamp>,
 }
@@ -563,6 +653,7 @@ impl DurableApproval {
             version: ApprovalVersion::FIRST,
             decided_by: None,
             decided_via: None,
+            decided_assurance: None,
             decided_at: None,
         }
     }
@@ -597,6 +688,27 @@ impl DurableApproval {
         self.decided_via
     }
 
+    /// Returns the assurance the decider proved, once a decision exists.
+    ///
+    /// Exposed so the **adapter can store it and a reader can report it**: the contract's audit section
+    /// requires the assurance recorded, and a field with a writer and no accessor cannot be persisted —
+    /// the "value nothing can read" shape this project has found in several slices.
+    #[must_use]
+    pub const fn decided_assurance(&self) -> Option<crate::model::exception::RequiredAssurance> {
+        self.decided_assurance
+    }
+
+    /// Returns when the decision was made, if one was.
+    ///
+    /// Exposed for the same reason `dispatched_at` is on the ledger row: the instant is a **stored
+    /// column**, and a reader that had the boolean but not the value would have to invent one. The
+    /// approval store orders a principal's history by this value, so it is read rather than derived
+    /// from `updated_at`, which a later non-decision transition would have moved.
+    #[must_use]
+    pub const fn decided_at(&self) -> Option<UtcTimestamp> {
+        self.decided_at
+    }
+
     /// Returns whether the approval has lapsed at `now`.
     ///
     /// **Lapsed is not the same as `Expired`.** This is a computation from the clock; the *state*
@@ -616,9 +728,13 @@ impl DurableApproval {
     /// action" rather than one per caller. A caller that checked three of the four would be a second,
     /// weaker answer — the shape of every scoping defect this project has found.
     #[must_use]
-    pub fn covers(&self, action_digest: &str, now: UtcTimestamp) -> bool {
+    pub fn covers(
+        &self,
+        action_digest: &super::canonical::ActionDigest,
+        now: UtcTimestamp,
+    ) -> bool {
         self.state == ApprovalState::Approved
-            && self.action_digest == action_digest
+            && self.action_digest == *action_digest
             && !self.is_lapsed_at(now)
     }
 
@@ -669,12 +785,22 @@ impl DurableApproval {
         let prior_version = self.version;
         self.state = to;
         self.version = self.version.next()?;
-        if let ApprovalActor::Decided { principal, channel } = actor {
+        if let ApprovalActor::Decided {
+            principal,
+            channel,
+            assurance,
+            ..
+        } = actor
+        {
             // `decided_at` is set once. A second decision cannot arrive because every decision state
             // is terminal, so this is bookkeeping rather than a guard — recorded so a later reader
-            // can see the reasoning that produced the state machine.
+            // can see the reasoning that produced the state machine. The assurance is written with the
+            // other three **and is read back by the adapter**, which is what makes the audit requirement
+            // satisfiable; recording it only on the transition actor left it lost the moment a later
+            // non-decision transition overwrote the column.
             self.decided_by = Some(principal);
             self.decided_via = Some(channel);
+            self.decided_assurance = Some(assurance);
             self.decided_at = Some(occurred_at);
         }
         Ok(ApprovalTransitionRecord {
@@ -703,6 +829,27 @@ pub enum ApprovalActor {
         principal: PrincipalId,
         /// Which channel they used.
         channel: ApprovalChannel,
+        /// The assurance the decider **proved**, as the server resolved it.
+        ///
+        /// **The contract's audit section requires "assurance", and this record did not carry it.**
+        /// It is the strongest evidence an operator has that a consequential decision was made by a
+        /// stepped-up caller rather than an ordinary session: the channel is the surface, while this is
+        /// the strength of the credential behind it. Recorded as the value the **server** derived from the
+        /// authenticated request — never anything a body stated, which is the `BRN-024` rule — and it is
+        /// written with the decision rather than derived later, because the assurance at decision time
+        /// cannot be reconstructed from a record that omits it.
+        assurance: crate::model::exception::RequiredAssurance,
+        /// The operator's own note, when one was given.
+        ///
+        /// **The contract's decision body carries a `comment`, and this is where it lives.** It was
+        /// declared on the wire with a doc comment saying "stored with the decision" and nothing stored it:
+        /// the field was deserialized and dropped, which made the doc a claim about a capability that did
+        /// not exist. It sits on the actor rather than on the record because it explains *this* transition
+        /// — a decision is the only transition a human authors — and it is `None` when the caller gave none,
+        /// which is distinct from an empty note (refused at construction) because "said nothing" and "said
+        /// nothing in particular" are different records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<DecisionNote>,
     },
     /// The approval lapsed because its expiry passed.
     ///
@@ -727,6 +874,15 @@ pub enum ApprovalActor {
     Cancelled {
         /// Who withdrew it.
         by: PrincipalId,
+        /// Why it was withdrawn, when the caller said.
+        ///
+        /// **The contract says a cancellation uses "`expected_version`, reason code, and
+        /// `Idempotency-Key`", and the reason is what makes the audit trail say *why* a prompt was
+        /// withdrawn rather than only that it was** — the same claim the wire type made while nothing stored
+        /// it. It lives on the actor for the same reason the decision's note does: it explains this one
+        /// transition rather than being a durable property of the approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DecisionNote>,
     },
 }
 
@@ -736,6 +892,33 @@ impl ApprovalActor {
     pub fn channel(&self) -> Option<ApprovalChannel> {
         match self {
             Self::Decided { channel, .. } => Some(*channel),
+            _ => None,
+        }
+    }
+
+    /// Returns the assurance a decider proved, when the actor decided.
+    ///
+    /// Exposed so an **adapter can store it and a reader can report it**, because the contract's audit
+    /// section requires the assurance to be recorded and a value with no accessor could be written but
+    /// never checked — the "field with a writer and no reader" shape this project has found repeatedly.
+    #[must_use]
+    pub fn assurance(&self) -> Option<crate::model::exception::RequiredAssurance> {
+        match self {
+            Self::Decided { assurance, .. } => Some(*assurance),
+            _ => None,
+        }
+    }
+
+    /// Returns the operator's own note, when the actor carries one.
+    ///
+    /// A decision's `comment` and a cancellation's `reason` are the same kind of value — caller-supplied
+    /// text explaining a human's choice — so one accessor serves both, and a reader asking "why was this
+    /// transition taken" gets the same answer for either.
+    #[must_use]
+    pub fn note(&self) -> Option<&DecisionNote> {
+        match self {
+            Self::Decided { note, .. } => note.as_ref(),
+            Self::Cancelled { reason, .. } => reason.as_ref(),
             _ => None,
         }
     }

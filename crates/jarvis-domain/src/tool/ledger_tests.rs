@@ -868,9 +868,10 @@ fn the_recovery_scan_finds_dispatched_calls_without_an_outcome_and_nothing_else(
 
 #[test]
 fn the_ledger_reports_which_attempt_a_key_is_on() {
-    // A second attempt has a **different key**, because the key identifies the invocation while the
-    // attempt number distinguishes retries of it — so the attempt count is a property of the row
-    // rather than of the key, which is why this is a lookup and not a scan.
+    // The attempt count is a property of the one row the key owns, so this is a lookup and not a scan.
+    // It is **not** a count of rows: only one row can exist per reservation key — a second attempt with
+    // the same key is refused rather than stored beside the first, which the durable adapter's unique
+    // index and this map both enforce.
     let mut ledger = ToolCallLedger::new();
     ledger.reserve(LedgerEntry::reserve(
         call_id(1),

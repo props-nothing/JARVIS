@@ -98,13 +98,32 @@ const EFFECTING_SQL: &str = select_sql!(
 
 /// The `SELECT` for the **conversion input**.
 ///
-/// `executing` alone, and that narrowing is load-bearing rather than an optimisation: converting a row
-/// moves it to `reconciling`, which the effecting scan above returns again. A pass that paged *that* scan
-/// would re-read its own output, and since the ordering ties on `updated_at` a later page can hold only
-/// converted rows — leaving unconverted ones beyond the page unreachable for ever. This predicate makes
-/// the set strictly shrink as the pass converts, so the paging terminates.
-const AWAITING_CONVERSION_SQL: &str =
-    select_sql!("state = 'executing' AND outcome IS NULL ORDER BY updated_at ASC LIMIT ?");
+/// **Every non-terminal state except `reconciling`, and the exact list is load-bearing twice over.**
+///
+/// The pass *classifies* six non-terminal states: `classify_interrupted` answers `Reconcile` for
+/// `executing`/`reconciling` and `SafeToRetry` for the five pre-dispatch states (`requested`,
+/// `validated`, `waiting_approval`, `approved`, `reserved`). A predicate narrower than that leaves the
+/// classification with no way to be applied — and the first version of this constant selected
+/// `executing` alone, so `report.cancelled` could never increment and a stranded **pre-dispatch**
+/// reservation was never settled. Its dead process kept the reservation, and every later retry of that
+/// key was answered `InFlight`, which is **waiting on a process that is gone** — the exact harm this
+/// pass exists to remove, applied to the five states it could not see.
+///
+/// `reconciling` is the one state excluded, and the exclusion is what keeps the paging terminating: the
+/// pass's own output for an `executing` row is a `reconciling` row, so a predicate that returned it
+/// would re-read rows already converted and — with the ordering tied on `updated_at` — a later page
+/// could hold only converted rows, leaving the rest unreachable for ever. Every other state strictly
+/// shrinks (pre-dispatch → `cancelled`, terminal; `executing` → `reconciling`, excluded), so the set the
+/// pass pages is strictly smaller after every conversion.
+///
+/// **The list is asserted against the domain's own state set** in
+/// `the_conversion_scan_covers_every_state_the_pass_can_settle`, because a `ToolCallState` added later
+/// with no arm here would be classified and never offered — a defect nothing else would catch, since
+/// both the domain's table and this string compile on their own.
+const AWAITING_CONVERSION_SQL: &str = select_sql!(
+    "state IN ('requested', 'validated', 'waiting_approval', 'approved', 'reserved', 'executing') \
+     AND outcome IS NULL ORDER BY updated_at ASC LIMIT ?"
+);
 
 /// The SQLite-backed tool-call ledger.
 #[derive(Debug, Clone)]

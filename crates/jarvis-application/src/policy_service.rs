@@ -181,6 +181,12 @@ impl PolicyServiceError {
 
 /// Maps the assurance a caller proved onto the level a grant is judged against.
 ///
+/// **`pub(crate)` because a decision is the same kind of authorization as a grant.** The approval
+/// service judges whether a caller may decide an approval, and a second copy of this ladder is how the
+/// two surfaces come to disagree about what `Standard` permits — the "same concept defined twice"
+/// shape this project counts and compares. The *refusal* is translated into each surface's own error
+/// type, so the codes stay distinct while the rule has one home.
+///
 /// # Errors
 ///
 /// Returns [`PolicyServiceError::Unauthenticated`] for [`AuthenticationAssurance::Guest`]. A guest
@@ -188,7 +194,7 @@ impl PolicyServiceError {
 /// treating it as merely "standard" would let an anonymous caller create a durable record of a
 /// relaxation and be named on it. The security rules require an identity to be authenticated
 /// *before* a tenant or workspace is resolved, and a guest is the state before that happened.
-fn required_assurance_of(
+pub(crate) fn required_assurance_of(
     held: AuthenticationAssurance,
 ) -> Result<RequiredAssurance, PolicyServiceError> {
     match held {

@@ -22,8 +22,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use jarvis_domain::ids::{
-    ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId,
-    PolicyExceptionId, RunId, WorkspaceId,
+    ApprovalId, ConversationId, MessageId, ModelCallId, ModelDataPolicyId, ModelRouteDecisionId,
+    PolicyExceptionId, PrincipalId, RunId, WorkspaceId,
 };
 use jarvis_domain::model::capability::DeliveryMeasurement;
 use jarvis_domain::model::identity::ModelRevision;
@@ -33,7 +33,12 @@ use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::lifecycle::RunLifecycle;
 use jarvis_domain::run::state::RunState;
 use jarvis_domain::time::UtcTimestamp;
+use jarvis_domain::tool::approval::{
+    ApprovalActor, ApprovalChannel, ApprovalState, ApprovalTransitionRecord, ApprovalVersion,
+    DurableApproval,
+};
 
+use crate::repository::approval::{ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE};
 use crate::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation, StoredMessage,
 };
@@ -73,7 +78,7 @@ struct RunRow {
     lifecycle: RunLifecycle,
     workspace_id: WorkspaceId,
     conversation_id: ConversationId,
-    principal_id: jarvis_domain::ids::PrincipalId,
+    principal_id: PrincipalId,
     objective_ref: Option<String>,
     created_at: UtcTimestamp,
     started_at: Option<UtcTimestamp>,
@@ -181,6 +186,20 @@ struct Store {
     /// conflict rather than a silent replacement — and an exception is the one record that
     /// relaxes a rule, so replacing it would rewrite what a past decision was permitted by.
     exceptions: BTreeMap<PolicyExceptionId, crate::repository::policy::JarvisPolicyException>,
+    /// Durable approval records, keyed by identity.
+    ///
+    /// A map because the identity is the key, so a duplicate request is a conflict rather than a
+    /// silent replacement — and because the port's listing methods filter on workspace and state,
+    /// which a map makes a scan a test can still exercise through the adapter's own SQL.
+    approvals: BTreeMap<ApprovalId, DurableApproval>,
+    /// Approval transition trails, keyed by the approval they belong to.
+    ///
+    /// **Appended by `apply_transition`, because the decision's note lives on the transition rather than
+    /// on the record.** A double that stored only the record would make the port's `transitions` reader
+    /// return nothing while the adapter returned a trail, so every application-level assertion about a
+    /// note would pass against the double and fail in production — the direction a double must never
+    /// differ in.
+    approval_transitions: BTreeMap<ApprovalId, Vec<ApprovalTransitionRecord>>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -793,7 +812,7 @@ impl RunRepository for InMemoryRepositories {
     fn lookup_idempotency(
         &self,
         workspace: WorkspaceId,
-        principal: jarvis_domain::ids::PrincipalId,
+        principal: PrincipalId,
         operation: &str,
         key: &str,
     ) -> RepositoryFuture<'_, Option<(String, RunId)>> {
@@ -1582,6 +1601,215 @@ impl crate::repository::policy::ModelDataPolicyRepository for InMemoryRepositori
                 }
                 exception.consumed_at = Some(at);
                 Ok(())
+            })
+        })
+    }
+}
+
+impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
+    fn request(&self, approval: &DurableApproval) -> RepositoryFuture<'_, ()> {
+        let approval = approval.clone();
+        Box::pin(async move {
+            self.with(|store| {
+                // The port's own rule: a request path never inserts a decided approval, because a row
+                // that arrived here already decided would be a decision nobody made. Mirrored from
+                // the adapter's assertion for the reason every double mirrors its adapter's
+                // *bounds*: a double enforcing less is the dangerous direction.
+                if approval.state() != ApprovalState::Pending {
+                    return Err(RepositoryError::Conflict {
+                        what: "approval_not_pending_on_insert",
+                    });
+                }
+                if store.approvals.contains_key(&approval.id) {
+                    return Err(RepositoryError::Conflict { what: "approval" });
+                }
+                store.approvals.insert(approval.id, approval);
+                Ok(())
+            })
+        })
+    }
+
+    fn load(
+        &self,
+        workspace: WorkspaceId,
+        approval: ApprovalId,
+    ) -> RepositoryFuture<'_, DurableApproval> {
+        Box::pin(async move {
+            self.with(|store| {
+                store
+                    .approvals
+                    .get(&approval)
+                    // Scope is a predicate, not a post-filter: another workspace's row must be
+                    // indistinguishable from an absent one, exactly as in the adapter.
+                    .filter(|stored| stored.workspace == workspace)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    fn apply_transition(
+        &self,
+        workspace: WorkspaceId,
+        transition: &ApprovalTransitionRecord,
+        expected: ApprovalVersion,
+        _actor: &ApprovalActor,
+        approval: &DurableApproval,
+    ) -> RepositoryFuture<'_, DecideOutcome> {
+        let transition = transition.clone();
+        let approval = approval.clone();
+        // Captured before the value is moved into the store, because the trail below is keyed by it —
+        // reading `approval.id` after `*stored = approval` is a use of a moved value, which is what the
+        // compiler said when the append was first written.
+        let approval_id = approval.id;
+        Box::pin(async move {
+            self.with(|store| {
+                let Some(stored) = store.approvals.get_mut(&approval.id) else {
+                    return Err(RepositoryError::NotFound);
+                };
+                if stored.workspace != workspace {
+                    return Err(RepositoryError::NotFound);
+                }
+                // **The ordering the adapter uses, mirrored.** A stale view is reported as stale
+                // before it is reported as a wrong transition, because an illegal edge computed from
+                // an old state may be legal from the current one.
+                if stored.version() != expected {
+                    return Err(RepositoryError::VersionConflict {
+                        expected: expected.get(),
+                        actual: stored.version().get(),
+                    });
+                }
+                // **A repeat in the requested state is idempotence, not a conflict.** The adapter
+                // conditions this on the version the *transition* produces rather than on the
+                // caller's expected value, so a double-tap — two requests built from one read —
+                // reports `AlreadyInState` instead of a version conflict.
+                if stored.state() == transition.to && stored.version() == transition.version {
+                    return Ok(DecideOutcome::AlreadyInState);
+                }
+                if !stored.state().can_transition_to(transition.to) {
+                    return Err(RepositoryError::TransitionRefused {
+                        code: "approval.state_conflict",
+                    });
+                }
+                // The caller's already-transitioned value is what is stored, so the domain's `apply`
+                // remains the only implementation of the state machine — this double never recomputes
+                // a state or a version.
+                *stored = approval;
+                // **The trail is appended here too, or the double would silently drop the decision's note.**
+                // The note lives on the transition rather than on the record, so a double that stored only
+                // the record would make every `transitions` assertion in the application suite pass against
+                // the adapter's data model and fail against its behaviour — the "double enforcing less than
+                // its adapter" shape this file records for the channel filter.
+                store
+                    .approval_transitions
+                    .entry(approval_id)
+                    .or_default()
+                    .push(transition);
+                Ok(DecideOutcome::Applied)
+            })
+        })
+    }
+
+    fn pending_in(
+        &self,
+        workspace: WorkspaceId,
+        channel: ApprovalChannel,
+        limit: u32,
+    ) -> RepositoryFuture<'_, ApprovalsPage> {
+        Box::pin(async move {
+            self.with(|store| {
+                let limit = limit.min(MAX_PENDING_PAGE) as usize;
+                let mut found: Vec<DurableApproval> = store
+                    .approvals
+                    .values()
+                    .filter(|stored| {
+                        stored.workspace == workspace
+                            && stored.state() == ApprovalState::Pending
+                            // **The channel filter is mirrored from the adapter's `json_each`
+                            // predicate.** A double that filtered *after* applying `limit` — or not at
+                            // all — would let a short-changed page pass every test, which is the
+                            // dangerous direction: a double enforcing less than its adapter.
+                            && stored.allowed_channels.permits(channel)
+                    })
+                    .cloned()
+                    .collect();
+                // Ordered by what lapses soonest, with the identifier breaking a tie — the same
+                // `ORDER BY expires_at ASC, id ASC` the adapter uses. The tie-break is not
+                // decoration: an order that is not total can show one row twice and hide another.
+                found.sort_by_key(|stored| (stored.expires_at, stored.id.to_string()));
+                // One row more than asked, so "there are more" is distinguishable from "that was
+                // all" — the probe row the adapter reads and the double must simulate, or the
+                // boundedness fact would be untestable without a database.
+                let bounded = found.len() > limit;
+                found.truncate(limit);
+                Ok(ApprovalsPage {
+                    approvals: found,
+                    bounded,
+                })
+            })
+        })
+    }
+
+    fn decided_by(
+        &self,
+        workspace: WorkspaceId,
+        principal: PrincipalId,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<DurableApproval>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let limit = limit.min(MAX_PENDING_PAGE) as usize;
+                let mut found: Vec<DurableApproval> = store
+                    .approvals
+                    .values()
+                    .filter(|stored| {
+                        stored.workspace == workspace && stored.decided_by() == Some(principal)
+                    })
+                    .cloned()
+                    .collect();
+                // Most recent first with the identifier breaking a tie, matching the adapter's
+                // `ORDER BY decided_at DESC, id ASC`.
+                found.sort_by_key(|stored| {
+                    (
+                        std::cmp::Reverse(stored.decided_at()),
+                        stored.id.to_string(),
+                    )
+                });
+                found.truncate(limit);
+                Ok(found)
+            })
+        })
+    }
+
+    fn transitions(
+        &self,
+        workspace: WorkspaceId,
+        approval: ApprovalId,
+    ) -> RepositoryFuture<'_, Vec<ApprovalTransitionRecord>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let Some(stored) = store.approvals.get(&approval) else {
+                    return Err(RepositoryError::NotFound);
+                };
+                // The scope rule, mirrored: a foreign-workspace record is `NotFound`, indistinguishable
+                // from one that does not exist.
+                if stored.workspace != workspace {
+                    return Err(RepositoryError::NotFound);
+                }
+                let mut trail = store
+                    .approval_transitions
+                    .get(&approval)
+                    .cloned()
+                    .unwrap_or_default();
+                // Oldest first, with the identifier breaking an instant tie — the adapter's
+                // `ORDER BY occurred_at ASC, id ASC`. Mirrored rather than left to insertion order,
+                // because a trail whose order depended on a map's iteration would read as a different
+                // sequence of events for the same records.
+                trail.sort_by(|left, right| {
+                    (left.occurred_at, left.id.to_string())
+                        .cmp(&(right.occurred_at, right.id.to_string()))
+                });
+                Ok(trail)
             })
         })
     }

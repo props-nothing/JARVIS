@@ -150,18 +150,27 @@ pub trait ToolCallRepository: Send + Sync {
     /// grows with real calls.
     fn possibly_effecting(&self, limit: u32) -> RepositoryFuture<'_, EffectingScan>;
 
-    /// Returns the calls that are dispatched and have **not yet been marked as needing reconciliation**.
+    /// Returns the calls that need settling and have **not yet been settled**.
     ///
     /// **The conversion input, and it is a separate method because the work list above cannot be paged.**
-    /// Converting a row in `EXECUTING` produces a row in `RECONCILING`, which the work list still returns
-    /// — legitimately, since a reconciling row is durable work. So a pass that paged the work list would
-    /// re-read its own output, and rows beyond the page could never be reached: with the ordering tied on
-    /// `updated_at`, a second page can hold only already-converted rows, leaving the rest stranded for
-    /// ever. This method selects `executing` alone, so **the set strictly shrinks** as the pass converts
-    /// rows and the paging terminates for the same reason the run pass's does.
+    /// It returns every non-terminal state **except `reconciling`**: settling an `executing` row produces
+    /// a `reconciling` row, which the work list still returns — legitimately, since a reconciling row is
+    /// durable work — so a pass that paged the work list would re-read its own output, and rows beyond
+    /// the page could never be reached: with the ordering tied on `updated_at`, a second page can hold
+    /// only already-settled rows, leaving the rest stranded for ever.
+    ///
+    /// **The excluded set is exactly one state, and that is a requirement rather than an optimisation.**
+    /// `classify_interrupted` answers for six non-terminal states — `Reconcile` for
+    /// `executing`/`reconciling`, `SafeToRetry` for the five pre-dispatch ones — so a predicate narrower
+    /// than "every non-terminal state except `reconciling`" leaves part of the classification with
+    /// nowhere to be applied. The first version of this method selected `executing` alone, and the
+    /// consequence was not a missing feature: a stranded **pre-dispatch** reservation was never settled,
+    /// so its dead holder kept the key and every later retry was answered `InFlight` — telling a caller
+    /// to wait on a process that is gone. Every state it selects strictly shrinks (pre-dispatch →
+    /// `cancelled`, terminal; `executing` → `reconciling`, excluded), so the paging terminates.
     ///
     /// A caller that wants everything outstanding asks [`Self::possibly_effecting`]; a caller that is
-    /// converting asks this one. Two methods, each with one meaning, rather than one whose meaning depends
+    /// settling asks this one. Two methods, each with one meaning, rather than one whose meaning depends
     /// on which caller named it.
     fn awaiting_conversion(&self, limit: u32) -> RepositoryFuture<'_, EffectingScan>;
 }

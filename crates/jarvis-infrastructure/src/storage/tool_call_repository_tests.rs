@@ -711,7 +711,7 @@ async fn a_stranded_call_is_settled_through_real_sql_by_the_recovery_pass() {
     );
 
     // And the pass is idempotent through the real predicate: a second run finds nothing to convert,
-    // because the conversion input selects `executing` alone and the row is now reconciling.
+    // because the conversion input excludes a row already in `reconciling` and the row is now there.
     let again = jarvis_application::tool_recovery::reconcile_tool_calls(&port, later())
         .await
         .expect("the second pass runs");
@@ -738,6 +738,110 @@ async fn a_stranded_call_is_settled_through_real_sql_by_the_recovery_pass() {
             .len(),
         0,
         "**it must no longer be offered for conversion**, or the paging would never terminate",
+    );
+}
+
+#[tokio::test]
+async fn a_stranded_pre_dispatch_reservation_is_settled_so_a_retry_is_not_told_to_wait() {
+    // **The harm the pass exists to remove, applied to the five states it could not reach.** A call that
+    // claimed its reservation and then lost its daemon still holds the unique index entry — so a retry of
+    // that key is answered `InFlight`, i.e. *wait on a process that is gone*. Settling it as `CANCELLED`
+    // is what releases the key's *meaning*: the reservation row stays (a reservation is durable), but the
+    // state says the call was stopped rather than that somebody is running it.
+    //
+    // This drives the **real SQL**, not the double, because the whole defect was in the predicate string:
+    // the double mirrors whatever set the tests assume, and only the database proves which rows the
+    // adapter's `state IN (...)` list actually returns.
+    let (_database, ledger) = repository().await;
+    let mut reserved = entry();
+    ledger.reserve(&reserved).await.expect("granted");
+    drive(&ledger, &mut reserved, ToolCallState::Reserved, None).await;
+
+    let port: Arc<dyn jarvis_application::repository::tool_call::ToolCallRepository> =
+        Arc::new((*ledger).clone());
+    let report = jarvis_application::tool_recovery::reconcile_tool_calls(&port, later())
+        .await
+        .expect("the pass runs against the real adapter");
+
+    assert_eq!(
+        report.cancelled, 1,
+        "**the real predicate must offer a pre-dispatch row**: {report:?}",
+    );
+    assert_eq!(report.reconciling, 0, "{report:?}");
+
+    let stored = ledger.load(workspace(), reserved.id).await.expect("loads");
+    assert_eq!(stored.state(), ToolCallState::Cancelled);
+    assert_eq!(
+        stored.outcome(),
+        Some(ToolErrorClass::Cancelled),
+        "a terminal row written with no outcome is refused as corruption by this adapter's own reader",
+    );
+    assert!(
+        !stored.was_dispatched(),
+        "nothing reached the provider, so no dispatch may be recorded",
+    );
+}
+
+#[tokio::test]
+async fn the_conversion_scan_covers_every_state_the_pass_can_settle() {
+    // **A predicate string and a domain enum can drift with nothing to catch it.** `awaiting_conversion`
+    // names its states in SQL, while `classify_interrupted` names the states the pass settles in Rust;
+    // they are the same set expressed twice, and the first version got it wrong — `executing` alone,
+    // which left five settled-able states unreachable and made `report.cancelled` dead. Nothing failed,
+    // because both the string and the table compile perfectly on their own.
+    //
+    // So this asserts the two agree **through the real SQL**: a row is placed in every non-terminal
+    // state, and the scan must return exactly those states that need a write. A state added to
+    // `ToolCallState` later with no entry in the predicate fails here rather than being silently
+    // unreachable at startup.
+    use jarvis_domain::tool::ledger::classify_interrupted;
+
+    let (_database, ledger) = repository().await;
+    let mut expected: Vec<&'static str> = Vec::new();
+    for state in ToolCallState::ALL.iter().copied() {
+        let Some(action) = classify_interrupted(state) else {
+            continue;
+        };
+        if !action.needs_write() {
+            // `reconciling` — the scan excludes the pass's own output on purpose.
+            continue;
+        }
+        let mut row = entry();
+        row.key = ReservationKey::new(
+            identity(),
+            workspace(),
+            principal(),
+            state.as_contract_str(),
+        )
+        .expect("valid");
+        row.id = ToolCallRecordId::from_uuid(uuid::Uuid::from_u128(9000 + u128::from(state as u8)));
+        ledger.reserve(&row).await.expect("granted");
+        if state != ToolCallState::Requested {
+            drive(&ledger, &mut row, state, None).await;
+        }
+        expected.push(state.as_contract_str());
+    }
+
+    let found = ledger
+        .awaiting_conversion(100)
+        .await
+        .expect("the scan runs");
+    let mut actual: Vec<&str> = found
+        .records
+        .iter()
+        .map(|entry| entry.state().as_contract_str())
+        .collect();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        actual, expected,
+        "the conversion predicate must offer exactly the states the classification can settle",
+    );
+    assert_eq!(
+        expected.len(),
+        6,
+        "six non-terminal states need a write; a change here means the state machine grew or shrank \
+         and the predicate must be revisited",
     );
 }
 
@@ -902,6 +1006,64 @@ async fn equal_identities_serialize_identically_so_the_unique_index_can_work() {
             .expect("answers")
             .is_granted(),
         "two independently built equal identities must collide in the store",
+    );
+}
+
+#[tokio::test]
+async fn a_second_attempt_at_one_reservation_key_is_refused_rather_than_stored_as_another_row() {
+    // **The claim this test exists to disprove, in three documents.** `000009_tool_call_ledger.sql`,
+    // `docs/data/schema.md`, and `jarvis_domain::tool::ledger` all describe the ledger as "one row per
+    // *attempt*", where "an invocation that is retried has several rows sharing one reservation key,
+    // and the attempt number is what distinguishes them". The unique index says otherwise: it is
+    // `(workspace_id, principal_id, tool_identity_json, idempotency_key)`, so a second row for the same
+    // key is refused **whatever** its `attempt` column holds — and that refusal is the reservation
+    // guarantee, because two rows for one key would let two processes each dispatch.
+    //
+    // So the two are asserted together, and it is the pair that decides which document is right: the
+    // same-key second attempt is *not* a second row, and the reservation is the thing that says so.
+    let (database, ledger) = repository().await;
+
+    let first = entry();
+    assert_eq!(
+        ledger.reserve(&first).await.expect("answers"),
+        ReservationOutcome::Granted,
+    );
+
+    // The same key, a different record identifier, and **attempt 2** — which is exactly the row the
+    // "several rows sharing one key" reading predicts would insert cleanly.
+    let mut second = LedgerEntry::reserve(
+        tool_call(),
+        2,
+        run_id(),
+        key(),
+        LedgerOperation::Execute,
+        now(),
+    );
+    second.id = ToolCallRecordId::from_uuid(uuid::Uuid::from_u128(2));
+    let outcome = ledger.reserve(&second).await.expect("answers");
+    assert!(
+        !outcome.is_granted(),
+        "**a second attempt at one key must not be a second row**: if it were, two processes could \
+         both hold the same reservation and both dispatch — got {outcome:?}",
+    );
+    assert_eq!(
+        outcome,
+        ReservationOutcome::InFlight {
+            state: ToolCallState::Requested
+        },
+        "the stored row is offered back to the retrying caller rather than duplicated",
+    );
+
+    // And exactly one row is stored, which is the difference between "reported as a duplicate" and
+    // "made impossible". A count is the assertion, because a second row that a later reader might pick
+    // is the defect the unique index exists to prevent.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tool_call_records")
+        .fetch_one(database.pool())
+        .await
+        .expect("the catalog is readable");
+    assert_eq!(
+        rows, 1,
+        "one reservation key means one row, whatever attempt number is presented",
     );
 }
 

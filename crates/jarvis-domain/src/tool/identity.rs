@@ -432,9 +432,17 @@ impl fmt::Display for ToolSource {
 /// algorithm would silently invalidate or silently *preserve* an existing approval depending
 /// on which way the comparison fell.
 ///
-/// The domain carries the value and validates its shape; **computing** it from a document is
-/// an adapter's job, because hashing is a concrete implementation and the domain layer must
-/// not depend on one. `jarvis-infrastructure` provides the computation.
+/// The domain carries the value and validates its shape; **computing** it from a document is an
+/// adapter's job, because hashing is a concrete implementation and the domain layer must not depend on
+/// one.
+///
+/// **⚠ That `jarvis-infrastructure` provides the computation is a claim this doc made for several rounds
+/// while the function did not exist.** The only construction path was [`Self::from_bytes`], which every
+/// caller in the product — and in the tests — used with a hand-written seed, so a schema change could not
+/// move an identity and `ACC-024`'s "a release that alters the input schema changes the fingerprint and
+/// therefore the identity" had nothing behind it. `jarvis_infrastructure::tool_fingerprint::schema_fingerprint_of`
+/// is the derivation now, and it domain-separates with a `tool-schema:` prefix so a schema fingerprint
+/// cannot collide with an action fingerprint over the same bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaFingerprint([u8; 32]);
 

@@ -1,0 +1,742 @@
+//! Handler tests for the approval surface.
+//!
+//! These drive the **router**, not the service, so what they can see that the service's own tests
+//! cannot is the surface itself: the shared error envelope, the status a code maps to, the
+//! `Idempotency-Key` requirement, and the fact that a route is *routable* without a store. They use
+//! the in-memory double rather than a migrated database, because the adapter's own tests already
+//! exercise the real SQL and a handler test that needed a seeded database would be asserting storage
+//! twice.
+//!
+//! Four properties are worth naming, and each is silent when broken:
+//!
+//! - **Every refusal carries the shared envelope**, including the `not_found` for an unparseable
+//!   identifier — a status alone would satisfy a weaker assertion while a client had nothing to parse.
+//! - **The status follows the code**, asserted for the whole stable-error family rather than one
+//!   instance, because a mapping copied per variant is how one comes to disagree.
+//! - **`Idempotency-Key` is required on both writes**, and it is checked *before* the body is parsed,
+//!   so a request missing both is told about the key rather than about its JSON.
+//! - **A store-less daemon answers `service.not_ready`**, so a client can tell "not ready" from "no
+//!   such endpoint" — the same distinction the run and policy surfaces make.
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use jarvis_application::approval_service::ApprovalService;
+use jarvis_application::repository::approval::ApprovalRepository;
+use jarvis_application::testing::InMemoryRepositories;
+use jarvis_domain::ids::{ApprovalId, RunId, ToolCallId, WorkspaceId};
+use jarvis_domain::time::UtcTimestamp;
+use jarvis_domain::tool::approval::{
+    AllowedChannels, ApprovalChannel, ApprovalPreview, ApprovalRequestParts, ApprovalScopeKind,
+    DurableApproval, MAX_DECISION_NOTE_BYTES, PreviewItem,
+};
+use jarvis_domain::tool::canonical::ActionDigest;
+use jarvis_domain::tool::classification::{Effect, Risk};
+use jarvis_domain::tool::identity::{
+    SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
+};
+use tower::ServiceExt;
+
+use super::super::{ApiState, router};
+use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
+use crate::http::tests::{TEST_AUTHORITY, temp_dir};
+
+/// The workspace a fixture approval belongs to.
+///
+/// **The daemon's default workspace**, because the scope is resolved server-side: a record seeded in
+/// another workspace would make every read a `not_found` for the wrong reason, and the test would pass
+/// while proving nothing about the handler. This is the same trap the policy handler tests record.
+fn workspace() -> WorkspaceId {
+    WorkspaceId::from_uuid(uuid::Uuid::from_u128(
+        crate::http::runs::DEFAULT_WORKSPACE_UUID,
+    ))
+}
+
+/// The principal the seeded client resolves to.
+///
+/// The fixture's approval is requested **by** this principal, so the cancellation path — where the
+/// requester may always withdraw its own request — is exercised by the same client that owns the row.
+fn principal() -> jarvis_domain::ids::PrincipalId {
+    jarvis_domain::ids::PrincipalId::from_uuid(uuid::Uuid::from_u128(1))
+}
+
+/// A pending approval whose allowed channels include the API.
+fn pending() -> DurableApproval {
+    let mut approval = DurableApproval::request(ApprovalRequestParts {
+        workspace: workspace(),
+        requesting_principal: principal(),
+        run: RunId::from_uuid(uuid::Uuid::from_u128(3)),
+        tool_call: ToolCallId::from_uuid(uuid::Uuid::from_u128(4)),
+        identity: ToolIdentity {
+            capability: ToolCapability::parse("mail.send@1").expect("canonical"),
+            source: ToolSource::new(
+                SourceKind::Connector,
+                "acme.mail",
+                ToolVersion::parse("1.0.0").expect("valid"),
+            )
+            .expect("the fixture source is valid"),
+            schema_fingerprint: SchemaFingerprint::from_bytes([7; 32]),
+        },
+        action_digest: ActionDigest::from_bytes([11; 32]),
+        risk: Risk::High,
+        effects: vec![Effect::Write],
+        summary: "Send one email".to_owned(),
+        preview: ApprovalPreview::new(vec![
+            PreviewItem::new("to", "peter@example.com").expect("a usable preview item"),
+        ])
+        .expect("a usable preview"),
+        allowed_channels: AllowedChannels::new(vec![ApprovalChannel::Api]).expect("a channel"),
+        // Far in the future, **on purpose**: the handler reads the real clock, so a fixture deadline
+        // near "now" would make these tests exercise the expiry path instead of the decision path —
+        // and a test that fails because the calendar moved is a flake, not a signal. The expiry path
+        // has its own test in the service suite, where the instant is a parameter.
+        expires_at: UtcTimestamp::parse("2030-01-01T00:00:00Z").expect("valid"),
+        scope: ApprovalScopeKind::OneShot,
+    });
+    approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(9));
+    approval
+}
+
+/// A router with an approval service over a seeded double.
+async fn fixture(tag: &str) -> (axum::Router, String, DurableApproval, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let destination = ClientCredentialPath::in_config_dir(&dir);
+    let (registered, credential) =
+        enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+    let mut clients = ClientRegistry::new();
+    clients.register(registered);
+
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let approval = pending();
+    repositories
+        .request(&approval)
+        .await
+        .expect("the fixture is inserted");
+    let service = Arc::new(ApprovalService::new(
+        Arc::clone(&repositories) as Arc<dyn ApprovalRepository>
+    ));
+
+    let state = Arc::new(
+        ApiState::new(
+            Arc::new(clients),
+            Arc::new(crate::http::Readiness::new()),
+            "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+        )
+        .with_approvals(service),
+    );
+    (
+        router(state),
+        credential.to_presentation_text(),
+        approval,
+        dir,
+    )
+}
+
+/// Authenticated headers for an approval request.
+fn approval_headers(token: &str) -> Vec<(&str, String)> {
+    vec![
+        ("authorization", format!("Bearer {token}")),
+        ("jarvis-api-version", "1".to_owned()),
+        ("content-type", "application/json".to_owned()),
+        ("idempotency-key", format!("key-{}", uuid::Uuid::now_v7())),
+    ]
+}
+
+/// Sends a request that may carry a body.
+async fn send(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &str,
+) -> (StatusCode, String) {
+    let overrides_host = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    let mut builder = Request::builder().uri(path).method(method);
+    if !overrides_host {
+        builder = builder.header("host", TEST_AUTHORITY);
+    }
+    for (name, value) in headers {
+        builder = builder.header(*name, value.clone());
+    }
+    // `Content-Length` is set explicitly because a real client sends it and the body-limit middleware
+    // reads it. `Request::builder()` does not add it, so a test that omitted it would exercise a path
+    // no client takes.
+    if !body.is_empty() {
+        builder = builder.header("content-length", body.len().to_string());
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_owned())).expect("builds"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("the body reads");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The contract text form of a fixture digest.
+///
+/// **A real digest rather than a readable word, and the fixture had to change when the wire rule did.**
+/// The handler now parses the fingerprint at the trust boundary — a malformed one is `request.invalid` —
+/// so `"sha256:action"` is refused before it reaches the service, and this helper is what the tests use
+/// to produce a value whose *shape* is valid. The distinction matters because the two failures are
+/// different: a malformed fingerprint is "fix your request", while a valid-but-different one is "this is
+/// not the action you approved".
+fn digest_text(seed: u8) -> String {
+    ActionDigest::from_bytes([seed; 32]).to_string()
+}
+
+/// A decision body.
+fn decide_body(decision: &str, version: u64, fingerprint: &str) -> String {
+    format!(
+        r#"{{"decision":"{decision}","expected_version":{version},"action_fingerprint":"{fingerprint}"}}"#,
+    )
+}
+
+#[tokio::test]
+async fn a_listing_returns_the_pending_approval_with_its_preview() {
+    let (app, token, approval, dir) = fixture("approval-list").await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&approval.id.to_string()), "{body}");
+    // The preview is the part a user reviews, so it is asserted by value rather than by presence: a
+    // rendered sentence would satisfy a `contains` on the key while dropping the value.
+    assert!(
+        body.contains(r#""key":"to","value":"peter@example.com""#),
+        "{body}"
+    );
+    assert!(body.contains(r#""state":"pending""#), "{body}");
+    assert!(body.contains(r#""max_page":200"#), "{body}");
+    // **`has_more` is asserted on the wire, not only in the service.** A client's decision to keep
+    // reading is made from this field, and a listing that omitted it would leave a client unable to
+    // tell a full page from a complete one on a surface that serves no cursor.
+    assert!(
+        body.contains(r#""has_more":false"#),
+        "one row cannot fill a page, so the listing is complete: {body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_listing_page_spends_its_bound_on_rows_the_caller_may_decide() {
+    // The end-to-end half of the short-page defect: a page of one, with a row the caller cannot decide
+    // seeded **first** (so it lapses soonest and would be any workspace-wide read's first row). The
+    // channel filter has to run before the bound, or the caller receives an empty page and concludes
+    // the queue is empty.
+    let (app, token, _approval, dir) = fixture("approval-page").await;
+    // The fixture's own approval permits `api`, which is this client's channel — so it is the row that
+    // must come back when the bound is one.
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals?limit=1",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains(r#""approvals":[]"#),
+        "**a bound of one must be spent on the decidable row, not on an excluded one**: {body}",
+    );
+    assert!(body.contains(r#""has_more":false"#), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_detail_carries_the_tool_source_and_schema_identity_the_contract_names() {
+    // The contract's detail requirement is "tool source/**schema identity**", and the rule it protects is
+    // `ACC-024`: an approval binds to the implementation rather than to a name that can be re-pointed. A
+    // client shown only `mail.send@1` could not tell that the tool behind it had been replaced — which is
+    // the review decision detail exists to support. Asserted **by value** for all four fields, because a
+    // presence check would pass for a rendered tuple a client cannot take apart, and asserted through the
+    // **router** so the projection is exercised rather than the domain value it came from.
+    let (app, token, approval, dir) = fixture("approval-identity").await;
+    let path = format!("/api/v1/approvals/{}", approval.id);
+    let (status, body) = send(&app, "GET", &path, &approval_headers(&token), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+    assert_eq!(parsed["tool_id"], "mail.send@1", "{body}");
+    assert_eq!(parsed["tool_source_kind"], "connector", "{body}");
+    assert_eq!(parsed["tool_source_owner"], "acme.mail", "{body}");
+    assert_eq!(parsed["tool_source_version"], "1.0.0", "{body}");
+    // The fixture's schema fingerprint is `[7; 32]`, so the rendered form is `sha256:` then 64 hex.
+    assert_eq!(
+        parsed["schema_fingerprint"],
+        format!("sha256:{}", "07".repeat(32)),
+        "the schema fingerprint must be the contract's `sha256:<hex>` form: {body}",
+    );
+
+    // **The two dimensions are independent facts, not one rendered tuple.** A test that only asserted the
+    // joined string would pass against an implementation that emitted the source twice, so each is
+    // checked against the value the fixture actually set rather than against the others.
+    assert_ne!(
+        parsed["schema_fingerprint"], parsed["action_fingerprint"],
+        "the schema fingerprint and the action fingerprint are different values",
+    );
+
+    // The contract's audit section requires the decision's **assurance** on the wire, and it is reported
+    // from the record rather than from a transition actor — so a later consumption cannot clear it. A
+    // pending approval has no decision and therefore omits the field rather than reporting `standard`,
+    // which is asserted here because "absent" and "the weakest level" are different answers a client must
+    // be able to tell apart.
+    assert!(
+        parsed.get("decided_assurance").is_none(),
+        "an undecided approval must not report an assurance: {body}",
+    );
+    assert!(
+        parsed.get("decided_by").is_none(),
+        "and it must not report a decider either: {body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_decided_approval_reports_the_assurance_the_decider_proved() {
+    // The other half of the field: once a decision exists the assurance is on the wire, and it is the value
+    // the **server** resolved rather than anything the request stated. The fixture decides through the real
+    // route with a `Standard` credential, so the reported level is the one the resolved context held.
+    let (app, token, approval, dir) = fixture("approval-assurance").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    let body = decide_body("approve", 1, &digest_text(11));
+    let (status, decided_body) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+    assert_eq!(status, StatusCode::OK, "{decided_body}");
+    let parsed: serde_json::Value = serde_json::from_str(&decided_body).expect("the body is JSON");
+    // The decision response **wraps** the view under `approval`, so reading the top level would find
+    // `Null` for every field and pass for the wrong reason. Reading the nested path is the assertion the
+    // fixture above got wrong on its first attempt, which is why the path is spelled out rather than
+    // indexed with a string the test could also get wrong.
+    assert_eq!(
+        parsed["approval"]["decided_assurance"], "standard",
+        "the assurance the decider proved must reach the client: {decided_body}",
+    );
+    assert!(
+        parsed["approval"]["decided_by"].is_string(),
+        "and the decider travels with it: {decided_body}",
+    );
+    assert_eq!(parsed["applied"], true, "{decided_body}");
+
+    // And a **read** after the decision agrees, so the value is durable rather than only in the response
+    // that happened to carry it.
+    let (read_status, read_body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/approvals/{}", approval.id),
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    let read: serde_json::Value = serde_json::from_str(&read_body).expect("the body is JSON");
+    assert_eq!(
+        read["decided_assurance"], parsed["approval"]["decided_assurance"],
+        "the durable record and the decision response must not disagree about the assurance",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_decision_is_applied_and_a_repeat_reports_that_it_was_not() {
+    // The wire half of idempotence: the second response must say `applied: false`, because reporting
+    // a repeat as a fresh decision would claim an event that did not happen.
+    let (app, token, approval, dir) = fixture("approval-decide").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    let body = decide_body("approve", 1, &digest_text(11));
+
+    let (first, first_body) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+    assert_eq!(first, StatusCode::OK, "{first_body}");
+    assert!(first_body.contains(r#""applied":true"#), "{first_body}");
+    assert!(first_body.contains(r#""state":"approved""#), "{first_body}");
+
+    let (second, second_body) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+    assert_eq!(second, StatusCode::OK, "{second_body}");
+    assert!(
+        second_body.contains(r#""applied":false"#),
+        "**a repeat must not claim to have applied a transition**: {second_body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_malformed_fingerprint_is_a_bad_request_rather_than_a_mismatch() {
+    // **The two failures are different and this is the test that keeps them apart.** A fingerprint whose
+    // *shape* is wrong — a different algorithm, a bare digest, uppercase hex, the wrong length — means the
+    // caller sent something that could never have been a fingerprint, so the answer is `request.invalid`.
+    // Reporting `approval.fingerprint_mismatch` instead would tell the user "this is not the action you
+    // approved" and send them to re-approve an action whose fingerprint they had no way to compute
+    // correctly. Asserted for every malformed shape in one test, so a later change that started accepting
+    // one of them fails here.
+    let (app, token, approval, dir) = fixture("approval-malformed-fingerprint").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    let hex = "ab".repeat(32);
+    for bad in [
+        format!("md5:{hex}"),
+        hex.clone(),
+        format!("sha256:{}", hex.to_uppercase()),
+        format!("sha256:{}", &hex[..60]),
+        "sha256:".to_owned(),
+        String::new(),
+    ] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            &path,
+            &approval_headers(&token),
+            &decide_body("approve", 1, &bad),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "**{bad:?} is malformed, not a mismatch**: {body}",
+        );
+        assert!(
+            body.contains("request.invalid"),
+            "the refusal must name the request as invalid rather than the action as different: {body}",
+        );
+        assert!(
+            !body.contains("fingerprint_mismatch"),
+            "a malformed fingerprint must not be reported as a mismatch: {body}",
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_decision_with_a_comment_returns_it_on_the_detail_read() {
+    // **The wire's `comment` said "stored with the decision" while nothing stored it.** The field was
+    // deserialized, bounded by nothing, and dropped — so the contract's "changed ... comment is
+    // `idempotency.conflict`" had no value to compare and an operator asking *why* a decision was taken got
+    // nothing. This asserts the round trip end to end: send a comment, then read the approval's detail and
+    // find it, **through the router**, because the note lives on a transition rather than in a column and a
+    // service-level assertion would not exercise the route that reads the trail.
+    let (app, token, approval, dir) = fixture("approval-comment").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    let body = format!(
+        r#"{{"decision":"approve","expected_version":1,"action_fingerprint":"{}","comment":"checked the recipient"}}"#,
+        digest_text(11),
+    );
+    let (status, decided) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+    assert_eq!(status, StatusCode::OK, "{decided}");
+
+    let (read_status, read_body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/approvals/{}", approval.id),
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    let parsed: serde_json::Value = serde_json::from_str(&read_body).expect("the body is JSON");
+    assert_eq!(
+        parsed["decided_note"], "checked the recipient",
+        "**the comment must be readable from detail**, or it is a value the caller sent and lost: {read_body}",
+    );
+
+    // A decision with **no** comment omits the field rather than reporting an empty note — "nobody wrote a
+    // comment" and "somebody wrote nothing" are different answers, and the second is refused at construction.
+    let (quiet_app, quiet_token, quiet, quiet_dir) = fixture("approval-no-comment").await;
+    let (quiet_status, _) = send(
+        &quiet_app,
+        "POST",
+        &format!("/api/v1/approvals/{}/decide", quiet.id),
+        &approval_headers(&quiet_token),
+        &decide_body("approve", 1, &digest_text(11)),
+    )
+    .await;
+    assert_eq!(quiet_status, StatusCode::OK);
+    let (_, quiet_read) = send(
+        &quiet_app,
+        "GET",
+        &format!("/api/v1/approvals/{}", quiet.id),
+        &approval_headers(&quiet_token),
+        "",
+    )
+    .await;
+    assert!(
+        !quiet_read.contains("decided_note"),
+        "an absent note must be omitted, not rendered as an empty one: {quiet_read}",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&quiet_dir);
+}
+
+#[tokio::test]
+async fn a_decision_body_that_carries_an_unusable_comment_is_a_bad_request() {
+    // The bound is enforced at the boundary, so an over-long or control-bearing comment is a
+    // `request.invalid` rather than a value that reaches the service and stops — the "validated at one
+    // layer, stored at none" shape the field had before.
+    let (app, token, approval, dir) = fixture("approval-bad-comment").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    for bad in [
+        "x".repeat(MAX_DECISION_NOTE_BYTES + 1),
+        "stop\u{7}now".to_owned(),
+        String::new(),
+    ] {
+        let body = format!(
+            r#"{{"decision":"approve","expected_version":1,"action_fingerprint":"{}","comment":"{}"}}"#,
+            digest_text(11),
+            bad.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        let (status, refused) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "**an unusable comment must be refused where it arrives**: {refused}",
+        );
+        assert!(refused.contains("request.invalid"), "{refused}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn every_stable_refusal_reaches_the_shared_envelope_with_a_code_and_a_status() {
+    // One case per family, because the mapping is a match that a copy-paste can put one variant in the
+    // wrong arm — and the assertion is on the **envelope**, not the status alone, because a status
+    // without a parseable body is what a client cannot act on.
+    let (app, token, approval, dir) = fixture("approval-refusals").await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+
+    let cases: Vec<(String, &str, StatusCode)> = vec![
+        // A fingerprint that is not the approved one.
+        (
+            decide_body("approve", 1, &digest_text(12)),
+            "approval.fingerprint_mismatch",
+            StatusCode::CONFLICT,
+        ),
+        // A verb outside the contract's closed set.
+        (
+            decide_body("maybe", 1, &digest_text(11)),
+            "request.invalid",
+            StatusCode::BAD_REQUEST,
+        ),
+        // A version of zero, which the domain refuses as an uninitialised counter.
+        (
+            decide_body("approve", 0, &digest_text(11)),
+            "request.invalid",
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (body, code, expected) in cases {
+        let (status, text) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+        assert_eq!(status, expected, "{code}: {text}");
+        assert!(text.contains(&format!(r#""code":"{code}""#)), "{text}");
+        // The envelope carries a request id, so a client reporting a fault can be correlated with the
+        // daemon's diagnostics — the property the field exists for.
+        assert!(text.contains(r#""request_id":"#), "{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_unknown_approval_and_a_malformed_identifier_answer_the_same_not_found() {
+    // The contract requires an unparseable identifier to be indistinguishable from an unknown one, so
+    // the assertion compares the two codes rather than checking one — a leak would be in the
+    // difference, and a single-sided assertion cannot see a difference.
+    let (app, token, _approval, dir) = fixture("approval-notfound").await;
+    let unknown = ApprovalId::from_uuid(uuid::Uuid::from_u128(4242));
+
+    let (unknown_status, unknown_body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/approvals/{unknown}"),
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    let (malformed_status, malformed_body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals/not-an-identifier",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(malformed_status, StatusCode::NOT_FOUND);
+    assert!(
+        unknown_body.contains(r#""code":"approval.not_found""#),
+        "{unknown_body}"
+    );
+    assert!(
+        malformed_body.contains(r#""code":"approval.not_found""#),
+        "**a malformed identifier must not be distinguished from an unknown one**: {malformed_body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn both_writes_require_an_idempotency_key_before_the_body_is_read() {
+    // The key is required by the contract, and it is checked first — so a request missing both the key
+    // and a usable body is told about the key. The assertion is on the **code**, because both refusals
+    // share `request.invalid` and only the message distinguishes them; asserting the status alone
+    // would pass for a request refused for the wrong reason.
+    let (app, token, approval, dir) = fixture("approval-idem").await;
+    let headers: Vec<(&str, String)> = approval_headers(&token)
+        .into_iter()
+        .filter(|(name, _)| *name != "idempotency-key")
+        .collect();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/approvals/{}/decide", approval.id),
+        &headers,
+        &decide_body("approve", 1, &digest_text(11)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("An idempotency key is required."), "{body}");
+
+    let (cancel_status, cancel_body) = send(
+        &app,
+        "POST",
+        &format!("/api/v1/approvals/{}/cancel", approval.id),
+        &headers,
+        r#"{"expected_version":1}"#,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::BAD_REQUEST, "{cancel_body}");
+    assert!(
+        cancel_body.contains("An idempotency key is required."),
+        "{cancel_body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_store_less_daemon_answers_not_ready_rather_than_missing() {
+    // A client must be able to tell "this endpoint exists but the daemon cannot serve it" from "there
+    // is no such endpoint", so the refusal is a named code rather than the unknown-route answer.
+    let dir = temp_dir("approval-no-storage");
+    let destination = ClientCredentialPath::in_config_dir(&dir);
+    let (registered, credential) =
+        enroll_owner_client("owner", "2026-09-21T00:00:00Z", &destination).expect("enrollment");
+    let mut clients = ClientRegistry::new();
+    clients.register(registered);
+    let state = Arc::new(ApiState::new(
+        Arc::new(clients),
+        Arc::new(crate::http::Readiness::new()),
+        "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+    ));
+    let app = router(state);
+    let token = credential.to_presentation_text();
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains(r#""code":"service.not_ready""#), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn every_approval_route_requires_authentication() {
+    // Applied by the same helper as every other API route, so this asserts the wiring rather than the
+    // middleware — a route added with `get(...)` instead of `authenticated(get(...))` would be
+    // reachable without a credential, and only a test that sent no credential would notice.
+    let (app, _token, approval, dir) = fixture("approval-auth").await;
+    let cases = [
+        ("GET", "/api/v1/approvals".to_owned(), String::new()),
+        (
+            "GET",
+            format!("/api/v1/approvals/{}", approval.id),
+            String::new(),
+        ),
+        (
+            "POST",
+            format!("/api/v1/approvals/{}/decide", approval.id),
+            decide_body("approve", 1, &digest_text(11)),
+        ),
+        (
+            "POST",
+            format!("/api/v1/approvals/{}/cancel", approval.id),
+            r#"{"expected_version":1}"#.to_owned(),
+        ),
+    ];
+    for (method, path, body) in cases {
+        let (status, text) = send(
+            &app,
+            method,
+            &path,
+            &[
+                ("jarvis-api-version", "1".to_owned()),
+                ("content-type", "application/json".to_owned()),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_listing_query_parser_accepts_only_a_bounded_limit() {
+    // The parser is a pure function so this needs no router: an unknown filter must be **refused**
+    // rather than ignored, because ignoring one would return a superset of what a caller asked for —
+    // on an approval listing, prompts the client believed it had excluded.
+    use super::parse_limit;
+    use axum::http::Uri;
+
+    let uri = |query: &str| -> Uri { format!("/api/v1/approvals{query}").parse().expect("a uri") };
+
+    assert_eq!(parse_limit(&uri("")).expect("no query"), None);
+    assert_eq!(parse_limit(&uri("?limit=25")).expect("a limit"), Some(25));
+    assert_eq!(
+        parse_limit(&uri("?limit=0")).expect("zero is parseable"),
+        Some(0)
+    );
+    // An unknown filter is a refusal, not a silently ignored parameter.
+    assert!(parse_limit(&uri("?state=pending")).is_err());
+    assert!(parse_limit(&uri("?limit=25&state=pending")).is_err());
+    // A non-numeric limit is a refusal too, rather than a default.
+    assert!(parse_limit(&uri("?limit=many")).is_err());
+}
+
+#[test]
+fn the_reported_page_bound_is_the_one_the_store_enforces() {
+    // `jarvis_protocol::approval::MAX_APPROVAL_PAGE` is what the listing **reports** as `max_page`,
+    // and `jarvis_application::repository::approval::MAX_PENDING_PAGE` is what the store **clamps** a
+    // requested limit to. They were two literals holding the same number with nothing comparing them.
+    //
+    // The comparison cannot live in either owning crate: this workspace's documented flow is
+    // `Protocol --> Domain`, so `jarvis-protocol` may not depend on `jarvis-application`, and
+    // application may not depend on the wire vocabulary. `jarvis-infrastructure` is the one crate
+    // that depends on both, which is the same reason `the_objective_bound_is_the_one_the_wire_bound_enforces`
+    // lives here.
+    //
+    // The failure it prevents is quiet and asymmetric: raising the protocol's bound alone would make
+    // the daemon advertise a page size larger than the one its own query applies, so a client that
+    // paged by `max_page` would silently receive fewer rows than the response claimed were available
+    // and could not tell a full page from a truncated one.
+    assert_eq!(
+        jarvis_protocol::approval::MAX_APPROVAL_PAGE,
+        jarvis_application::repository::approval::MAX_PENDING_PAGE,
+        "the reported page bound and the enforced page bound must be the same limit",
+    );
+}

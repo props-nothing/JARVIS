@@ -4,10 +4,12 @@
 //!
 //! > Implement idempotent tool-call ledger and execution state machine.
 //!
-//! The ledger records one row per **attempt** at a tool call, keyed so that a duplicate submission
-//! finds the existing row rather than causing a second effect. The state machine is
-//! [`ToolCallState`], and its shape follows one rule from the tool contract that decides everything
-//! else:
+//! The ledger records **one row per reservation key** at a tool call, keyed so that a duplicate
+//! submission finds the existing row rather than causing a second effect. The row's `attempt` field
+//! records how many times that call was tried; it is **not** a row discriminator, because the unique
+//! index does not include it and a second attempt at one key is refused rather than stored. The state
+//! machine is [`ToolCallState`], and its shape follows one rule from the tool contract that decides
+//! everything else:
 //!
 //! > `EXECUTING` is recorded before an external effect. An unknown outcome uses `RECONCILING`, not
 //! > automatic retry.
@@ -996,12 +998,12 @@ impl ToolCallLedger {
             .collect()
     }
 
-    /// Returns the attempt count recorded for a call's key family, at most 1.
+    /// Returns the attempt count recorded for a call's reservation key.
     ///
-    /// A helper rather than a scan because the ledger keys on the whole reservation key, so *all*
-    /// attempts of one logical call share a key — which is deliberate: the key identifies the
-    /// invocation, and the attempt number distinguishes retries of it. Exposed so an executor can
-    /// report which attempt it is on without walking the map.
+    /// A lookup rather than a scan because the ledger is keyed on the whole reservation key — the key
+    /// identifies the invocation, and the row's attempt number records how many times it was tried. It
+    /// is **not** a count of rows: only one row can exist per key (the unique index enforces it), so
+    /// `Some(n)` means "the single row for this key is on attempt `n`", and `None` means no such call.
     #[must_use]
     pub fn attempt_for(&self, key: &ReservationKey) -> Option<u32> {
         self.by_key.get(key).map(|entry| entry.attempt)

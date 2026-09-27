@@ -1792,3 +1792,11 @@ mod policy_store;
 
 #[path = "repositories/exception.rs"]
 mod exception_store;
+
+/// Re-exported so a sibling adapter stores the same assurance vocabulary.
+///
+/// **The stored spelling of an assurance has one definition**, and the approval adapter writes the same
+/// column vocabulary the exception store does. Two spellings would let an `elevated` decision be stored as
+/// a string the exception reader does not recognize — which is the "two implementations of one value" defect
+/// this project keeps finding, and here it would silently mis-read a step-up decision as unrecognised.
+pub(crate) use exception_store::{assurance_from_stored, assurance_stored};

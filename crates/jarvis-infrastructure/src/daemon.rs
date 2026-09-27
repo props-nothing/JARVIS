@@ -213,7 +213,23 @@ pub struct RunningDaemon {
     policies: Arc<jarvis_application::policy_service::PolicyService>,
     /// The model candidates a probe may consider.
     inventory: Arc<crate::http::ProviderInventory>,
+    /// The approval surface's use cases.
+    ///
+    /// Built over the same pool as every other store, so an approval a run created and an approval a
+    /// client decides are the same row. The approval repository is its own struct rather than part of
+    /// `SqliteRepositories`, like the tool-call ledger, and it is composed here because the composition
+    /// root is the layer unit tests are structurally blind to: a daemon that never attached this service
+    /// would answer `service.not_ready` to every real client while every handler test passed.
+    approvals: Arc<jarvis_application::approval_service::ApprovalService>,
     recovery: RecoverySummary,
+    /// What the tool-call recovery pass settled.
+    ///
+    /// Kept beside the run summary because the two are the same kind of fact about the previous
+    /// shutdown — work left mid-flight — and the tool-call half is the one whose absence is silent: a
+    /// stranded `EXECUTING` call looks like a run in progress, and a stranded pre-dispatch reservation
+    /// looks like *any other busy key*. Reporting it or not is the difference between an operator
+    /// learning from a crash and having to infer it from calls that fail to start.
+    tool_recovery: jarvis_application::tool_recovery::ToolRecoveryReport,
     guard: InstanceGuard,
 }
 
@@ -261,6 +277,18 @@ impl RunningDaemon {
         self.recovery
     }
 
+    /// Returns what the startup tool-call recovery pass settled.
+    ///
+    /// Returned to the caller rather than logged here, for the same reason [`Self::recovery`]
+    /// records: this crate has no logging dependency, and startup order, logging, and exit decisions
+    /// all live in the composition root. A non-zero `changed` count means the previous shutdown left
+    /// tool calls mid-flight — each reconciled call is an effect whose existence is unknown, and each
+    /// cancelled one was a reservation whose holder had died and which no retry could have taken.
+    #[must_use]
+    pub fn tool_recovery(&self) -> &jarvis_application::tool_recovery::ToolRecoveryReport {
+        &self.tool_recovery
+    }
+
     /// Returns the listener for a serve loop.
     #[must_use]
     pub fn listener(&self) -> &TcpListener {
@@ -289,7 +317,8 @@ impl RunningDaemon {
                 address,
             )
             .with_runs(Arc::clone(&self.runs))
-            .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory)),
+            .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory))
+            .with_approvals(Arc::clone(&self.approvals)),
         ))
     }
 
@@ -592,6 +621,12 @@ pub async fn start(
             as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
     ));
 
+    // The approval surface over the same pool, so a decision a client takes and the record a run's
+    // `Ask` decision created are one row. Extracted rather than inlined because `start` is already at
+    // clippy's line budget, and the extraction is the improvement the limit is pointing at: the
+    // approval composition is one concern and reads better named.
+    let approvals = approval_service_over(&database);
+
     Ok(RunningDaemon {
         listener,
         discovery_path: config.discovery_path(),
@@ -601,9 +636,31 @@ pub async fn start(
         runs,
         policies,
         inventory,
+        approvals,
         recovery,
+        tool_recovery: tool_report,
         guard,
     })
+}
+
+/// Builds the approval surface's service over the daemon's own pool.
+///
+/// **Composed here rather than inside `SqliteRepositories`**, because the approval store is its own
+/// struct — the same shape the tool-call ledger takes — and because the composition root is the layer
+/// unit tests are structurally blind to: a daemon that never attached this service would answer
+/// `service.not_ready` to every real client while every handler test, which builds its own `ApiState`,
+/// still passed. That is exactly the defect the policy surface had before `BRN-014`, and the reason the
+/// end-to-end approval journey exists.
+fn approval_service_over(
+    database: &crate::storage::connection::Database,
+) -> Arc<jarvis_application::approval_service::ApprovalService> {
+    Arc::new(jarvis_application::approval_service::ApprovalService::new(
+        Arc::new(
+            crate::storage::approval_repository::SqliteApprovalRepository::new(
+                database.pool().clone(),
+            ),
+        ) as Arc<dyn jarvis_application::repository::approval::ApprovalRepository>,
+    ))
 }
 
 /// Builds the run service's ports over a migrated pool.

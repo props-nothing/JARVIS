@@ -1,12 +1,16 @@
 //! Tests for the tool-call recovery pass.
 //!
-//! Four properties are worth stating up front, because all four are silent failures:
+//! Five properties are worth stating up front, because all five are silent failures:
 //!
 //! - **A dispatched call must end up `RECONCILING`, never retried.** It is the conclusion `ACC-025`
 //!   depends on, and the wrong answer is a duplicated effect rather than a confusing message.
-//! - **A row already `RECONCILING` must not be written.** `RECONCILING -> RECONCILING` is not an edge,
-//!   so a pass that wrote it would report a failure for a row that is already correct — and a pass that
-//!   *skipped* it would be right for the wrong reason, which the `needs_write` mutation distinguishes.
+//! - **A call that never dispatched must be settled `CANCELLED`, not left holding its reservation.** Its
+//!   holder is gone, so leaving it non-terminal makes every later retry of that key answer `InFlight`.
+//!   This is asserted across every pre-dispatch state, because the pass's first version could reach none
+//!   of them and a test over one state would not have shown that.
+//! - **A row already `RECONCILING` must not be written.** The conversion scan excludes it — the pass's
+//!   own output — so this is asserted as the scan's reach rather than as a branch, since a branch nothing
+//!   can reach is not coverage.
 //! - **A failed write must not stop the pass**, or one bad row strands every later one.
 //! - **A stalled page must not loop**, or startup hangs. The paging decision is asserted as a pure
 //!   function so the hang is unrepresentable in a test rather than an observed timeout.
@@ -83,11 +87,12 @@ impl LedgerDouble {
         self.rows.lock().expect("the lock is not poisoned").len()
     }
 
-    /// The two scans, which differ only in whether reconciling rows are included.
+    /// The two scans, which differ only in which states they select.
     ///
-    /// `include_reconciling` is the whole difference the adapter's two predicates encode, so the double
-    /// takes it as a parameter rather than duplicating the body — a copy would be a second place the
-    /// distinction could be got wrong.
+    /// `awaiting_conversion` offers every non-terminal state **except** `reconciling` — the pass's own
+    /// output — so the double mirrors the adapter's `state IN (...)` list exactly. Getting this narrower
+    /// is the defect the real adapter had, so the double must not reproduce it: a double that selected
+    /// `executing` alone would let a pass that reached only dispatched calls pass every test.
     fn scan(&self, limit: u32, include_reconciling: bool) -> RepositoryFuture<'_, EffectingScan> {
         Box::pin(async move {
             let rows = self.rows.lock().map_err(|_| RepositoryError::Query)?;
@@ -95,8 +100,8 @@ impl LedgerDouble {
                 .values()
                 .filter(|row| {
                     let state = row.entry.state();
-                    let wanted = state == ToolCallState::Executing
-                        || (include_reconciling && state == ToolCallState::Reconciling);
+                    let wanted = !state.is_terminal()
+                        && (include_reconciling || state != ToolCallState::Reconciling);
                     wanted && row.entry.outcome().is_none()
                 })
                 .map(|row| row.entry.clone())
@@ -230,24 +235,28 @@ fn row(record: u128, suffix: &str, at: UtcTimestamp) -> LedgerEntry {
 
 /// Drives a row to `to` in memory, so the fixture reaches the state under test.
 ///
-/// The paths are the domain's own legal ones, and the first version got `RESERVED` wrong: it is reached
-/// through `VALIDATED`, not from the initial state — `REQUESTED -> RESERVED` is not an edge, so a
-/// fixture that assumed it failed with a state conflict rather than exercising the pass.
+/// **The path is derived by breadth-first search over the domain's own table, not written out here.**
+/// The first version hardcoded the sequence and went straight from `REQUESTED` to `EXECUTING` — which
+/// is not an edge — so the fixture failed for a reason about the helper rather than about the pass. A
+/// second version added `WAITING_APPROVAL` and `APPROVED` by hand and immediately got `REQUESTED ->
+/// APPROVED` wrong, which is the same defect a second time. Deriving the path means a helper cannot
+/// disagree with the machine it exercises, and the two extra states are reached for free.
 fn drive_to(entry: &mut LedgerEntry, to: ToolCallState) {
-    let path: Vec<ToolCallState> = match to {
-        ToolCallState::Validated => vec![ToolCallState::Validated],
-        ToolCallState::Reserved => vec![ToolCallState::Validated, ToolCallState::Reserved],
-        ToolCallState::Executing => vec![ToolCallState::Validated, ToolCallState::Reserved, to],
-        ToolCallState::Reconciling
-        | ToolCallState::Succeeded
-        | ToolCallState::Failed
-        | ToolCallState::Cancelled => vec![
-            ToolCallState::Validated,
-            ToolCallState::Reserved,
-            ToolCallState::Executing,
-            to,
-        ],
-        other => vec![other],
+    let mut frontier: Vec<(ToolCallState, Vec<ToolCallState>)> = vec![(entry.state(), Vec::new())];
+    let mut seen: Vec<ToolCallState> = vec![entry.state()];
+    let path = loop {
+        let (from, path) = frontier.remove(0);
+        if from == to {
+            break path;
+        }
+        for next in ToolCallState::ALL.iter().copied() {
+            if from.can_transition_to(next) && !seen.contains(&next) {
+                seen.push(next);
+                let mut extended = path.clone();
+                extended.push(next);
+                frontier.push((next, extended));
+            }
+        }
     };
     for step in path {
         let version = entry.version();
@@ -387,9 +396,10 @@ async fn a_call_that_already_reconciling_is_not_offered_to_the_pass_at_all() {
     // **The case the illegal self-transition hid, and the fix changed *how* it is avoided.** The
     // classification still answers `Reconcile` for a row found in `RECONCILING` — correctly, because such
     // a row may have effected — and `RECONCILING -> RECONCILING` is still not an edge. But the pass no
-    // longer meets that case, because the conversion scan selects `EXECUTING` alone: a reconciling row is
-    // *outstanding work*, not *unconverted work*, and conflating the two is what made the first version
-    // page over its own output and hang.
+    // longer meets that case, because the conversion scan excludes `RECONCILING` (the pass's own output)
+    // and selects every other non-terminal state: a reconciling row is *outstanding work*, not
+    // *unconverted work*, and conflating the two is what made the first version page over its own output
+    // and hang.
     //
     // So the assertion is now on the **scan** rather than on `needs_write` alone: the row must not be
     // offered, no write may happen, and it must still be visible through the outstanding-work list that a
@@ -442,27 +452,94 @@ async fn a_call_that_never_dispatched_is_cancelled_rather_than_reconciled() {
     // The other half: nothing reached the provider, so nothing about the row is worth preserving as
     // in-flight — and leaving it non-terminal would make a later reservation wait on a process that is
     // gone. Cancelled rather than failed, because no work was lost.
+    //
+    // **This test used to assert the opposite, and its own name is what gave it away.** It drove a row to
+    // `RESERVED` and then asserted `cancelled == 0`, explaining that the effecting scan omits
+    // undispatched rows. That was true of the *reporting* scan and false of the *conversion* scan the pass
+    // actually pages — which selected `executing` alone, so a stranded pre-dispatch reservation was never
+    // settled at all. The assertion matched the bug. A row in `REQUESTED`..`RESERVED` is exactly what the
+    // pass must resolve, because the dead process still holds the reservation.
     let ledger = LedgerDouble::new();
-    let undispatched = row(12, "undispatched", now());
-    // Driven to `RESERVED`, which is non-terminal, undispatched, and *not* found by the effecting scan.
-    // So the scan is widened here deliberately: this test is about the classification's other arm, and
-    // a row the scan does not offer cannot exercise it. The scan's own reach is asserted separately.
-    let mut reserved = undispatched.clone();
+    let mut reserved = row(12, "undispatched", now());
     drive_to(&mut reserved, ToolCallState::Reserved);
     ledger.insert(reserved.clone());
     let port: Arc<dyn ToolCallRepository> = Arc::new(ledger.clone());
 
-    // `RESERVED` is not offered by the effecting scan, which is the point of that scan — so the pass
-    // sees nothing and this asserts the *scan's* exclusion rather than the classification's second arm.
     let report = reconcile_tool_calls(&port, later())
         .await
         .expect("the pass runs");
+
     assert_eq!(
-        report.cancelled, 0,
-        "**an undispatched call is not part of the effecting scan at all**: it cannot have effected, \
-         so the reconciliation work list correctly omits it",
+        report.cancelled, 1,
+        "**a stranded pre-dispatch reservation must be settled**: its holder is gone, so leaving it \
+         non-terminal makes every later retry of this key answer `InFlight` — waiting on a dead process",
     );
-    assert_eq!(ledger.row(reserved.id).state(), ToolCallState::Reserved);
+    assert_eq!(report.reconciling, 0);
+    let stored = ledger.row(reserved.id);
+    assert_eq!(stored.state(), ToolCallState::Cancelled);
+    assert!(
+        !stored.was_dispatched(),
+        "nothing reached the provider, so no dispatch may be recorded",
+    );
+    // The terminal row carries an outcome. `apply` writes `None` for a terminal transition handed `None`,
+    // and a terminal row with `NULL` outcome is refused as corruption by the reader — so a pass that wrote
+    // one would produce a row the next start cannot read.
+    assert_eq!(
+        stored.outcome(),
+        Some(ToolErrorClass::Cancelled),
+        "a terminal row must record why it ended, or the next start refuses it as corrupt",
+    );
+}
+
+#[tokio::test]
+async fn every_state_the_classification_settles_is_offered_to_the_pass() {
+    // **The reachability property, asserted over the domain's own state set rather than a list here.**
+    // `classify_interrupted` answers for six non-terminal states; the conversion scan must offer exactly
+    // those whose settling would shrink the set it pages. The one exclusion is `reconciling` — the pass's
+    // own output — and it must be the *only* one, because every other exclusion is a state the
+    // classification can name and the pass can never reach.
+    use jarvis_domain::tool::ledger::classify_interrupted;
+
+    let ledger = LedgerDouble::new();
+    let mut offered = 0_u32;
+    for state in ToolCallState::ALL.iter().copied() {
+        let Some(action) = classify_interrupted(state) else {
+            continue;
+        };
+        // A row already in its target state is the pass's own output and is deliberately not offered;
+        // every other classified state must be, or the classification has nowhere to be applied.
+        if action.needs_write() {
+            offered += 1;
+        }
+        let mut row = row(7000 + u128::from(state as u8), "reach", now());
+        if state != ToolCallState::Requested {
+            drive_to(&mut row, state);
+        }
+        ledger.insert(row);
+    }
+    let port: Arc<dyn ToolCallRepository> = Arc::new(ledger.clone());
+    let report = reconcile_tool_calls(&port, later())
+        .await
+        .expect("the pass runs");
+
+    // Five pre-dispatch states, each cancelled; `executing` and `reconciling` are the dispatched ones,
+    // but only `executing` needs a write (a `reconciling` row is already in its target state and is not
+    // offered). Four state values are terminal and classify to `None`.
+    assert_eq!(
+        report.cancelled, 5,
+        "every pre-dispatch state must be reachable and settled: {report:?}",
+    );
+    assert_eq!(
+        report.reconciling, 1,
+        "the `executing` row must be the only one converted: {report:?}",
+    );
+    assert_eq!(
+        offered, 6,
+        "six non-terminal states need a write; a seventh would mean a state was added without a scan \
+         entry, and a fifth would mean one was lost",
+    );
+    assert!(report.is_complete(), "{report:?}");
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
 }
 
 #[tokio::test]
@@ -660,10 +737,7 @@ async fn a_store_holding_more_than_one_page_of_stranded_calls_drains_rather_than
          refuse",
     );
     assert!(report.is_complete(), "{report:?}");
-    // The converted rows remain outstanding work, which is the honest description: their outcomes are
-    // unknown and only a provider read can settle them.
-    assert_eq!(
-        report.awaiting_reconciliation, 0,
-        "they were converted, not already settled"
-    );
+    // Every row was settled, so nothing waits on a provider read: the converted rows are the ones whose
+    // outcomes are unknown, and they are counted as reconciled rather than as outstanding.
+    assert_eq!(report.reconciling, u64::from(total), "{report:?}");
 }

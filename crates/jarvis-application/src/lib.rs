@@ -4,6 +4,7 @@
 // a resolving one until something checks, so unresolved links are denied rather than warned.
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod approval_service;
 pub mod cancellation;
 pub mod context_assembly;
 pub mod live_events;

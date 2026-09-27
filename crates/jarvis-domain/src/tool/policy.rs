@@ -212,12 +212,16 @@ pub struct ApprovalRecord {
     pub workspace: crate::ids::WorkspaceId,
     /// A digest over the exact action approved.
     ///
-    /// Compared against [`PolicyRequest::action_digest`] rather than interpreted: computing the
-    /// fingerprint is `TLS-005`'s concern and needs a canonicalization this module must not invent.
-    /// What matters here is that a mismatch **fails**, because an approval for one action must not
-    /// authorize another — the contract's "approving 'send this email' does not approve a rewritten
-    /// recipient, subject, body, attachment, or account".
-    pub action_digest: String,
+    /// Compared against [`PolicyRequest::action_digest`] rather than interpreted: **the computation is
+    /// `jarvis_infrastructure`'s**, because hashing is a concrete implementation this layer must not depend
+    /// on, and the canonicalization is
+    /// [`crate::tool::canonical`](super::canonical)'s. The type is the domain's, so a malformed or
+    /// differently-typed digest is refused where it is accepted rather than compared as text — which is
+    /// what makes "a mismatch **fails**" a property of the value instead of a string comparison nobody
+    /// validated. The contract's rule is that an approval for one action must not authorize another:
+    /// "approving 'send this email' does not approve a rewritten recipient, subject, body, attachment, or
+    /// account".
+    pub action_digest: super::canonical::ActionDigest,
     /// When the approval stops being valid.
     pub expires_at: UtcTimestamp,
     /// Whether it has already been spent.
@@ -317,7 +321,12 @@ pub struct PolicyRequest<'a> {
     /// The classification of the arguments.
     pub sensitivity: Sensitivity,
     /// A digest of the exact action, matching an approval's.
-    pub action_digest: &'a str,
+    ///
+    /// **By value rather than by reference, and [`ActionDigest`](super::canonical::ActionDigest) is `Copy`**
+    /// — a 32-byte value needs no borrow, and owning it means a caller that computed one can pass it
+    /// through without a lifetime that ties the request to the computation. The typed value is what stops
+    /// this from being a string comparison nobody validated.
+    pub action_digest: super::canonical::ActionDigest,
     /// Whether the tool is currently enabled.
     pub tool_enabled: bool,
     /// The run's deadline, if it has one.

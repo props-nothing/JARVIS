@@ -43,6 +43,14 @@ use crate::error::DomainError;
 pub struct UtcTimestamp(Timestamp);
 
 impl UtcTimestamp {
+    /// The Unix epoch, used where an instant is required but none was available.
+    ///
+    /// **A fixed past instant rather than a clock read**, mirroring [`IsoDate::UNIX_EPOCH`]. A caller
+    /// that deliberately had no clock — a synchronous context, or a handler whose clock read failed —
+    /// must not get "now" by accident, and the fail-closed direction differs by use: an expiry check
+    /// against this instant treats every real deadline as passed, which refuses rather than honours.
+    pub const UNIX_EPOCH: Self = Self(Timestamp::UNIX_EPOCH);
+
     /// Wraps an instant that is already normalized to UTC.
     #[must_use]
     pub const fn from_timestamp(timestamp: Timestamp) -> Self {

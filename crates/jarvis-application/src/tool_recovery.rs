@@ -18,9 +18,17 @@
 //!   drained or when a page changed nothing.
 //! - **One row's failed write does not stop the pass**, because stopping would leave every later row
 //!   unsettled. The failure is counted, so a caller can report it.
-//! - **A row is only moved where a move is legal.** `RECONCILING -> RECONCILING` is not an edge, and a
-//!   row found already reconciling needs no write — so `InterruptedCallAction::needs_write` decides,
-//!   rather than this module comparing states for itself.
+//! - **Every non-terminal state is offered except `reconciling`.** The classification answers for six
+//!   states — `Reconcile` for `executing`/`reconciling`, `SafeToRetry` for the five pre-dispatch ones —
+//!   and a scan narrower than that leaves a classification with nowhere to be applied. That is not
+//!   hypothetical: this pass's first version selected `executing` alone, so a stranded **pre-dispatch**
+//!   reservation was never settled and its dead holder blocked every retry of that key for ever — the
+//!   very harm this pass exists to remove, applied to the states it could not see. `reconciling` is the
+//!   one exclusion, because the pass's own output for an `executing` row is a `reconciling` row; every
+//!   other state strictly shrinks (`cancelled` is terminal, and `reconciling` is excluded), so the set
+//!   the loop pages is strictly smaller after each conversion and the paging terminates.
+//! - **A terminal target carries an outcome**, because a terminal row with a `NULL` outcome is refused
+//!   as corruption by the reader — a pass that wrote one would produce a row the next start cannot read.
 //!
 //! ## What this pass does *not* do, and it is the important half
 //!
@@ -42,8 +50,9 @@ use std::sync::Arc;
 
 use jarvis_domain::ids::ToolCallRecordId;
 use jarvis_domain::time::UtcTimestamp;
+use jarvis_domain::tool::error_class::ToolErrorClass;
 use jarvis_domain::tool::ledger::{
-    InterruptedCallAction, ToolCallState, ToolCallTransition, classify_interrupted,
+    InterruptedCallAction, ToolCallTransition, classify_interrupted,
 };
 
 use crate::repository::RepositoryError;
@@ -74,17 +83,13 @@ pub struct ToolRecoveryReport {
     /// The count that matters most, because each one is an effect whose existence is unknown. Reported
     /// separately from `cancelled` rather than as one "recovered" total: the two need different
     /// operator attention, and a reader given one number would have to guess which they were looking at.
-    pub reconciling: u64,
-    /// Calls that were **already reconciling** when the pass read them, so no write was needed.
     ///
-    /// **A separate counter, and the first version did not have one.** It folded this into
-    /// `reconciling`, which made the report say a row had been *moved* when it had not — and it made a
-    /// second pass look like it had changed something, so "is recovery idempotent" was unassertable.
-    /// The distinction is real and not bookkeeping: a reconciling row legitimately stays on the scan for
-    /// as long as its outcome is unknown, because it *is* the work item awaiting a provider read. So a
-    /// settled pass reports `reconciling == 0` with this field non-zero, which is the honest description
-    /// of "there is work here and it is already marked as work".
-    pub awaiting_reconciliation: u64,
+    /// A row found **already** `RECONCILING` is not counted here or anywhere: the conversion scan
+    /// selects every non-terminal state *except* `reconciling`, so such a row is never offered to the
+    /// pass. It is not lost — `possibly_effecting` returns it as outstanding work awaiting a provider
+    /// read — but a pass cannot convert work whose conversion has already happened, and counting it as
+    /// this pass's would make a second pass look like it had changed something.
+    pub reconciling: u64,
     /// Calls that had never been dispatched and were ended as cancelled.
     pub cancelled: u64,
     /// Calls whose write failed, and the code each failure reported.
@@ -98,24 +103,27 @@ pub struct ToolRecoveryReport {
 }
 
 impl ToolRecoveryReport {
-    /// Returns the number of calls this pass changed.
+    /// Returns the number of calls this pass settled.
     ///
-    /// **Writes only.** A row found already reconciling is not counted, which is what makes
-    /// `changed() == 0` on a second pass mean "this pass wrote nothing" rather than "this pass wrote
-    /// nothing new" — a difference that decides whether a caller may treat the store as settled.
+    /// Each is a row the pass moved to a terminal or reconciled state — `reconciling` for a dispatched
+    /// call, `cancelled` for one that never dispatched. It is the only count of what the pass did:
+    /// a row already in its target state is not offered to the pass at all, so there is no third
+    /// "already correct" category to report.
     #[must_use]
     pub const fn changed(&self) -> u64 {
         self.reconciling + self.cancelled
     }
 
-    /// Returns the total number of rows this pass examined, changed or not.
+    /// Returns the total number of rows this pass settled.
     ///
-    /// `changed` answers "did this pass write", this answers "how many rows are still outstanding" — and
-    /// a caller reporting recovery progress needs the second, because a reconciling row is durable work
-    /// that will be found again on every restart until a provider read resolves it.
+    /// The same value as [`Self::changed`], and kept as a named method because a caller asking "how many
+    /// rows did recovery look at" is a different question from "how many did it write" even where the
+    /// answer coincides. The two were once different — a reconciling row was counted here and not in
+    /// `changed` — but the conversion scan excludes reconciling rows, so that category is unproducible
+    /// and the second counter was removed rather than left as a field nothing could ever set.
     #[must_use]
     pub const fn examined(&self) -> u64 {
-        self.changed() + self.awaiting_reconciliation
+        self.changed()
     }
 
     /// Returns whether the pass settled everything it saw **and saw everything**.
@@ -155,38 +163,34 @@ pub async fn reconcile_tool_calls(
     let mut report = ToolRecoveryReport::default();
 
     loop {
-        // **The conversion input, not the outstanding-work list.** The work list contains this pass's own
-        // output — converting an `EXECUTING` row produces a `RECONCILING` row that the work list still
-        // returns — so paging it would re-read rows already converted and could never reach the ones
-        // beyond the first page. `awaiting_conversion` selects `EXECUTING` alone, so the set strictly
-        // shrinks as rows are converted and the paging terminates.
+        // **The conversion input, not the outstanding-work list.** The work list (`possibly_effecting`)
+        // returns `executing` **and** `reconciling` rows — the latter is this pass's own output for an
+        // `executing` row — so paging it would re-read rows already converted and could never reach the
+        // ones beyond the first page. `awaiting_conversion` returns every non-terminal state **except**
+        // `reconciling`, so the set strictly shrinks as rows are settled and the paging terminates.
         let scan = calls
             .awaiting_conversion(MAX_EFFECTING_SCAN)
             .await
             .map_err(ToolRecoveryError::Read)?;
         let bounded = scan.bounded;
-        // **The drain signal is rows *converted*, not rows examined, and the first version used the
-        // wrong one — which a mutation turned into a hung startup path.** This pass pages over a set
-        // that **contains its own output**: the scan selects undispatched-outcome rows in `EXECUTING` or
-        // `RECONCILING`, and converting an `EXECUTING` row produces a `RECONCILING` row that the very
-        // same scan still returns — legitimately, because a reconciling row is durable work awaiting a
-        // provider read. So a converted row comes back on a later page, and terminating on "did this
-        // page change anything" made a store with more than one page of stranded calls look **stalled
-        // for ever**, which the daemon turns into a refusal to start.
-        //
-        // The two facts a page can honestly report are therefore counted separately: how many rows it
-        // *converted*, and how many writes *failed*. A page that converted nothing and failed nothing
-        // held only rows already in the target state, so there is no conversion work left and the store
-        // is drained **of this pass's work** — which is a different thing from having no unsettled calls,
-        // and the report keeps them apart.
-        let moved_before = report.reconciling;
+        // **The drain signal is rows *settled*, not rows examined, and the first version used the wrong
+        // one — which a mutation turned into a hung startup path.** A page's honest facts are how many
+        // rows it *settled* and how many writes *failed*. A page that settled nothing and failed nothing
+        // held only rows already in their target state — which cannot happen for a scan that excludes
+        // `reconciling`, but the branch is kept because `outcome_of` is the decision and a scan widened
+        // again must not silently hang. A page whose every write failed **is** the genuine stall: the rows
+        // are exactly as the scan finds them, so reading again would repeat the refusals.
+        let settled_before = report.changed();
         let failed_before = report.failures.len();
 
         for entry in scan.records {
             apply(calls, &entry, at, &mut report).await;
         }
 
-        let moved = report.reconciling - moved_before;
+        // Both settled outcomes count as progress: a cancelled call and a reconciling one both leave the
+        // set the scan returns. Counting only `reconciling` would make a page of pre-dispatch rows look
+        // like a stall and report the store unfinished for ever.
+        let moved = report.changed() - settled_before;
         let failed = report.failures.len() - failed_before;
 
         match outcome_of(bounded, moved, failed) {
@@ -220,26 +224,19 @@ async fn apply(
     };
 
     match settle(calls, entry, action, at).await {
-        Ok(()) => {
-            match action {
-                InterruptedCallAction::Reconcile { was_in } => {
-                    // **Two counters for one action, because a row moved and a row already there are
-                    // different facts.** A reconciling row stays on the scan until its outcome is known,
-                    // so counting it as "moved" would make every pass report work it did not do — and
-                    // would make a second pass look like a change, which is what an idempotency test has
-                    // to be able to see.
-                    if was_in == ToolCallState::Reconciling {
-                        report.awaiting_reconciliation =
-                            report.awaiting_reconciliation.saturating_add(1);
-                    } else {
-                        report.reconciling = report.reconciling.saturating_add(1);
-                    }
-                }
-                InterruptedCallAction::SafeToRetry { .. } => {
-                    report.cancelled = report.cancelled.saturating_add(1);
-                }
+        Ok(()) => match action {
+            // A dispatched call whose outcome is unknown: moved to `RECONCILING`, where the next
+            // reservation is told to reconcile rather than to wait.
+            InterruptedCallAction::Reconcile { .. } => {
+                report.reconciling = report.reconciling.saturating_add(1);
             }
-        }
+            // A call that never reached the provider: ended as cancelled, because nothing about it is
+            // worth preserving as in-flight — and leaving it reserved is what makes a later retry wait
+            // on a process that is gone.
+            InterruptedCallAction::SafeToRetry { .. } => {
+                report.cancelled = report.cancelled.saturating_add(1);
+            }
+        },
         Err(error) => {
             // The row stays where it is, so the next pass — or the next restart — sees it again.
             report.failures.push((entry.id, error));
@@ -250,9 +247,16 @@ async fn apply(
 /// Moves one call to the state the classification requires.
 ///
 /// **The move is made through the domain's `apply`, not by writing a state.** That is what makes the
-/// optimistically-checked version travel and what refuses an edge the table does not contain — and it
-/// is why `needs_write` exists: a row already in `RECONCILING` has nothing to transition to, so
-/// `apply` would refuse it and this pass would record a failure for a row that is already correct.
+/// optimistically-checked version travel and what refuses an edge the table does not contain.
+///
+/// **The `needs_write` guard is defence-in-depth here rather than a live branch.** The conversion scan
+/// excludes `reconciling`, so the pass can only be handed an action whose target differs from the row's
+/// state, and `classify_interrupted` returns `needs_write() == false` for exactly one input — a row
+/// found in `reconciling` — which this pass therefore never sees. It is kept because the branch belongs
+/// to `settle`'s contract rather than to one caller: a row already in its target state has nothing to
+/// transition to, and a widened scan would otherwise write an `RECONCILING -> RECONCILING` no-op the
+/// table refuses, recording a failure for a row that is already correct. The doc says so because a
+/// reader who greps `needs_write` will find exactly one use and should know it is not on the live path.
 async fn settle(
     calls: &Arc<dyn ToolCallRepository>,
     entry: &jarvis_domain::tool::ledger::LedgerEntry,
@@ -266,8 +270,15 @@ async fn settle(
     }
     let mut row = entry.clone();
     let expected = row.version();
-    let transition: ToolCallTransition = match row.apply(action.target_state(), expected, None, at)
-    {
+    let target = action.target_state();
+    // **A terminal target must carry an outcome, and `Cancelled` is the outcome for a cancelled call.**
+    // `LedgerEntry::apply` records `None` for a terminal transition when handed `None`, and a terminal
+    // row with a `NULL` outcome is refused as corruption by both `LedgerEntry::restore` and the adapter's
+    // reader — so the very row this pass wrote would be unreadable on the next start. The class comes
+    // from the classification's own target rather than from a caller's guess: only `SafeToRetry` settles
+    // a call as cancelled, and its reason is that the call was stopped rather than that it failed.
+    let outcome = target.is_terminal().then_some(ToolErrorClass::Cancelled);
+    let transition: ToolCallTransition = match row.apply(target, expected, outcome, at) {
         Ok(transition) => transition,
         // A refused edge means the classification and the table disagree, which is a defect in one of
         // them rather than a store fault — reported under the refusal's own code so it is diagnosable
@@ -283,14 +294,15 @@ async fn settle(
 
 /// What a paging pass must do after handling one page.
 ///
-/// Deliberately the same three answers as the run pass's `PageOutcome`, but reached from **two** counts
-/// rather than one, because this pass's scan contains its own output: a converted row returns on a later
-/// page, so "did this page change anything" is not a termination signal. See the paging loop.
+/// Deliberately the same three answers as the run pass's `PageOutcome`, reached from **two** counts: how
+/// many rows the page settled and how many writes it failed. A page that settled nothing and failed
+/// nothing is not a stall — nothing needed settling — and only a page whose every write was refused is,
+/// because the rows then sit exactly as the scan finds them and another read would repeat the refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageOutcome {
-    /// This pass's conversion work is done, whether or not the store still holds unsettled calls.
+    /// This pass's settling work is done, whether or not the store still holds reconciling calls.
     Drained,
-    /// The store held more than this page and this page converted something, so read on.
+    /// The store held more than this page and this page settled something, so read on.
     More,
     /// The store held more than this page, this page converted **nothing**, and every write it attempted
     /// failed. Reading it again would behave identically, so the store is reported as still holding rows.

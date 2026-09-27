@@ -8,8 +8,9 @@
 
 use super::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
-    ApprovalScopeKind, ApprovalState, ApprovalVersion, DurableApproval, MAX_APPROVAL_CHANNELS,
-    MAX_PREVIEW_ITEMS, MAX_PREVIEW_TEXT_BYTES, MAX_SUMMARY_BYTES, PreviewItem, is_usable_summary,
+    ApprovalScopeKind, ApprovalState, ApprovalVersion, DecisionNote, DurableApproval,
+    MAX_APPROVAL_CHANNELS, MAX_DECISION_NOTE_BYTES, MAX_PREVIEW_ITEMS, MAX_PREVIEW_TEXT_BYTES,
+    MAX_SUMMARY_BYTES, PreviewItem, is_usable_summary,
 };
 use super::classification::{Effect, Risk};
 use super::identity::{
@@ -17,6 +18,7 @@ use super::identity::{
 };
 use crate::error::DomainError;
 use crate::ids::{PrincipalId, RunId, ToolCallId, WorkspaceId};
+use crate::model::exception::RequiredAssurance;
 use crate::time::UtcTimestamp;
 
 // ---------------------------------------------------------------------------------------
@@ -56,7 +58,7 @@ fn parts() -> ApprovalRequestParts {
         run: RunId::from_uuid(uuid::Uuid::from_u128(2)),
         tool_call: ToolCallId::from_uuid(uuid::Uuid::from_u128(3)),
         identity: tool_identity(),
-        action_digest: "sha256:the-approved-action".to_owned(),
+        action_digest: super::canonical::ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::ExternalCommunication, Effect::Write],
         summary: "Send one email to peter@example.com".to_owned(),
@@ -75,10 +77,30 @@ fn parts() -> ApprovalRequestParts {
     }
 }
 
-fn decision(channel: ApprovalChannel) -> ApprovalActor {
+/// A decision actor, at `Standard` assurance unless a test says otherwise.
+///
+/// `Standard` is the ordinary verified-credential case; a test that is *about* the recorded assurance
+/// passes `Elevated` explicitly so the two are distinguishable, which is the whole reason the field exists.
+fn decision_at(channel: ApprovalChannel, assurance: RequiredAssurance) -> ApprovalActor {
     ApprovalActor::Decided {
         principal: principal(1),
         channel,
+        assurance,
+        note: None,
+    }
+}
+
+fn decision(channel: ApprovalChannel) -> ApprovalActor {
+    decision_at(channel, RequiredAssurance::Standard)
+}
+
+/// A decision actor carrying an operator note, so a test can assert the note survives.
+fn decision_with_note(channel: ApprovalChannel, note: &str) -> ApprovalActor {
+    ApprovalActor::Decided {
+        principal: principal(1),
+        channel,
+        assurance: RequiredAssurance::Standard,
+        note: Some(DecisionNote::new(note).expect("a usable note")),
     }
 }
 
@@ -453,6 +475,87 @@ fn a_decision_records_who_decided_and_on_which_channel() {
 }
 
 #[test]
+fn a_note_bounds_the_text_it_accepts_and_the_bound_holds_on_the_way_in() {
+    // **The type `DecisionNote` exists because the wire's `comment` and the cancellation's `reason` were
+    // bounded at one layer and stored at none.** Each asserted here against the rule its constructor
+    // enforces, in the shape `wire_validation_tests` established for every other validated newtype in
+    // this crate: the valid value round-trips, and the value the constructor refuses is refused by the
+    // **deserializer** too.
+    assert!(DecisionNote::new("asked Bob, he said no").is_ok());
+    // A newline and a tab are legitimate in an operator's note, because the value is never interpreted.
+    assert!(DecisionNote::new("line one\nline two\ttabbed").is_ok());
+    assert!(
+        DecisionNote::new("").is_err(),
+        "an empty note is not a note — `None` is how a caller says it gave none",
+    );
+    assert!(DecisionNote::new(&"x".repeat(MAX_DECISION_NOTE_BYTES + 1)).is_err());
+    assert!(
+        DecisionNote::new("bell\u{7}here").is_err(),
+        "a control character is refused because the note reaches an operator display",
+    );
+
+    // The deserializer goes through the constructor, so a note that arrived over the wire cannot carry a
+    // control character or exceed the bound — the systemic defect this crate recorded for nine types.
+    assert!(serde_json::from_str::<DecisionNote>("\"fine\"").is_ok());
+    assert!(serde_json::from_str::<DecisionNote>("\"\"").is_err());
+    let over = format!("\"{}\"", "x".repeat(MAX_DECISION_NOTE_BYTES + 1));
+    assert!(serde_json::from_str::<DecisionNote>(&over).is_err());
+}
+
+#[test]
+fn a_decision_note_is_carried_by_the_actor_that_recorded_it() {
+    // The note explains **this** transition, so it belongs to the actor rather than to the record: a
+    // decision's comment and a cancellation's reason are the same kind of value, and both are reachable
+    // through one accessor. Asserted through `apply`, because the actor the transition records is what an
+    // adapter stores and what a reader reconstructs.
+    let mut approval = DurableApproval::request(parts());
+    let transition = approval
+        .apply(
+            ApprovalState::Approved,
+            ApprovalVersion::FIRST,
+            decision_with_note(ApprovalChannel::Cli, "checked the recipient"),
+            now(),
+        )
+        .expect("the approval may be given");
+    assert_eq!(
+        transition.actor.note().map(DecisionNote::as_str),
+        Some("checked the recipient"),
+        "**the note must travel on the transition the human authored**",
+    );
+
+    // A decision with no note reports none, which is distinct from an empty note (refused above).
+    let mut quiet = DurableApproval::request(parts());
+    let quiet_transition = quiet
+        .apply(
+            ApprovalState::Approved,
+            ApprovalVersion::FIRST,
+            decision(ApprovalChannel::Cli),
+            now(),
+        )
+        .expect("the approval may be given");
+    assert!(quiet_transition.actor.note().is_none());
+
+    // And a cancellation carries its own reason through the same accessor.
+    let mut withdrawn = DurableApproval::request(parts());
+    let cancellation = withdrawn
+        .apply(
+            ApprovalState::Cancelled,
+            ApprovalVersion::FIRST,
+            ApprovalActor::Cancelled {
+                by: principal(1),
+                reason: Some(DecisionNote::new("superseded").expect("a usable note")),
+            },
+            now(),
+        )
+        .expect("PENDING -> CANCELLED is legal");
+    assert_eq!(
+        cancellation.actor.note().map(DecisionNote::as_str),
+        Some("superseded"),
+        "a cancellation's reason is the same kind of value as a decision's comment",
+    );
+}
+
+#[test]
 fn the_state_round_trips_through_its_contract_spelling() {
     for state in [
         ApprovalState::Pending,
@@ -492,7 +595,36 @@ fn an_approved_unexpired_approval_covers_its_exact_action() {
             now(),
         )
         .expect("the approval may be given");
-    assert!(approval.covers("sha256:the-approved-action", now()));
+    assert!(approval.covers(&approved_digest(), now()));
+}
+
+/// The digest the fixture approval was recorded for.
+///
+/// A real digest's **shape** rather than a placeholder word, because the type now validates one: a value
+/// like `"sha256:the-approved-action"` would have been accepted as text and refused as a digest, which is
+/// the change this fixture exists to reflect — the fingerprint is a value a computation produced rather
+/// than a string a caller asserted.
+fn approved_digest() -> super::canonical::ActionDigest {
+    super::canonical::ActionDigest::from_bytes([11; 32])
+}
+
+/// A digest for an action the fixture approval does **not** cover.
+fn other_digest() -> super::canonical::ActionDigest {
+    super::canonical::ActionDigest::from_bytes([12; 32])
+}
+
+#[test]
+fn an_approved_approval_covers_exactly_its_own_action() {
+    let mut approval = DurableApproval::request(parts());
+    approval
+        .apply(
+            ApprovalState::Approved,
+            ApprovalVersion::FIRST,
+            decision(ApprovalChannel::Cli),
+            now(),
+        )
+        .expect("the approval may be given");
+    assert!(approval.covers(&approved_digest(), now()));
 }
 
 #[test]
@@ -501,7 +633,7 @@ fn a_pending_approval_covers_nothing() {
     // the same as "the action was approved". A `covers` that checked only the digest would allow a
     // call whose approval had never been given.
     let approval = DurableApproval::request(parts());
-    assert!(!approval.covers("sha256:the-approved-action", now()));
+    assert!(!approval.covers(&approved_digest(), now()));
 }
 
 #[test]
@@ -518,7 +650,7 @@ fn an_approved_approval_for_a_different_action_covers_nothing() {
             now(),
         )
         .expect("the approval may be given");
-    assert!(!approval.covers("sha256:an-entirely-different-action", now()));
+    assert!(!approval.covers(&other_digest(), now()));
 }
 
 #[test]
@@ -544,21 +676,12 @@ fn a_lapsed_approval_covers_nothing_even_though_its_state_is_still_approved() {
     // One second before expiry it still covers; at expiry it does not. The boundary is the same
     // convention as an expiry instant elsewhere in this project: an expiry at `T` does not permit
     // work at `T`.
-    assert!(approval.covers(
-        "sha256:the-approved-action",
-        instant("2026-09-27T12:09:59Z")
-    ));
+    assert!(approval.covers(&approved_digest(), instant("2026-09-27T12:09:59Z")));
     assert!(
-        !approval.covers(
-            "sha256:the-approved-action",
-            instant("2026-09-27T12:10:00Z")
-        ),
+        !approval.covers(&approved_digest(), instant("2026-09-27T12:10:00Z")),
         "an approval lapsed exactly at its expiry must not cover the action",
     );
-    assert!(!approval.covers(
-        "sha256:the-approved-action",
-        instant("2026-09-27T13:00:00Z")
-    ));
+    assert!(!approval.covers(&approved_digest(), instant("2026-09-27T13:00:00Z")));
 }
 
 #[test]
@@ -575,7 +698,7 @@ fn a_consumed_approval_no_longer_covers_its_action() {
             now(),
         )
         .expect("the approval may be given");
-    assert!(approval.covers("sha256:the-approved-action", now()));
+    assert!(approval.covers(&approved_digest(), now()));
     approval
         .apply(
             ApprovalState::Consumed,
@@ -586,7 +709,7 @@ fn a_consumed_approval_no_longer_covers_its_action() {
             now(),
         )
         .expect("the approval may be spent");
-    assert!(!approval.covers("sha256:the-approved-action", now()));
+    assert!(!approval.covers(&approved_digest(), now()));
 }
 
 #[test]
