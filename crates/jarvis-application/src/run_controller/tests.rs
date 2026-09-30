@@ -1461,6 +1461,32 @@ async fn a_run_that_exceeds_its_output_token_ceiling_is_failed_and_its_answer_di
             .any(|message| message.content.contains("Hello there")),
         "a discarded answer must not be persisted: {messages:?}",
     );
+
+    // **The report that breached the ceiling is recorded, which is the only evidence left once the
+    // answer is discarded.** The path writes a `Failed` call row *before* the usage event is
+    // published, and it used to clear the usage on the way — so a run failed for consuming too many
+    // tokens stored a model call that consumed **none**, and a reader sent to
+    // `run.budget_output_tokens_exceeded` had no number to compare against the ceiling. A code with
+    // no visible cause is the defect `BRN-053` fixed for the deadline, in the consumption dimension.
+    let stored_calls = fixture
+        .repositories
+        .recorded_call_usage()
+        .expect("the calls are readable");
+    assert_eq!(stored_calls.len(), 1, "{stored_calls:?}");
+    let reported = stored_calls[0]
+        .usage
+        .as_ref()
+        .expect("**the usage that breached the ceiling must be recorded on the failed call**");
+    assert_eq!(
+        reported.output_tokens,
+        Some(2049),
+        "the recorded count must be the one that exceeded the 2048 ceiling",
+    );
+    assert_eq!(
+        stored_calls[0].estimated_cost_microunits,
+        Some(100),
+        "and the cost lifted from the same source, so the two columns cannot disagree",
+    );
 }
 
 #[tokio::test]
@@ -1598,6 +1624,58 @@ async fn the_usage_is_published_as_its_own_event() {
     assert!(
         payload.contains(r#""call_id":"#),
         "the report must name the call it describes, or two calls are indistinguishable: {payload}",
+    );
+}
+
+#[tokio::test]
+async fn the_usage_event_carries_every_counter_the_provider_reported() {
+    // **Two of the four counters were parsed, stored, and never published.** The adapter reads
+    // `cached_input_tokens` and `reasoning_tokens` off the same usage block, and the call row keeps
+    // all four — but the event carried only `input_tokens` and `output_tokens`, so a client
+    // following a run saw a provider's report truncated and could not see the reasoning spend a
+    // reasoning model charges for. The contract's usage example lists all four counters.
+    //
+    // Asserted **as a whole object**: an earlier version checked only the two fields it expected to
+    // be present, and each of those passed its own assertion while the other two were simply never
+    // mentioned. Comparing the entire payload is what makes a fifth counter's omission fail here.
+    let fixture = fixture(answering_with_usage(
+        "Hello there",
+        Usage {
+            input_tokens: Some(11),
+            output_tokens: Some(22),
+            cached_input_tokens: Some(7),
+            reasoning_tokens: Some(5),
+            provider_reported: true,
+            ..Usage::default()
+        },
+    ));
+    seed(&fixture).await;
+    execute(&fixture, &CancellationScope::new())
+        .await
+        .expect("the run completes");
+
+    let published = usage_events(&fixture);
+    assert_eq!(published.len(), 1, "{published:?}");
+    let (_, payload) = &published[0];
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).expect("the payload is a JSON object");
+    let mut counters = parsed.as_object().expect("an object").clone();
+    // The call identifier is expected and not a counter, so it is removed before the comparison
+    // rather than made part of it — otherwise the assertion would be about the id too.
+    let call_id = counters.remove("call_id");
+    assert!(
+        call_id.is_some(),
+        "the report must name its call: {payload}"
+    );
+    assert_eq!(
+        serde_json::Value::Object(counters),
+        serde_json::json!({
+            "input_tokens": 11,
+            "output_tokens": 22,
+            "cached_input_tokens": 7,
+            "reasoning_tokens": 5,
+        }),
+        "every counter the provider reported must be published, and only those: {payload}",
     );
 }
 

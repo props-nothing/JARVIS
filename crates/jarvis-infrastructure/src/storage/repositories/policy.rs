@@ -21,7 +21,8 @@ use jarvis_application::repository::policy::{
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ModelDataPolicyId, ModelRouteDecisionId, PolicyExceptionId, WorkspaceId};
 use jarvis_domain::model::policy::{
-    ModelDataPolicyStatus, ModelRouteDecision, PolicyRules, PolicyVersionRef,
+    ModelDataPolicyStatus, ModelRouteDecision, PolicyLayerContribution, PolicyRules,
+    PolicyVersionRef,
 };
 use jarvis_domain::time::UtcTimestamp;
 use sqlx::Row as _;
@@ -34,7 +35,7 @@ use super::SqliteRepositories;
 /// column to exactly that — so the list exists in one macro and each query names it.
 macro_rules! policy_columns {
     () => {
-        "id, policy_id, version, workspace_id, name, status, rules_json, created_at"
+        "id, policy_id, version, workspace_id, name, status, rules_json, layers_json, created_at"
     };
 }
 
@@ -50,11 +51,24 @@ impl ModelDataPolicyRepository for SqliteRepositories {
                 serde_json::to_string(&policy.rules).map_err(|_| RepositoryError::Conflict {
                     what: "policy_rules_unserializable",
                 })?;
+            // The provenance is serialized **only when there is some**, so a version created with no
+            // known contributor stores NULL rather than an empty document array. The two are
+            // indistinguishable once read (`layers` is a `Vec` either way), and NULL is the honest
+            // stored form for "not recorded" — the same choice `000010` made for an absent assurance.
+            let layers_json = if policy.layers.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&policy.layers).map_err(|_| {
+                    RepositoryError::Conflict {
+                        what: "policy_layers_unserializable",
+                    }
+                })?)
+            };
 
             let inserted = sqlx::query(
                 "INSERT INTO model_data_policies (\
-                     id, policy_id, version, workspace_id, name, status, rules_json, created_at\
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     id, policy_id, version, workspace_id, name, status, rules_json, layers_json, created_at\
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid::Uuid::now_v7().to_string())
             .bind(policy.policy_id.to_string())
@@ -63,6 +77,7 @@ impl ModelDataPolicyRepository for SqliteRepositories {
             .bind(&policy.name)
             .bind(policy.status.as_str())
             .bind(&rules_json)
+            .bind(&layers_json)
             .bind(policy.created_at.to_string())
             .execute(&self.pool)
             .await;
@@ -316,6 +331,13 @@ fn read_policy(row: &sqlx::sqlite::SqliteRow) -> Result<StoredPolicyVersion, Rep
     let status = ModelDataPolicyStatus::from_stored(&text(row, "status")?)
         .ok_or(RepositoryError::Corrupted { column: "status" })?;
     let rules: PolicyRules = decode(&text(row, "rules_json")?, "rules_json")?;
+    // An absent document is "not recorded" and reads as no known contributor, not as an empty
+    // contribution — the column is nullable precisely because a row written before provenance was
+    // kept has none, and `NULL` is distinguishable from `[]` only here, at the boundary.
+    let layers: Vec<PolicyLayerContribution> = match opt_text(row, "layers_json")? {
+        Some(json) => decode(&json, "layers_json")?,
+        None => Vec::new(),
+    };
 
     Ok(StoredPolicyVersion {
         policy_id,
@@ -324,6 +346,7 @@ fn read_policy(row: &sqlx::sqlite::SqliteRow) -> Result<StoredPolicyVersion, Rep
         name: text(row, "name")?,
         status,
         rules,
+        layers,
         created_at: parse_time(&text(row, "created_at")?, "created_at")?,
     })
 }

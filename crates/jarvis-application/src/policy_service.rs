@@ -32,7 +32,8 @@ use jarvis_domain::model::exception::{
     ExceptionScope, NewPolicyException, PolicyException, PolicyRuleKey, RequiredAssurance,
 };
 use jarvis_domain::model::policy::{
-    ModelDataPolicyStatus, ModelRouteDecision, PolicyRules, PolicyVersionRef, Sensitivity,
+    ModelDataPolicyStatus, ModelRouteDecision, PolicyLayer, PolicyLayerContribution, PolicyRules,
+    PolicyVersionRef, Sensitivity,
 };
 use jarvis_domain::model::routing::{
     RouteCandidate, RouteRequest, RouteSelectionFailure, select_route_explained,
@@ -363,12 +364,46 @@ impl PolicyService {
 
         // Layer 2 (the workspace policy already in force) merged with layer 4 (this submission).
         // `merge_stricter` only narrows, so the result can never permit more than either input.
-        let rules = match current.as_ref() {
-            Some(stored) => stored
+        //
+        // **The contribution is kept, not only the result.** The merge computed here is exactly the
+        // case where an operator later asks *which* layer narrowed the policy, and the answer was
+        // being dropped on the next line: the version recorded the merged rules and nothing about
+        // who supplied them. `ResolvedPolicy::merge` and `narrowing_layers` had been written for
+        // that question and had no production caller for as long as this threw the inputs away.
+        let mut layers = Vec::new();
+        let rules = if let Some(stored) = current.as_ref() {
+            // The stored version is the workspace layer; without this entry a narrowing
+            // submission would look like the only contributor, and a reader asking why a rule
+            // applies would be pointed at the submission rather than at the policy that imposed
+            // it.
+            layers.push(PolicyLayerContribution {
+                layer: PolicyLayer::Workspace,
+                rules: stored.rules.clone(),
+                policy_version: Some(stored.reference()),
+            });
+            let merged = stored
                 .rules
                 .merge_stricter(&submitted)
-                .map_err(|error| PolicyServiceError::Contradictory { code: error.code() })?,
-            None => submitted,
+                .map_err(|error| PolicyServiceError::Contradictory { code: error.code() })?;
+            // Recorded with the **submitted** rules rather than the merged ones, and only this
+            // layer's own contribution can be attributed: the stored rules above already carry
+            // whatever narrowing earlier writes applied. Recording the merged set here would
+            // make this layer appear responsible for a restriction a previous version imposed.
+            layers.push(PolicyLayerContribution {
+                layer: PolicyLayer::TaskRestriction,
+                rules: submitted,
+                policy_version: None,
+            });
+            merged
+        } else {
+            // The first write for this workspace, so the submission *is* the workspace layer.
+            // Attributing it to a task restriction would name a layer that does not exist yet.
+            layers.push(PolicyLayerContribution {
+                layer: PolicyLayer::Workspace,
+                rules: submitted.clone(),
+                policy_version: None,
+            });
+            submitted
         };
 
         let next_version = current_version.saturating_add(1);
@@ -383,6 +418,7 @@ impl PolicyService {
             // does not need archiving for the newer one to take effect.
             status: ModelDataPolicyStatus::Active,
             rules,
+            layers,
             created_at,
         }
         .validated()

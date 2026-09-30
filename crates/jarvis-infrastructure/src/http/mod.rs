@@ -1816,6 +1816,13 @@ pub(crate) mod tests {
     enum FixtureProvider {
         /// Answers and completes, so a run reaches `Completed`.
         Answers,
+        /// Answers, completes, and **reports usage** on its terminal.
+        ///
+        /// Exists because every other variant completes with `usage: None`, so a run driven by them
+        /// records no consumption and the run read's `usage` field is genuinely absent — which makes
+        /// "the read carries the summed usage" unobservable through the HTTP surface. A provider
+        /// that reports nothing cannot demonstrate that the sum is read back.
+        ReportsUsage,
         /// Refuses to open, so a run reaches `Failed` with a code.
         Refuses,
         /// Streams one delta, then **waits** for the test to release it before completing.
@@ -1973,6 +1980,81 @@ pub(crate) mod tests {
         runs_fixture_with_gate(tag, kind, Gate::new()).await
     }
 
+    /// Builds the provider a fixture variant runs against.
+    ///
+    /// Extracted so `runs_fixture_with_bounds` stays inside the line bound the workspace denies
+    /// breaking, and because the construction is one concern: every variant shares one answer script
+    /// and differs only in how the terminal ends or whether the stream waits.
+    ///
+    /// `Answers` and `ReportsUsage` are two builders rather than one with an `Option<Usage>`, because
+    /// `ScriptedProvider`'s steps are fixed at construction — there is no step to mutate afterwards.
+    fn fixture_provider(
+        kind: FixtureProvider,
+        model: &jarvis_domain::model::identity::ModelRef,
+        gate: &Gate,
+    ) -> Arc<dyn jarvis_application::model::ModelProvider> {
+        use jarvis_application::model::ProviderError;
+        use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
+
+        let answering = jarvis_application::model::ScriptedProvider::new(model.clone())
+            .emit(ModelStreamEventKind::OutputItemAdded {
+                item_id: "out-1".to_owned(),
+            })
+            .emit_text("out-1", "hello from the scripted provider")
+            .emit(ModelStreamEventKind::CallCompleted {
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                refused: false,
+            });
+        match kind {
+            FixtureProvider::Answers => Arc::new(answering),
+            // The same script as `Answers`, with the terminal carrying a usage block, so a run
+            // driven by this variant records a consumption a read can sum.
+            FixtureProvider::ReportsUsage => Arc::new(
+                jarvis_application::model::ScriptedProvider::new(model.clone())
+                    .emit(ModelStreamEventKind::OutputItemAdded {
+                        item_id: "out-1".to_owned(),
+                    })
+                    .emit_text("out-1", "hello from the scripted provider")
+                    .emit(ModelStreamEventKind::CallCompleted {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(jarvis_domain::model::stream::Usage {
+                            input_tokens: Some(11),
+                            output_tokens: Some(22),
+                            cached_input_tokens: Some(3),
+                            reasoning_tokens: Some(4),
+                            provider_reported: true,
+                            estimated_cost_microunits: None,
+                            currency: None,
+                        }),
+                        refused: false,
+                    }),
+            ),
+            // `Refused` rather than `Unavailable`, because it is not retryable: a retryable
+            // failure leaves the run live so another attempt can be made, and the fixture's
+            // purpose is to reach a terminal `Failed` with a code.
+            FixtureProvider::Refuses => Arc::new(answering.fail_on_open(ProviderError::Refused)),
+            FixtureProvider::Flooding { deltas } => {
+                // One delta per script step, so each becomes its own durable event and therefore its
+                // own frame: the point is to exceed the follow channel's depth, which is counted in
+                // *frames*, so a single large delta would fill one slot and prove nothing.
+                let mut provider = jarvis_application::model::ScriptedProvider::new(model.clone());
+                for index in 0..deltas {
+                    provider = provider.emit_text("out-1", &format!("chunk-{index} "));
+                }
+                Arc::new(provider.emit(ModelStreamEventKind::CallCompleted {
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    refused: false,
+                }))
+            }
+            FixtureProvider::Gated => Arc::new(GatedProvider {
+                models: vec![model.clone()],
+                gate: gate.clone(),
+            }),
+        }
+    }
+
     /// The fixture with an explicit gate, for the tests that drive a gated provider.
     ///
     /// The gate is passed in rather than returned, because it must be in the test's hands *before*
@@ -2006,12 +2088,10 @@ pub(crate) mod tests {
         use crate::storage::repositories::SqliteRepositories;
         use crate::storage::{Database, migrate};
         use jarvis_application::live_events::StreamDeltaSink;
-        use jarvis_application::model::{ModelProvider, ProviderError};
         use jarvis_application::run_service::{
             RunCancellationRegistry, RunPorts, RunService, TokioSpawner,
         };
         use jarvis_domain::model::identity::{ModelId, ModelRef, ProviderId};
-        use jarvis_domain::model::stream::{FinishReason, ModelStreamEventKind};
 
         let dir = temp_dir(tag);
         let destination = ClientCredentialPath::in_config_dir(&dir);
@@ -2027,41 +2107,7 @@ pub(crate) mod tests {
             ProviderId::parse("scripted.local").expect("valid"),
             ModelId::parse("fixture-1").expect("valid"),
         );
-        let answering = jarvis_application::model::ScriptedProvider::new(model.clone())
-            .emit(ModelStreamEventKind::OutputItemAdded {
-                item_id: "out-1".to_owned(),
-            })
-            .emit_text("out-1", "hello from the scripted provider")
-            .emit(ModelStreamEventKind::CallCompleted {
-                finish_reason: FinishReason::Stop,
-                usage: None,
-                refused: false,
-            });
-        let provider: Arc<dyn ModelProvider> = match kind {
-            FixtureProvider::Answers => Arc::new(answering),
-            // `Refused` rather than `Unavailable`, because it is not retryable: a retryable
-            // failure leaves the run live so another attempt can be made, and the fixture's
-            // purpose is to reach a terminal `Failed` with a code.
-            FixtureProvider::Refuses => Arc::new(answering.fail_on_open(ProviderError::Refused)),
-            FixtureProvider::Flooding { deltas } => {
-                // One delta per script step, so each becomes its own durable event and therefore its
-                // own frame: the point is to exceed the follow channel's depth, which is counted in
-                // *frames*, so a single large delta would fill one slot and prove nothing.
-                let mut provider = jarvis_application::model::ScriptedProvider::new(model.clone());
-                for index in 0..deltas {
-                    provider = provider.emit_text("out-1", &format!("chunk-{index} "));
-                }
-                Arc::new(provider.emit(ModelStreamEventKind::CallCompleted {
-                    finish_reason: FinishReason::Stop,
-                    usage: None,
-                    refused: false,
-                }))
-            }
-            FixtureProvider::Gated => Arc::new(GatedProvider {
-                models: vec![model.clone()],
-                gate: gate.clone(),
-            }),
-        };
+        let provider = fixture_provider(kind, &model, &gate);
         let service = Arc::new(RunService::new(
             RunPorts {
                 runs: Arc::clone(&repositories)
@@ -2433,6 +2479,69 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_run_resource_publishes_the_deadline_that_explains_a_timeout() {
+        // `run.deadline_exceeded` is a **client-visible** terminal — the controller produces it
+        // before a call, mid-wait, and on the terminal — and the controller's own comment says a
+        // reader "knows to look at the configured budget". No surface carried the budget, so a
+        // client receiving that code could look at nothing: it could not tell how much time the run
+        // was given, how long remained, or whether a retry would fit inside it.
+        //
+        // Asserted **over the router** rather than on the view type, because a field that reaches
+        // the struct and not the wire is exactly the defect: the projection is where a field is
+        // dropped, and a type-level test constructs the struct directly so it cannot see it.
+        let (app, token) = runs_fixture("run-deadline").await;
+        let response = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &run_headers(&token),
+            &create_body("hello"),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::ACCEPTED, "{}", response.1);
+        let created: serde_json::Value =
+            serde_json::from_str(&response.1).expect("the create response is JSON");
+        let run_id = created["run_id"].as_str().expect("a run id").to_owned();
+
+        let read = send(
+            &app,
+            "GET",
+            &format!("/api/v1/runs/{run_id}"),
+            &run_headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(read.0, StatusCode::OK, "{}", read.1);
+        let stored: serde_json::Value = serde_json::from_str(&read.1).expect("JSON");
+        // An `assert!` rather than `unwrap_or_else(|| panic!(...))`: the workspace lint policy denies
+        // `panic!` even in tests, and the assertion must carry the **response body** because the
+        // failure it guards against is a field silently missing from a real answer.
+        assert!(
+            stored["deadline_at"].is_string(),
+            "**a run's deadline must be readable by its client**: {}",
+            read.1,
+        );
+        let deadline = stored["deadline_at"]
+            .as_str()
+            .expect("the assertion above proves it is a string");
+        // It parses as the contract's timestamp shape, so a client can compare it to `now` rather
+        // than receiving a value it must guess the format of.
+        let parsed = jarvis_domain::time::UtcTimestamp::parse(deadline)
+            .expect("the published deadline must be a timestamp a client can parse");
+        // And it is in the future for a freshly created run — the assertion that makes it a
+        // *budget* rather than a field that happens to be filled.
+        let created_at = jarvis_domain::time::UtcTimestamp::parse(
+            stored["created_at"].as_str().expect("a created_at"),
+        )
+        .expect("parses");
+        assert!(
+            parsed > created_at,
+            "a new run's deadline ({parsed}) must be after its creation ({created_at})",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("run-deadline"));
+    }
+
+    #[tokio::test]
     async fn the_advertised_capabilities_cover_every_routed_operation() {
         // The contract publishes this list and a client negotiates against it. It had drifted in
         // **both** directions at once: the contract's example named four run capabilities while
@@ -2679,6 +2788,92 @@ pub(crate) mod tests {
             "{state} is not a client-visible state",
         );
         assert!(parsed["version"].as_u64().is_some_and(|v| v >= 1), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_run_read_reports_the_usage_its_calls_recorded() {
+        // The architecture requires the durable run record to carry "model/tool usage and budget
+        // state", and the contract says the call row keeps every counter — but `model_calls` was
+        // written with `usage_json` and never selected it, so a run's consumption was reachable by
+        // no caller. Asserted here rather than only against the repository, because the defect this
+        // closes is a *dropped projection*: a port test cannot see a handler that reads the port and
+        // omits the field.
+        let (app, token, _) =
+            runs_fixture_with("runs-usage-read", FixtureProvider::ReportsUsage).await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let body = read_run_until_terminal(&app, &token, &run_id).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let usage = &parsed["usage"];
+        assert!(
+            usage.is_object(),
+            "the run read must carry the usage its calls recorded: {body}",
+        );
+        // Every counter, asserted as a whole object rather than field by field: a per-field check is
+        // green for an incomplete set by construction, which is how two of these four were withheld
+        // from the `run.usage` event in `BRN-055`.
+        assert_eq!(usage["input_tokens"], 11, "{body}");
+        assert_eq!(usage["output_tokens"], 22, "{body}");
+        assert_eq!(usage["cached_input_tokens"], 3, "{body}");
+        assert_eq!(usage["reasoning_tokens"], 4, "{body}");
+        assert_eq!(
+            usage["provider_reported"], true,
+            "the fixture's report is provider-reported: {body}",
+        );
+        assert_eq!(
+            parsed["state"], "completed",
+            "the run must have completed for its usage to be the terminal figure: {body}",
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-usage-read"));
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_recorded_usage_omits_the_field_rather_than_zeroing_it() {
+        // "This run consumed nothing" and "nothing was measured" are different facts. The fixture's
+        // provider reports no usage, so the read must omit the field rather than publish a zeroed
+        // block a client would read as a measurement — the same rule the per-call event follows.
+        let (app, token) = runs_fixture("runs-usage-absent").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let body = read_run_until_terminal(&app, &token, &run_id).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("valid JSON")["state"],
+            "completed",
+            "the run must have completed, or an absent field would prove nothing: {body}",
+        );
+        assert!(
+            !body.contains(r#""usage""#),
+            "an unmeasured run must omit usage rather than report zeroes: {body}",
+        );
+    }
+
+    /// Reads a run until it reports a terminal state, returning the last body.
+    ///
+    /// Polling rather than sleeping, for the reason the event-stream tests give: the run is driven on
+    /// a real runtime, so a fixed sleep would either be a race or a needlessly slow test. The bound is
+    /// generous and the exit is the terminal state, so the check is on the value rather than on the
+    /// clock.
+    async fn read_run_until_terminal(app: &axum::Router, token: &str, run_id: &str) -> String {
+        let mut body = String::new();
+        for _ in 0..200 {
+            let (status, current) = send(
+                app,
+                "GET",
+                &format!("/api/v1/runs/{run_id}"),
+                &run_headers(token),
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{current}");
+            body = current;
+            if body.contains(r#""state":"completed""#)
+                || body.contains(r#""state":"failed""#)
+                || body.contains(r#""state":"cancelled""#)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        body
     }
 
     #[tokio::test]
@@ -4759,6 +4954,36 @@ pub(crate) mod tests {
             omitted.get("input_tokens").is_none(),
             "an unreported counter must be absent, not zero: {omitted}",
         );
+
+        // **Every counter the provider reported is published, and two of them were not.** The
+        // adapter parses `cached_input_tokens` and `reasoning_tokens` off the same usage block, the
+        // call row stores all four, and the public event carried only two — so a client following a
+        // run saw a provider's report truncated, and could not see the reasoning spend a reasoning
+        // model charges for. The contract's usage example lists all four. Asserted **as a whole
+        // object**, not field by field: a per-field check is what let the omission stand, because
+        // each field that *was* there passed its own assertion.
+        let every_counter = Usage {
+            input_tokens: Some(11),
+            output_tokens: Some(22),
+            cached_input_tokens: Some(7),
+            reasoning_tokens: Some(5),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let published: serde_json::Value = serde_json::from_str(
+            &jarvis_application::run_controller::usage_payload_for_wire(&every_counter),
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            published,
+            serde_json::json!({
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cached_input_tokens": 7,
+                "reasoning_tokens": 5,
+            }),
+            "the event must carry every counter the provider reported, and only those",
+        );
     }
 
     #[tokio::test]
@@ -5204,6 +5429,7 @@ pub(crate) mod tests {
                 name: name.to_owned(),
                 status: ModelDataPolicyStatus::Active,
                 rules: local_only_rules(),
+                layers: Vec::new(),
                 created_at: policy_now(),
             })
             .await
@@ -5237,6 +5463,65 @@ pub(crate) mod tests {
         // would say "everything is allowed" on an operator's behalf who never said so.
         assert!(body.contains("model.policy_not_found"), "{body}");
         let _ = std::fs::remove_dir_all(temp_dir("policy-none"));
+    }
+
+    #[tokio::test]
+    async fn a_policy_write_records_and_reports_the_layers_that_narrowed_it() {
+        // `BRN-057`. The contract's `GET /api/v1/model-data-policy` section requires the read to
+        // return "the active workspace policy, version, **source layers**, ..." — and the response
+        // carried four of those five. The merge that decides those layers happens in
+        // `PolicyService::put`, which recorded the merged rules and dropped the reason.
+        //
+        // Driven through the **write** path rather than a seeded row, because that is where the
+        // provenance is produced: a fixture that set `layers` directly would assert only that the
+        // projection copies a value nobody computes, which is precisely how this went unnoticed —
+        // `ResolvedPolicy::merge` and `narrowing_layers` had no production caller at all.
+        let (app, token, _) = policy_fixture("policy-layers").await;
+
+        // The first write is the workspace layer, and it is the one that narrows: a policy with no
+        // predecessor imposes every restriction from nothing.
+        let (status, body) =
+            policy_put(&app, &token, &policy_body(0, "local_only"), Some("key-1")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let written: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        assert!(
+            written["source_layers"].is_array(),
+            "**the response must carry source layers**: {body}",
+        );
+        let layers = written["source_layers"].as_array().expect("asserted above");
+        assert_eq!(layers.len(), 1, "{body}");
+        assert_eq!(layers[0]["layer"], "workspace");
+        assert_eq!(
+            layers[0]["narrowed"], true,
+            "the layer that imposed the rules must be reported as narrowing them: {body}",
+        );
+
+        // A second write narrows further, so the version now has **two** contributors — and the
+        // order is the contract's precedence order, strongest first, not insertion order.
+        let (status, body) =
+            policy_put(&app, &token, &policy_body(1, "local_only"), Some("key-2")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let written: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        let layers = written["source_layers"].as_array().expect("layers");
+        let names: Vec<&str> = layers
+            .iter()
+            .map(|layer| layer["layer"].as_str().expect("a layer name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["workspace", "task-restriction"],
+            "the layers must be reported in the contract's precedence order: {body}",
+        );
+        // And the **read** agrees with the write, because the contract requires a client that PUT a
+        // policy and immediately GETs it to see the same document.
+        let (status, read_body) = policy_get(&app, &token, "/api/v1/model-data-policy").await;
+        assert_eq!(status, StatusCode::OK);
+        let stored: serde_json::Value = serde_json::from_str(&read_body).expect("JSON");
+        assert_eq!(
+            stored["source_layers"], written["source_layers"],
+            "the read must report the provenance the write recorded: {read_body}",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("policy-layers"));
     }
 
     /// A submission body, so the write tests differ only in the fields they vary.

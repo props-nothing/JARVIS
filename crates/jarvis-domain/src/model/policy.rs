@@ -270,6 +270,42 @@ impl PolicyLayer {
         Self::UserPreference,
         Self::ProviderDefault,
     ];
+
+    /// Returns the spelling JARVIS stores and puts on the wire.
+    ///
+    /// The label exists here because two layers need the same spelling and neither can reach the
+    /// other: `jarvis-infrastructure` stores it and renders the `GET /api/v1/model-data-policy`
+    /// response, and `jarvis-protocol` owns the wire vocabulary. A `serde(rename_all)` derive would
+    /// not be enough for a stored label that is read back and compared, which is why this returns
+    /// the name rather than relying on the variant's own spelling.
+    ///
+    /// The names are the **contract's** precedence list, kebab-cased, so a client reading
+    /// `legal-or-administrator` can match it against the numbered list in
+    /// `docs/contracts/model-data-policy.md` without a translation table.
+    #[must_use]
+    pub const fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::LegalOrAdministrator => "legal-or-administrator",
+            Self::Workspace => "workspace",
+            Self::ResourceSensitivity => "resource-sensitivity",
+            Self::TaskRestriction => "task-restriction",
+            Self::UserPreference => "user-preference",
+            Self::ProviderDefault => "provider-default",
+        }
+    }
+
+    /// Parses the stored contract spelling.
+    ///
+    /// The inverse of [`as_contract_str`](Self::as_contract_str). Returns `None` for an unknown
+    /// spelling rather than defaulting to a layer, because a stored provenance whose name nobody
+    /// recognises must be reported as uninterpretable — defaulting would attribute a narrowing to
+    /// whichever layer the default happened to be, which is a fabricated explanation of a refusal.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ORDERED
+            .into_iter()
+            .find(|layer| layer.as_contract_str() == value)
+    }
 }
 
 /// A named layer's contribution to the resolved policy, retained for explanation.
@@ -337,6 +373,20 @@ pub struct PolicyVersionRef {
 /// Retains the layers that produced it so a route decision can explain itself
 /// without re-deriving the merge from current state, which may have changed since
 /// the call.
+///
+/// **The route-decision half of that sentence remains false; the operator half is now true.** No
+/// field on [`RouteRequest`](crate::model::routing::RouteRequest) or [`ModelRouteDecision`] can carry
+/// a layer list, so a *model call* still cannot say which layer narrowed it. What changed in
+/// `BRN-057` is that [`ResolvedPolicy::merge`] and [`ResolvedPolicy::narrowing_layers`] are called by
+/// production code: `source_layers_view` in `jarvis-infrastructure` merges a stored version's
+/// recorded contributions to answer the contract's "source layers" requirement on
+/// `GET /api/v1/model-data-policy`. So the type is reachable and the explanation exists — it is
+/// attached to the *policy document* rather than to the call that applied it.
+///
+/// The contributions are recorded by `PolicyService::put`, persisted in the `layers_json` column
+/// (added by migration `000011`; the column is absent for rows written before it, which read as an
+/// empty provenance rather than as a guessed one), and rendered as `source_layers` on both
+/// `ActivePolicyResponse` and `PutPolicyResponse`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPolicy {
     /// The merged, most restrictive rules.
@@ -370,8 +420,23 @@ impl ResolvedPolicy {
 
     /// Returns the layers that actually narrowed the result.
     ///
-    /// Used by operator output so the reader sees which policy is responsible for
-    /// a refusal, rather than being told only that a rule applies.
+    /// **Producer: `source_layers_view` in `jarvis-infrastructure`**, which answers the contract's
+    /// "source layers" requirement on `GET /api/v1/model-data-policy` (`BRN-057`). The doc here used
+    /// to say "used by operator output" while nothing called it; what made it true was not this
+    /// function changing but a reader being built for it.
+    ///
+    /// The computation is right and its test falsifies a wrong version (a permissive layer must not
+    /// be named as the reason). Two limits a reader of `narrowed` should know:
+    ///
+    /// - A layer earns it when the accumulated ruleset **changed** at that step. A layer repeating an
+    ///   earlier restriction contributes without narrowing, and reads `false`.
+    /// - A step whose merge errors is **skipped** by the `if let Ok` below, so a provenance that
+    ///   cannot be merged yields an empty result — indistinguishable from "no layer narrowed". The
+    ///   caller is where that is handled: `source_layers_view` maps a failed merge to the empty set,
+    ///   so every layer reads `narrowed: false`. `PolicyService::put` refuses a contradictory
+    ///   submission before recording it, so no version it wrote can reach this state; the residual
+    ///   risk is a writer outside it. Recorded in `docs/contracts/model-data-policy.md` rather than
+    ///   repaired, because the wire field is a bool and cannot carry "unknown".
     #[must_use]
     pub fn narrowing_layers(&self) -> Vec<PolicyLayer> {
         let mut accumulated = PolicyRules::permissive();

@@ -253,7 +253,8 @@ async function readFirstOutputAt(profile, runId) {
   return await withDatabase(profile, (database) =>
     database
       .prepare(
-        "SELECT first_output_at, last_output_at, output_delta_count " +
+        "SELECT first_output_at, last_output_at, output_delta_count, " +
+          "json_extract(usage_json, '$.input_tokens') AS input_tokens " +
           "FROM model_calls WHERE run_id = ? " +
           "ORDER BY started_at DESC LIMIT 1",
       )
@@ -701,6 +702,77 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
+    // 7b. The write and the read agree about *which layers* produced the version.
+    //
+    // `BRN-057`. The contract's `GET /api/v1/model-data-policy` requires the answer to carry the
+    // "source layers", and it could not before: the merge that decides them happened inside the
+    // service and was dropped in the same step, so a rule was enforced while the layer responsible
+    // for it was unnameable. The router asserts this too, but a router test builds its own state —
+    // and the defect class this section already exists for (section 11, `policies: None`) is one a
+    // router test cannot see: the response was assembled from a value the handler never received.
+    //
+    // Version 2 is the two-layer case, which is why this sits here rather than after the first
+    // write: a first write records one contributor and would pass against an implementation that
+    // hard-coded `["workspace"]`. Its order is asserted, not just its membership, because the
+    // contract's precedence puts `workspace` above `task-restriction` and a client reading the list
+    // top-down must be reading strongest-first.
+    //
+    // `narrowed` is asserted in **both** directions, and this is the assertion that makes the
+    // field worth having. The second write submits `approved_cloud_allowed`, which is *looser*
+    // than the `local_only` already in force — so the submission contributes a layer without
+    // narrowing anything, and must read `false`. An implementation that marked every contributor
+    // `true` (the obvious shortcut, and what the first draft of this check wrongly required) fails
+    // here, which is why the expectation is derived from the merge rather than from the fact that
+    // the layer was recorded. `policy_version` is asserted alongside it: the workspace layer came
+    // from stored version 1 and must name it, while a submission has no stored version and must
+    // omit the field rather than invent one.
+    // ---------------------------------------------------------------------
+    const layers = widening.json?.source_layers;
+    const layerNames = Array.isArray(layers) ? layers.map((entry) => entry.layer) : null;
+    if (!Array.isArray(layers)) {
+      fail(
+        "a policy write must report the layers that produced the version",
+        widening.text,
+      );
+    } else if (
+      JSON.stringify(layerNames) !== JSON.stringify(["workspace", "task-restriction"])
+    ) {
+      fail(
+        "the layers must be the two that contributed, in precedence order",
+        JSON.stringify(layers),
+      );
+    } else if (
+      layers[0]?.narrowed !== true ||
+      layers[0]?.policy_version !== 1 ||
+      layers[1]?.narrowed !== false ||
+      layers[1]?.policy_version !== undefined
+    ) {
+      fail(
+        "only the workspace layer narrowed, and only it came from a stored version",
+        JSON.stringify(layers),
+      );
+    } else {
+      pass(
+        `the write names its contributors in precedence order, and marks only the one that ` +
+          `narrowed: ${layerNames.join(", ")}`,
+      );
+    }
+
+    // The read must describe the same version the same way. A reply that carried provenance while
+    // the store kept none would pass every assertion above and lose the explanation on the next
+    // request — which is the one a client that PUT and then GETs would be told.
+    const reread = await request(record, credential, "GET", "/api/v1/model-data-policy");
+    const rereadLayers = reread.json?.source_layers;
+    if (JSON.stringify(rereadLayers) !== JSON.stringify(layers)) {
+      fail(
+        "the read must report the same provenance the write did",
+        `${widening.text}\n${reread.text}`,
+      );
+    } else {
+      pass("the provenance survives the write and is reported identically on the next read");
+    }
+
+    // ---------------------------------------------------------------------
     // 8. A stale precondition is a conflict that changes nothing.
     // ---------------------------------------------------------------------
     const stale = await request(
@@ -908,6 +980,63 @@ async function main() {
       pass(
         `the model call records its delivery spread: ${firstOutput.output_delta_count} delta(s), ` +
           `${firstOutput.output_delta_count === 1 ? "a burst" : "streaming"} by measurement`,
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // The run read carries what the run consumed (`BRN-058`).
+    //
+    // Asserted here rather than only against the repository, because the defect was a **dropped
+    // projection**: `usage_json` and `estimated_cost_microunits` were bound on every write and named
+    // by no `SELECT`, so `StoredModelCall` had no field for them and no caller could ask. A port test
+    // cannot see a handler that reads the port and omits the field, and the composed surface is the
+    // only place the two halves are exercised together.
+    //
+    // The sum is asserted against the calls the journey already read, so the value is checked against
+    // its own inputs rather than against a literal: if the scripted provider's report changes, this
+    // says what the total should be.
+    // ---------------------------------------------------------------------
+    const runUsage = await request(
+      record,
+      credential,
+      "GET",
+      `/api/v1/runs/${governed.json.run_id}`,
+    );
+    const reported = [firstOutput].filter((row) => row !== null);
+    const expectedInput = reported.reduce(
+      (total, row) => total + (row.input_tokens ?? 0),
+      0,
+    );
+    if (runUsage.status !== 200) {
+      fail(`the settled run must be readable, got ${runUsage.status}`, runUsage.text);
+    } else if (runUsage.json?.state !== "completed") {
+      fail(
+        "the run must be completed for its usage to be the terminal figure, got " +
+          JSON.stringify(runUsage.json?.state),
+      );
+    } else if (runUsage.json?.usage === undefined) {
+      // The daemon's scripted provider reports **no** usage on its terminal, and that is deliberate:
+      // it does not call a model, so fabricating a consumption figure would put a measurement nobody
+      // made into a durable record. So this journey can only assert the *absent* case — and asserting
+      // it here is what proves the field is omitted rather than zeroed, against a real file-backed
+      // profile rather than an in-memory one. A run that consumed nothing and a run whose provider
+      // reported nothing are different facts, and a client reading `{"input_tokens":0}` could not
+      // tell them apart.
+      //
+      // The *present* case — the sum actually appearing and equalling its inputs — is asserted by
+      // `jarvis_infrastructure`'s `a_run_read_reports_the_usage_its_calls_recorded`, which drives a
+      // real router over a real migrated store with a provider that does report usage. The two checks
+      // together cover the branch; neither alone does.
+      pass("a run whose provider reported no usage omits the field rather than reporting zeroes");
+    } else if (runUsage.json.usage.input_tokens !== expectedInput) {
+      fail(
+        "the run read must sum the usage its own calls recorded, got " +
+          JSON.stringify(runUsage.json.usage) +
+          ` against ${expectedInput} from ${reported.length} measured call(s)`,
+      );
+    } else {
+      pass(
+        `the run read reports its summed usage: ${runUsage.json.usage.input_tokens} input token(s)`,
       );
     }
 

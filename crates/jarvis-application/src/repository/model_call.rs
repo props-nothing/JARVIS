@@ -271,6 +271,27 @@ pub struct StoredModelCall {
     pub last_output_at: Option<UtcTimestamp>,
     /// How many output deltas it produced, when that was recorded.
     pub output_delta_count: Option<u32>,
+    /// What the provider reported this attempt consumed, when anything was recorded.
+    ///
+    /// **Read back rather than write-only, and this one was the last of its class.** `record_outcome`
+    /// has always serialized `usage_json`, and no `SELECT` ever named the column, so "what did this
+    /// run consume" was unanswered by every read while three public surfaces assumed it was
+    /// answered: the control API's contract says "the call row kept all four" counters, the
+    /// architecture requires the durable run record to carry "model/tool usage and budget state", and
+    /// `agent-runtime.md` says the token and cost halves of that are implemented. The *write* half
+    /// was. The read half did not exist, and a budget ceiling that is only ever compared against one
+    /// live call is a bound on a call rather than on a run.
+    ///
+    /// `None` means nothing was recorded — a call that failed before the provider reported anything,
+    /// or a row written before the column was selected. It is not zero: an unmeasured call and a
+    /// free one are different facts, which is the rule every `Usage` counter already follows.
+    pub usage: Option<Usage>,
+    /// The estimated cost in millionths of the billing currency unit, when recorded.
+    ///
+    /// A separate column from `usage.estimated_cost_microunits` in the store, and read alongside it
+    /// because the two are written on the same statement: leaving one unselected would let a run's
+    /// summed cost disagree with the per-call values it was summed from.
+    pub estimated_cost_microunits: Option<u64>,
     /// When it reached its outcome.
     pub completed_at: Option<UtcTimestamp>,
 }
@@ -323,6 +344,30 @@ pub trait ModelCallRepository: Send + Sync {
         &self,
         workspace: WorkspaceId,
         logical_call_id: ModelCallId,
+    ) -> RepositoryFuture<'_, Vec<StoredModelCall>>;
+
+    /// Returns every attempt recorded for `run`, across every logical call.
+    ///
+    /// **Why this exists rather than summing in the caller.** A run's consumption is the sum over its
+    /// attempts, and the question "what did this run spend" cannot be answered from the attempts of
+    /// one logical call — a run may make several. `load_attempts` is keyed by `logical_call_id`, and
+    /// `StoredActivityEvent`-style run reads do not carry model calls, so a run's usage previously had
+    /// no read path at all: `budget.exceeded_by` compared one live call's usage in memory, and nothing
+    /// else could see a number. That is a bound on a *call* wearing the name of a bound on a *run*.
+    ///
+    /// Attempt order is `(started_at, attempt)` so the sequence reads as the run happened. Ordered
+    /// rather than aggregated here because the sum is arithmetic over the domain's own [`Usage`], and
+    /// putting it in SQL would mean a second definition of "what counts" — one of which would silently
+    /// ignore a counter added later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`] for a driver failure and [`RepositoryError::Corrupted`] for
+    /// an uninterpretable column.
+    fn load_run_calls(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
     ) -> RepositoryFuture<'_, Vec<StoredModelCall>>;
 
     /// Returns the recorded delivery samples per model, for a measurement campaign.

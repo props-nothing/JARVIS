@@ -881,6 +881,47 @@ impl RunService {
         Ok(self.ports.runs.load(context.workspace_id, run).await?)
     }
 
+    /// Returns what a run's model calls consumed, summed across every attempt.
+    ///
+    /// **This is the read the architecture requires and nothing had.** `agent-runtime.md` lists
+    /// "model/tool usage and budget state" as part of the durable run record, and
+    /// `local-control-api.md` says the call row "kept all four" counters — but every
+    /// `model_calls` read selected neither `usage_json` nor `estimated_cost_microunits`, so the
+    /// figures existed in the store and were reachable by nobody. `budget.exceeded_by` compared the
+    /// one report the controller held in memory, which is a bound on a *call* rather than on a run.
+    ///
+    /// Returns `None` for a run whose calls recorded nothing, rather than a zeroed figure: "this run
+    /// consumed nothing" and "nothing was measured" are different facts, and a `0` would state the
+    /// first for a provider that reports no usage.
+    ///
+    /// The sum is `Usage::summed` over the domain's own type, so the arithmetic has one definition
+    /// and a counter added later cannot be silently excluded from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::Storage`] or [`RunServiceError::NotFound`] for a foreign run,
+    /// because resolving the scope is the store's job — a caller cannot sum another workspace's
+    /// spend by naming its run.
+    pub async fn usage(
+        &self,
+        context: &RequestContext,
+        run: RunId,
+    ) -> Result<Option<jarvis_domain::model::stream::Usage>, RunServiceError> {
+        // The run is loaded first, so a foreign or absent run is `NotFound` rather than an empty
+        // sum. Without this the answer for a run that does not exist would be indistinguishable
+        // from the answer for a run that consumed nothing — and the caller of a usage read is
+        // exactly the caller that cannot be trusted to have the identifier right.
+        self.ports.runs.load(context.workspace_id, run).await?;
+        let calls = self
+            .ports
+            .model_calls
+            .load_run_calls(context.workspace_id, run)
+            .await?;
+        Ok(jarvis_domain::model::stream::Usage::summed(
+            calls.into_iter().filter_map(|call| call.usage),
+        ))
+    }
+
     /// Reads a page of a run's public events.
     ///
     /// # Errors

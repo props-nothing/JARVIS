@@ -1301,6 +1301,9 @@ async fn a_named_policy_reaches_the_created_run() {
             name: "named".to_owned(),
             status: ModelDataPolicyStatus::Active,
             rules: PolicyRules::permissive(),
+            // No provenance: this fixture seeds a version directly, so there is no merge to record.
+            // An empty list is what the adapter writes for a version with no known contributor.
+            layers: Vec::new(),
             created_at: now(),
         })
         .await
@@ -1381,6 +1384,7 @@ async fn a_run_created_with_no_named_policy_uses_the_active_one() {
             name: "active".to_owned(),
             status: ModelDataPolicyStatus::Active,
             rules: PolicyRules::permissive(),
+            layers: Vec::new(),
             created_at: now(),
         })
         .await
@@ -1447,6 +1451,7 @@ async fn insert_policy(
             name: "active".to_owned(),
             status: ModelDataPolicyStatus::Active,
             rules,
+            layers: Vec::new(),
             created_at: now(),
         })
         .await

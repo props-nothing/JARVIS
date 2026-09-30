@@ -39,14 +39,14 @@ use jarvis_domain::ids::{CorrelationId, RequestId};
 use jarvis_domain::model::identity::EndpointClass;
 use jarvis_domain::model::policy::{
     EffectiveResidency, EffectiveRetention, EffectiveTrainingUse, FallbackPermission, Locality,
-    ModelRouteDecision, PolicyRules, PolicyVersionRef, ProviderRetention, RequestedDataPolicy,
-    Sensitivity, Telemetry, TrainingUse,
+    ModelRouteDecision, PolicyLayer, PolicyRules, PolicyVersionRef, ProviderRetention,
+    RequestedDataPolicy, ResolvedPolicy, Sensitivity, Telemetry, TrainingUse,
 };
 use jarvis_domain::model::stream::{Modality, RouteRequirements};
 use jarvis_domain::time::{IsoDate, UtcTimestamp};
 use jarvis_protocol::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
-    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
+    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView, SourceLayerView,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for, runs};
@@ -187,9 +187,15 @@ pub async fn put_active_policy(
             &PutPolicyResponse {
                 policy_id: stored.policy_id.to_string(),
                 version: stored.version,
-                name: stored.name,
+                name: stored.name.clone(),
                 status: stored.status.as_str().to_owned(),
                 rules: full_rules_view(&stored.rules),
+                // The reply describes the version it created, and the contract requires a client
+                // that PUT a policy and immediately GETs it to see the **same document** — so the
+                // provenance is rendered here through the same helper as the read. A reply that
+                // omitted it would make the two disagree about a version whose layers nobody had
+                // changed in between, which is the shape the comment above already guards for rules.
+                source_layers: source_layers_view(&stored),
             },
         ),
         Err(error) => policy_error_response(request_id, &error),
@@ -299,7 +305,58 @@ fn active_view(stored: &StoredPolicyVersion) -> ActivePolicyResponse {
         name: stored.name.clone(),
         status: stored.status.as_str().to_owned(),
         rules: full_rules_view(&stored.rules),
+        source_layers: source_layers_view(stored),
     }
+}
+
+/// Renders a version's layer provenance, marking the layers that actually narrowed it.
+///
+/// **The contract requires this and the response did not carry it** (`BRN-057`): its `GET
+/// /api/v1/model-data-policy` section says the read returns "the active workspace policy, version,
+/// **source layers**, ...". Without it an operator asking why a rule applies could be told only that
+/// it does.
+///
+/// `narrowed` is computed rather than assumed, and the reason is the one `narrowing_layers`' own
+/// doc gives: a layer that contributed a **permissive** ruleset is in the precedence list without
+/// having imposed anything, and naming it as the cause would send an operator to change a policy
+/// that is not responsible. The computation re-folds the contributions in order and records which
+/// step changed the result — the same rule the domain function applies, kept here rather than
+/// duplicated so there is one definition of "narrowed".
+fn source_layers_view(stored: &StoredPolicyVersion) -> Vec<SourceLayerView> {
+    // `ResolvedPolicy::merge` sorts by the layer's precedence, which is what makes the response
+    // ordered strongest-first; the stored order is the order they were recorded, which for a
+    // second write is workspace-then-submission and therefore already correct, but relying on that
+    // would break the moment a third contributor is added out of order.
+    let merged = ResolvedPolicy::merge(stored.layers.clone()).ok();
+    let narrowing = merged
+        .as_ref()
+        .map(ResolvedPolicy::narrowing_layers)
+        .unwrap_or_default();
+    let mut layers: Vec<SourceLayerView> = stored
+        .layers
+        .iter()
+        .map(|contribution| SourceLayerView {
+            layer: contribution.layer.as_contract_str().to_owned(),
+            policy_version: contribution
+                .policy_version
+                .map(|reference| reference.version),
+            narrowed: narrowing.contains(&contribution.layer),
+        })
+        .collect();
+    // Sorted by the contract's precedence rather than by insertion, so the strongest layer reads
+    // first. `position` cannot fail for a name this module produced, and an unknown name sorts last
+    // rather than being dropped — a rendering choice, not a validity judgement: dropping it would
+    // hide a layer from the operator who asked which one is responsible.
+    layers.sort_by_key(|view| {
+        PolicyLayer::parse(&view.layer)
+            .and_then(|layer| {
+                PolicyLayer::ORDERED
+                    .iter()
+                    .position(|ordered| *ordered == layer)
+            })
+            .unwrap_or(usize::MAX)
+    });
+    layers
 }
 
 /// Renders the full nine-field rules of a stored policy.

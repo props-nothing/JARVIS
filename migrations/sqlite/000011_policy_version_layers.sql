@@ -1,0 +1,22 @@
+-- `model_data_policies` stores a version's merged rules in `rules_json` and nothing about **which
+-- layers produced them**. The contract's `GET /api/v1/model-data-policy` requires the response to
+-- return "source layers", so an operator asked which policy is responsible for a refusal could be told
+-- only that a rule applies (`BRN-057`).
+--
+-- `PolicyLayerContribution` is the domain type that already models this — a layer, the rules it
+-- supplied, and the stored policy version that supplied them — and `ResolvedPolicy::merge` and
+-- `narrowing_layers` already compute the answer. None of it had a producer: the merge happened inside
+-- `PolicyService::put` through `PolicyRules::merge_stricter` directly, so the reason for the result was
+-- dropped at the moment it was computed.
+--
+-- The column is nullable and NOT back-filled, deliberately. A row written before provenance was kept
+-- genuinely has none: it was created by a merge whose contributors were never recorded, and inventing
+-- `["workspace"]` would attribute a narrowing to a layer nobody observed. NULL means "not recorded",
+-- which is the same honest-absence rule `decided_assurance` follows in `000010` — and it is why the
+-- reader treats an absent document as empty rather than as a claim that one layer applied.
+ALTER TABLE model_data_policies ADD COLUMN layers_json TEXT;
+
+-- No index. The provenance is read with the version it belongs to (same primary key, same row), never
+-- searched by, so an index would be write cost for a query nothing makes — the same reasoning the
+-- `decided_assurance` index does *not* follow, because that one answers an audit question about which
+-- decisions were made at a level.

@@ -1297,8 +1297,11 @@ impl RunController {
                             // No stream was drained on this path — the backoff elapsed before a
                             // retry began — so no output was produced and the timing is the
                             // default: no first instant, no sample, which is what "nothing was
-                            // measured" looks like rather than a zeroed profile.
+                            // measured" looks like rather than a zeroed profile. The usage is
+                            // absent for the same reason, and the previous attempt's report
+                            // belongs to its own row rather than to this no-call.
                             DeliveryTiming::default(),
+                            None,
                             "deadline_exceeded",
                             ControllerError::DeadlineExceeded.code(),
                         )
@@ -1369,7 +1372,9 @@ impl RunController {
             // The bound elapsed before the provider answered.
             None => {
                 // Nothing was drained, so no output was produced: the default timing says "no
-                // measurement" rather than a zeroed profile.
+                // measurement" rather than a zeroed profile. No usage is passed either, because the
+                // provider never opened a stream and therefore reported none — an absent usage is
+                // honest here, where a `usage_of` over the empty drain would invent one.
                 self.finish_deadline_exceeded(run, Some(call_id), DeliveryTiming::default())
                     .await?;
                 return Err(ControllerError::DeadlineExceeded);
@@ -1559,6 +1564,12 @@ impl RunController {
                 run,
                 Some(call_id),
                 DeliveryTiming::of(&drained),
+                // **The report that breached the ceiling travels with the failure.** This path
+                // discards the run's answer, so the usage is the only evidence of what the provider
+                // produced — and the code a client receives names the breached ceiling. Without the
+                // usage the model call was recorded as having consumed *nothing*, and the reader
+                // sent to `run.budget_output_tokens_exceeded` had no number to compare against it.
+                Some(reported),
                 "consumption_budget_exceeded",
                 ControllerError::BudgetExceeded { limit }.code(),
             )
@@ -1776,6 +1787,11 @@ impl RunController {
 
             // The bound elapsed while waiting for a frame.
             let Some(frame) = next else {
+                // No usage is passed, and that is deliberate rather than an omission: no usage frame
+                // has been folded into `drained` on this path — the wait *is* what failed — so a
+                // `usage_of(&drained)` here would fabricate a report for a call that made none. The
+                // deadline path therefore records an absent usage, which is honest, while the
+                // ceiling path records the report it breached.
                 self.finish_deadline_exceeded(run, Some(call_id), DeliveryTiming::of(&drained))
                     .await?;
                 return Ok(Err(ControllerError::DeadlineExceeded));
@@ -2087,17 +2103,18 @@ impl RunController {
         Ok(Err(ControllerError::Provider(error)))
     }
 
-    /// Ends a run because its own budget expired.
-    ///
-    /// One method rather than a transition at each timeout site, so the state, the
-    /// event, the reason, and the recorded call outcome cannot disagree about why the
-    /// run stopped.
     /// Ends a run whose own deadline expired, recording what the caller will be told.
     ///
     /// A wrapper over [`finish_expired`](Self::finish_expired) so the deadline's reason and code
     /// are one decision. They were passed separately at four call sites, which is four chances for
     /// a run to record a code that disagrees with the error its caller receives — exactly the
     /// divergence the parameter exists to prevent.
+    ///
+    /// **It takes no usage, because both of its call sites are waits that produced none.** One is a
+    /// provider that never opened its stream and the other is a frame wait that elapsed; neither
+    /// folded a usage report into its drain. Offering the parameter anyway would invite a caller to
+    /// pass a `usage_of(&drained)` over an empty drain, which *fabricates* a report for a call that
+    /// made none — so the type makes the honest value the only one expressible.
     async fn finish_deadline_exceeded(
         &self,
         run: RunRef,
@@ -2108,6 +2125,7 @@ impl RunController {
             run,
             call_id,
             delivery,
+            None,
             "deadline_exceeded",
             ControllerError::DeadlineExceeded.code(),
         )
@@ -2118,11 +2136,21 @@ impl RunController {
     ///
     /// One method rather than a transition at each timeout site, so the state, the event, the
     /// reason, and the recorded call outcome cannot disagree about why the run stopped.
+    ///
+    /// `usage` is the provider's own report for the attempt, when it made one, and carrying it here
+    /// is the difference between an explicable termination and a silent one: **this path discards the
+    /// run's output**, so the usage is the only evidence of what the provider actually produced. It
+    /// was previously written as `RecordedOutcome { delivery, ..default() }` on every path, so a run
+    /// that failed for exceeding its output-token budget recorded a model call that consumed
+    /// **nothing** — and the reader sent to `run.budget_output_tokens_exceeded` could see no number to
+    /// compare against the ceiling. The same shape as `BRN-053`: a client-visible code whose cause the
+    /// client could not inspect.
     async fn finish_expired(
         &self,
         run: RunRef,
         call_id: Option<ModelCallId>,
         delivery: DeliveryTiming,
+        usage: Option<&Usage>,
         reason: &'static str,
         code: &'static str,
     ) -> Result<(), ControllerError> {
@@ -2136,12 +2164,14 @@ impl RunController {
             // abandoned mid-stream is finished, and a pending row would make a later
             // reconciliation pass read it as still outstanding.
             // The delivery timing is carried through, because a call abandoned *after*
-            // emitting tokens still produced them.
+            // emitting tokens still produced them — and the usage for the same reason, since
+            // a call that was ended over its output is the one whose output matters most.
             self.record_call_outcome_with(
                 run,
                 call_id,
                 ModelCallState::Failed,
                 RecordedOutcome {
+                    usage: usage.cloned(),
                     delivery,
                     ..RecordedOutcome::default()
                 },
@@ -2425,16 +2455,37 @@ pub fn usage_payload_for_wire(usage: &Usage) -> String {
 /// The call identifier is optional rather than mandatory so the cross-check can compare the
 /// counter fields against `jarvis_protocol`'s builder, which has no call to name. A published
 /// event always supplies one — two calls in a run would otherwise be indistinguishable.
+///
+/// **Every counter the provider reported is published, and two of them were not.** The payload
+/// carried `input_tokens` and `output_tokens` while the adapter parses `cached_input_tokens` and
+/// `reasoning_tokens` off the same usage block and the call row stores all four — so a client
+/// following a run saw a provider's report **truncated**, and specifically could not see the
+/// reasoning spend that a reasoning model charges for. The contract's own usage example lists all
+/// four, and the local control API states this event carries "the counters the provider
+/// **reported**": a counter JARVIS parsed, stored, and withheld from a public event is the reader
+/// half of the same defect this project has recorded four times.
+///
+/// Each is omitted when the provider did not report it, which is the contract's "unknown is not
+/// zero" applied to a durable statement — writing `0` for an unreported count would publish a
+/// measurement nobody made.
 fn usage_payload(usage: &Usage, call_id: Option<ModelCallId>) -> String {
     let mut fields: Vec<String> = Vec::new();
     if let Some(call_id) = call_id {
         fields.push(format!("\"call_id\":\"{call_id}\""));
     }
-    if let Some(input) = usage.input_tokens {
-        fields.push(format!("\"input_tokens\":{input}"));
-    }
-    if let Some(output) = usage.output_tokens {
-        fields.push(format!("\"output_tokens\":{output}"));
+    // A table of name/value pairs rather than four `if let` blocks, so the set of counters is one
+    // readable list and adding a counter to [`Usage`] has an obvious home. The list is guarded by
+    // `usage_payload_publishes_every_counter_the_provider_reported`, because a table still lets an
+    // entry be dropped — which is exactly how two counters came to be missing here.
+    for (name, value) in [
+        ("input_tokens", usage.input_tokens),
+        ("output_tokens", usage.output_tokens),
+        ("cached_input_tokens", usage.cached_input_tokens),
+        ("reasoning_tokens", usage.reasoning_tokens),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("\"{name}\":{value}"));
+        }
     }
     format!("{{{}}}", fields.join(","))
 }

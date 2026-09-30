@@ -675,6 +675,64 @@ impl Usage {
             || self.cached_input_tokens.is_some()
             || self.reasoning_tokens.is_some()
     }
+
+    /// Folds `other` into this value, adding each reported counter.
+    ///
+    /// **This is what makes a run's ceiling a run's ceiling.** `RunBudget::exceeded_by` judges one
+    /// `Usage`, and the controller holds one live call's report — so a ceiling documented as "across
+    /// the run" was in fact compared against a single call. Summing is how the accumulated figure is
+    /// produced, and it belongs here rather than at the call site because it is arithmetic over this
+    /// type: a second implementation would be a second definition of what "consumed" means.
+    ///
+    /// **An unreported counter stays unreported.** Two calls that each omitted `reasoning_tokens`
+    /// sum to a call that omitted it, not to zero: `None + None` is not a measurement, and the
+    /// "unknown is not zero" rule holds under the fold or the sum would invent a figure. A `None`
+    /// beside a `Some` therefore yields the `Some`, which is the honest answer — one call reported
+    /// and the other did not is a measurement plus silence, not silence.
+    ///
+    /// `provider_reported` is the **and** of the two, because it claims every value in the fold came
+    /// from the provider: one estimated contribution makes the total estimated. It is not folded with
+    /// a default, so two unreported usages stay unreported rather than becoming an estimate.
+    #[must_use]
+    pub fn folding(self, other: &Self) -> Self {
+        fn add(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+            match (left, right) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                // One side measured and the other silent: the measurement is what is known.
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+        Self {
+            input_tokens: add(self.input_tokens, other.input_tokens),
+            output_tokens: add(self.output_tokens, other.output_tokens),
+            cached_input_tokens: add(self.cached_input_tokens, other.cached_input_tokens),
+            reasoning_tokens: add(self.reasoning_tokens, other.reasoning_tokens),
+            provider_reported: self.provider_reported && other.provider_reported,
+            estimated_cost_microunits: add(
+                self.estimated_cost_microunits,
+                other.estimated_cost_microunits,
+            ),
+            // The first currency named wins, and a disagreement keeps the first rather than
+            // inventing a third. Summing across currencies would be meaningless, and this build's
+            // adapter reports one currency per call, so a mismatch is data JARVIS could not read
+            // rather than a figure to add.
+            currency: self.currency.clone().or_else(|| other.currency.clone()),
+        }
+    }
+
+    /// Sums a run's per-call reports into one figure.
+    ///
+    /// Returns `None` for an empty sequence rather than a zeroed `Usage`: a run with no recorded
+    /// call has **no** consumption, and reporting `0` there would state that a run which never
+    /// reached a provider consumed nothing — the same claim `has_any_counter` exists to separate
+    /// from "nothing was measured".
+    #[must_use]
+    pub fn summed(calls: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut calls = calls.into_iter();
+        let first = calls.next()?;
+        Some(calls.fold(first, |total, next| total.folding(&next)))
+    }
 }
 
 /// Why a model call stopped producing output.
@@ -1466,6 +1524,69 @@ mod tests {
         let json = serde_json::to_string(&unreported).expect("serializes");
         assert!(!json.contains("input_tokens"), "{json}");
         assert!(!json.contains("estimated_cost"), "{json}");
+    }
+
+    #[test]
+    fn summing_a_runs_calls_keeps_an_unreported_counter_unreported() {
+        // The "unknown is not zero" rule has to survive the fold, or a run total would invent a
+        // measurement: two calls that each omitted `reasoning_tokens` sum to a call that omitted it,
+        // not to zero. And a `Some` beside a `None` is the value that was measured — the other call
+        // was silent, which is not the same as it having reported nothing.
+        let measured = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let silent = Usage {
+            input_tokens: Some(3),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let total = Usage::summed([measured, silent]).expect("two calls sum");
+        assert_eq!(total.input_tokens, Some(13), "both reported an input count");
+        assert_eq!(
+            total.output_tokens,
+            Some(4),
+            "one call reported output tokens and the other was silent, so the measurement stands",
+        );
+        assert_eq!(
+            total.reasoning_tokens, None,
+            "neither call reported reasoning tokens, so the total must not invent a zero",
+        );
+
+        // An empty sequence is `None` rather than a zeroed figure: a run with no recorded call has
+        // no consumption, and reporting `0` would state that a run which never reached a provider
+        // consumed nothing.
+        assert!(Usage::summed(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn one_estimated_call_makes_the_whole_run_total_estimated() {
+        // `provider_reported` claims every value in the fold came from the provider, so it is the
+        // conjunction rather than the first or the last. A total that said `true` because one call
+        // reported would misrepresent the contributing estimate as provider-reported.
+        let reported = Usage {
+            input_tokens: Some(1),
+            provider_reported: true,
+            ..Usage::default()
+        };
+        let estimated = Usage {
+            input_tokens: Some(2),
+            provider_reported: false,
+            ..Usage::default()
+        };
+        let total = Usage::summed([reported.clone(), estimated.clone()]).expect("sums");
+        assert!(
+            !total.provider_reported,
+            "one estimated contribution makes the total estimated",
+        );
+        assert_eq!(total.input_tokens, Some(3));
+
+        // And the conjunction is order-independent: the same pair the other way round agrees, which
+        // is what stops the flag from being "whichever call came first".
+        let reversed = Usage::summed([estimated, reported]).expect("sums");
+        assert_eq!(total, reversed, "the fold must not depend on call order");
     }
 
     #[test]

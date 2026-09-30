@@ -255,12 +255,49 @@ executable evidence:
 | Rule here | Enforced by | Falsified by |
 | --- | --- | --- |
 | an earlier deny cannot be weakened by a later layer | `PolicyRules::merge_stricter` only narrows, and an absent layer merges against a permissive identity | `an_absent_layer_cannot_loosen_a_deny`; `a_stricter_later_layer_still_narrows_an_earlier_one` is the case a "first deny wins" shortcut gets wrong |
-| the precedence order is the contract's order | `PolicyLayer` declaration order with `ResolvedPolicy::merge` sorting by it | `the_layer_order_matches_the_contracts_precedence_list`, plus layers supplied out of order |
+| the precedence order is the contract's order | `PolicyLayer` declaration order with `ResolvedPolicy::merge` sorting by it, called live by `source_layers_view` | `the_layer_order_matches_the_contracts_precedence_list`, plus layers supplied out of order; `a_policy_write_records_and_reports_the_layers_that_narrowed_it` asserts the served order end to end |
 | allow/deny narrows to the intersection | `PolicyRules::merge_stricter` | `an_allow_list_narrows_to_the_intersection` |
 | a contradictory policy is reported, not permitted | two disjoint allow-lists are `jarvis.invalid_policy_layer` | `two_disjoint_allow_lists_are_refused_rather_than_resolved_empty` |
 | an unrestricted layer is not "nothing allowed" | an empty set means "no restriction at this layer" | `an_unrestricted_layer_does_not_erase_a_restricted_one` |
 | expired and `UNVERIFIED` evidence fail a hard rule | `Evidence::satisfies_hard_requirement_on` is one predicate over label **and** date | `evidence_is_valid_through_its_revalidation_day_and_stale_after_it`, `only_verified_evidence_satisfies_a_hard_requirement` |
 | provider guarantees are not JARVIS guarantees | `EffectiveDataPolicy` has no such field to populate | `the_effective_policy_has_no_provider_guarantee_field` asserts the shape |
+
+**Layer provenance is now recorded, persisted, and served — `BRN-057`.** `ResolvedPolicy` was
+written to let a decision "explain itself without re-deriving the merge", and until this slice the
+only call of `ResolvedPolicy::merge` and `narrowing_layers` was in `jarvis-domain`'s own test module:
+the real path, `PolicyService::put`, merged the stored rules with a submission through
+`PolicyRules::merge_stricter` **directly** and recorded the merged rules alone. So a rule was enforced
+while *which layer narrowed it* was dropped at the moment of creation — and this contract's own
+`GET /api/v1/model-data-policy` requires the response to carry "source layers", which
+`ActivePolicyResponse` did not.
+
+Closing it took four changes, and the second is why it could not be a wire-up: `put` now records a
+`PolicyLayerContribution` per contributor, `model_data_policies` grew a nullable `layers_json` column
+(see `docs/data/schema.md`), the repository reads it back, and both `ActivePolicyResponse` and
+`PutPolicyResponse` now serve `source_layers`. The row above is therefore live: `source_layers_view`
+in `jarvis-infrastructure` calls `ResolvedPolicy::merge` and `narrowing_layers` for real, and the
+`narrowed` flag is computed rather than assumed so that a layer which contributed a **permissive**
+ruleset is listed in precedence order without being named as the cause.
+
+The composed surface asserts this in `tests/e2e/policy-surface.mjs` §7b, and the assertion that
+carries the weight is the *negative* one: a second write submits a **looser** locality than the one in
+force, so `task-restriction` is recorded and must read `narrowed: false`. The first draft of that check
+required both entries to be marked and failed against a correct implementation — which is the useful
+outcome, because a test that wanted every contributor marked would pass against the shortcut of
+hard-coding `true`, and would have made the field meaningless.
+
+Two limits are worth stating rather than leaving to be discovered:
+
+- **`narrowed` is a claim about the fold, not about intent.** A layer earns it when the accumulated
+  ruleset changed at that step. A layer that repeats an earlier restriction contributes without
+  narrowing, and reads `false`.
+- **A contradictory persisted provenance degrades silently.** `source_layers_view` maps a failed
+  `ResolvedPolicy::merge` to an empty narrowing set, and `narrowing_layers` itself skips a step whose
+  merge errors — so a version whose recorded layers cannot be merged reports **every** layer as
+  `narrowed: false`, which is not the same statement as "no layer narrowed". `PolicyService::put`
+  refuses a contradiction before writing, so no version it created can reach this state; a
+  hand-written row or a future writer could. The field is a bool and cannot express "unknown", so
+  this is a named gap rather than a repaired one.
 
 The last row is the contract's own distinction made structural rather than
 documented: `model.evidence_missing` and `model.evidence_stale` are reported by

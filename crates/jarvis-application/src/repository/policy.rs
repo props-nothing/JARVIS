@@ -26,7 +26,8 @@
 
 use jarvis_domain::ids::WorkspaceId;
 use jarvis_domain::model::policy::{
-    ModelDataPolicyStatus, ModelRouteDecision, PolicyRules, PolicyVersionRef,
+    ModelDataPolicyStatus, ModelRouteDecision, PolicyLayerContribution, PolicyRules,
+    PolicyVersionRef,
 };
 use jarvis_domain::time::UtcTimestamp;
 
@@ -64,6 +65,12 @@ pub struct NewPolicyVersion {
     pub status: ModelDataPolicyStatus,
     /// The typed rules, which the adapter serializes.
     pub rules: PolicyRules,
+    /// The layers that contributed to `rules`, in precedence order.
+    ///
+    /// Written with the version so the provenance a later `GET` reports is the one that was true
+    /// when the rules were merged — see [`StoredPolicyVersion::layers`]. The adapter persists it
+    /// beside `rules_json`.
+    pub layers: Vec<PolicyLayerContribution>,
     /// When it was created.
     pub created_at: UtcTimestamp,
 }
@@ -112,6 +119,22 @@ pub struct StoredPolicyVersion {
     pub status: ModelDataPolicyStatus,
     /// The typed rules, as read back and re-validated.
     pub rules: PolicyRules,
+    /// The layers that contributed to these rules, in precedence order.
+    ///
+    /// **The provenance the contract's `GET /api/v1/model-data-policy` requires and the wire did not
+    /// carry** (`BRN-057`). A version is created by merging a submission into the policy already in
+    /// force, and the merged rules were recorded while the *reason* was dropped — so an operator
+    /// could see that a rule applied and not which layer imposed it, and
+    /// `ResolvedPolicy::narrowing_layers`, written for exactly that question, had no caller outside
+    /// a test module.
+    ///
+    /// A list rather than one value because a version can have several contributors: a first write
+    /// contributes the workspace layer alone, and a narrowing submission adds the task-restriction
+    /// layer beside it. An empty list means "recorded before provenance was kept", which is a fact
+    /// about the row rather than a claim that no layer contributed — the same distinction every
+    /// optional field in this crate draws, and the reason this is not defaulted to
+    /// `[Workspace]`.
+    pub layers: Vec<PolicyLayerContribution>,
     /// When it was created.
     pub created_at: UtcTimestamp,
 }

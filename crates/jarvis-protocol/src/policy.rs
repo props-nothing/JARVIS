@@ -117,6 +117,49 @@ pub struct ActivePolicyResponse {
     pub status: String,
     /// The typed rules in force.
     pub rules: PolicyRulesView,
+    /// The layers that contributed to `rules`, strongest first.
+    ///
+    /// **The contract's own requirement, which this response did not meet.** Its `GET
+    /// /api/v1/model-data-policy` section says the read returns "the active workspace policy,
+    /// version, **source layers**, user-visible provider evidence freshness, and any
+    /// policy-controlled fields the caller may change" — and the type carried four of those five.
+    /// Without it an operator asking *why* a rule applies could be told only that it does, which is
+    /// the question `ResolvedPolicy::narrowing_layers` was written to answer and could not be asked.
+    ///
+    /// **An object per layer rather than a list of names**, because the name alone cannot answer the
+    /// question: a client seeing `workspace` and `task-restriction` cannot tell which one imposed the
+    /// restriction, and `narrowed` is exactly that answer. The order is the contract's precedence
+    /// order, so the strongest layer reads first without consulting the document.
+    ///
+    /// **Empty does not mean "no layer contributed"**: it means the row was written before provenance
+    /// was kept, which is why the field is `default`-ed and why a reader must not substitute a
+    /// fabricated `["workspace"]`.
+    #[serde(default)]
+    pub source_layers: Vec<SourceLayerView>,
+}
+
+/// One layer's contribution, as the read reports it.
+///
+/// The layer name alone is not enough to answer "which policy is responsible" when a version has
+/// several contributors: a client that sees `workspace` and `task-restriction` cannot tell whether
+/// the narrowing came from one, the other, or both. [`PolicyRulesView`] cannot be reused for the
+/// per-layer rules either, because it is the **nine-field** stored shape while a layer contributes
+/// the same six-field statement a request carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLayerView {
+    /// The layer's contract name, from the precedence list.
+    pub layer: String,
+    /// The stored policy version that supplied these rules, when it was a stored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    /// Whether this layer actually narrowed the result.
+    ///
+    /// The distinction the contract's own wording implies: a layer named in the precedence list
+    /// that contributed a permissive ruleset did not impose the restriction a reader is asking
+    /// about, and reporting it as the cause would send an operator to change the wrong policy.
+    /// `ResolvedPolicy::narrowing_layers` computes exactly this.
+    pub narrowed: bool,
 }
 
 /// The typed rules a client submits to `PUT /api/v1/model-data-policy`.
@@ -201,6 +244,13 @@ pub struct PutPolicyResponse {
     /// `allow_fallback` would describe a policy the daemon had not stored, and a client reading its
     /// own write back to confirm it would conclude the rule had been dropped.
     pub rules: PolicyRulesView,
+    /// The layers that contributed to the created version, strongest first.
+    ///
+    /// Rendered through the same helper as the read, because the contract requires a client that
+    /// PUT a policy and immediately GETs it to see the **same document** — a reply omitting the
+    /// provenance would disagree with the read about a version nothing had changed in between.
+    #[serde(default)]
+    pub source_layers: Vec<SourceLayerView>,
 }
 
 #[cfg(test)]

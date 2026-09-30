@@ -1614,6 +1614,121 @@ async fn a_retry_is_a_new_attempt_of_the_same_logical_call() {
 }
 
 #[tokio::test]
+async fn a_runs_calls_load_across_logical_calls_and_in_the_order_they_happened() {
+    // `load_attempts` is keyed by `logical_call_id`, so it answers "what did this one operation
+    // consume" — not "what did this run consume". A run may make several logical calls, so the run's
+    // total could not be summed from any existing read, which is why the ceiling compared a single
+    // live call instead.
+    let (_database, repositories) = repository().await;
+    seed(&repositories).await;
+
+    // Two logical calls of one run, deliberately with the **later** logical call recorded first so
+    // ordering by insert order would produce the wrong sequence.
+    let second_row = ModelCallId::from_uuid(id(40));
+    let second = ModelCallId::from_uuid(id(50));
+    repositories
+        .record_attempt(attempt(40, 1, second))
+        .await
+        .expect("records");
+    let mut second_outcome = outcome(ModelCallState::Completed, Some(now()));
+    second_outcome.usage = Some(jarvis_domain::model::stream::Usage {
+        input_tokens: Some(7),
+        provider_reported: true,
+        ..jarvis_domain::model::stream::Usage::default()
+    });
+    repositories
+        .record_outcome(workspace(), second_row, second_outcome)
+        .await
+        .expect("records");
+
+    let first_row = ModelCallId::from_uuid(id(41));
+    let first = ModelCallId::from_uuid(id(51));
+    repositories
+        .record_attempt(attempt(41, 1, first))
+        .await
+        .expect("records");
+    let mut first_outcome = outcome(ModelCallState::Completed, Some(now()));
+    first_outcome.usage = Some(jarvis_domain::model::stream::Usage {
+        input_tokens: Some(5),
+        output_tokens: Some(9),
+        provider_reported: true,
+        ..jarvis_domain::model::stream::Usage::default()
+    });
+    repositories
+        .record_outcome(workspace(), first_row, first_outcome)
+        .await
+        .expect("records");
+
+    // A call belonging to a different run must not be folded in, or one run's spend would be
+    // attributed to another. The run is created rather than merely referenced: `model_calls.run_id`
+    // is a foreign key, and `record_attempt` maps an insert failure to a conflict — so a call for a
+    // run that does not exist is refused as a `logical_call_attempt` conflict, which would have
+    // looked like a uniqueness violation rather than the missing parent it is.
+    repositories
+        .create(
+            NewRun::new(
+                other_run_id(),
+                workspace(),
+                conversation_id(),
+                principal(),
+                None,
+                now(),
+            )
+            .expect("valid"),
+            run_received_event(other_run_id(), now()),
+        )
+        .await
+        .expect("the second run is created");
+    let unrelated_row = ModelCallId::from_uuid(id(42));
+    repositories
+        .record_attempt(
+            NewModelCall {
+                id: unrelated_row,
+                workspace_id: workspace(),
+                run_id: other_run_id(),
+                logical_call_id: ModelCallId::from_uuid(id(52)),
+                attempt: 1,
+                model: model(),
+                route_decision: None,
+                request_fingerprint: None,
+                started_at: now(),
+            }
+            .validated()
+            .expect("the fixture is valid"),
+        )
+        .await
+        .expect("records");
+    let mut unrelated = outcome(ModelCallState::Completed, Some(now()));
+    unrelated.usage = Some(jarvis_domain::model::stream::Usage {
+        input_tokens: Some(1000),
+        provider_reported: true,
+        ..jarvis_domain::model::stream::Usage::default()
+    });
+    repositories
+        .record_outcome(workspace(), unrelated_row, unrelated)
+        .await
+        .expect("records");
+
+    let calls = repositories
+        .load_run_calls(workspace(), run_id())
+        .await
+        .expect("loads");
+    assert_eq!(calls.len(), 2, "only this run's calls: {calls:?}");
+
+    // The summed figure is the one thing this read exists for, and it must exclude the other run.
+    let summed = jarvis_domain::model::stream::Usage::summed(
+        calls.iter().filter_map(|call| call.usage.clone()),
+    )
+    .expect("two calls with usage sum");
+    assert_eq!(summed.input_tokens, Some(12), "7 + 5, never the 1000");
+    assert_eq!(summed.output_tokens, Some(9));
+    assert!(
+        !summed.provider_reported || summed.input_tokens == Some(12),
+        "the sum must describe this run alone",
+    );
+}
+
+#[tokio::test]
 async fn a_recorded_outcome_cannot_be_rewritten_by_a_late_writer() {
     let (_database, repositories) = repository().await;
     seed(&repositories).await;
@@ -2543,9 +2658,29 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
         .expect("the attempt loads");
     assert_eq!(stored.state, ModelCallState::Completed);
 
-    // Read the two columns directly, because `StoredModelCall` deliberately exposes only
-    // what a caller needs and usage is not part of it. The adapter's own write is what is
-    // under test here.
+    // Read through the **port**, not around it. This test previously queried `usage_json` and
+    // `estimated_cost_microunits` with raw SQL and justified the detour with a comment saying
+    // `StoredModelCall` "deliberately exposes only what a caller needs and usage is not part of
+    // it" — which was the defect stated as a design decision. Both columns were bound on every
+    // write and named by no `SELECT`, so a run's consumption was unreachable by any caller while
+    // three public surfaces assumed it was readable, and a test that reached past the port is
+    // exactly what kept that from being noticed. The assertion is now what a caller can do.
+    assert_eq!(
+        stored.usage.as_ref(),
+        Some(&usage),
+        "the whole block must round-trip through the port",
+    );
+    assert_eq!(
+        stored.usage.as_ref().and_then(|u| u.output_tokens),
+        Some(2049)
+    );
+    assert_eq!(
+        stored.estimated_cost_microunits,
+        Some(5678),
+        "the cost is read from its own column, from the same source as the block",
+    );
+    // And it is still the stored column, not a value reconstructed from the block — the two are
+    // written together precisely so a cost read and a ceiling read cannot disagree.
     let row =
         sqlx::query("SELECT usage_json, estimated_cost_microunits FROM model_calls WHERE id = ?")
             .bind(call_id.to_string())
@@ -2556,16 +2691,7 @@ async fn reported_usage_and_its_lifted_cost_round_trip_through_real_columns() {
     let encoded = encoded.expect("the usage block is stored");
     let decoded: jarvis_domain::model::stream::Usage =
         serde_json::from_str(&encoded).expect("the stored usage is readable");
-    assert_eq!(decoded, usage, "the whole block must round-trip");
-    assert_eq!(decoded.output_tokens, Some(2049));
-
-    let cost: Option<i64> =
-        sqlx::Row::try_get(&row, "estimated_cost_microunits").expect("the cost column");
-    assert_eq!(
-        cost,
-        Some(5678),
-        "the cost is written to its own column from the same source",
-    );
+    assert_eq!(decoded, usage, "the stored bytes decode to the same value");
 }
 
 #[tokio::test]
@@ -3240,6 +3366,7 @@ fn new_policy(
         name: name.to_owned(),
         status,
         rules: local_only_rules(),
+        layers: Vec::new(),
         created_at: now(),
     }
 }
@@ -3402,6 +3529,103 @@ async fn a_second_write_at_one_version_is_a_conflict_and_changes_nothing() {
     );
     assert_eq!(stored.rules.maximum_sensitivity, Sensitivity::Confidential);
     assert_eq!(stored.status, ModelDataPolicyStatus::Active);
+}
+
+#[tokio::test]
+async fn a_versions_layer_provenance_round_trips_and_an_absent_one_reads_as_empty() {
+    // `BRN-057`. The contract's `GET /api/v1/model-data-policy` requires the read to return "source
+    // layers", and the column did not exist: the merge happened inside `PolicyService::put` and the
+    // reason for the result was dropped at the moment it was computed.
+    //
+    // Two directions, because they fail differently. A stored document that is **lost** on the way
+    // back (a column in the INSERT but not the SELECT) leaves the wire reporting an empty provenance
+    // for a policy that has one — an operator told "no layer narrowed this" when one did. A `NULL`
+    // document that is **read as a claim** would attribute a narrowing to a layer nobody observed.
+    let (_database, repositories) = repository().await;
+    let mut with_layers = new_policy(
+        policy_id(),
+        1,
+        ModelDataPolicyStatus::Active,
+        "private client work",
+    );
+    with_layers.layers = vec![
+        jarvis_domain::model::policy::PolicyLayerContribution {
+            layer: jarvis_domain::model::policy::PolicyLayer::Workspace,
+            rules: local_only_rules(),
+            policy_version: Some(PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            }),
+        },
+        jarvis_domain::model::policy::PolicyLayerContribution {
+            layer: jarvis_domain::model::policy::PolicyLayer::TaskRestriction,
+            rules: local_only_rules(),
+            policy_version: None,
+        },
+    ];
+    repositories
+        .insert_version(with_layers)
+        .await
+        .expect("the version inserts");
+
+    let stored = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 1,
+            },
+        )
+        .await
+        .expect("the version loads");
+    assert_eq!(
+        stored.layers.len(),
+        2,
+        "**the layers a version was created with must be read back**: {stored:?}",
+    );
+    assert_eq!(
+        stored.layers[0].layer,
+        jarvis_domain::model::policy::PolicyLayer::Workspace,
+    );
+    assert_eq!(
+        stored.layers[1].layer,
+        jarvis_domain::model::policy::PolicyLayer::TaskRestriction,
+    );
+    // The stored version reference survives too, because it is what makes a contribution
+    // attributable to a *specific* stored policy rather than to a layer in the abstract.
+    assert_eq!(
+        stored.layers[0]
+            .policy_version
+            .expect("the workspace layer names the version it came from")
+            .version,
+        1,
+    );
+
+    // And a version written without provenance reads as no known contributor rather than as a
+    // fabricated one. `new_policy` leaves `layers` empty, which the adapter stores as NULL.
+    repositories
+        .insert_version(new_policy(
+            policy_id(),
+            2,
+            ModelDataPolicyStatus::Active,
+            "no provenance recorded",
+        ))
+        .await
+        .expect("the second version inserts");
+    let without = repositories
+        .load_version(
+            workspace(),
+            PolicyVersionRef {
+                policy_id: policy_id(),
+                version: 2,
+            },
+        )
+        .await
+        .expect("the second version loads");
+    assert!(
+        without.layers.is_empty(),
+        "an absent provenance document must read as no known contributor, not as a claim: {without:?}",
+    );
 }
 
 #[tokio::test]

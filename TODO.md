@@ -1566,10 +1566,14 @@ Foundation TODO remains incomplete.
   the state most easily mistaken for an enforced one. The usage and the cost lifted from it
   are written in one call, so a ceiling check and a cost query cannot read different amounts
   for the same call. Falsified by making the comparison never breach, at which point all
-  three enforcement tests fail. **Not done:** usage is not yet summed **across** a run's
-  calls (there is one call today, so the ceilings are per-call in effect), there is no turn
-  budget, no byte or concurrency budget, no retry budget, and the disconnect case remains
-  open — so `ACC-073` is closer but not closed.
+  three enforcement tests fail. **The summed figure now exists** (`BRN-058`): a run's calls
+  are read back through `ModelCallRepository::load_run_calls`, `Usage::summed` folds them,
+  and `GET /api/v1/runs/{id}` serves the total — so "what did this run consume" is answerable
+  rather than only "what did the one live call consume". The **enforcement** path still
+  compares one call's report, which is now a correctness gap with a producer available
+  rather than a missing read; **not done:** the ceiling is not yet judged against the sum,
+  there is no turn budget, no byte or concurrency budget, no retry budget, and the
+  disconnect case remains open — so `ACC-073` is closer but not closed.
   **Retry is now implemented, and it found a defect.** `jarvis_domain::run::retry` holds
   `RetryPolicy` and the pure decision that applies it; the controller honours it, so a
   transient failure **before the provider accepted the call** closes the attempt and leaves
@@ -3761,6 +3765,104 @@ Foundation TODO remains incomplete.
     configurability gap: absent and 8192 behave alike), `budget_is_verifiable` (uncalled — nothing
     reports an unverified ceiling yet), and the context ceiling is still a fixed 8192 that ignores the
     routed model's attested window.
+- [x] `BRN-053` Publish a run's **deadline** on the run resource, so the client-visible
+  `run.deadline_exceeded` terminal is explicable to the client that receives it.
+  Evidence: `RunController` returns `run.deadline_exceeded` from **three** paths — a deadline already
+  past before any provider is contacted, a wait that outlives the remaining time, and a budget-caused
+  retry refusal — and its own doc comment says a reader "knows to look at the configured budget".
+  **No wire surface carried the budget.** `RunView` had `run_id`, `conversation_id`, `state`,
+  `version`, `created_at`, `started_at`, `updated_at`, `completed_at`, and `error_code`, so a client
+  that received the code could look at nothing: it could not tell how much time the run was given, how
+  long remained, or whether a retry would fit inside the budget it was being refused by. The
+  architecture's own durable-run-record list names "cancellation and **deadline state**", and only the
+  cancellation half was ever visible.
+  - **The value is the run's own stored column**, `agent_runs.deadline_at`, which `NewRun::with_budget`
+    derived from `budget.deadline` — the same instant `RunBudget::status_at` compares against. So the
+    published value is the one enforced rather than a second computation that could drift from it, the
+    same reasoning `BRN-011` used for delivery profiles.
+  - **An absolute instant, never a remaining duration.** A duration would restart its own countdown on
+    every read, so two `GET`s of one motionless run would report different values under the same field
+    name. The test asserts the instant's shape *and* that no `remaining`-shaped field exists.
+  - **Omitted only when a run has no deadline**, which this build does not produce: `budget_for` gives
+    every created run one, and a test in `run_service` asserts it cannot be absent. An empty string or
+    a `null` would make "no deadline" and "a deadline at the epoch" indistinguishable.
+  - **Falsified over the router**: projecting `deadline_at: None` fails
+    `the_run_resource_publishes_the_deadline_that_explains_a_timeout` with the actual response body —
+    `{"run_id":…,"state":"received","version":1,"created_at":…,"updated_at":…}` — and no `deadline_at`
+    at all. The check is at the router rather than on the view type on purpose: a field that reaches
+    the struct and not the wire is exactly this class, and a type-level test constructs the struct
+    directly so it is structurally blind to a dropped projection.
+  - **The CLI needed no change and that is the design working**: `jarvis runs show` prints the daemon's
+    own body rather than a re-derived summary, so a new field reaches the terminal without a second
+    renderer that could disagree with the daemon.
+  - 2 protocol tests (+1) and 640 HTTP tests (+1). `local-control-api.md` names the field on the run
+    resource and in the read's field list.
+  - **Still not done:** the run does not publish its **remaining token/cost headroom**, only the
+    deadline; and the `context_manifest_id` column remains `MEM-008`'s, as its own comment records.
+- [x] `BRN-054` Record the usage that breached a consumption ceiling, so
+  `run.budget_output_tokens_exceeded` is explicable to the client that receives it. The same defect
+  as `BRN-053`, one field over.
+  Evidence: the ceiling check runs **before** the usage event is published — deliberately, because the
+  run must be failed and its answer discarded — and the terminal it calls wrote
+  `RecordedOutcome { delivery, ..RecordedOutcome::default() }`, clearing the usage on the way. So a run
+  failed for consuming too many tokens stored a model call that consumed **none**, and a reader sent to
+  `run.budget_output_tokens_exceeded` had no number to compare against the 2048 ceiling that refused it.
+  **That path discards the answer, which makes the usage the only evidence of what the provider
+  produced** — so the one scenario where the numbers matter most was the one that recorded nothing.
+  - **`finish_expired` now takes the usage** and writes `usage: usage.cloned()`, so the state, the
+    event, the reason, the code, and the recorded call outcome are set in one place and cannot disagree.
+    The ceiling path passes `Some(reported)` — the very value `exceeded_by` judged.
+  - **`finish_deadline_exceeded` deliberately does not take one, and the earlier version of this change
+    was wrong to add it.** Both of its call sites are waits that produced no report: one is a provider
+    that never opened its stream, the other a frame wait that elapsed. Neither folds a usage into its
+    drain, so a parameter there could only ever be passed `None` — and offering it invites a caller to
+    pass `usage_of(&drained)` over an **empty** drain, which fabricates a report for a call that made
+    none. The absent value belongs to the type, not to two call sites that must remember it.
+  - **Falsified**: passing `None` on the ceiling path fails
+    `a_run_that_exceeds_its_output_token_ceiling_is_failed_and_its_answer_discarded` with "**the usage
+    that breached the ceiling must be recorded on the failed call**". The assertion was added to the
+    existing test rather than a new one, because the property belongs to the case that test already
+    owns — a separate test would let the original drift while the new one stayed green.
+  - 77 controller tests, 1506 workspace tests. `agent-runtime.md`'s budget section records the path and
+    why the deadline's sites take no usage.
+  - **Still not done:** the run publishes no remaining token/cost headroom, and
+    `budget_is_verifiable` remains uncalled, so a ceiling the provider left unmeasurable is still not
+    **reported** as unverifiable.
+- [x] `BRN-055` Publish **every** usage counter on the `run.usage` event. The adapter parsed four
+  counters, the call row stored four, and the public event carried two.
+  Evidence: `jarvis_infrastructure`'s adapter reads `cached_input_tokens` from
+  `prompt_tokens_details.cached_tokens` and `reasoning_tokens` from
+  `completion_tokens_details.reasoning_tokens` — the latter from a field the real endpoint capture
+  found and the documented schema does not list — and its own test asserts both land on the `Usage`.
+  The call row keeps all four. But `usage_payload` pushed only `input_tokens` and `output_tokens`, so a
+  client following a run saw the provider's report **truncated**, and specifically could not see the
+  reasoning spend that a reasoning model charges for. `model-stream.md`'s usage example lists all four
+  counters, and `local-control-api.md` says this event carries "the counters the provider **reported**"
+  — a counter JARVIS parsed, stored, and withheld from a public event is the reader half of the defect
+  class this project has recorded four times.
+  - **The counter set is now one table** (`for (name, value) in [...]`) rather than four `if let`
+    blocks, so the list is readable in one place and adding a counter to `Usage` has an obvious home.
+  - **Asserted as a whole object, and that is the load-bearing part of the fix.** The previous test
+    checked the two fields it expected to be present — and both passed, because the omission was of two
+    fields nothing mentioned. Comparing the entire payload (minus the expected `call_id`) is what makes
+    a *fifth* counter's omission fail here rather than pass silently again.
+  - **A deliberate non-change: `provider_reported` is not published.** `model-stream.md`'s usage shape
+    includes it, so adding it is tempting — but `grep 'provider_reported: true'` finds **no `false`
+    producer anywhere**: the adapter sets `true`, and every other occurrence is a fixture. Publishing a
+    constant boolean would put a field in a durable public payload that can never carry information,
+    and the honest state is to leave it absent (as the contract already permits: "Missing usage fields
+    remain `null`/absent") and add it when JARVIS has an estimator. The same reasoning applies to
+    `estimated_cost_microunits` and `currency`, which have no pricing catalog.
+  - **Falsified**: removing `reasoning_tokens` from the table fails
+    `the_usage_event_carries_every_counter_the_provider_reported` with the payload as published —
+    `{"call_id":…,"input_tokens":11,"output_tokens":22,"cached_input_tokens":7}` against the expected
+    four-counter object.
+  - 78 controller tests (+1), 641 HTTP tests (+1 guard), 1507 workspace tests. `local-control-api.md`
+    names the four counters and records why the set is compared whole.
+  - **Still not done:** on the `run.usage` *event* — which reports one call — `provider_reported`,
+    `estimated_cost_microunits`, and `currency` remain unpublished because nothing can produce a value
+    for them; and `budget_is_verifiable` remains uncalled. Usage **is** now summed across a run's calls
+    for the run *read* (`BRN-058`), where the fold has a source: each call's stored block.
 - [x] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its
@@ -4515,8 +4617,155 @@ Dependencies: Milestone 2 exit gate.
   shipping the decision alone, so the gap is named here. Also absent: symlink and reparse-point
   detection (which needs the metadata the adapter would read), a write *plan* with approval preview, the
   tools themselves, and any grant store — `PathGrant` values are passed in, not persisted.
+- [x] `BRN-056` Sweep the migrations for columns nothing references, and name the dead policy-layer
+  machinery a doc claimed was in use. Two documentation defects found by two sweeps, no behaviour
+  changed.
+  Evidence: **a corrected sweep of the migrations against the Rust sources** (207 surviving columns
+  across 17 tables, after processing migrations in order so a table a later one drops and recreates is
+  not counted with its old shape) still finds **nine** columns mentioned nowhere in `crates/` or
+  `apps/`. Seven are already documented as absent — the `agent_steps` group belongs to the table
+  `docs/data/schema.md` marks "**Still schema-only**", and `application_locks` is explicitly "created
+  but unused". **Three were not:** `agent_runs.result_ref`, `agent_runs.error_ref`, and
+  `agent_runs.plan_summary_ref` were listed in the `agent_runs` field list as ordinary members of the
+  record, while the same document carefully flags `context_manifest_id` and the `runtime_id` pair as
+  unpopulated. A reader of that list would take them for implemented. They are now called out, with
+  the reason each is absent (two need an artifact store; the third needs a plan, and nothing writes
+  one) and with the note that `error_code` *is* populated beside `error_ref`, which is what makes the
+  distinction visible.
+  - **⚠ The first version of the sweep was wrong, and the false positives were the useful signal.**
+    It concatenated every migration and reported eleven orphans, including `granted_by` and
+    `scope_ref` from `model_policy_exceptions` — a table `000005` **drops and recreates** with a
+    different shape. A sweep that over-reports is worse than none, because it is read as a work list.
+    The rewrite tracks `DROP TABLE` and replacement `CREATE TABLE` in version order and re-run it
+    gave nine.
+  - **The second defect: `ResolvedPolicy` is dead machinery that a contract table described as
+    live.** `PolicyLayer`, `PolicyLayerContribution`, `ResolvedPolicy::merge`, and
+    `narrowing_layers` implement the contract's six-layer precedence — and a grep of `crates/` and
+    `apps/` finds **every call site in `jarvis-domain`'s own test module**. The real path is
+    `PolicyService::put`, which merges through `PolicyRules::merge_stricter` directly, so the rules
+    are enforced while *which layer narrowed them* is dropped at creation. `model-data-policy.md`'s
+    test table listed `ResolvedPolicy::merge` as the enforcer of "the precedence order is the
+    contract's order", and `narrowing_layers`' own doc claimed it was "used by operator output" —
+    while the CLI prints only the *configured* policy id from its config file and
+    `ActivePolicyResponse` has no layer field at all. Both claims are now recorded as false rather
+    than left to mislead, and the type is kept because it is correct and its test falsifies a wrong
+    version.
+  - **Closing the layer gap is a named slice, not a wire-up**, and that is why this round recorded
+    it rather than half-implementing it: it needs a contribution recorded at version creation, a
+    **migration** (`model_data_policies` stores `rules_json` and has no provenance column), a read
+    path, and a wire field — four parts, each a real change, against a contract requirement
+    ("`GET` returns ... source layers") that is presently unmet.
+  - 1507 tests (unchanged — no behaviour changed), fmt/clippy/doc clean, both docs gates green. The
+    two doc corrections are in `docs/data/schema.md`, `docs/contracts/model-data-policy.md`, and the
+    two `jarvis-domain` doc comments whose claims were false.
+  - **Still not done:** the layer provenance above; `agent_runs.result_ref`/`error_ref` and
+    `plan_summary_ref` (each needs a producer that does not exist).
 - [ ] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
+- [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
+  the source layers a policy version was merged from, so the contract's `GET` requirement stops being
+  unmet. Behaviour change: one nullable column, one new wire field, and a producer that was absent.
+  Evidence: **the `narrowed` flag is falsified by removing the producer.** Making `PolicyService::put`
+  record an empty provenance instead of its two contributions fails
+  `a_policy_write_records_and_reports_the_layers_that_narrowed_it` with `source_layers: []`, which is
+  what proves the four parts are connected rather than four changes that each compile. The test drives
+  `PUT` twice against a running router and asserts `["workspace"]` for a first write, then
+  `["workspace", "task-restriction"]` in precedence order for a second, and then re-reads through
+  `GET` to require the two responses to describe the same version. The adapter half is asserted
+  separately by `a_versions_layer_provenance_round_trips_and_an_absent_one_reads_as_empty`, which
+  stores NULL explicitly — the not-back-filled case a fresh schema never exercises.
+  - **Why this was four changes and not a wire-up:** `model_data_policies` stored `rules_json` alone,
+    so provenance had nowhere to live. `000011_policy_version_layers.sql` adds a nullable
+    `layers_json`, deliberately **not back-filled**: a row written before provenance was kept genuinely
+    has none, and defaulting it to `["workspace"]` would attribute a narrowing to a layer nobody
+    observed. That is why the wire field is `#[serde(default)]` rather than required — an absent
+    provenance and an unreported one are the same statement to a client.
+  - **The `narrowed` flag is computed, not assumed.** `source_layers_view` re-folds the recorded
+    contributions through `ResolvedPolicy::merge` and `narrowing_layers` rather than marking every
+    contributor, because a layer that contributed a **permissive** ruleset is in the list without
+    having imposed anything; naming it as the cause would send an operator to change a policy that is
+    not responsible. The list is sorted by `PolicyLayer::ORDERED` position rather than by insertion,
+    so the strongest layer reads first; an unrecognised name sorts last instead of being dropped,
+    because dropping it would hide a layer from the operator who asked which one is responsible.
+  - **Two limits recorded rather than repaired.** `narrowed` is a claim about the fold and not about
+    intent (a layer repeating an earlier restriction reads `false`), and a **contradictory persisted
+    provenance degrades silently**: `source_layers_view` maps a failed merge to an empty narrowing set
+    and `narrowing_layers` skips an erroring step, so every layer would read `narrowed: false` — not
+    the same statement as "no layer narrowed". `PolicyService::put` refuses a contradiction before
+    recording it, so no version it wrote can reach this state; the residual risk is a writer outside
+    it. The wire field is a bool and cannot carry "unknown", so this is named in
+    `docs/contracts/model-data-policy.md` instead of being papered over.
+  - **Doc claims corrected in the same change, because this slice made them false the other way:**
+    `ResolvedPolicy`'s "no production caller" header and `narrowing_layers`' "used by operator output"
+    are both replaced with what is now true; the contract's "recorded rather than repaired" paragraph
+    is replaced by the four parts; the contract test table row for precedence names the live caller;
+    `docs/data/schema.md` documents the column and the nil-not-backfilled decision.
+  - 1509 tests (+2), fmt/clippy/doc clean, both docs gates green.
+  - **Also asserted at the composed daemon surface**, which is where this defect class is invisible to
+    a router test: `tests/e2e/policy-surface.mjs` §7b drives two writes against a real `jarvisd` and
+    requires the second to report `["workspace", "task-restriction"]` in precedence order, that only
+    the workspace entry reads `narrowed: true`, and that the workspace entry names stored version 1
+    while the submission omits `policy_version`. **Falsified by hard-coding `narrowed: true`**, which
+    fails the journey with "only the workspace layer narrowed" — so the flag is not decoration.
+  - **The first draft of the journey check was wrong and failed against a correct implementation.** It
+    required both contributors to be marked, and the second write submits a *looser* locality than the
+    one in force, so `task-restriction` genuinely narrows nothing. That is the field working as
+    designed, and the episode is recorded in the contract doc because a test that wanted every
+    contributor marked would have passed against the shortcut and made `narrowed` meaningless.
+  - **Not closed by this slice:** a *route decision* still cannot carry a layer list — no field on
+    `RouteRequest` or `ModelRouteDecision` can hold one — so a model call can report the rules that
+    applied but not which layer narrowed them. That half of `ResolvedPolicy`'s own doc remains
+    aspirational and is left stated rather than implied.
+- [x] `BRN-058` Make a run's consumption durable and readable: two `model_calls` columns were bound on
+  every write and named by no `SELECT`, so the run record's "model/tool usage and budget state" had no
+  read path and the ceilings were compared against a single live call.
+  Evidence: **falsified by removing the two columns from `model_call_columns!`**, which fails four
+  tests — `reported_usage_and_its_lifted_cost_round_trip_through_real_columns`,
+  `a_runs_calls_load_across_logical_calls_and_in_the_order_they_happened`, and both new HTTP tests
+  (`a_run_read_reports_the_usage_its_calls_recorded`,
+  `a_run_with_no_recorded_usage_omits_the_field_rather_than_zeroing_it`). **Falsified again** by
+  replacing the run predicate with `(run_id = ? OR 1 = 1)`, which fails the run-scope test naming the
+  leaked foreign call (`input_tokens: Some(1000)`).
+  - **The defect was two-layered, not one.** `usage_json` and `estimated_cost_microunits` existed from
+    the first migration and `record_outcome` bound both; the port's own `StoredModelCall` had no field
+    for either and `model_call_columns!` omitted them. So the value was written, the type could not
+    carry it, and no reader could ask for it — three gaps that each look like "not wired up".
+  - **An existing test worked around the hole and documented the workaround as a design decision.** The
+    round-trip test read `usage_json` with **raw SQL** and justified the detour with "`StoredModelCall`
+    deliberately exposes only what a caller needs and usage is not part of it". The test directly below
+    it is about the *same* defect class for `finish_reason` — a column bound by the write and named by
+    no `SELECT` — and calls it a defect. That comment is now replaced with an assertion through the
+    port, which is what kept this from being noticed.
+  - **`Usage::summed` puts the arithmetic in the domain.** An unreported counter stays unreported
+    through the fold (`None + None` is not a measurement), a `Some` beside a `None` keeps the
+    measurement, and `provider_reported` is the **conjunction** so one estimated contribution makes the
+    total estimated. `summed` returns `None` for an empty sequence rather than a zeroed `Usage`.
+  - **The run scope is asserted against a *second run*.** The test creates another run — `model_calls.run_id`
+    is a foreign key, and `record_attempt` maps an insert failure to a `logical_call_attempt` conflict,
+    so referencing a run that does not exist was refused as a uniqueness violation rather than the
+    missing parent it is.
+  - **A mutation that was not a mutation.** My first bypass attempt replaced the predicate with
+    `run_id = ? OR ? IS NOT NULL` and the test **passed** — because `sqlx` leaves the now-unbound third
+    placeholder as NULL, and `NULL IS NOT NULL` is false. A falsification that does not fail is a signal
+    to check the mutation was real; the literal `1 = 1` failed correctly.
+  - 1514 tests (+5), docs synced in the same change.
+  - **Also asserted at the composed daemon surface, in the direction that is reachable there.**
+    `tests/e2e/policy-surface.mjs` reads `GET /api/v1/runs/{id}` after a real run settles and asserts
+    the field is **omitted** rather than zeroed. The daemon's composed provider is the scripted one,
+    whose terminal carries no usage block — deliberately, because it does not call a model and
+    fabricating a consumption figure would put a measurement nobody made into a durable record. So the
+    journey can only reach the absent branch, and the *present* branch (the sum appearing and equalling
+    its inputs) is asserted by `a_run_read_reports_the_usage_its_calls_recorded`, which drives a real
+    router over a real migrated store with a provider that does report usage. **Two checks, two
+    branches; neither alone covers it.** A journey check that silently took the absent branch and
+    called it passing is the shape this note exists to prevent.
+  - **`clippy`'s line bound fired and the extraction was the right fix**, as in rounds 102 and 103: the
+    fixture crossed 100 lines once it gained a variant, and `fixture_provider` is now one concern
+    (built from one shared answer script) rather than a `match` buried in state assembly.
+  - **Still open:** `budget_is_verifiable` remains **uncalled**, so a ceiling the provider left
+    unmeasurable is still not *reported* as unverified. The read path that makes it reportable now
+    exists, but the field to carry the verdict does not, and a field that is always `true` in this build
+    would be a constant in a durable payload.
 - [ ] `TLS-010` Add MCP negotiation, auth, cancellation, malformed payload, and
   conformance/Inspector tests.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.

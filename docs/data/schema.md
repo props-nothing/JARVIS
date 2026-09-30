@@ -188,6 +188,21 @@ created_at, started_at, updated_at, completed_at
 
 State and waiting fields have constraints preventing incompatible combinations.
 
+**Three columns here have no producer, and this list read as though they did.** `result_ref`,
+`error_ref`, and `plan_summary_ref` are named above as ordinary members of the record, and a sweep of
+the migrations against the Rust sources found **no reference to any of them anywhere in `crates/` or
+`apps/`** — so every row carries `NULL` and a reader of this document would take them for
+implemented. The contract's durable-run-record list does require "final response/artifact references
+or normalized error", so two of the three are *owed* rather than unnecessary; they are absent because
+each needs an artifact store, which does not exist (`result_ref` on `tool_call_records` is absent for
+the same reason, and that note is recorded at the `tool_call_records` section). `plan_summary_ref`
+needs a plan, and nothing writes one.
+
+They are called out rather than deleted because the distinction matters: a column with no port is
+`MEM-008`-style deferred work, while a column nothing references is a schema promise with no owner.
+`error_code` is the one that *is* populated — `BRN-012` gave it a writer — which is why a failed run
+reports its code and `error_ref` is still `NULL` beside it.
+
 `runtime_id` and `runtime_version` name the runtime that *executed* the run and the build version it
 was, so a resume can validate both against the runtime it is about to use
 (`docs/architecture/agent-runtime.md`). They are written by the create path and read back by the
@@ -233,13 +248,15 @@ provider id is attached to a stream frame's metadata rather than to a specific e
 write was missing in a different place from the other two: the controller's frame fold never read
 `provider_metadata` at all.
 
-`first_output_at` is the instant the **first** output delta arrived, observed from JARVIS's own
-clock so it is comparable across providers, and it is what a time-to-first-token interval is
-computed from. It was the last column in this group to gain a producer: the port, the bind, the
-`SELECT`, and the double all carried it while every controller path wrote `None`, so the column was
-`NULL` on every row and nothing could measure the interval the roadmap asks for. A call that emits
-output and then fails still records it, because the tokens were really produced; a call refused
-before the provider accepted it does not, which is why those two paths pass `None` explicitly rather
+  `usage_json` and `estimated_cost_microunits` are the last two columns in this section to be read,
+  and the same rule applies to them (`BRN-058`): both were bound by `record_outcome` on every write
+  and named by **no** `SELECT`, so a run's consumption was stored and unreachable. They are read
+  together, from one decoder, because the cost is lifted out of the usage block so a ceiling check
+  reads the block while a cost read reads the column — and if only one were selected, a run's summed
+  cost could contradict the per-call values it was summed from. `load_run_calls` orders by
+  `(started_at, attempt, id)` so the attempts of a run's several logical calls read in the order they
+  happened, and `id` is the tie-break because the order must be total — a run can make two calls in
+  the same instant, and a non-total order is how a summing read loses a row.
 than by omission.
 
 `last_output_at` and `output_delta_count` complete that measurement (`BRN-011`). One instant and a
@@ -282,13 +299,22 @@ and safe metadata.
 
 ```text
 id, workspace_id, owner_principal_id nullable, name, version, status,
-rules_schema_version, rules_json, created_by, created_at, activated_at,
-superseded_at
+rules_schema_version, rules_json, layers_json nullable, created_by,
+created_at, activated_at, superseded_at
 UNIQUE(workspace_id, id, version)
 ```
 
 Policy versions are immutable. One active version per policy identity/workspace
 is selected through an optimistic transition.
+
+`layers_json` (added by `000011`) records the **contributions** that produced `rules_json`: the layer,
+the rules it supplied, and the stored version it came from. It exists because the contract's
+`GET /api/v1/model-data-policy` requires the response to return "source layers", and the merge that
+decides them happens inside `PolicyService::put` — so before this column the reason for a rule was
+computed and dropped in the same step. It is nullable and **not back-filled**: a row written before
+provenance was kept genuinely has none, and defaulting it to `["workspace"]` would attribute a
+narrowing to a layer nobody observed. A reader treats NULL as "no known contributor", which is why
+the wire field is `default`-ed rather than required.
 
 ### `model_policy_exceptions`
 

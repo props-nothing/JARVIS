@@ -43,7 +43,7 @@ use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
     CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
     MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RetryRequest,
-    RunEventFrame, RunView, SseEvent,
+    RunEventFrame, RunUsageView, RunView, SseEvent,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for};
@@ -351,6 +351,14 @@ pub async fn read_run(
         return not_found(request_id);
     };
     let context = context_for(&client, request_id);
+    // The usage is read **before** the run is answered so a failure to read it is not reported as a
+    // successful read with a missing field. The two reads are separate ports, and answering as soon
+    // as the run loaded would make a storage fault on the call table indistinguishable from a run
+    // that consumed nothing — the exact conflation the `Option` exists to prevent.
+    let usage = match service.usage(&context, run).await {
+        Ok(usage) => usage,
+        Err(error) => return service_error_response(request_id, &error),
+    };
     match service.read(&context, run).await {
         Ok(stored) => json_response(
             request_id,
@@ -365,6 +373,24 @@ pub async fn read_run(
                 updated_at: stored.updated_at.to_string(),
                 completed_at: stored.completed_at.map(|value| value.to_string()),
                 error_code: stored.error_code,
+                // The limit the run is held to, so `run.deadline_exceeded` is explicable to the
+                // client that receives it. The value is the run's stored column, which
+                // `NewRun::with_budget` derived from the budget the controller reads — so the
+                // instant published here is the one enforced, not a second computation of it.
+                deadline_at: stored.deadline_at.map(|value| value.to_string()),
+                // Summed across the run's attempts rather than taken from one call, so the figure a
+                // client compares against the ceilings is the quantity the ceilings are documented
+                // to bound. `None` when nothing was recorded — not a zeroed block, which would say
+                // a run whose provider reported nothing consumed nothing.
+                usage: usage.map(|usage| RunUsageView {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                    provider_reported: usage.provider_reported,
+                    estimated_cost_microunits: usage.estimated_cost_microunits,
+                    currency: usage.currency,
+                }),
             },
         ),
         Err(error) => service_error_response(request_id, &error),

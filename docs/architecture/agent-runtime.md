@@ -331,6 +331,43 @@ it — an unchecked ceiling is the state most easily mistaken for an enforced on
 usage block and the cost lifted from it are written in a single call, so a ceiling
 check and a cost query cannot read different amounts for the same call.
 
+**The usage is durable and readable, which is what the run record requires.** This
+document lists "model/tool usage and budget state" as part of the durable run record,
+and until `BRN-058` only the *time* half was true of a read: `model_calls` carried
+`usage_json` and `estimated_cost_microunits` from the first migration, `record_outcome`
+bound both on every write, and **no `SELECT` named either** — so a run's consumption
+existed and was reachable by no caller. The ceilings were therefore compared against the
+one live report the controller held in memory, which makes a ceiling documented as
+"across the run" a bound on a **single call**. `ModelCallRepository::load_run_calls`
+now reads a run's attempts, `StoredModelCall` carries the usage, `Usage::summed` folds
+them with the domain's own arithmetic, and `GET /api/v1/runs/{id}` serves the total.
+
+The summing rule matters and is the domain's, not the caller's: an unreported counter
+stays unreported through the fold, because `None + None` is not a measurement and two
+calls that each omitted `reasoning_tokens` must not sum to a call that reported zero.
+`provider_reported` is the **conjunction**, so one estimated contribution makes the
+total estimated. And a run whose calls recorded nothing reports **no** usage object
+rather than a zeroed one — "consumed nothing" and "nothing was measured" are different
+facts, which is the same rule `has_any_counter` exists to keep apart.
+
+**Still open:** `budget_is_verifiable` remains *uncalled*, so a ceiling the provider left
+unmeasurable is still not **reported** as unverified. The read path that makes it
+reportable now exists — a run's summed usage is available where a response is built — but
+the field to carry the verdict does not, and adding one that is always `true` in this
+build would put a constant in a durable payload.
+
+**The report that breached a ceiling is recorded on the failed call** (`BRN-054`).
+The ceiling check runs *before* the usage event is published, because the run must be
+failed and its answer discarded — so for one round the path cleared the usage on the
+way into `finish_expired`, and a run failed for consuming too many tokens stored a
+model call that consumed **none**. Since that path discards the answer, the usage is the
+only evidence of what the provider produced, and the code the client receives names the
+breached ceiling — so `run.budget_output_tokens_exceeded` was another **client-visible
+code whose cause the client could not inspect**, the same shape `BRN-053` fixed for the
+deadline. Every terminal that has a usage now carries it; the deadline's two sites take
+none, and `finish_deadline_exceeded` no longer accepts one, because both are waits that
+produced no report and a parameter there would invite a fabricated one.
+
 **What is not implemented, and is not claimed:** the token and cost ceilings are
 enforced per call, but usage is **not summed across a run's calls** — there is one
 call today, so the ceilings are per-call in effect and a multi-turn run would need

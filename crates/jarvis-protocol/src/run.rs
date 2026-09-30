@@ -178,6 +178,41 @@ pub struct CreateRunResponse {
     pub links: RunLinks,
 }
 
+/// What a run consumed, summed across its model calls.
+///
+/// Every counter is optional and omitted when unreported, so an absent field means "the provider
+/// reported nothing for this counter" rather than zero — the same rule the per-call `run.usage`
+/// event follows, applied to a durable statement about the whole run.
+///
+/// `provider_reported` is `false` when **any** contributing call was estimated rather than
+/// reported, because the field claims every value here came from the provider: one estimate in the
+/// sum makes the total an estimate. It is the same conjunction `Usage::folding` performs, published
+/// so a client need not infer it from an absence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunUsageView {
+    /// Reported input tokens across the run's calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Reported output tokens across the run's calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Reported cached input tokens across the run's calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Reported reasoning tokens across the run's calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Whether every contributing call's figures were provider-reported.
+    pub provider_reported: bool,
+    /// The estimated cost across the run's calls, in millionths of the billing unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_microunits: Option<u64>,
+    /// The billing currency, when a cost is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
 /// An authenticated read of one run.
 ///
 /// Deliberately bounded: it carries state, identity, the optimistic version, and
@@ -210,6 +245,39 @@ pub struct RunView {
     /// The normalized error code, when it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// When the run's wall-clock budget expires, once it has one.
+    ///
+    /// **This is what makes `run.deadline_exceeded` explicable to a client.** The code is a
+    /// client-visible terminal produced on three paths — before the call, mid-wait, and on the
+    /// terminal — and the controller's own doc says a reader "knows to look at the configured
+    /// budget". No surface carried the budget, so a client that received the code could look at
+    /// nothing: it could not tell how much time it was given, how long remains, or whether a retry
+    /// would fit. The instant is the run's own, stored in `agent_runs.deadline_at` and applied by
+    /// `budget_for`, so the value a client reads is the one the controller enforces.
+    ///
+    /// An **absolute instant** rather than a remaining duration, for the same reason the stored
+    /// column is: a duration would restart its own countdown on every read, so two `GET`s of one
+    /// unmoved run would disagree while presenting as the same field.
+    ///
+    /// Omitted when a run has no deadline — which `budget_for` does not currently produce, since
+    /// every created run is given one — because `null` and "expires at a stated instant" are
+    /// different facts and the absence must not read as "expired long ago".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<String>,
+    /// What the run's model calls consumed, summed across every attempt.
+    ///
+    /// **The durable run record's "model/tool usage and budget state".** The architecture lists it
+    /// and the token and cost ceilings are judged against usage, but no read surface carried a
+    /// number: `budget.exceeded_by` compared the one report the controller held in memory, so a
+    /// client could not see what a run spent, and a ceiling documented as "across the run" was in
+    /// effect a bound on a single call.
+    ///
+    /// Omitted when nothing was recorded, rather than sent as zeroes. A run whose provider reported
+    /// no usage and a run that consumed nothing are different facts, and the contract's own
+    /// "unknown is not zero" rule applies to a durable statement about a run exactly as it applies
+    /// to the per-call event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsageView>,
 }
 
 /// The data body of one streamed run event.
@@ -606,6 +674,8 @@ mod tests {
             updated_at: "2026-09-20T12:35:10Z".to_owned(),
             completed_at: None,
             error_code: None,
+            deadline_at: None,
+            usage: None,
         };
         let json = serde_json::to_string(&view).expect("serializes");
         assert!(json.contains(r#""version":1"#), "{json}");
@@ -613,7 +683,41 @@ mod tests {
         // from "set to an empty value" without a null check.
         assert!(!json.contains("completed_at"), "{json}");
         assert!(!json.contains("error_code"), "{json}");
+        assert!(!json.contains("deadline_at"), "{json}");
+        assert!(!json.contains("usage"), "{json}");
         assert!(!json.contains("prompt"), "{json}");
+    }
+
+    #[test]
+    fn the_run_view_publishes_the_deadline_that_makes_a_timeout_explicable() {
+        // `run.deadline_exceeded` is a client-visible terminal, and the client that receives it
+        // could previously look at nothing to explain it: no wire surface carried the run's
+        // deadline, so it could not tell how much time it had been given or whether a retry would
+        // fit. The field is the run's own stored instant rather than a recomputed one.
+        let view = RunView {
+            run_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ee".to_owned(),
+            conversation_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ef".to_owned(),
+            state: "failed".to_owned(),
+            version: 3,
+            created_at: "2026-09-20T12:35:10Z".to_owned(),
+            started_at: Some("2026-09-20T12:35:11Z".to_owned()),
+            updated_at: "2026-09-20T12:49:00Z".to_owned(),
+            completed_at: Some("2026-09-20T12:49:00Z".to_owned()),
+            error_code: Some("run.deadline_exceeded".to_owned()),
+            deadline_at: Some("2026-09-20T12:50:10Z".to_owned()),
+            usage: None,
+        };
+        let json = serde_json::to_string(&view).expect("serializes");
+        assert!(
+            json.contains(r#""deadline_at":"2026-09-20T12:50:10Z""#),
+            "the deadline must be published as an instant a client can read: {json}",
+        );
+        // It is an **instant**, not a remaining duration, so two reads of one unmoved run agree.
+        // A duration field would have counted down between them while presenting as the same value.
+        assert!(
+            !json.contains("remaining"),
+            "the deadline must not be published as a remaining duration: {json}",
+        );
     }
 
     #[test]

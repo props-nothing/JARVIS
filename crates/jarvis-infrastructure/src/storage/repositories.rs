@@ -43,7 +43,7 @@ use jarvis_domain::ids::{
 };
 use jarvis_domain::model::capability::IncrementalDelivery;
 use jarvis_domain::model::identity::{ModelId, ModelRevision, ProviderId};
-use jarvis_domain::model::stream::{FinishReason, Role};
+use jarvis_domain::model::stream::{FinishReason, Role, Usage};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::run::state::{RunState, RunVersion};
 use jarvis_domain::time::UtcTimestamp;
@@ -371,7 +371,7 @@ macro_rules! model_call_columns {
         "id, run_id, logical_call_id, attempt, provider_id, model_id, \
          model_revision, route_decision_id, finish_reason, state, \
          provider_request_id, started_at, first_output_at, last_output_at, \
-         output_delta_count, completed_at"
+         output_delta_count, usage_json, estimated_cost_microunits, completed_at"
     };
 }
 
@@ -1428,10 +1428,6 @@ fn stored_model_call(row: &sqlx::sqlite::SqliteRow) -> Result<StoredModelCall, R
         // cannot reinterpret is `Corrupted` rather than absent: reporting it absent would say the
         // provider reported nothing, when the truth is that JARVIS wrote something it can no
         // longer read. That is the same rule the policy rules column follows.
-        // The finish reason is stored as the domain type's own JSON, and a value this build
-        // cannot reinterpret is `Corrupted` rather than absent: reporting it absent would say the
-        // provider reported nothing, when the truth is that JARVIS wrote something it can no
-        // longer read. That is the same rule the policy rules column follows.
         finish_reason: opt_text(row, "finish_reason")?
             .map(|value| {
                 serde_json::from_str::<FinishReason>(&value).map_err(|_| {
@@ -1459,6 +1455,27 @@ fn stored_model_call(row: &sqlx::sqlite::SqliteRow) -> Result<StoredModelCall, R
             .map(|value| {
                 u32::try_from(value).map_err(|_| RepositoryError::Corrupted {
                     column: "output_delta_count",
+                })
+            })
+            .transpose()?,
+        // The usage block is stored as the domain type's own JSON, so a value this build cannot
+        // reinterpret is `Corrupted` rather than absent — the same rule the finish reason and
+        // the policy rules follow. Reporting it absent would say the provider reported nothing,
+        // when the truth is that JARVIS wrote a report it can no longer read.
+        usage: opt_text(row, "usage_json")?
+            .map(|value| {
+                serde_json::from_str::<Usage>(&value).map_err(|_| RepositoryError::Corrupted {
+                    column: "usage_json",
+                })
+            })
+            .transpose()?,
+        // Selected together with the usage, because a run's summed cost must not contradict the
+        // per-call values it was summed from. A negative or non-integer value is corruption rather
+        // than absence: this is a count of millionths, so it cannot be negative.
+        estimated_cost_microunits: opt_int(row, "estimated_cost_microunits")?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| RepositoryError::Corrupted {
+                    column: "estimated_cost_microunits",
                 })
             })
             .transpose()?,
@@ -1636,6 +1653,34 @@ impl ModelCallRepository for SqliteRepositories {
             ))
             .bind(workspace.to_string())
             .bind(logical_call_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            rows.iter().map(stored_model_call).collect()
+        })
+    }
+
+    fn load_run_calls(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+    ) -> RepositoryFuture<'_, Vec<StoredModelCall>> {
+        Box::pin(async move {
+            // Ordered by `(started_at, attempt)` so the sequence reads as the run happened. Both
+            // terms are needed: `started_at` orders the logical calls against each other, and
+            // `attempt` orders the retries *within* one — which is the whole point of the chain, and
+            // a retry chain whose rows came back shuffled would make the attempt that consumed the
+            // output indistinguishable from the one that never reached the provider. `id` is the
+            // tie-break so the order is total, because two calls of one run can share a start
+            // instant and a page boundary is exactly where a non-total order loses a row.
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                model_call_columns!(),
+                " FROM model_calls WHERE workspace_id = ? AND run_id = ? \
+                 ORDER BY started_at ASC, attempt ASC, id ASC"
+            ))
+            .bind(workspace.to_string())
+            .bind(run.to_string())
             .fetch_all(&self.pool)
             .await
             .map_err(|_| RepositoryError::Query)?;

@@ -1178,6 +1178,36 @@ impl ModelCallRepository for InMemoryRepositories {
         })
     }
 
+    fn load_run_calls(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+    ) -> RepositoryFuture<'_, Vec<StoredModelCall>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut rows: Vec<StoredModelCall> = store
+                    .calls
+                    .values()
+                    .filter(|row| row.workspace_id == workspace)
+                    .filter(|row| row.run_id == run)
+                    .map(stored_call)
+                    .collect();
+                // The adapter's `ORDER BY started_at ASC, attempt ASC, id ASC`, reproduced so a
+                // grouping or summing bug that depends on iteration order cannot pass here and fail
+                // against SQLite. `BTreeMap` iterates by call id, which is *not* start order, so
+                // omitting this would make the double's order an accident of identifier generation.
+                rows.sort_by(|left, right| {
+                    (left.started_at, left.attempt, left.id.as_uuid()).cmp(&(
+                        right.started_at,
+                        right.attempt,
+                        right.id.as_uuid(),
+                    ))
+                });
+                Ok(rows)
+            })
+        })
+    }
+
     fn delivery_campaigns(
         &self,
         workspace: WorkspaceId,
@@ -1342,6 +1372,11 @@ fn stored_call(row: &CallRow) -> StoredModelCall {
         first_output_at: row.first_output_at,
         last_output_at: row.last_output_at,
         output_delta_count: row.output_delta_count,
+        // Carried through, because the point of this slice is that the port returns the usage it
+        // stores. A double that omitted it would let a test assert a run's summed usage against a
+        // store that never returned one — the exact divergence the double exists to prevent.
+        usage: row.usage.clone(),
+        estimated_cost_microunits: row.estimated_cost_microunits,
         completed_at: row.completed_at,
     }
 }
@@ -1375,6 +1410,11 @@ impl crate::repository::policy::ModelDataPolicyRepository for InMemoryRepositori
                         name: policy.name,
                         status: policy.status,
                         rules: policy.rules,
+                        // Carried through rather than dropped, so the double's read-back matches the
+                        // adapter's. A double that discarded the provenance would let a service test
+                        // pass while the real store returned nothing — the divergence this crate's
+                        // other doubles avoid by mirroring the adapter's reads exactly.
+                        layers: policy.layers,
                         created_at: policy.created_at,
                     },
                 );

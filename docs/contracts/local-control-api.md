@@ -297,7 +297,8 @@ path (the same path the response body carries as `links.self`), and:
 ```
 
 `GET /api/v1/runs/{run_id}` returns the authenticated client's accessible run,
-including state, public result/error summary, timestamps, and monotonically
+including state, public result/error summary, timestamps, the wall-clock
+`deadline_at` its budget enforces, and monotonically
 increasing resource `version`. It does not expose prompts assembled from hidden
 policy, secret values, provider internals, or hidden chain-of-thought. A run from
 another scope is indistinguishable from a missing run.
@@ -318,6 +319,16 @@ than derived at read time. Two rules make it trustworthy:
   failed and then succeeded stops reporting the earlier failure. A `completed` or `cancelled` run
   carries no `error_code` at all, and a cancellation is deliberately **not** a failure: the
   contract maps the three terminal states one-to-one, and `run.cancelled` is not a failure code.
+
+**The run resource also publishes `deadline_at`**, the absolute instant by which the run's
+wall-clock budget requires it to finish. It is the run's own stored value — the same one the
+controller enforces through `RunBudget::status_at` — published so a code the client already
+receives is **explicable**: `run.deadline_exceeded` is a client-visible terminal, and without this
+field a client that received it could not tell how much time the run was given, how long remained,
+or whether a retry would fit inside the budget. It is an **instant, not a remaining duration**,
+because a duration would restart its own countdown on every read and two `GET`s of one unmoved run
+would disagree while presenting as the same field. The field is omitted only for a run with no
+deadline, which this build does not create, since `budget_for` gives every run one.
 
 A recovered run's code comes from the same `RecoveryAction` that builds its recovery event
 payload, so the row and the event agree.
@@ -462,6 +473,30 @@ reported none: the contract's own "unknown is not zero" applies to a durable sta
 `0` for an unreported count would publish a measurement nobody made. A provider that reported nothing
 produces **no** usage event at all, rather than an empty one a client switching on the type would
 have to interpret.
+
+The counters are `input_tokens`, `output_tokens`, `cached_input_tokens`, and `reasoning_tokens` —
+every counter `Usage` can carry. **Two of them were parsed, stored, and withheld**: the adapter read
+`cached_input_tokens` and `reasoning_tokens` from the provider's usage block and the call row kept all
+four, while this event carried two, so a client following a run saw the provider's report truncated
+and could not see the reasoning spend a reasoning model charges for. The event's own counter set is
+guarded by a test comparing the **whole payload**, because per-field assertions are what let the
+omission stand — each field that was present passed its own check.
+
+`GET /api/v1/runs/{run_id}` carries a `usage` object — the same counters, **summed across every
+attempt of the run** — and the sentence "the call row kept all four" above was, until `BRN-058`, true
+only in the write direction. `record_outcome` serialized `usage_json` and `estimated_cost_microunits`
+on every write and **no `SELECT` ever named either column**, while the architecture requires the
+durable run record to carry "model/tool usage and budget state" and says the token and cost halves are
+implemented. So a run's consumption existed in the store and was reachable by no caller: the ceilings
+were judged against the one live report the controller held in memory, which makes a ceiling documented
+as "across the run" a bound on a **single call**. Both columns are now selected, `StoredModelCall`
+carries them, and the run read sums them.
+
+The object is **omitted** for a run whose calls recorded nothing, rather than sent as zeroes: a run
+whose provider reports no usage and a run that consumed nothing are different facts, and "unknown is
+not zero" applies to a durable statement about a run exactly as it applies to the per-call event.
+`provider_reported` is `false` when **any** contributing call was estimated rather than reported,
+because the field claims every value in the block came from the provider.
 
 ## Common Error Envelope
 

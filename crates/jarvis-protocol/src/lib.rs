@@ -22,11 +22,11 @@ pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 pub use error::{ErrorEnvelope, ErrorResponse};
 pub use policy::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
-    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView,
+    PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView, SourceLayerView,
 };
 pub use run::{
     CancelRunRequest, CreateRunRequest, CreateRunResponse, DEFAULT_RETRY_MAX_ATTEMPTS,
     MAX_CANCEL_REASON_BYTES, MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME,
-    RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunInput, RunLinks, RunView, SseEvent,
-    event_type,
+    RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunInput, RunLinks, RunUsageView, RunView,
+    SseEvent, event_type,
 };
