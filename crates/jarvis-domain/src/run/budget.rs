@@ -45,6 +45,20 @@ pub const MAX_STEP_TIMEOUT_MS: u64 = 3_600_000;
 /// ceiling — a caller may supply its own, and the field is optional.
 pub const DEFAULT_RUN_DEADLINE_MS: u64 = 900_000;
 
+/// The default bound on a run's **output** tokens, when its creator named none.
+///
+/// **Why a default rather than an absent field.** `max_output_tokens` is enforced twice — the
+/// adapter forwards it to the provider as `max_completion_tokens` (so the provider is *told* the
+/// bound), and `exceeded_by` checks the reported usage against it so a provider that ignores the
+/// hint is still caught. Both halves are real, and the field being unset made both unreachable:
+/// `budget_for` never set it and the only setters were in test files. An unset ceiling is the state
+/// `budget_is_verifiable` was written to report, and it was reported to nobody.
+///
+/// Four thousand ninety-six is a *bounded default*, not a claim about any model's window: it is half
+/// the context ceiling, which keeps the two consistent for a small model and is far above what this
+/// milestone's single-turn answers produce. A run that needs more states its own.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 4_096;
+
 /// The default bound on a single step's wall-clock time, in milliseconds.
 ///
 /// **The same unreachability, and this one is load-bearing.** The controller derives every provider
@@ -328,6 +342,17 @@ impl RunBudget {
     #[must_use]
     pub const fn with_default_step_timeout(mut self) -> Self {
         self.step_timeout_ms = Some(DEFAULT_STEP_TIMEOUT_MS);
+        self
+    }
+
+    /// Returns this budget with the default output-token ceiling applied.
+    ///
+    /// Infallible for the same reason as [`with_default_step_timeout`](Self::with_default_step_timeout):
+    /// the constant is one this module bounds, and a fallible call would push callers toward
+    /// `.ok()` — which silently drops the ceiling and restores the unreachability this removes.
+    #[must_use]
+    pub const fn with_default_output_tokens(mut self) -> Self {
+        self.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
         self
     }
 

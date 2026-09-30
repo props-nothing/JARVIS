@@ -498,6 +498,29 @@ impl OpenAiCompatibleProvider {
             body["tools"] = serde_json::Value::Array(tools);
         }
 
+        // The run's output ceiling, forwarded so the provider is **told** the bound rather than
+        // JARVIS merely judging the answer afterwards.
+        //
+        // Two facts from the official reference decide the shape of this:
+        //
+        // 1. The correct parameter is **`max_completion_tokens`**, described as "an upper bound for
+        //    the number of tokens that can be generated for a completion, including visible output
+        //    tokens and **[reasoning tokens]**(/api/docs/guides/reasoning)". The older `max_tokens`
+        //    is "now deprecated in favor of `max_completion_tokens`, and is **not compatible with
+        //    o-series models**" — so sending `max_tokens` would break the reasoning models this
+        //    adapter can be pointed at.
+        // 2. Because it *includes* reasoning tokens, it bounds exactly the quantity JARVIS compares
+        //    against: this adapter maps `completion_tokens` onto `Usage::output_tokens`, and the
+        //    reference lists `completion_tokens` as "the number of tokens in the generated
+        //    completion". A narrower bound (visible text only) would let `exceeded_by` fire on an
+        //    answer the provider considered within limit — a false failure.
+        //
+        // Absent when the run states no ceiling, which is honest: a limit JARVIS did not set must
+        // not be invented, and an omitted parameter leaves the provider's own default in force.
+        if let Some(limit) = request.limits.max_output_tokens {
+            body["max_completion_tokens"] = serde_json::json!(limit);
+        }
+
         Ok(body)
     }
 }
@@ -1507,6 +1530,52 @@ mod tests {
         // The routed model is named on the wire. Omitting it left the policy constraining the record
         // rather than the call, which is the defect `BRN-015` fixed for the request type.
         assert_eq!(body["model"], serde_json::json!("test-model"));
+    }
+
+    #[test]
+    fn the_runs_output_ceiling_is_forwarded_under_the_parameter_that_bounds_what_is_measured() {
+        // `BRN-052`. The budget's `max_output_tokens` is checked against the provider's own reported
+        // `completion_tokens`, and the check is only *enforcement* if the provider was told the bound —
+        // otherwise a provider is free to produce an answer JARVIS then throws away, which is data
+        // loss rather than a limit. Nothing forwarded it before this.
+        //
+        // Three properties, each of which a plausible wrong implementation would fail:
+        let adapter = provider();
+        let mut request = request_for(&adapter);
+        request.limits.max_output_tokens = Some(1234);
+        let body = adapter.build_body(&request).expect("the fixture builds");
+
+        // 1. It is `max_completion_tokens`. The older `max_tokens` is documented as "deprecated in
+        //    favor of `max_completion_tokens`, and is not compatible with o-series models", so a body
+        //    using the deprecated name would be refused by the reasoning models this adapter can be
+        //    pointed at.
+        assert_eq!(
+            body["max_completion_tokens"],
+            serde_json::json!(1234),
+            "the ceiling must be sent under the current parameter name",
+        );
+        assert!(
+            body.get("max_tokens").is_none(),
+            "**the deprecated parameter must not be sent**: it is documented as incompatible with \
+             o-series models, so it would refuse exactly the models that need the bound",
+        );
+
+        // 2. The value is the run's own ceiling, not a constant this adapter invented. Asserted with a
+        //    second value, because a single comparison against a literal would also pass if the adapter
+        //    hard-coded it.
+        request.limits.max_output_tokens = Some(7);
+        let second = adapter.build_body(&request).expect("the fixture builds");
+        assert_eq!(second["max_completion_tokens"], serde_json::json!(7));
+
+        // 3. **An absent ceiling sends no parameter at all.** Sending `null`, `0`, or a default would
+        //    invent a limit the run never stated — and `0` in particular would ask the provider for an
+        //    empty answer.
+        request.limits.max_output_tokens = None;
+        let unset = adapter.build_body(&request).expect("the fixture builds");
+        assert!(
+            unset.get("max_completion_tokens").is_none(),
+            "a run with no ceiling must not have one invented for it: {unset}",
+        );
     }
 
     #[test]

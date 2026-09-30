@@ -6,7 +6,6 @@ Owner: Model gateway
 Last verified: 2026-09-27
 Revalidate by: 2027-03-26
 Implementation gate: PASSED
-
 ## Decision Summary
 
 - Purpose: give JARVIS one real, streamed text model call through
@@ -138,7 +137,21 @@ Attempted `llms.txt` URLs that did not exist:
 ### Data and Limits
 
 - Request schema (the subset JARVIS sends): `model`, `messages[] {role, content}`,
-  `stream: true`, and `stream_options: { include_usage: true }`.
+  `stream: true`, `stream_options: { include_usage: true }`, and — **when the run
+  states one** — `max_completion_tokens: <n>`.
+- **`max_completion_tokens` vs `max_tokens` (verified 2026-09-30, `BRN-052`).** The
+  reference defines `max_completion_tokens` as "an upper bound for the number of tokens
+  that can be generated for a completion, including visible output tokens and
+  [reasoning tokens](https://developers.openai.com/api/docs/guides/reasoning)". It
+  describes `max_tokens` as "now deprecated in favor of `max_completion_tokens`, and is
+  **not compatible with [o-series models](https://developers.openai.com/api/docs/guides/reasoning)**".
+  So the adapter sends `max_completion_tokens`: the deprecated name would refuse exactly
+  the reasoning models that most need an output bound. Because the bound **includes**
+  reasoning tokens, it constrains the same quantity this adapter maps from
+  `completion_tokens` onto `Usage::output_tokens`, which is what `RunBudget::exceeded_by`
+  compares against — a bound over visible text alone would fail an answer the provider
+  considered within limit. Omitting the parameter when the run states no ceiling is
+  deliberate: an invented limit is a limit nobody set.
 - Response schema: the chunk described above. `usage` is `null` on every chunk
   except the last when `stream_options.include_usage` is requested.
 - Pagination: not applicable to this endpoint.
@@ -147,7 +160,9 @@ Attempted `llms.txt` URLs that did not exist:
   its own outbound header set and must not pass operator-supplied headers through
   unbounded. Per-model context and output token limits are properties of the model,
   not the protocol, so they belong in the capability inventory (`BRN-011`), not in
-  this adapter's constants.
+  this adapter's constants. **The adapter still sends `max_completion_tokens` for a
+  run that states a ceiling**: a per-request bound is not the model's own maximum, and
+  the run's ceiling is the one JARVIS enforces.
 - Rate-limit headers and behavior: `Retry-After` (seconds, minimum wait),
   `x-ratelimit-limit-requests`, `x-ratelimit-limit-tokens`,
   `x-ratelimit-remaining-requests`, `x-ratelimit-remaining-tokens`,
@@ -279,6 +294,7 @@ than an implicit one.
 
 | Provider concept | JARVIS concept | Conversion/loss |
 | --- | --- | --- |
+| `max_completion_tokens` (request) | `CallLimits::max_output_tokens` | **Forwarded 1:1, and omitted when the run states no ceiling.** Sent as `max_completion_tokens`, never as the deprecated `max_tokens`. See "Data and Limits" for why the bound's inclusion of reasoning tokens is what makes it the right quantity to compare against `Usage::output_tokens` |
 | HTTP 200 with `stream: true` | `call.started` | JARVIS emits this itself; the provider has no start frame. `model` is filled from the chunk's `model` when present |
 | `choices[0].delta.role` | (no event) | Absorbed. A role-only first chunk is not an output item |
 | `choices[0].delta.content` (string) | `output.text.delta` | `item_id` is JARVIS-generated, because this contract has no per-item identifier. One item per call |
@@ -567,3 +583,4 @@ contain. Capture, then reconcile the table against the bytes.
 | 2026-09-27 | **A real provider run is verified end to end — Milestone 2's exit gate.** `tests/e2e/provider-smoke.mjs` drives a daemon configured for **Ollama on loopback** and asserts the model's own text is durable in the run's events and that `jarvis ask` prints it and exits 0. The gate is a reachable endpoint rather than a secret, and a skip is **reported** as "nothing was proved" rather than as a pass. The real endpoint forced two additions that no fixture could reveal: `[model.provider].base_path` (Ollama serves `/v1/chat/completions`, not `/chat/completions`) and `[model.provider].model_names` (a JARVIS model id cannot contain the `:` in `glm-5.3-flash:cloud`, so without a mapping the adapter cannot name an Ollama cloud model at all). Both are validated where they are used and both leave the default configuration byte-identical | A live `jarvis ask` against `127.0.0.1:11434` returning `JARVIS OLLAMA OK` with exit 0; the smoke harness run twice (live and gated); the adapter's path and model-name validation tests |
 | 2026-09-27 | **Tool calls are translated, reversing a decision that was wrong in the dangerous direction.** The Security Analysis above claimed "tool calls appear as `tool.call.*` events and remain subject to the canonical tool pipeline" while `translate.rs` recognized `tool_calls` and emitted nothing — so the note described behaviour the adapter did not have, and the omission produced a **silent success** rather than a refusal: the controller's typed `run.tools_not_implemented` terminal was reachable only through the scripted provider, so a real model that asked to call a tool yielded a stream with no delta and no tool event and the run could reach `completed` with an empty answer. Now emits `tool.call.added`, `tool.call.arguments.delta`, and `tool.call.completed` (the last carrying the accumulated arguments, because a fragment is not parseable JSON), keyed by the protocol's `index` because later fragments carry neither the id nor the name. Emitting is not a grant: the events are proposals the deterministic layer judges | Five translator tests, falsified by restoring the silent drop; the controller's existing tool-intent tests; the adapter's own code against its security section |
 | 2026-09-27 | **A raw capture of one real stream, taken while answering the open `[DONE]` question — and it closed that question while finding a field the documented schema does not have.** The capture ends `data: [DONE]\n\n` (**so the sentinel exists**, `OC-C004`'s `[DONE]` half moves from UNVERIFIED to OBSERVED) and carries `finish_reason: "stop"` before it, so the adapter's refusal to depend on the sentinel is vindicated. It also carries **`delta.reasoning` on the majority of its frames** — the raw model-internal thinking text, **absent from the Chat Completions documented field set** the mapping table above was built from. The adapter already discarded it, and that is exactly the defect: a field no code names is indistinguishable from a field the translator forgot, and the two have opposite remedies. It is now **counted** and explicitly never translated, with the code stating why it is *not* mapped onto `reasoning.summary.delta` (which carries a user-visible summary the contract permits). Falsified by removing the increment, which fails both new tests | The live capture; `model_internal_reasoning_is_counted_and_never_becomes_output` and `the_shape_of_a_captured_stream_from_a_real_endpoint_is_handled`, the latter built from the captured frames; `Cargo.lock` still has no TLS crate |
+| 2026-09-30 | **The output ceiling is now forwarded to the provider, under the parameter that bounds what JARVIS measures.** `RequestSchema` listed only `model`, `messages`, `stream`, and `stream_options`, and `max_output_tokens` never reached the wire while `RunBudget::exceeded_by` was documented as making the ceiling "a bound rather than a number carried in a request" — so the check was unreachable from a real run and a defaulted ceiling would have **discarded a working answer** without ever asking the provider to be shorter. The reference settles the parameter: `max_completion_tokens` is "an upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens", while `max_tokens` "is now deprecated in favor of `max_completion_tokens`, and is **not compatible with o-series models**" — so the older name would refuse exactly the reasoning models that need the bound. Because it *includes* reasoning tokens it bounds the same quantity this adapter maps from `completion_tokens` onto `Usage::output_tokens`, which is what `exceeded_by` compares against; a visible-text-only bound would fail an answer the provider considered within limit. The parameter is omitted when the run states no ceiling | `the_runs_output_ceiling_is_forwarded_under_the_parameter_that_bounds_what_is_measured` (asserts the current name, the absence of the deprecated one, that the value is the run own, and that an unset ceiling sends nothing); the live endpoint capture; `llms.txt` root and API/reference indexes, then `/api/reference/resources/chat.md` |

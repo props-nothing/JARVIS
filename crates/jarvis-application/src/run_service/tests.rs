@@ -480,15 +480,75 @@ async fn a_created_run_carries_a_bounded_deadline_so_it_cannot_hang_forever() {
     // `budget_for` never set one — the retry machinery was unreachable in production. Comparing the
     // whole value is what makes that reachability an assertion rather than a claim.
     .with_retry(jarvis_domain::run::retry::RetryPolicy::default_for_run())
-    // And the same for the step timeout (`BRN-051`): it is applied by the create path now, and
-    // comparing the whole budget is what makes that an assertion rather than a claim. The field was
-    // read by a real consumer — `RunController::wait_bound` — and set by nothing.
-    .with_default_step_timeout();
+    // And the same for the step timeout and output ceiling (`BRN-051`/`BRN-052`): both are applied
+    // by the create path now, and comparing the whole budget is what makes that an assertion rather
+    // than a claim. Each was read by a real consumer and set by nothing.
+    .with_default_step_timeout()
+    .with_default_output_tokens();
     assert_eq!(stored.budget, expected);
     assert!(
         deadline > stored.created_at,
         "{deadline} {0}",
         stored.created_at
+    );
+}
+
+/// A created run's **output ceiling** is set, and the check that enforces it can fire.
+///
+/// `BRN-052`. `max_output_tokens` is enforced twice — the adapter forwards it to the provider as
+/// `max_completion_tokens`, and `exceeded_by` compares the reported usage against it — and with the
+/// field unset on every real run, **both** were dead: no provider was told the bound, and the check
+/// had nothing to compare against. An unset ceiling is exactly the state `budget_is_verifiable` was
+/// written to report.
+///
+/// The assertions cover the **consumer** as well as the field, because a ceiling that is present and
+/// cannot report a breach would satisfy a field-only test while constraining nothing.
+#[tokio::test]
+async fn a_created_run_bounds_its_output_and_the_breach_check_can_fire() {
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+
+    assert_eq!(
+        stored.budget.max_output_tokens,
+        Some(jarvis_domain::run::budget::DEFAULT_MAX_OUTPUT_TOKENS),
+        "**an output ceiling must be set**, because `exceeded_by` can only fail a run when one is",
+    );
+
+    // A usage that exceeds the ceiling must be reported as a breach by the very function the
+    // controller calls, and one inside it must not — the second half is what stops this passing
+    // against a budget that reports a breach unconditionally.
+    let over = jarvis_domain::model::stream::Usage {
+        output_tokens: Some(jarvis_domain::run::budget::DEFAULT_MAX_OUTPUT_TOKENS + 1),
+        ..jarvis_domain::model::stream::Usage::default()
+    };
+    assert!(
+        stored.budget.exceeded_by(&over).is_some(),
+        "a run's own default ceiling must be able to report a breach",
+    );
+    let under = jarvis_domain::model::stream::Usage {
+        output_tokens: Some(1),
+        ..jarvis_domain::model::stream::Usage::default()
+    };
+    assert!(
+        stored.budget.exceeded_by(&under).is_none(),
+        "a usage inside the ceiling must not be reported as a breach",
+    );
+    assert!(
+        stored.budget.budget_is_verifiable(&over),
+        "and the ceiling must be verifiable: the usage the provider reported is what judges it",
+    );
+
+    // The ceiling reaches the **provider request**, not only the row. That is the half round 106
+    // found missing, and it is what makes the default an enforcement rather than a discard rule.
+    assert_eq!(
+        stored.budget.call_limits().max_output_tokens,
+        Some(jarvis_domain::run::budget::DEFAULT_MAX_OUTPUT_TOKENS),
+        "the ceiling must reach the per-call limits the controller sends",
     );
 }
 

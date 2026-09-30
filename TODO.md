@@ -3717,6 +3717,50 @@ Foundation TODO remains incomplete.
     ceiling be *not reported as enforced*, which no surface does yet), and the context ceiling is not
     constrained by the routed model's attested window — `CapabilityDescriptor::max_context_tokens`
     still has neither producer nor consumer.
+- [x] `BRN-052` Forward the run's output ceiling to the provider, so the ceiling is **enforced twice
+  rather than neither way**. This is the missing half `BRN-051` identified and deliberately did not
+  paper over: the previous round defaulted `max_output_tokens` was implemented, then **reverted**,
+  because the adapter never sent the limit.
+  Evidence: `RequestSchema` in the adapter's own evidence note listed only `model`, `messages`,
+  `stream`, and `stream_options`, and `grep max_tokens` over the whole repository returned a single
+  protocol **test fixture** and one `None`. So `RunBudget::max_output_tokens` was dead in both
+  directions: no provider was told the bound, and `exceeded_by` had nothing to compare against on a
+  real run. The distinction matters because the two halves fail differently — **a local check that
+  only discards is not enforcement, it is data loss with a nicer name.** A provider that produces
+  an over-long answer and has it thrown away is worse off than one never asked to produce it.
+  - **The official reference settles the parameter name, and the obvious choice is wrong.**
+    `max_completion_tokens` is "an upper bound for the number of tokens that can be generated for a
+    completion, **including visible output tokens and reasoning tokens**". `max_tokens` is "now
+    deprecated in favor of `max_completion_tokens`, and is **not compatible with o-series models**" —
+    so a body using the older, more familiar name would be *refused* by exactly the reasoning models
+    that most need an output bound. The adapter sends the current name and a test asserts the
+    deprecated one is **absent**, not merely that the new one is present.
+  - **The bound must measure the same thing JARVIS judges.** Because `max_completion_tokens`
+    *includes* reasoning tokens, it bounds the quantity this adapter already maps from
+    `completion_tokens` onto `Usage::output_tokens`, which is what `exceeded_by` compares. A bound
+    over visible text alone would let the check fail an answer the provider considered within limit —
+    a false failure, and the direction this project has recorded before as the worse one.
+  - **An absent ceiling sends no parameter at all.** Not `null`, not `0`, not a default: `0` would
+    ask the provider for an empty answer, and any invented value is a limit nobody set. Asserted
+    explicitly, because "send nothing when unset" is the branch a later refactor drops.
+  - With both halves in place, `budget_for` applies `DEFAULT_MAX_OUTPUT_TOKENS` (4096) — the default
+    round 106 removed, restored now that it constrains something. `call_limits()` carries it to the
+    request, so the field, the wire, and the check are one chain.
+  - **Falsified in both halves.** Suppressing the forward (`&& false`) fails
+    `the_runs_output_ceiling_is_forwarded_under_the_parameter_that_bounds_what_is_measured` with
+    `left: Null, right: Number(1234)`; removing `with_default_output_tokens()` fails
+    `a_created_run_bounds_its_output_and_the_breach_check_can_fire` and the whole-budget assertion
+    with `left: max_output_tokens None, right: Some(4096)`.
+  - **The research gate was honoured before the edit**: the note's own `llms.txt` root and API/reference
+    indexes were used to locate `/api/reference/resources/chat.md`, and the quote above is from that
+    page. The evidence note gains a `max_completion_tokens` mapping row, a "Data and Limits" subsection
+    with the parameter decision and its citations, and a changelog entry. `Last verified`/`Revalidate
+    by` are unchanged because the manifest pair must stay exact.
+  - 1 adapter test (+1 with three cases), 47 run-service tests (+1), 1504 workspace tests.
+  - **Still not done:** `max_cost_microunits` (no pricing catalog), `with_context_tokens` (a
+    configurability gap: absent and 8192 behave alike), `budget_is_verifiable` (uncalled — nothing
+    reports an unverified ceiling yet), and the context ceiling is still a fixed 8192 that ignores the
+    routed model's attested window.
 - [x] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its

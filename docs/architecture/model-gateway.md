@@ -153,16 +153,25 @@ remain open — routing still does not consider a budget when selecting a route.
 budget** in the sense of a spend limit is also absent, though a *retry policy* is now stated
 per run and settable per request (`BRN-050`, below).
 
-**The output ceiling's `BRN-051` half is deliberately unimplemented, and the reason is worth
-recording because the obvious fix makes things worse.** `RunBudget::max_output_tokens` is checked by
-`exceeded_by` and nothing sets the field, so the check cannot fire. The apparent remedy — default the
-ceiling the way the step timeout is defaulted — was implemented and then **reverted**, because the
-two halves of "enforce a ceiling" are missing: the OpenAI-compatible adapter **does not forward
-`limits.max_output_tokens`** to the provider, so no provider would ever be asked to be shorter. A
-defaulted ceiling would therefore let a provider produce an over-long answer and then **discard** it,
-converting a working answer into a failed run while constraining nothing. A default is only
-appropriate once the adapter forwards the limit; until then the absent ceiling is the honest state,
-and `budget_is_verifiable` is the function written to say so.
+**The output ceiling's `BRN-051` half was deliberately unimplemented for one round, and the reason is
+worth keeping because the obvious fix made things worse.** `RunBudget::max_output_tokens` is checked by
+`exceeded_by` and nothing set the field, so the check could not fire. Defaulting the ceiling alone was
+implemented and then **reverted**: the two halves of "enforce a ceiling" were missing, because the
+OpenAI-compatible adapter **did not forward `limits.max_output_tokens`** to the provider — so a defaulted
+ceiling would let a provider produce an over-long answer and then have JARVIS **discard** it, converting
+a working answer into a failed run while constraining nothing. **A default is only correct when the
+bounded component can be told to comply.**
+
+`BRN-052` supplied the missing half. The adapter now sends the ceiling as **`max_completion_tokens`**,
+which the official reference defines as "an upper bound for the number of tokens that can be generated
+for a completion, including visible output tokens and reasoning tokens" — the same quantity this adapter
+maps from `completion_tokens` onto `Usage::output_tokens`, and therefore the quantity `exceeded_by`
+compares against. The deprecated `max_tokens` is explicitly **not** used: the reference says it "is now
+deprecated in favor of `max_completion_tokens`, and is not compatible with o-series models", so sending
+it would refuse exactly the reasoning models that most need an output bound. The parameter is omitted
+when the run states no ceiling, because an invented limit is a limit nobody set. With both halves in
+place, `budget_for` applies `DEFAULT_MAX_OUTPUT_TOKENS` (4096) and the ceiling is enforced **twice**: the
+provider is told the bound, and a provider that ignores the hint is caught by the usage check.
 
 ## Normalized Events
 

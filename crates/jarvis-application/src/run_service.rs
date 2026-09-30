@@ -1334,21 +1334,20 @@ fn budget_for(
         )
     })?;
     let budget = budget.with_retry(retry.unwrap_or_else(RetryPolicy::default_for_run));
-    // The step timeout is applied here for the same reason the deadline is, and `BRN-051` recorded
-    // what its absence cost: the controller derives every provider await from
-    // `(remaining deadline, step timeout)` and takes the tighter of the two, and **nothing in the
-    // product ever set the field** — so on every real run the bound reduced to the run's whole
-    // remaining deadline, and a provider that accepted the connection and then stalled held the run
-    // for the full fifteen-minute default instead of being cut off at two minutes.
+    // The step timeout and the output ceiling are applied here for the same reason the deadline is,
+    // and `BRN-051`/`BRN-052` recorded what their absence cost: both were read by a real consumer —
+    // the controller's `wait_bound` and `exceeded_by` — and **nothing in the product ever set
+    // either**, so on every real run the step bound reduced to the whole remaining deadline and the
+    // token ceiling had nothing to compare against.
     //
-    // **The output ceiling is deliberately NOT defaulted here, and that is a decision rather than an
-    // omission.** `exceeded_by` is unreachable because nothing sets `max_output_tokens`, but a value
-    // would not constrain anything either: the OpenAI-compatible adapter does not forward the ceiling
-    // to the provider, so a provider would still produce an over-long answer and JARVIS would then
-    // **discard** it. That converts a working answer into a failed run without ever asking the
-    // provider to be shorter. The two halves belong together and are named as absent rather than
-    // half-implemented — see the evidence note in `TODO.md` under `BRN-051`.
-    let budget = budget.with_default_step_timeout();
+    // The output ceiling is enforced on **both** sides now: the adapter forwards it to the provider
+    // as `max_completion_tokens`, so the provider is told the bound, and `exceeded_by` checks the
+    // reported usage against it, so a provider that ignores the hint is still caught. A default is
+    // only appropriate once the bounded component can be told what it is — which is why this default
+    // was removed in round 106 and restored here, after the adapter learned to send it.
+    let budget = budget
+        .with_default_step_timeout()
+        .with_default_output_tokens();
     Ok(match resolved {
         Some((reference, rules)) => {
             let budget = budget.with_policy(reference, rules.maximum_sensitivity);
