@@ -160,6 +160,25 @@ async fn fixture() -> (ApprovalService, Arc<InMemoryRepositories>, DurableApprov
     (service, repositories, approval)
 }
 
+/// A fixture holding one **critical-risk** approval, at a distinct identifier.
+///
+/// The risk is the only thing that differs from [`pending`], so a test that varies the assurance proves
+/// the refusal turns on the risk and not on some other fixture detail. The identifier differs because
+/// the two fixtures cannot share a row: a service holds one approval per identifier, and reusing it
+/// would make "the critical one was refused" indistinguishable from "the high-risk one was decided".
+async fn critical_fixture() -> (ApprovalService, Arc<InMemoryRepositories>, DurableApproval) {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut approval = pending();
+    approval.risk = Risk::Critical;
+    approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(10));
+    repositories
+        .request(&approval)
+        .await
+        .expect("the fixture approval is inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+    (service, repositories, approval)
+}
+
 #[tokio::test]
 async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     // The contract requires the server to expose "only approvals the authenticated principal may
@@ -168,7 +187,7 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     let (service, _repositories, _approval) = fixture().await;
 
     let visible = service
-        .list(&context(RequestChannel::Cli), 50, now())
+        .list(&context(RequestChannel::Cli), 50, None, now())
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -179,7 +198,7 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     assert!(!visible.bounded, "one row cannot fill a page of fifty");
 
     let hidden = service
-        .list(&context(RequestChannel::Voice), 50, now())
+        .list(&context(RequestChannel::Voice), 50, None, now())
         .await
         .expect("the listing runs");
     assert!(
@@ -228,7 +247,7 @@ async fn a_page_is_not_short_changed_by_rows_the_caller_cannot_decide() {
     // **A page of one.** The channel filter must run before the bound, so the one row returned is the
     // one the caller can decide — not the excluded row that happened to lapse sooner.
     let page = service
-        .list(&context(RequestChannel::Cli), 1, now())
+        .list(&context(RequestChannel::Cli), 1, None, now())
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -249,9 +268,11 @@ async fn a_page_is_not_short_changed_by_rows_the_caller_cannot_decide() {
 
 #[tokio::test]
 async fn a_full_page_reports_that_more_may_remain() {
-    // `bounded` is what tells a client to keep reading. Without it a full page is indistinguishable
-    // from a complete one, and this surface has no cursor to fall back on — so a client would stop at
-    // the bound and believe it had seen every prompt in the workspace.
+    // `bounded` is what tells a client to keep reading, and it is the **only** thing that does: the
+    // cursor is produced from `bounded`, so a listing that guessed boundedness from `len() == limit`
+    // would either hand back no cursor for a full page or hand back one for a page with nothing
+    // behind it. The page bound is also where the cursor's position comes from, so both are asserted
+    // on one store rather than in separate fixtures that could drift apart.
     let repositories = Arc::new(InMemoryRepositories::new());
     for index in 0..3 {
         let mut approval = pending();
@@ -268,7 +289,7 @@ async fn a_full_page_reports_that_more_may_remain() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let full = service
-        .list(&context(RequestChannel::Cli), 2, now())
+        .list(&context(RequestChannel::Cli), 2, None, now())
         .await
         .expect("the listing runs");
     assert_eq!(full.approvals.len(), 2, "the page respects its bound");
@@ -280,13 +301,77 @@ async fn a_full_page_reports_that_more_may_remain() {
     // And the complement, on the same store: a page the store had nothing beyond reports complete —
     // which is the half that makes the first assertion meaningful rather than a constant.
     let complete = service
-        .list(&context(RequestChannel::Cli), 3, now())
+        .list(&context(RequestChannel::Cli), 3, None, now())
         .await
         .expect("the listing runs");
     assert_eq!(complete.approvals.len(), 3);
     assert!(
         !complete.bounded,
         "a page the store had nothing beyond is complete: {complete:?}",
+    );
+    assert!(
+        complete.next.is_none(),
+        "a complete page must carry no cursor, or a client would follow one into an empty page: {complete:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_bound_to_another_channel_is_refused() {
+    // **The cursor carries the channel it was minted for, and replaying it elsewhere is refused.**
+    // The store filters by the cursor's own channel, so honouring a foreign cursor would let a caller
+    // page through a view it cannot otherwise ask for — and an empty page would answer the question
+    // the probe asked ("are there rows on that channel?" rather than "are there rows I may decide?").
+    //
+    // A refusal rather than an empty page, because the empty page *is* the disclosure.
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut approval = pending();
+    approval.allowed_channels = jarvis_domain::tool::approval::AllowedChannels::new(vec![
+        jarvis_domain::tool::approval::ApprovalChannel::Cli,
+        jarvis_domain::tool::approval::ApprovalChannel::Voice,
+    ])
+    .expect("two channels");
+    repositories
+        .request(&approval)
+        .await
+        .expect("the row is inserted");
+    // A **second** row, so a page of one is bounded and therefore carries a cursor. Without it the
+    // single row fills the page exactly, `bounded` is false, and no cursor is produced — which is the
+    // correct behaviour and would make this test unable to exercise the binding at all.
+    let mut second = pending();
+    second.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0x9090));
+    second.allowed_channels = approval.allowed_channels.clone();
+    // A later deadline, so the first page is unambiguously the first row rather than depending on the
+    // identifier tie-break.
+    second.expires_at = UtcTimestamp::parse("2030-02-01T00:00:00Z").expect("a valid instant");
+    repositories
+        .request(&second)
+        .await
+        .expect("the second row is inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+
+    let page = service
+        .list(&context(RequestChannel::Cli), 1, None, now())
+        .await
+        .expect("the listing runs");
+    let cursor = page.next.expect("a bounded page carries a cursor");
+
+    // The same cursor against a different channel's caller is refused by name.
+    let error = service
+        .list(&context(RequestChannel::Voice), 1, Some(cursor), now())
+        .await
+        .expect_err("a cursor from another channel must be refused");
+    assert_eq!(error.code(), "request.invalid_cursor", "{error:?}");
+
+    // And the same cursor against the channel that minted it is accepted, so the refusal above is the
+    // **binding** rather than a cursor that never round-trips at all. Without this half the test would
+    // pass against an implementation that refused every cursor.
+    let again = service
+        .list(&context(RequestChannel::Cli), 1, Some(cursor), now())
+        .await
+        .expect("the minting channel's own cursor is accepted");
+    assert!(
+        !again.approvals.iter().any(|row| row.id == approval.id),
+        "resuming after the only row must not repeat it: {again:?}",
     );
 }
 
@@ -381,6 +466,133 @@ async fn a_guest_cannot_decide_and_is_refused_before_the_record_is_read() {
 }
 
 #[tokio::test]
+async fn a_critical_action_cannot_be_decided_by_an_ordinary_session() {
+    // The contract's "critical actions default to step-up" and its stable error
+    // `approval.assurance_insufficient`, which had **no producer** before this: the assurance was
+    // recorded as an audit fact while nothing compared it against a requirement, so an ordinary
+    // session could decide the one class of prompt the risk label exists to make a user step up for.
+    // `context` is a **standard** assurance on the `cli` channel, which the fixture permits — so the
+    // refusal below can only be the assurance and not the channel.
+    let (service, _repositories, approval) = critical_fixture().await;
+
+    let error = service
+        .decide(
+            &context(RequestChannel::Cli),
+            approval.id,
+            DecisionCommand {
+                decision: Decision::Approve,
+                expected_version: ApprovalVersion::FIRST,
+                fingerprint: &approved_digest(),
+                note: None,
+            },
+            now(),
+        )
+        .await
+        .expect_err("a critical action requires a step-up");
+
+    assert_eq!(error.code(), "approval.assurance_insufficient");
+    assert!(
+        !error.retryable(),
+        "re-sending the same request at the same assurance refuses again",
+    );
+    // **Nothing changed.** A refusal that had already written the decision would be the worst
+    // direction, so the row is read back and must still be pending at version one.
+    let stored = service
+        .read(&context(RequestChannel::Cli), approval.id, now())
+        .await
+        .expect("the record is still readable");
+    assert_eq!(stored.state(), ApprovalState::Pending);
+    assert_eq!(stored.version(), ApprovalVersion::FIRST);
+}
+
+#[tokio::test]
+async fn a_critical_action_is_decided_by_a_stepped_up_session_and_the_level_is_recorded() {
+    // The other half, without which the refusal above would be satisfied by an implementation that
+    // refused every critical action — including for a caller that did step up, which is a refusal no
+    // operator wants and the one that pushes toward weakening the requirement.
+    let (service, _repositories, approval) = critical_fixture().await;
+
+    let decided = service
+        .decide(
+            &context_at(RequestChannel::Cli, AuthenticationAssurance::Elevated),
+            approval.id,
+            DecisionCommand {
+                decision: Decision::Approve,
+                expected_version: ApprovalVersion::FIRST,
+                fingerprint: &approved_digest(),
+                note: None,
+            },
+            now(),
+        )
+        .await
+        .expect("a stepped-up session may decide a critical action");
+
+    assert!(decided.applied);
+    assert_eq!(decided.approval.state(), ApprovalState::Approved);
+    assert_eq!(
+        decided.approval.decided_assurance(),
+        Some(RequiredAssurance::Elevated),
+        "the assurance the caller proved is what the audit row records",
+    );
+}
+
+#[tokio::test]
+async fn a_high_risk_action_is_decidable_by_an_ordinary_session() {
+    // The threshold, asserted from the other side. `pending()` is `High`, so this pins the boundary:
+    // stepping up everything above `Moderate` would make the label meaningless, because `High` is
+    // what an ordinary write is classified as.
+    let (service, _repositories, approval) = fixture().await;
+
+    let decided = service
+        .decide(
+            &context(RequestChannel::Cli),
+            approval.id,
+            DecisionCommand {
+                decision: Decision::Approve,
+                expected_version: ApprovalVersion::FIRST,
+                fingerprint: &approved_digest(),
+                note: None,
+            },
+            now(),
+        )
+        .await
+        .expect("a high-risk action does not require a step-up");
+
+    assert!(decided.applied);
+}
+
+#[tokio::test]
+async fn a_channel_refusal_outranks_an_assurance_refusal() {
+    // Two refusals apply to this request — the channel may not decide it and the caller is not
+    // stepped up — and which one is reported is a decision, not an accident. The channel is checked
+    // first, because the two send the user to different places: "use another surface" is a remedy the
+    // caller can act on immediately, while stepping up on a surface that may not decide the prompt
+    // would be work that cannot succeed.
+    let (service, _repositories, approval) = critical_fixture().await;
+
+    let error = service
+        .decide(
+            &context(RequestChannel::Mobile),
+            approval.id,
+            DecisionCommand {
+                decision: Decision::Approve,
+                expected_version: ApprovalVersion::FIRST,
+                fingerprint: &approved_digest(),
+                note: None,
+            },
+            now(),
+        )
+        .await
+        .expect_err("neither check permits this decision");
+
+    assert_eq!(
+        error.code(),
+        "approval.channel_not_allowed",
+        "the channel refusal must be reported rather than the assurance one",
+    );
+}
+
+#[tokio::test]
 async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
     // The contract requires expiry to be "evaluated on every read" and by a durable worker. A record
     // that lapsed while nobody was looking still reads `pending` in storage, so the refusal must
@@ -415,7 +627,7 @@ async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
     );
 
     let listing = service
-        .list(&context(RequestChannel::Cli), 50, now())
+        .list(&context(RequestChannel::Cli), 50, None, now())
         .await
         .expect("the listing runs");
     assert!(
@@ -483,7 +695,7 @@ async fn a_listing_expires_lapsed_rows_and_does_not_return_a_short_page() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let page = service
-        .list(&context(RequestChannel::Cli), 2, now())
+        .list(&context(RequestChannel::Cli), 2, None, now())
         .await
         .expect("the listing runs");
     assert_eq!(

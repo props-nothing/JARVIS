@@ -165,11 +165,21 @@ pub struct ApprovalListView {
     /// Whether the daemon stopped at its page bound with more approvals unread.
     ///
     /// **Present because a short list and a complete one are different answers**, and a client that
-    /// cannot tell them apart concludes there is nothing left to decide and stops. It is reported
-    /// rather than turned into a cursor because this build serves no cursor: a cursor synthesized from
-    /// the last row's deadline would claim a stable position the listing does not yet guarantee across
-    /// a concurrent decision.
+    /// cannot tell them apart concludes there is nothing left to decide and stops.
     pub has_more: bool,
+    /// The opaque cursor to pass back as `?cursor=` for the next page, when more remain.
+    ///
+    /// **`has_more` without this was a dead end**: the daemon told a client that more prompts awaited a
+    /// decision and gave it no way to fetch one — the worst of both, because the client knows work
+    /// remains and cannot do it. Omitted when nothing follows, so "no cursor" and "nothing after this"
+    /// are one fact rather than a cursor that points at nothing.
+    ///
+    /// **Opaque is a promise about use, not a secrecy claim.** A client may pass it back and nothing
+    /// else; a cursor it constructs would name a position the listing never produced, which is how one
+    /// skips approvals rather than merely reading them oddly. Everything it carries is data the client
+    /// already received, and the store re-applies its own workspace and channel predicates regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// The reply to a decision or cancellation.

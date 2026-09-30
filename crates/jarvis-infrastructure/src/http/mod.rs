@@ -4424,6 +4424,7 @@ pub(crate) mod tests {
         // touching the table fails here rather than at a client.
         for (code, flag) in [
             ("request.invalid", false),
+            ("request.invalid_cursor", false),
             ("idempotency.conflict", false),
             ("stream.replay_unavailable", false),
             ("request.too_large", false),

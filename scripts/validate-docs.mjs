@@ -94,6 +94,7 @@ const REQUIRED_FILES = [
   "docs/research/evidence-manifest.json",
   "docs/research/integrations/elevenlabs.md",
   "docs/research/integrations/github-actions.md",
+  "docs/research/integrations/json-schema-validation.md",
   "docs/research/integrations/mcp.md",
   "docs/research/integrations/openai-compatible-model.md",
   "docs/research/integrations/release-signing.md",
@@ -414,6 +415,32 @@ export function hasNonemptyEvidence(block) {
   return block.split(/\r?\n/).some((line) => /^\s+Evidence:\s+\S/.test(line));
 }
 
+/**
+ * Returns the documented acceptance scenarios that no traceability row names.
+ *
+ * The docs validator already checks the other direction — a row must name an `ACC-` that exists — so
+ * an *unreferenced* heading was invisible: nothing schedules a scenario no requirement owns, and it
+ * reads as covered because it is written down. `ACC-007` (configuration compatibility, implemented by
+ * `FND-004`) was orphaned that way.
+ *
+ * **Ranges are expanded first, and that is not decoration.** A cell may say
+ * "`ACC-070` through `ACC-073`", which names only the endpoints literally, so a bare `ACC-\d{3}` scan
+ * reports the scenarios *inside* the range as orphaned. Running it without expansion reported
+ * `ACC-071` as unowned while `NFR-SEC-001` covers it — a false positive that would have sent a reader
+ * to edit a row that was already correct.
+ */
+export function unownedAcceptanceScenarios(traceability, acceptanceHeadings) {
+  const owned = new Set(traceability.match(/ACC-\d{3}/g) ?? []);
+  for (const match of traceability.matchAll(
+    /ACC-(\d{3})[^|\n]{0,12}(?:through|to)\s*`?ACC-(\d{3})/g,
+  )) {
+    for (let n = Number(match[1]); n <= Number(match[2]); n += 1) {
+      owned.add(`ACC-${String(n).padStart(3, "0")}`);
+    }
+  }
+  return acceptanceHeadings.filter((value) => !owned.has(value));
+}
+
 export function traceabilityRowErrors(line, knownTodos, knownAcceptance) {
   const rowErrors = [];
   const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
@@ -708,6 +735,18 @@ function validateIdsAndTraceability(errors) {
   if (unknownAcceptance.length > 0) {
     errors.push(
       `traceability references unknown acceptance IDs: ${unknownAcceptance.sort().join(", ")}`,
+    );
+  }
+
+  // The converse of the check above, which was missing: a scenario may be **documented and owned by
+  // no requirement**. That is how `ACC-007` (configuration compatibility, which `FND-004` implements)
+  // stayed orphaned — nothing schedules a scenario no row names, and it reads as covered because it
+  // is written down. The check only ever ran from the table outwards, so an unreferenced heading was
+  // invisible.
+  const unownedAcceptance = unownedAcceptanceScenarios(traceability, acceptanceHeadings);
+  if (unownedAcceptance.length > 0) {
+    errors.push(
+      `acceptance scenarios with no owning requirement: ${unownedAcceptance.join(", ")}`,
     );
   }
 

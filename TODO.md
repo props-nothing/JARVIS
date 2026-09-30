@@ -57,6 +57,24 @@ IDs are stable. Do not renumber completed work.
   `node --test scripts/validate-docs.test.mjs`, and
   `node scripts/validate-docs.mjs` pass; mutation tests prove changed-path and
   empty-evidence cases fail closed.
+  - **The consistency check ran one way only, and the missing direction found a real gap** (added
+    2026-09-30; folded in rather than given a new id, because Milestone 0's `DOC-001`..`DOC-015` is a
+    closed set the validator enforces — a sixteenth item is refused, and that refusal is correct).
+    `traceabilityRowErrors` requires a row to name an `ACC-` that exists; nothing required a
+    *documented* scenario to be named by a row. So `ACC-007` — "Configuration Compatibility", which
+    `FND-004` implements — was documented in `docs/testing/acceptance.md` and owned by no requirement.
+    Nothing schedules a scenario no row names, and it reads as covered because it is written down.
+  - **The converse check was written as a throwaway script first, which is why the range handling
+    exists.** The first version reported `ACC-071` as unowned; it is covered by `NFR-SEC-001`'s
+    "`ACC-070` through `ACC-073`", whose interior ids appear nowhere literally. Without range expansion
+    the check would have been a false-positive generator, and its first reader would have "fixed" a row
+    that was already correct. Both spellings the table uses (`through`, `to`) expand.
+  - **`unownedAcceptanceScenarios` is exported and unit-tested** (validator tests now 20, +2), with the
+    range case asserted in both directions — one orphan reported against a table naming two of three,
+    and an empty result when a range covers everything — so the check cannot be satisfied by always
+    reporting. **Falsified by removing `ACC-007` from the `NFR-COMP-001` row**: the validator fails with
+    "acceptance scenarios with no owning requirement: ACC-007". Restored. Now 80 requirements, 80 rows,
+    67 scenarios, 0 unowned.
 
 ## Owner-Controlled Public Release Gates
 
@@ -1179,12 +1197,27 @@ Foundation TODO remains incomplete.
     0; `runs events` streamed delta and terminal frames in 35 ms and terminated on its own. 1133
     workspace tests (+4, all in the CLI's parser), `fmt`, `clippy -D warnings`, and both doc gates
     clean.
-  **What is still not done** in the client half: `Idempotency-Key` is scoped per client rather than per
-  principal-and-credential as the contract words it, the run list and the `jarvis ask`
-  conversation-continuation option are absent, and the E2E step's abrupt-restart and
-  disconnect cases belong to `BRN-008`.
-  **The golden-fixture half of contract test 12 is now done, and it found two defects.**
-  `jarvis-protocol`'s `run_contract_tests` and `jarvis-domain`'s
+  **What is still not done** in the client half: the run list is absent, and the E2E step's
+  abrupt-restart and disconnect cases belong to `BRN-008`.
+  **Two of the three items this paragraph used to list were stale, and both are now corrected rather
+  than re-asserted.** (1) *"`Idempotency-Key` is scoped per client rather than per
+  principal-and-credential"* — **false**: migration `000007_idempotency_principal_scope.sql` rebuilt the
+  table on `(workspace_id, principal_id, operation, idempotency_key)`, and
+  `lookup_idempotency(workspace, principal, operation, key)` plus a cross-principal test confirm it. The
+  paragraph was written before that migration landed and never revised. (2) *"the `jarvis ask`
+  conversation-continuation option is absent"* — **true, and now done**: `jarvis ask --conversation <id>`
+  sends `CreateRunRequest::conversation_id`, which the daemon has accepted since the create route existed
+  while the CLI sent `null` unconditionally, so every `jarvis ask` began a fresh conversation and the
+  model received no history. The body is built by an extracted `ask_body(text, conversation)` and
+  asserted in two CLI tests, **falsified** by restoring the unconditional `null` (the failure prints the
+  body with `"conversation_id":null` and the named conversation dropped). The defect is worth naming
+  because **no test could see it**: the request was valid, the run succeeded, and the only symptom was an
+  answer ignoring what had been said before — which reads as a model problem rather than a dropped field.
+  - **A stale "not done" list is its own hazard.** This paragraph told a reader two things were missing
+    when one was already built, which wastes the work of whoever trusts it — the same class as a doc
+    claiming a capability that does not exist, in the opposite direction. Both claims were checked by
+    reading the migration and the repository signature rather than by re-reading the prose.
+  **The golden-fixture half of contract test 12 is now done, and it found two defects.**  `jarvis-protocol`'s `run_contract_tests` and `jarvis-domain`'s
   `model/stream_contract_tests` **read each contract document's own JSON examples** and
   assert the types accept them, rather than checking in copies of them. A copy can drift
   from the document it claims to represent while the test passes, which is worse than no
@@ -4104,10 +4137,11 @@ Dependencies: Milestone 2 exit gate.
   tests. `DiscoveryScope` deliberately has **no `expires_at` field**: the TTL is applied when the
   answer is stored (`DISCOVERY_TTL_DAYS`) rather than carried in the key, because a key that
   varied with time would make every entry distinct and the cache useless.
-- [~] `TLS-003` Implement input/output validation and bounded result storage. **The result half and
-  the error-class half are done; validating arguments *against a schema* is not, and that is the
-  whole of `TLS-003`'s first word — so this stays `~` rather than `[x]`.**
-  Evidence: `jarvis_domain::tool::call` and `jarvis_domain::tool::error_class`.
+- [x] `TLS-003` Implement input/output validation and bounded result storage. **Argument validation
+  against a schema is now implemented, so all three words of the entry are done.**
+  Evidence: `jarvis_domain::tool::call`, `jarvis_domain::tool::error_class`, and
+  `jarvis_infrastructure::tool_schema`. Research evidence:
+  [JSON Schema 2020-12 validation](docs/research/integrations/json-schema-validation.md).
   - **Bounded result storage is done, and building it found a real defect.** `ContentBlock`,
     `ResultPayload`, and `ToolResultBody` bound a result by **bytes** rather than characters (a
     character-counted bound admits four times the memory for the same number, and a test uses a
@@ -4146,12 +4180,61 @@ Dependencies: Milestone 2 exit gate.
     says explicitly that a shared capability is *not* a conflict (two majors, two servers) and that
     the source claim is the check that makes impersonation impossible.
   - 24 tests in `call_tests.rs`. 1234 workspace tests. All gates green. **DO NOT COMMIT.**
-  **Not done, and this is the larger half:** no JSON Schema subset, no validator, and therefore no
-  argument validation at all — `ToolArguments` carries a document and bounds its size, which is
-  *shape* checking, not *schema* checking. A schema validator needs a supported-subset decision
-  (which dialect keywords JARVIS honours) and belongs wherever that decision is owned, which is not
-  the domain layer. There is also no durable result storage: these are in-memory values, and the
-  ledger that would persist them is `TLS-006`.
+  - **Argument validation against a schema is done, and it is its own crate-boundary decision.**
+    `jarvis_infrastructure::tool_schema::ToolSchema` parses a schema, walks it, refuses it if it
+    cannot be honoured, and decides an argument document against it. It is in
+    `jarvis-infrastructure` rather than the domain because the domain has **no JSON dependency at
+    all** — a parsed schema and a parsed instance are both `serde_json::Value` — and because the
+    supported-subset decision is an integration decision. That is the same split, for the same
+    reason, as `tool_fingerprint` beside it.
+  - **The subset is decided twice, and the second decision is the important one.** The keywords
+    JARVIS implements are a table; everything else is **refused at load** rather than ignored. The
+    specification says an unrecognised keyword "SHOULD be treated as an annotation" (Core §6.5), so
+    the compliant-looking implementation is the one that silently validates *less* than the schema
+    asked for. A refusal is an operator-visible configuration defect; an ignored assertion admits a
+    malformed tool call. `pattern`/`patternProperties` are refused because evaluating them needs a
+    reviewed regex engine, and the Validation specification's own Security Considerations names why
+    ("catastrophic backtracking ... denial-of-service"); `multipleOf` is refused because its exact
+    decimal semantics cannot be honoured by `f64`.
+  - **Two resource bounds, each required by a specification, and the depth bound had to be
+    MEASURED rather than chosen.** `MAX_SCHEMA_STEPS` is charged per keyword and per `uniqueItems`
+    comparison, because a bounded input does not bound the work — a 633-item array exhausts it
+    while fitting comfortably in an argument document. `MAX_SCHEMA_DEPTH` covers schema descent,
+    instance descent, and `$ref` hops, since a `$ref` cycle consumes no instance. It is **32, not
+    128**, because `serde_json` refuses a document nested more than 127 containers deep and a schema
+    needs about two containers per level — a bound near 128 could never fire, so it would have been a
+    declaration nothing enforced. The test asserts that ordering, so lowering it past the parser's
+    limit fails in the build instead of silently making the bound dead.
+  - **The specification's number equality rule is implemented, not `serde_json`'s.** Core §4.2.2 says
+    two numbers are equal when they "have the same mathematical value" and that "trailing zeros" are
+    insignificant, so `enum: [1.0]` must accept `1`. The derived comparison does not follow that
+    rule, and a validator that used it would reject a document the schema accepts.
+  - **`items` and `additionalProperties` read their SIBLINGS.** Core §10.3.1.2 defines `items` in
+    terms of a sibling `prefixItems`'s length and §10.3.2.3 defines `additionalProperties` in terms
+    of sibling `properties`, so both need the schema object rather than their own value. A test with
+    only one of each pair present passes against the wrong implementation, so both are tested with
+    the sibling absent *and* present.
+  - **`ToolSchema::confirms` is what keeps this from being a component nothing consults.** A tool's
+    identity is bound to a `SchemaFingerprint` and an approval is recorded against that identity, so
+    the fingerprint a definition carries must describe the schema calls are actually validated
+    against. Without the check a definition could state one schema's fingerprint while a looser
+    schema was in force — `ACC-024`'s failure mode reached through two disagreeing values instead of
+    through a display name. Proven end to end in
+    `tool_schema/composition_tests.rs`, which is the only place that can compose a domain
+    `ToolDefinition` with a parsed schema.
+  - **Falsified 15 ways, zero survivors, and two harness defects were caught in the process.** The
+    mutation harness's "did it compile" check matched cargo's `error: test failed` line, which read
+    all 13 killed mutations as unproven; and one mutation — `additionalProperties`'s sibling read —
+    was a **no-op**, because that arm is guarded and never executes. A mutation that cannot execute
+    proves nothing, exactly like an unreached branch not counting as covered.
+  - 34 tests (`tool_schema/tests.rs` 30, `tool_schema/composition_tests.rs` 4). 1557 workspace tests.
+  - **Not done, and it is the half that makes this reachable: no adapter stores a schema and no
+    request reaches the validator.** The validator is complete and composes with a definition, but
+    the fabric as a whole has no HTTP surface, so every tool-fabric type is still reachable only from
+    tests. `TLS-002`'s registry, `TLS-004`'s policy, `TLS-005`'s approvals, and `TLS-006`'s ledger
+    are in the same position: complete domain capabilities whose first production consumer is the
+    tool surface that does not exist yet. Nor is there durable result storage — these are in-memory
+    values, and the ledger that would persist them is `TLS-006`.
 - [x] `TLS-004` Implement deterministic policy evaluation and explainable decisions. Owns
   `jarvis_domain::tool::policy`.
   Evidence: `evaluate` is a **pure function** of a request and its inputs, and determinism is a
@@ -4866,6 +4949,61 @@ Dependencies: Milestone 2 exit gate.
     row more than the bound** so `bounded` is observed rather than inferred from `len() == limit`, the
     page order is `(expires_at, id)` so a tie cannot show one row twice and hide another, and the
     response carries `has_more`.
+  - **The cursor is now served, and the doc that said otherwise was wrong about the reason.** `has_more`
+    without a cursor was a dead end — the daemon told a client more prompts awaited a decision and gave it
+    no way to fetch one, the worst of both because the client knows work remains and cannot do it. The
+    previous note claimed a cursor "would claim a stable position the listing does not yet guarantee
+    across a concurrent decision"; **the position was always stable**: the order is `(expires_at, id)`,
+    `expires_at` is an immutable column and `id` is primary, so the order is total. What a concurrent
+    decision changes is *membership*, not order — which is precisely why the cursor is a **keyset**
+    position (`(expires_at, id) > (last.expires_at, last.id)`) rather than an offset. An offset *would*
+    be the unstable choice: a row decided between two fetches shifts every later row by one, so page two
+    skips an approval, and a skipped approval is a prompt nobody decides. `ApprovalCursor` carries the
+    channel it was minted for and a cursor replayed against another channel is `request.invalid_cursor`
+    rather than an empty page, because the empty page *is* the disclosure. The value is opaque (a
+    versioned base64 payload) so a client passes it back rather than constructing one.
+  - **Two SQL constants rather than one statement with a nullable resume parameter.** A single statement
+    would need `(? IS NULL OR (expires_at, id) > (?, ?))`, which SQLite cannot index — silently degrading
+    every first-page fetch to a scan — or a string built by concatenation, which is how a user-supplied
+    value reaches a statement. The bound is a **row-value** comparison matching the `ORDER BY` exactly;
+    comparing `expires_at` alone with `>` drops every row sharing the boundary instant, which is the tie
+    the identifier exists to break. **Falsified by dropping `id` from the comparison**: the resume test
+    then fails, because a row removed between pages shifts the window.
+  - **The expiry re-read resumes from the caller's own position.** `expire_lapsed` sweeps a page and
+    re-reads; re-reading page one would answer a different question than the caller asked — a request for
+    page three would receive rows from the beginning, and the cursor it held would then be the wrong one,
+    so its next fetch would jump backwards. The same `after` is passed to every pass.
+  - **Journey check added** (`tests/e2e/approval-journey.mjs`): a third live row is seeded so a bound of
+    one is genuinely bounded, `has_more: true` must come with a `next_cursor`, the cursor is then used and
+    the next page must be a **different** row, an unusable cursor is `400 request.invalid_cursor`, and a
+    complete page omits the cursor. The journey's pre-existing "exactly one approval is live" count was
+    updated to two rather than weakened — it is the listing half of the read-path expiry assertion, and
+    keeping it exact is what stops the new row from becoming a third live one unnoticed.
+  - **The in-memory double and the adapter disagreed about where the resuming channel comes from.** The
+    adapter binds `cursor.channel` on the resuming statement; the double used the `channel` parameter.
+    Production never saw it, because `ApprovalService::list` refuses a cursor whose channel differs from
+    the caller's — so every test that went through the service passed while the two stores enforced
+    *different* rules, and the diverging input (a forged cursor) is exactly the one a caller can only
+    produce by bypassing the service. Fixed the double and added
+    `the_double_and_the_adapter_agree_on_a_cursor_for_another_channel` in **`jarvis-infrastructure`**, the
+    only crate that depends on both — the arrangement `the_reported_page_bound_is_the_one_the_store_enforces`
+    already uses. **The first falsification passed**, because the seeded row permitted *both* channels and
+    so could not separate the two paths; the row now permits only `api` and the mutation fails with
+    `left: 1, right: 0`.
+  - **The contract's cursor wording names a binding this surface cannot have.**
+    "opaque **workspace/principal**/query-bound" — but the listing is deliberately **not principal-scoped**
+    (an operator view must show prompts waiting on somebody else), so two of the three named bindings
+    cannot both hold. The workspace half needs no cursor field and is *stronger* for it (it comes from the
+    authenticated context on every request, applied unconditionally); the channel half is carried because
+    it is the caller's own choice rather than the authenticated identity. Said so in the contract rather
+    than fabricating a field to satisfy the wording.
+  - **Two of `000008`'s three indexes cover queries that do not exist.** The migration says each covers
+    "a query the port actually has" and names `pending_in`, `decided_by` ("what did I approve?"), and a
+    lookup "every tool call performs — is there an approval for this call?". The third has **neither a port
+    method nor a caller**, and `decided_by`'s method exists but is called from nothing but its own adapter
+    tests. Recorded in `docs/data/schema.md`: one index for the listing, one for a method with no caller,
+    one for a query nobody wrote. The indexes are right for the queries they were designed around; what is
+    missing is the queries.
   - **The page bound had two definitions and nothing held them together.** `MAX_PENDING_PAGE` (the
     store's clamp) and `MAX_APPROVAL_PAGE` (what the listing *reports* as `max_page`) were two literals
     holding `200` with no comparison anywhere — and neither owning crate can make one, because the
@@ -4939,13 +5077,56 @@ Dependencies: Milestone 2 exit gate.
     route (no standing-grant store), approval creation (no executor, so nothing calls `request`), the
     **durable expiry worker** (the contract names two evaluators and only per-read exists, so a row
     nobody reads stays `pending` with a passed deadline — it belongs with the scheduler `AUT-002`
-    adds, as another instance of the reaper that slice owns), list filters and cursors, `CONSUMED`/`INVALIDATED` (they
+    adds, as another instance of the reaper that slice owns), the remaining list **filters** (`state`,
+    `risk`, `effect`, requesting run/tool, and time — the **cursor** is now served, see below),
+    `CONSUMED`/`INVALIDATED` (they
     need a reservation through the ledger), the outbox/resume signal (`AUT-004`), preview redaction
-    (the producer redacts; there is no producer), assurance beyond `Standard` (the record has no field
-    for a required level, so a step-up approval is unrepresentable), the detail view's remaining named
+    (the producer redacts; there is no producer), the detail view's remaining named
     inputs (`output_schema` fingerprint, artifact and content hashes, connector account/resource
     resolution — each needs a producer that does not exist), cross-language fingerprint vectors, and
     generated OpenAPI.
+  - **The step-up rule now has a producer, and finding it exposed a variant that could never fire.**
+    `approval.assurance_insufficient` is in the contract's stable-error list and **nothing produced it**:
+    `ApprovalServiceError::InsufficientAssurance` was constructed only by a `_ =>` arm inside
+    `required_assurance_of`, and that function's inner call returns exactly one variant
+    (`Unauthenticated`) — so the arm was unreachable code that made the refusal *look* produced, the
+    same dead-protection shape as the terminal-state guard in `ApprovalState::can_transition_to`. The
+    assurance was resolved and *recorded* as an audit fact (`ApprovalActor::Decided.assurance`) while
+    nothing ever *compared* it, so "critical actions default to step-up" was a contract sentence with
+    no code behind it and an ordinary session could decide the one class of prompt the risk label
+    exists to make a user step up for.
+    - **The requirement is derived, not configured.** `RequiredAssurance::required_for(Risk)` owns the
+      threshold — `Critical` requires `Elevated`, everything else `Standard` — so there is one answer
+      rather than two values that must agree, which is why no `required_assurance` column is added.
+      `High` deliberately does **not** step up: stepping up everything above `Moderate` would make the
+      label meaningless, because `High` is what an ordinary write is classified as. The rule is
+      asserted over the **whole** four-rung ladder with the expected table written out by hand, so a
+      risk level added without an answer fails rather than silently inheriting one.
+    - **Enforced in `decide`, after the channel check**, and the position is a decision: the two
+      refusals send the user to different places — `approval.channel_not_allowed` means "use another
+      surface", while `approval.assurance_insufficient` means "prove who you are again" on the surface
+      they are already on. `a_channel_refusal_outranks_an_assurance_refusal` pins it, because a request
+      that violates both must not report the remedy that cannot succeed.
+    - The comparison is the ladder (`is_satisfied_by`), not equality, so a stepped-up caller is not
+      refused a standard requirement — the one refusal that pushes toward weakening a requirement.
+    - **Falsified six ways, zero survivors:** removing the check (killed by the service test),
+      never satisfying the requirement (7 tests), requiring step-up for every risk, treating critical
+      as ordinary, inverting the ladder (3 tests), and demoting the channel check below the assurance
+      one. The **wire** test was falsified separately against the removed check, so it is not vacuous:
+      it asserts the `403`, the contract's own code, `retryable:false`, and that the refused decision
+      left the record `pending` at version 1 — a refusal that had already written the decision would be
+      the worst direction.
+    - **What is still missing, and named:** a per-record override, so an approval cannot require
+      *more* than its risk implies. That needs a field plus a producer (policy) that does not exist,
+      which is why the derived rule is the honest increment rather than a half-wired column.
+  - **The list filters remain unimplemented, and they stay refused by name rather than ignored.**
+    `state`, `risk`, `effect`, requesting run/tool, and the time filters are each a real query the port
+    does not have. They are refused explicitly because an ignored filter returns a **superset** of what
+    the caller asked for — a client believing it is looking at refused prompts while it is being shown
+    every one — which is the same disclosure direction the channel predicate exists to prevent. Adding
+    one is a port method, an adapter statement, and a wire field together; the `risk` filter in
+    particular is now meaningful in a new way, since a client may want the critical prompts that will
+    demand a step-up.
 - [ ] `TLS-014` Implement plugin package provenance/signature verification,
   compatibility validation, install-disabled, staged update/rollback, disable,
   data-retention choice, and removal.

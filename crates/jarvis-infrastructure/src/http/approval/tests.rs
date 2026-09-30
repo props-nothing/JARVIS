@@ -112,6 +112,24 @@ async fn fixture_seeded(
     tag: &str,
     approval: DurableApproval,
 ) -> (axum::Router, String, DurableApproval, std::path::PathBuf) {
+    let (router, token, mut approvals, dir) = fixture_seeded_many(tag, vec![approval]).await;
+    (router, token, approvals.remove(0), dir)
+}
+
+/// The same, over **several** seeded rows, in the order given.
+///
+/// Exists for the paging test, which needs more rows than its page bound so the first page is
+/// bounded and must hand back a cursor. The fixture returns only one row's identity, so a caller
+/// needing to assert *which* rows came back cannot work through it.
+async fn fixture_seeded_many(
+    tag: &str,
+    seed: Vec<DurableApproval>,
+) -> (
+    axum::Router,
+    String,
+    Vec<DurableApproval>,
+    std::path::PathBuf,
+) {
     let dir = temp_dir(tag);
     let destination = ClientCredentialPath::in_config_dir(&dir);
     let (registered, credential) =
@@ -120,10 +138,12 @@ async fn fixture_seeded(
     clients.register(registered);
 
     let repositories = Arc::new(InMemoryRepositories::new());
-    repositories
-        .request(&approval)
-        .await
-        .expect("the fixture is inserted");
+    for approval in &seed {
+        repositories
+            .request(approval)
+            .await
+            .expect("the fixture is inserted");
+    }
     let service = Arc::new(ApprovalService::new(
         Arc::clone(&repositories) as Arc<dyn ApprovalRepository>
     ));
@@ -137,12 +157,7 @@ async fn fixture_seeded(
         )
         .with_approvals(service),
     );
-    (
-        router(state),
-        credential.to_presentation_text(),
-        approval,
-        dir,
-    )
+    (router(state), credential.to_presentation_text(), seed, dir)
 }
 
 /// Authenticated headers for an approval request.
@@ -238,6 +253,131 @@ async fn a_listing_returns_the_pending_approval_with_its_preview() {
         body.contains(r#""has_more":false"#),
         "one row cannot fill a page, so the listing is complete: {body}",
     );
+    // A complete page carries **no** cursor, so "there is nothing after this" is the absence of the
+    // field rather than a cursor pointing at nothing — which a client would follow and receive an
+    // empty page from.
+    assert!(
+        !body.contains("next_cursor"),
+        "a complete page must omit the cursor: {body}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_listing_hands_back_a_cursor_that_reads_the_next_page() {
+    // **The contract's cursor, end to end through the router.** `has_more` alone told a client that
+    // more prompts awaited a decision and gave it no way to fetch one, which is worse than silence
+    // because the client knows work remains and cannot do it.
+    //
+    // Two approvals and a bound of one, so the first page is bounded and must carry a cursor. The
+    // second page is then fetched **with the value the daemon returned**, which is what makes this a
+    // test of the cursor rather than of the encoder: a cursor the client could not use back would
+    // leave the second page empty.
+    let (app, token, seeded, dir) = fixture_seeded_many(
+        "approval-cursor",
+        vec![pending(), {
+            // A second row with a **later** deadline, so the order is decided by `expires_at` rather
+            // than by the identifier tie-break — which is what makes a cursor derived from the wrong
+            // column produce a visibly wrong page rather than accidentally the right one.
+            //
+            // The instant must be in the **future**, because the listing expires lapsed rows on read:
+            // a past deadline would see this row swept away and the page reported complete, which is
+            // the correct behaviour and would make this test assert nothing about paging.
+            let mut second = pending();
+            second.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0x7002));
+            second.expires_at =
+                UtcTimestamp::parse("2030-01-02T00:00:00Z").expect("a valid instant");
+            second
+        }],
+    )
+    .await;
+    let first = &seeded[0];
+    let second = seeded[1].clone();
+
+    let (status, page_one) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals?limit=1",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page_one}");
+    let parsed: serde_json::Value = serde_json::from_str(&page_one).expect("JSON");
+    assert_eq!(
+        parsed["has_more"], true,
+        "a bound of one over two rows must report more: {page_one}",
+    );
+    let cursor = parsed["next_cursor"]
+        .as_str()
+        .expect("a bounded page must carry a cursor");
+    assert!(
+        cursor.starts_with("v1."),
+        "the cursor is a versioned opaque value: {cursor}",
+    );
+    let first_page_id = parsed["approvals"][0]["approval_id"]
+        .as_str()
+        .expect("a row id")
+        .to_owned();
+
+    assert!(
+        page_one.contains(&first.id.to_string()),
+        "page one must be the row that lapses soonest — the order the cursor is a position in — so a \
+         cursor derived from the wrong column cannot pass this by accident: {page_one}",
+    );
+
+    let path = format!("/api/v1/approvals?limit=1&cursor={cursor}");
+    let (status, page_two) = send(&app, "GET", &path, &approval_headers(&token), "").await;
+    assert_eq!(status, StatusCode::OK, "{page_two}");
+    let parsed_two: serde_json::Value = serde_json::from_str(&page_two).expect("JSON");
+    let second_page_ids: Vec<&str> = parsed_two["approvals"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .filter_map(|row| row["approval_id"].as_str())
+        .collect();
+    assert_eq!(
+        second_page_ids.len(),
+        1,
+        "the second page must carry the remaining row: {page_two}",
+    );
+    // **The two pages must be disjoint.** A cursor that restarted from the beginning would return the
+    // same row again — a client would loop forever, re-reading one prompt and never deciding the other.
+    assert_ne!(
+        second_page_ids[0], first_page_id,
+        "page two must not repeat page one's row: {page_one} / {page_two}",
+    );
+    assert!(
+        page_two.contains(&second.id.to_string()),
+        "page two must be the row page one did not show: {page_two}",
+    );
+    // And the second page is complete, so it carries no further cursor.
+    assert_eq!(parsed_two["has_more"], false, "{page_two}");
+    assert!(!page_two.contains("next_cursor"), "{page_two}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_cursor_that_was_not_produced_by_this_listing_is_refused() {
+    // The cursor is opaque, and opacity is a promise about *use* — a client may pass one back and
+    // nothing else. A malformed value must be a `400` rather than a silent restart from page one: a
+    // restart looks like a legitimate answer, so a client would loop forever without ever learning
+    // that its cursor was bad.
+    let (app, token, _approval, dir) = fixture("approval-bad-cursor").await;
+    for cursor in ["v1.not-base64!!", "v1.", "nonsense", "v1.aGVsbG8"] {
+        let path = format!("/api/v1/approvals?cursor={cursor}");
+        let (status, body) = send(&app, "GET", &path, &approval_headers(&token), "").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`{cursor}` must be refused rather than treated as no cursor: {body}",
+        );
+        assert!(
+            body.contains("request.invalid_cursor"),
+            "the refusal must use the cursor code so a client can tell it from a body defect: {body}",
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -379,6 +519,48 @@ async fn a_decision_is_applied_and_a_repeat_reports_that_it_was_not() {
         second_body.contains(r#""applied":false"#),
         "**a repeat must not claim to have applied a transition**: {second_body}",
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_critical_action_is_forbidden_to_an_ordinary_session_over_the_wire() {
+    // **The wire half of the step-up rule, and the test that keeps the contract's stable-error list
+    // honest.** `approval.assurance_insufficient` sat in that list with no producer, so a client could
+    // key on a code it could never receive. The fixture registers a `Standard` credential and the row is
+    // `Critical`, so the refusal is the assurance and not the channel — `api` is the only permitted
+    // channel and this client arrives on it.
+    let mut critical = pending();
+    critical.risk = Risk::Critical;
+    let (app, token, approval, dir) = fixture_seeded("approval-step-up", critical).await;
+    let path = format!("/api/v1/approvals/{}/decide", approval.id);
+    let body = decide_body("approve", 1, &digest_text(11));
+    let (status, refusal) = send(&app, "POST", &path, &approval_headers(&token), &body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert!(
+        refusal.contains("approval.assurance_insufficient"),
+        "the refusal must carry the contract's own code: {refusal}",
+    );
+    assert!(
+        refusal.contains("\"retryable\":false"),
+        "a stronger assurance is a different request, so re-sending this one cannot succeed: {refusal}",
+    );
+    // **Nothing changed.** A refusal that had already written the decision would be the worst
+    // direction, so the record is read back and must still be pending.
+    let (read_status, read_body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/approvals/{}", approval.id),
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    let read: serde_json::Value = serde_json::from_str(&read_body).expect("the body is JSON");
+    assert_eq!(
+        read["state"], "pending",
+        "a refused decision must leave the record where it was: {read_body}",
+    );
+    assert_eq!(read["version"], 1, "{read_body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -762,22 +944,25 @@ fn the_listing_query_parser_accepts_only_a_bounded_limit() {
     // The parser is a pure function so this needs no router: an unknown filter must be **refused**
     // rather than ignored, because ignoring one would return a superset of what a caller asked for —
     // on an approval listing, prompts the client believed it had excluded.
-    use super::parse_limit;
+    use super::parse_list_query;
     use axum::http::Uri;
 
     let uri = |query: &str| -> Uri { format!("/api/v1/approvals{query}").parse().expect("a uri") };
 
-    assert_eq!(parse_limit(&uri("")).expect("no query"), None);
-    assert_eq!(parse_limit(&uri("?limit=25")).expect("a limit"), Some(25));
+    assert_eq!(parse_list_query(&uri("")).expect("no query"), (None, None));
     assert_eq!(
-        parse_limit(&uri("?limit=0")).expect("zero is parseable"),
-        Some(0)
+        parse_list_query(&uri("?limit=25")).expect("a limit"),
+        (Some(25), None)
+    );
+    assert_eq!(
+        parse_list_query(&uri("?limit=0")).expect("zero is parseable"),
+        (Some(0), None)
     );
     // An unknown filter is a refusal, not a silently ignored parameter.
-    assert!(parse_limit(&uri("?state=pending")).is_err());
-    assert!(parse_limit(&uri("?limit=25&state=pending")).is_err());
+    assert!(parse_list_query(&uri("?state=pending")).is_err());
+    assert!(parse_list_query(&uri("?limit=25&state=pending")).is_err());
     // A non-numeric limit is a refusal too, rather than a default.
-    assert!(parse_limit(&uri("?limit=many")).is_err());
+    assert!(parse_list_query(&uri("?limit=many")).is_err());
 }
 
 #[test]

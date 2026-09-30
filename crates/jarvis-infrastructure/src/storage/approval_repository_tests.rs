@@ -19,7 +19,10 @@ use super::SqliteApprovalRepository;
 use crate::storage::repositories::SqliteRepositories;
 use crate::storage::repositories::tests::{run_id, seed, workspace};
 use jarvis_application::repository::RepositoryError;
-use jarvis_application::repository::approval::{ApprovalRepository as _, DecideOutcome};
+use jarvis_application::repository::approval::{
+    ApprovalCursor, ApprovalRepository as _, DecideOutcome,
+};
+use jarvis_application::testing::InMemoryRepositories;
 use jarvis_domain::ids::{ApprovalId, PrincipalId, ToolCallId, WorkspaceId};
 use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
@@ -752,7 +755,7 @@ async fn an_approval_in_another_workspace_is_not_found_rather_than_forbidden() {
     );
     assert!(
         approvals
-            .pending_in(other_workspace(), ApprovalChannel::Cli, 10)
+            .pending_in(other_workspace(), ApprovalChannel::Cli, 10, None)
             .await
             .expect("the listing succeeds")
             .approvals
@@ -762,7 +765,7 @@ async fn an_approval_in_another_workspace_is_not_found_rather_than_forbidden() {
     // And the owning workspace still sees it, so the refusal is about scope rather than about the row.
     assert_eq!(
         approvals
-            .pending_in(workspace(), ApprovalChannel::Cli, 10)
+            .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
             .await
             .expect("the listing succeeds")
             .approvals
@@ -969,7 +972,7 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
     approvals.request(&sooner).await.expect("inserted");
 
     let pending = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 10)
+        .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
         .await
         .expect("lists");
     assert_eq!(pending.approvals.len(), 2);
@@ -992,7 +995,7 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
         .await
         .expect("stored");
     let pending = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 10)
+        .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
         .await
         .expect("lists");
     assert_eq!(
@@ -1077,7 +1080,7 @@ async fn a_listing_is_bounded_by_its_limit_and_reports_whether_more_remain() {
         approvals.request(&approval).await.expect("inserted");
     }
     let full = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 2)
+        .pending_in(workspace(), ApprovalChannel::Cli, 2, None)
         .await
         .expect("lists");
     assert_eq!(full.approvals.len(), 2, "the limit is honoured");
@@ -1089,13 +1092,194 @@ async fn a_listing_is_bounded_by_its_limit_and_reports_whether_more_remain() {
     // The complement on the same store: a page the store had nothing beyond is complete. Without this
     // half the first assertion would pass for a store that always reported `bounded`.
     let complete = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 5)
+        .pending_in(workspace(), ApprovalChannel::Cli, 5, None)
         .await
         .expect("lists");
     assert_eq!(complete.approvals.len(), 5);
     assert!(
         !complete.bounded,
         "five rows and a bound of five is complete"
+    );
+}
+
+#[tokio::test]
+async fn the_double_and_the_adapter_agree_on_a_cursor_for_another_channel() {
+    // **This crate is the only one that depends on both**, so it is the only place the agreement can be
+    // asserted — the same arrangement `the_reported_page_bound_is_the_one_the_store_enforces` uses.
+    //
+    // The divergence this pins: resuming binds a channel into the query, and the adapter took it from
+    // the **cursor** while the in-memory double took it from the **parameter**. Production never sees a
+    // difference, because `ApprovalService::list` refuses a cursor whose channel differs from the
+    // caller's — so every test that went through the service passed. But a double that enforces
+    // something *other* than its adapter is the dangerous direction: a rule the adapter keeps gets
+    // asserted against a store that holds a different one, and the test that pins the rule is testing
+    // the double.
+    //
+    // The forged cursor is built here rather than obtained from a page, because a page cannot produce
+    // one: that is exactly what the service's guard prevents.
+    let (_database, adapter) = repository().await;
+    let double = InMemoryRepositories::new();
+    // The row permits **only** `api`, so the two channel sources produce different answers: filtering by
+    // the cursor's `api` finds the row, while filtering by the caller's `desktop` finds nothing. A row
+    // permitting both would make this pass whichever value the store used — the mutation that reverts
+    // the double to the parameter then survived, which is why the seed is a single channel.
+    let seeded = {
+        let mut approval = approval();
+        approval.allowed_channels =
+            AllowedChannels::new(vec![ApprovalChannel::Api]).expect("one channel");
+        approval
+    };
+    adapter.request(&seeded).await.expect("inserted");
+    double.request(&seeded).await.expect("inserted");
+
+    // A cursor for `api`, but the query is being run for `desktop`. Both stores must answer the same.
+    let forged = ApprovalCursor {
+        // Before every seeded row, so the position itself excludes nothing and the *channel* is the only
+        // thing under test.
+        expires_at: UtcTimestamp::parse("2000-01-01T00:00:00Z").expect("a valid instant"),
+        id: ApprovalId::from_uuid(uuid::Uuid::from_u128(1)),
+        channel: ApprovalChannel::Api,
+    };
+
+    // The adapter honours the **cursor's** channel, so the row is visible.
+    let from_adapter = adapter
+        .pending_in(workspace(), ApprovalChannel::Desktop, 10, Some(forged))
+        .await
+        .expect("the adapter lists");
+    // The double must agree, not merely return some page.
+    let from_double = double
+        .pending_in(workspace(), ApprovalChannel::Desktop, 10, Some(forged))
+        .await
+        .expect("the double lists");
+    assert_eq!(
+        from_adapter.approvals.len(),
+        from_double.approvals.len(),
+        "the double and the adapter must filter by the same channel when resuming",
+    );
+    assert_eq!(
+        from_adapter.bounded, from_double.bounded,
+        "and agree on whether more remain",
+    );
+    assert_eq!(
+        from_adapter.next, from_double.next,
+        "and produce the same next position",
+    );
+}
+
+#[tokio::test]
+async fn paging_through_the_listing_yields_every_row_exactly_once() {
+    // **The property the cursor exists for.** A client told "there are more" must be able to read them
+    // all, and the failure this guards is a page boundary that repeats or *skips* a row — a skipped
+    // approval is a prompt nobody ever decides, which is the worst outcome this surface has.
+    //
+    // Walked to exhaustion rather than asserted for two pages, because a cursor that happened to work
+    // once and then stall is exactly what a two-page test cannot see.
+    let (_database, approvals) = repository().await;
+    for index in 0..7 {
+        let mut approval = approval();
+        approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(60 + index));
+        // Distinct deadlines, so the order is decided by the deadline rather than by the id tie-break —
+        // and so a cursor derived from the wrong column would produce a visibly wrong page.
+        approval.expires_at = UtcTimestamp::parse(&format!("2026-10-{:02}T00:00:00Z", index + 1))
+            .expect("a valid instant");
+        approvals.request(&approval).await.expect("inserted");
+    }
+
+    let mut seen: Vec<ApprovalId> = Vec::new();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let page = approvals
+            .pending_in(workspace(), ApprovalChannel::Cli, 2, after)
+            .await
+            .expect("lists");
+        pages += 1;
+        seen.extend(page.approvals.iter().map(|approval| approval.id));
+        match page.next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+        assert!(pages < 10, "the walk must terminate: {seen:?}");
+    }
+
+    assert_eq!(pages, 4, "seven rows at two per page is four pages");
+    assert_eq!(seen.len(), 7, "every row exactly once: {seen:?}");
+    let unique: std::collections::BTreeSet<ApprovalId> = seen.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        7,
+        "no row may appear twice across pages: {seen:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_resumes_after_a_row_that_was_decided_between_pages() {
+    // **The keyset property, and the reason the cursor is not an offset.** A row that leaves the set
+    // between two fetches shifts every later row by one under an offset, so page two begins one row too
+    // far in and *skips* an approval. A keyset bound names the last row seen, so it cannot skip.
+    //
+    // Falsified by making the bound an offset: this test then reports six rows seen instead of seven,
+    // with one silently missing.
+    let (_database, approvals) = repository().await;
+    let ids: Vec<ApprovalId> = (0..5)
+        .map(|index| ApprovalId::from_uuid(uuid::Uuid::from_u128(80 + index)))
+        .collect();
+    for (index, id) in ids.iter().enumerate() {
+        let mut approval = approval();
+        approval.id = *id;
+        approval.expires_at = UtcTimestamp::parse(&format!("2026-11-{:02}T00:00:00Z", index + 1))
+            .expect("a valid instant");
+        approvals.request(&approval).await.expect("inserted");
+    }
+
+    let first = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 2, None)
+        .await
+        .expect("lists");
+    assert_eq!(first.approvals.len(), 2);
+    let cursor = first
+        .next
+        .expect("more rows remain, so a cursor is produced");
+
+    // The **first** row on the page just read is decided away — the position a naive offset would
+    // depend on. The rows the next page must return are unaffected.
+    //
+    // `apply_transition`'s `expected` is the version the caller held *before* the write, so it is the
+    // pre-transition version rather than the applied one — passing the post-transition version is the
+    // `VersionConflict` this test hit first.
+    let mut decided = first.approvals[0].clone();
+    let expected = decided.version();
+    let transition = decided
+        .apply(
+            ApprovalState::Cancelled,
+            expected,
+            ApprovalActor::Cancelled {
+                by: principal(),
+                reason: Some(DecisionNote::new("superseded").expect("a valid reason")),
+            },
+            UtcTimestamp::parse("2026-10-01T00:00:00Z").expect("a valid instant"),
+        )
+        .expect("the transition is legal");
+    approvals
+        .apply_transition(
+            workspace(),
+            &transition,
+            expected,
+            &transition.actor,
+            &decided,
+        )
+        .await
+        .expect("the decision is recorded");
+
+    let second = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, 2, Some(cursor))
+        .await
+        .expect("lists");
+    // Rows 3 and 4, not 4 and 5: the bound is the cursor's position, which the removal did not move.
+    assert_eq!(
+        second.approvals.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![ids[2], ids[3]],
+        "a resume must be unaffected by a row removed earlier on the previous page",
     );
 }
 
@@ -1124,7 +1308,7 @@ async fn the_pending_listing_excludes_rows_the_channel_may_not_decide() {
     approvals.request(&cli_only).await.expect("inserted");
 
     let page = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 1)
+        .pending_in(workspace(), ApprovalChannel::Cli, 1, None)
         .await
         .expect("lists");
     assert_eq!(page.approvals.len(), 1);
@@ -1141,7 +1325,7 @@ async fn the_pending_listing_excludes_rows_the_channel_may_not_decide() {
     // The desktop caller sees the other one, which is what makes the filter a *predicate* rather than a
     // preference — both rows exist and each channel sees exactly its own.
     let desktop_page = approvals
-        .pending_in(workspace(), ApprovalChannel::Desktop, 1)
+        .pending_in(workspace(), ApprovalChannel::Desktop, 1, None)
         .await
         .expect("lists");
     assert_eq!(desktop_page.approvals.len(), 1);

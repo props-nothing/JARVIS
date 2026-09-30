@@ -104,6 +104,9 @@ enum Command {
     Ask {
         /// The text to send.
         text: String,
+        /// Continue an existing conversation instead of starting a new one.
+        #[arg(long, value_name = "ID")]
+        conversation: Option<String>,
     },
     /// Inspect durable runs.
     Runs {
@@ -270,7 +273,7 @@ async fn run(cli: Cli) -> ExitCode {
 
     match cli.command {
         Command::Status => status(paths).await,
-        Command::Ask { text } => ask(paths, &text).await,
+        Command::Ask { text, conversation } => ask(paths, &text, conversation.as_deref()).await,
         Command::Runs { action } => runs(paths, action).await,
         Command::Approvals { action } => approvals(paths, action).await,
         Command::Config => config(paths),
@@ -393,7 +396,7 @@ fn daemon_client(paths: &ProfilePaths) -> Result<ClientState, ClientError> {
 /// The command returns as soon as the run is created and then follows it, because a run
 /// can outlive the request that created it: printing the create response and exiting
 /// would leave the operator without the answer they asked for.
-async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
+async fn ask(paths: &ProfilePaths, text: &str, conversation: Option<&str>) -> ExitCode {
     if text.trim().is_empty() {
         eprintln!("error: the question is empty");
         return ExitCode::from(EXIT_ATTENTION);
@@ -410,13 +413,7 @@ async fn ask(paths: &ProfilePaths, text: &str) -> ExitCode {
     // and because the daemon ignored the field the request succeeded anyway, which meant the
     // run's record described a policy nobody had configured. Omission states the truth: this run
     // is governed by whatever the workspace has in force.
-    let body = format!(
-        concat!(
-            r#"{{"conversation_id":null,"input":{{"type":"text","text":{}}},"#,
-            r#""runtime":"jarvis-native"}}"#
-        ),
-        json_string(text),
-    );
+    let body = ask_body(text, conversation);
     let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
     let (status, response) = match post_authenticated(
         &state.discovered,
@@ -1270,6 +1267,34 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// Builds the body of a create-run request for `jarvis ask`.
+///
+/// **Extracted so the request's shape is assertable without a daemon.** The field that mattered here
+/// is `conversation_id`: the daemon has accepted it since the route existed, and the CLI sent `null`
+/// unconditionally, so every `jarvis ask` began a fresh conversation and the model received no
+/// history. Nothing could observe that: the request was valid, the run succeeded, and the only
+/// evidence was the answer ignoring what had been said before.
+///
+/// `null` rather than an omitted key when no conversation is named, because this is the field's own
+/// "start a new one" value. Sending it explicitly keeps the request's shape stable whichever form the
+/// flag takes, so a caller diffing two requests sees the conversation change and nothing else.
+///
+/// `model_policy` is **omitted**, never sent as a placeholder: the identifier is derived from the
+/// workspace, which is resolved server-side from this client's credential, so the only value the CLI
+/// could send is one it invented. It previously sent `{"policy_id":"default","version":1}`, and
+/// because the daemon ignored the field the request succeeded anyway — so the run's record described a
+/// policy nobody had configured. Omission states the truth.
+fn ask_body(text: &str, conversation: Option<&str>) -> String {
+    format!(
+        concat!(
+            r#"{{"conversation_id":{},"input":{{"type":"text","text":{}}},"#,
+            r#""runtime":"jarvis-native"}}"#
+        ),
+        conversation.map_or("null".to_owned(), json_string),
+        json_string(text),
+    )
+}
+
 /// Generates an idempotency key for one command.
 ///
 /// A fresh key per invocation is deliberate: the contract makes a *repeat with the same
@@ -2117,8 +2142,8 @@ mod tests {
     use super::{
         AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command, FollowStep,
         InstallAction, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher, SseFrame, SseParser,
-        StatusBody, event_stream_headers, follow_after, follow_run, follow_step, idempotency_key,
-        json_string, parse_status,
+        StatusBody, ask_body, event_stream_headers, follow_after, follow_run, follow_step,
+        idempotency_key, json_string, parse_status,
     };
     use clap::Parser as _;
     use jarvis_infrastructure::client::Discovered;
@@ -3111,6 +3136,44 @@ mod tests {
         assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
         // A multi-byte character is passed through unchanged rather than mangled.
         assert_eq!(json_string("héllo — ok"), "\"héllo — ok\"");
+    }
+
+    #[test]
+    fn a_question_without_a_conversation_starts_a_new_one() {
+        // The default shape the CLI has always sent. Asserted so adding the flag cannot change it:
+        // a `jarvis ask` with no `--conversation` must still ask for a fresh conversation.
+        let body = ask_body("hello", None);
+        assert!(body.contains(r#""conversation_id":null"#), "{body}");
+        assert!(
+            body.contains(r#""input":{"type":"text","text":"hello"}"#),
+            "{body}"
+        );
+        assert!(body.contains(r#""runtime":"jarvis-native""#), "{body}");
+        // The policy is **omitted**, not sent as a placeholder. A `policy_id` here would name a
+        // policy the CLI invented, and the run's record would describe one nobody configured.
+        assert!(!body.contains("model_policy"), "{body}");
+    }
+
+    #[test]
+    fn a_named_conversation_is_sent_so_the_model_receives_its_history() {
+        // **The defect this test exists for is behavioural, so no other test could see it.** The
+        // daemon has accepted `conversation_id` since the create route existed and the CLI sent
+        // `null` unconditionally, so every `jarvis ask` began a fresh conversation: the request was
+        // valid, the run succeeded, and the only symptom was an answer that ignored what had been
+        // said before — which reads as a model problem, not as a dropped field.
+        let body = ask_body("and then?", Some("0195f4f0-4c13-7bf4-89fb-f067adac13ee"));
+        assert!(
+            body.contains(r#""conversation_id":"0195f4f0-4c13-7bf4-89fb-f067adac13ee""#),
+            "the named conversation must reach the request: {body}",
+        );
+        assert!(!body.contains("conversation_id\":null"), "{body}");
+        // The identifier goes through the JSON encoder like the question does, so a value containing
+        // a quote cannot produce a body the daemon refuses.
+        let quoting = ask_body("hi", Some("has\"quote"));
+        assert!(
+            quoting.contains(r#""conversation_id":"has\"quote""#),
+            "{quoting}"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@
 use sqlx::SqlitePool;
 
 use jarvis_application::repository::approval::{
-    ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+    ApprovalCursor, ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ApprovalId, PrincipalId, RunId, ToolCallId, WorkspaceId};
@@ -87,6 +87,28 @@ const PENDING_SQL: &str =
      decided_assurance, decided_at, 
      created_at, updated_at FROM approvals WHERE workspace_id = ? AND state = 'pending' \
      AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
+     ORDER BY expires_at ASC, id ASC LIMIT ?";
+
+/// The `SELECT` for [`ApprovalRepository::pending_in`] when resuming from a cursor.
+///
+/// **A separate statement rather than a branch inside [`PENDING_SQL`], and the reason is the same one
+/// that makes the cursor a keyset.** A single statement would need either a nullable resume parameter
+/// in the `WHERE` — `(? IS NULL OR (expires_at, id) > (?, ?))`, which SQLite cannot index and which
+/// silently degrades every first-page fetch to a scan — or a string built by concatenation, which is
+/// how a user-supplied value reaches a statement. Two constants keep both statements indexable and
+/// keep the values bound.
+///
+/// The comparison is a **row-value** comparison over `(expires_at, id)`, matching the `ORDER BY`
+/// exactly. Comparing only `expires_at` with `>` would drop every row sharing the boundary instant,
+/// which is precisely the tie the identifier exists to break.
+const PENDING_AFTER_SQL: &str =
+    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+     tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
+     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+     decided_assurance, decided_at, 
+     created_at, updated_at FROM approvals WHERE workspace_id = ? AND state = 'pending' \
+     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
+     AND (expires_at, id) > (?, ?) \
      ORDER BY expires_at ASC, id ASC LIMIT ?";
 
 /// The `SELECT` for [`ApprovalRepository::decided_by`], most recent first.
@@ -366,6 +388,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
         workspace: WorkspaceId,
         channel: ApprovalChannel,
         limit: u32,
+        after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage> {
         Box::pin(async move {
             // **Clamped to the port's own bound, not trusted from the caller.** A limit is a request,
@@ -376,20 +399,54 @@ impl ApprovalRepository for SqliteApprovalRepository {
             // One row more than asked, so a full page can be told from a complete one. Reading exactly
             // `limit` rows makes "there are more" and "that was all" the same observation — and here
             // that ambiguity makes an operator believe the queue is empty.
-            let rows = sqlx::query(PENDING_SQL)
-                .bind(workspace.to_string())
-                .bind(channel.as_contract_str())
-                .bind(i64::from(limit.saturating_add(1)))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|_| RepositoryError::Query)?;
+            let probe = i64::from(limit.saturating_add(1));
+            let rows = match after {
+                // The channel is taken from the **cursor** rather than from the parameter, because a
+                // cursor is bound to the query that produced it: honouring a caller's channel here
+                // would let a cursor from one view be replayed against another and report whether
+                // rows exist outside it. The two are the same value on every real request — the
+                // handler builds one from the other — and this is the one that cannot be forged.
+                Some(cursor) => {
+                    sqlx::query(PENDING_AFTER_SQL)
+                        .bind(workspace.to_string())
+                        .bind(cursor.channel.as_contract_str())
+                        .bind(cursor.expires_at.to_string())
+                        .bind(cursor.id.to_string())
+                        .bind(probe)
+                        .fetch_all(&self.pool)
+                        .await
+                }
+                None => {
+                    sqlx::query(PENDING_SQL)
+                        .bind(workspace.to_string())
+                        .bind(channel.as_contract_str())
+                        .bind(probe)
+                        .fetch_all(&self.pool)
+                        .await
+                }
+            }
+            .map_err(|_| RepositoryError::Query)?;
             let bounded = rows.len() > limit as usize;
             let approvals = rows
                 .iter()
                 .take(limit as usize)
                 .map(stored_approval)
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(ApprovalsPage { approvals, bounded })
+            // The cursor is the **last row actually returned**, not the probe row: resuming after the
+            // probe would skip it, and resuming before the last returned row would repeat it.
+            let next = bounded
+                .then(|| approvals.last())
+                .flatten()
+                .map(|last| ApprovalCursor {
+                    expires_at: last.expires_at,
+                    id: last.id,
+                    channel,
+                });
+            Ok(ApprovalsPage {
+                approvals,
+                bounded,
+                next,
+            })
         })
     }
 

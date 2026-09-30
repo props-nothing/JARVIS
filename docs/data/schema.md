@@ -584,6 +584,19 @@ preview_json, allowed_channels_json, expires_at, scope, state, version,
 decided_by, decided_via, decided_assurance, decided_at, created_at, updated_at
 ```
 
+**Two of the three indexes `000008` creates index a query that does not exist yet, and the migration's
+own comment reads as though they do.** It says each index covers "a query the port actually has" and
+names three: `pending_in` (exists), `decided_by` ("answers *what did I approve?*"), and a lookup "every
+tool call performs — *is there an approval for this call?*". The first two have port methods; the third
+has **neither a method nor a caller**, and `tool_call_id` is selected and rendered but never used as a
+filter anywhere in the workspace. `decided_by`'s method exists and is called from nothing but the
+adapter's own tests.
+
+An index is cheap and a missing one is a scan, so this is not harm — but the comment is a claim, and a
+reader who trusts it concludes the tool-call lookup is implemented. The honest state: one index for the
+listing, one for a method that exists with no caller, and one for a query nobody has written. Each is the
+right index **for the query it was designed around**; what is missing is the queries, not the indexes.
+
 - **`tool_identity_json` rather than a `tool_definition_id`** and separate source columns. An approval
   binds the whole identity tuple — capability, source, provenance, schema fingerprint — and the domain
   type's serialization is the canonical spelling of it, already round-trip tested. Splitting it would
@@ -598,8 +611,9 @@ decided_by, decided_via, decided_assurance, decided_at, created_at, updated_at
   no assurance — wrote `NULL` over the value the decision had established. `NULL` there means **not
   recorded** (the state of a decision taken before the column existed) and is deliberately distinct from
   `standard`; the reader refuses an unknown spelling as corruption rather than mapping it to a level. The
-  remaining `TLS-013` gap is different and still real: the record names no level a decision **requires**, so
-  a step-up approval is unrepresentable rather than merely unenforced.
+  level a decision **requires** is deliberately not a column: it is derived from the record's own `risk`
+  (`RequiredAssurance::required_for`), so "critical actions default to step-up" has one owner rather than
+  two values that must agree. A per-record override still has no producer and is named in the contract.
 - **`summary` and `preview_json` are stored verbatim**, because they are the *record* of what the user
   was shown and agreed to. Rebuilding them from the tool would show a preview the user never saw, whose
   definition may since have changed.

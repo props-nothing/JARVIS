@@ -408,6 +408,42 @@ fn an_elevated_principal_satisfies_a_standard_requirement_but_not_the_reverse() 
 }
 
 #[test]
+fn only_a_critical_action_requires_step_up_and_every_risk_has_one_answer() {
+    // The contract's "critical actions default to step-up" as a table over the WHOLE ladder, so a
+    // fourth risk level added without an answer fails here instead of silently inheriting one. Written
+    // out rather than derived, because a test that derived its expectation from the implementation
+    // would pass against any threshold.
+    use crate::tool::classification::Risk;
+    let expected = [
+        (Risk::Low, RequiredAssurance::Standard),
+        (Risk::Moderate, RequiredAssurance::Standard),
+        (Risk::High, RequiredAssurance::Standard),
+        (Risk::Critical, RequiredAssurance::Elevated),
+    ];
+    for (risk, required) in expected {
+        assert_eq!(
+            RequiredAssurance::required_for(risk),
+            required,
+            "the requirement for {risk:?} must be {required:?}",
+        );
+    }
+    // The boundary the table asserts, stated as the property it protects: an ordinary session may
+    // decide everything below critical, and only critical needs a step-up.
+    assert!(
+        RequiredAssurance::required_for(Risk::High).is_satisfied_by(RequiredAssurance::Standard)
+    );
+    assert!(
+        !RequiredAssurance::required_for(Risk::Critical)
+            .is_satisfied_by(RequiredAssurance::Standard),
+        "a critical action must not be decidable by an ordinary session",
+    );
+    assert!(
+        RequiredAssurance::required_for(Risk::Critical)
+            .is_satisfied_by(RequiredAssurance::Elevated),
+    );
+}
+
+#[test]
 fn a_rule_that_crosses_a_boundary_requires_step_up_and_no_other_waivable_rule_does() {
     // The predicate over the whole vocabulary, so a waivable rule added with the wrong step-up
     // answer fails here rather than being discovered as a permissive default.

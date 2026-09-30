@@ -22,6 +22,7 @@
 //! a **user's own answer** to a prompt.
 
 use jarvis_domain::ids::{ApprovalId, PrincipalId, WorkspaceId};
+use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     ApprovalActor, ApprovalChannel, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
 };
@@ -60,6 +61,44 @@ pub struct ApprovalsPage {
     pub approvals: Vec<DurableApproval>,
     /// Whether the store stopped at its bound with rows still unread.
     pub bounded: bool,
+    /// Where this page ended, for the next fetch, when more rows remain.
+    ///
+    /// **Produced by the store rather than derived by the caller, and that is a correctness choice.**
+    /// The position is the last row's `(expires_at, id)` — and the caller assembling it from
+    /// `approvals.last()` would depend on the page being non-empty and on the caller knowing which
+    /// pair the query ordered by. Here the store already has the row and the order.
+    ///
+    /// `None` when nothing was left, so "the cursor is absent" and "there is nothing after this"
+    /// are the same fact rather than a cursor pointing at nothing.
+    pub next: Option<ApprovalCursor>,
+}
+
+/// The stable position a page ended at, for fetching the next one.
+///
+/// **This is the contract's "opaque workspace/principal/query-bound cursor".** `has_more` without a
+/// cursor is a dead end: the listing could say "there are more approvals to decide" and a client had
+/// no way to fetch one — told that work remained (every pending prompt matters) and given no means to
+/// do it. The contract's own implementation notes call a cursor "the next increment"; this is it.
+///
+/// **A keyset position, not an offset.** The listing's total order is `(expires_at, id)`, so the
+/// position is exactly that pair of the last row returned. An offset would be wrong here in a way that
+/// matters: a row decided or expired between two page fetches shifts every later row by one, so page
+/// two would *skip* an approval — and a skipped approval is a prompt nobody decides. A keyset bound
+/// cannot skip: it names the last row seen, and the next page begins after it whatever has happened to
+/// the rows in between.
+///
+/// **Carries the channel it was bound to.** A position derived from one caller's filtered view is
+/// meaningless against another's, so the channel travels with it and the store applies its own filter
+/// from that value — a cursor cannot be replayed across a different channel to probe what the filter
+/// excludes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalCursor {
+    /// The `expires_at` of the last row on the previous page.
+    pub expires_at: UtcTimestamp,
+    /// The identifier that broke the tie, in the same order the query sorts by.
+    pub id: ApprovalId,
+    /// The channel the page was fetched for.
+    pub channel: ApprovalChannel,
 }
 
 /// What `decide` did, so a caller can distinguish a first decision from a repeat.
@@ -163,7 +202,16 @@ pub trait ApprovalRepository: Send + Sync {
     ///
     /// **The order is part of the contract**: soonest deadline first, because that is the order an
     /// operator has to act in. It is a **total** order — the identifier breaks a tie on `expires_at` —
-    /// because a page whose order is not total can show one row twice and hide another.
+    /// because a page whose order is not total can show one row twice and hide another. **That
+    /// totality is also what makes the cursor well defined**, since the resume bound is a comparison
+    /// over that same pair.
+    ///
+    /// **`after` is the contract's cursor, and its absence was a dead end.** The listing reported
+    /// `has_more`, telling a client there were more prompts to decide, and gave it no way to fetch one
+    /// — the worst of both, because the client knows work remains and cannot do it. The bound is
+    /// `(expires_at, id) > (after.expires_at, after.id)`, a **keyset** position rather than an offset:
+    /// a row decided or expired between two fetches shifts every later row by one under an offset, so
+    /// page two would *skip* an approval, and a skipped approval is a prompt nobody decides.
     ///
     /// # Errors
     ///
@@ -173,6 +221,7 @@ pub trait ApprovalRepository: Send + Sync {
         workspace: WorkspaceId,
         channel: ApprovalChannel,
         limit: u32,
+        after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage>;
 
     /// Returns the approvals a principal decided, most recent first.

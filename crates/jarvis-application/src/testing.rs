@@ -38,7 +38,7 @@ use jarvis_domain::tool::approval::{
     DurableApproval,
 };
 
-use crate::repository::approval::{ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE};
+use crate::repository::approval::{ApprovalCursor, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE};
 use crate::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation, StoredMessage,
 };
@@ -1755,10 +1755,21 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
         workspace: WorkspaceId,
         channel: ApprovalChannel,
         limit: u32,
+        after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage> {
         Box::pin(async move {
             self.with(|store| {
                 let limit = limit.min(MAX_PENDING_PAGE) as usize;
+                // **The filter's channel comes from the cursor when resuming, matching the adapter.**
+                // The adapter binds `cursor.channel` on the resuming statement and the passed
+                // `channel` only on the first-page one, because a cursor is bound to the query that
+                // produced it. This double filtered by the *parameter* in both cases, so the two
+                // disagreed about which value is authoritative — invisible in production, where
+                // `ApprovalService::list` refuses a cursor whose channel differs from the caller's, but
+                // a double that enforces something *else* than its adapter is the direction that
+                // matters: a rule the adapter keeps could be asserted against a store that never held
+                // it, and here the mirror was of a rule the adapter applies to a different input.
+                let filter_channel = after.map_or(channel, |cursor| cursor.channel);
                 let mut found: Vec<DurableApproval> = store
                     .approvals
                     .values()
@@ -1769,7 +1780,7 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                             // predicate.** A double that filtered *after* applying `limit` — or not at
                             // all — would let a short-changed page pass every test, which is the
                             // dangerous direction: a double enforcing less than its adapter.
-                            && stored.allowed_channels.permits(channel)
+                            && stored.allowed_channels.permits(filter_channel)
                     })
                     .cloned()
                     .collect();
@@ -1777,14 +1788,34 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                 // `ORDER BY expires_at ASC, id ASC` the adapter uses. The tie-break is not
                 // decoration: an order that is not total can show one row twice and hide another.
                 found.sort_by_key(|stored| (stored.expires_at, stored.id.to_string()));
+                // **The keyset bound is mirrored from the adapter's row-value comparison.** Resuming
+                // after `(expires_at, id)` rather than at an index is what makes a concurrent decision
+                // skip nothing: a row removed between fetches does not shift the position. A double
+                // that used an offset would pass every single-fetch test and fail the moment a page
+                // boundary followed a removal, so the mirror has to be the comparison and not a count.
+                if let Some(cursor) = after {
+                    found.retain(|stored| {
+                        (stored.expires_at, stored.id.to_string())
+                            > (cursor.expires_at, cursor.id.to_string())
+                    });
+                }
                 // One row more than asked, so "there are more" is distinguishable from "that was
                 // all" — the probe row the adapter reads and the double must simulate, or the
                 // boundedness fact would be untestable without a database.
                 let bounded = found.len() > limit;
                 found.truncate(limit);
+                let next = bounded
+                    .then(|| found.last())
+                    .flatten()
+                    .map(|last| ApprovalCursor {
+                        expires_at: last.expires_at,
+                        id: last.id,
+                        channel,
+                    });
                 Ok(ApprovalsPage {
                     approvals: found,
                     bounded,
+                    next,
                 })
             })
         })

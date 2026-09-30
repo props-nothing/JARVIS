@@ -88,6 +88,33 @@ impl RequiredAssurance {
             (Self::Elevated, Self::Standard) => false,
         }
     }
+
+    /// Returns the assurance a decision on an action of this risk must hold.
+    ///
+    /// **A rule rather than a call-site choice**, because two surfaces that each decided it would be
+    /// two answers to one question — the shape of every scoping defect this project has found. The
+    /// contract states the rule directly: "Critical actions default to step-up in CLI/desktop/mobile"
+    /// and "Sensitive or cross-border exceptions require policy-defined step-up/approval". This is
+    /// the *default* half of that sentence, and it is a floor: a policy may require more, and the
+    /// caller's own context decides what it actually holds.
+    ///
+    /// The type lives in the model gateway's exception vocabulary because [`Self`] does — a second
+    /// assurance ladder would let a requirement and a held level compare an integer to a
+    /// differently-typed label, which is the reason `DataClasses` reuses `Sensitivity` rather than
+    /// declaring its own.
+    ///
+    /// **Why `High` does not step up.** "Critical" is the contract's word and its ladder has four
+    /// rungs; stepping up everything above `Moderate` would make the label meaningless, since
+    /// `High` is what an ordinary write is classified as. The threshold is a decision, so it is
+    /// stated in one place, in prose, and a change to it is a change to this function.
+    #[must_use]
+    pub const fn required_for(risk: crate::tool::classification::Risk) -> Self {
+        use crate::tool::classification::Risk;
+        match risk {
+            Risk::Low | Risk::Moderate | Risk::High => Self::Standard,
+            Risk::Critical => Self::Elevated,
+        }
+    }
 }
 
 /// The longest accepted exception reason.

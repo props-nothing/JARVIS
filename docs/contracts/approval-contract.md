@@ -101,6 +101,20 @@ stable ordering, and a bounded page size. The server exposes only approvals the
 authenticated principal may inspect or decide. A foreign-workspace record is
 indistinguishable from a missing record.
 
+**On that cursor wording, because two of the three bindings cannot both hold here.** A cursor binds the
+*query* it was produced by, and this listing's query is bound by **workspace** and **channel**; it is
+deliberately **not** principal-scoped (an operator view must show prompts waiting on somebody else, so a
+listing narrowed to one principal would hide work). So "principal-bound" is not what this surface
+implements, and the binding that actually matters is the pair the query filters on. The **workspace**
+half needs no cursor field: it comes from the authenticated context on every request, so a cursor carried
+into another workspace names a position in *that* workspace's own filtered rows rather than reaching
+across — the workspace filter is applied unconditionally, which is strictly stronger than binding it into
+the value. The **channel** half is carried in the cursor, because it is the caller's own choice rather
+than the authenticated identity, and replaying a cursor minted for one channel against another is refused
+(`request.invalid_cursor`) rather than answered with an empty page — the empty page *is* the disclosure of what that channel
+excludes. When a principal-scoped listing exists, its cursor must carry the principal for the same reason
+the channel is carried here.
+
 Detail returns the immutable action fingerprint inputs needed for informed
 review as a bounded, schema-defined, redacted preview plus request/version/state,
 requesting identity, tool source/schema identity, effects/risk, allowed channels,
@@ -258,7 +272,11 @@ itself (the record stores the bounded preview verbatim, because it is the record
 - changed recipient/body/attachment/account;
 - expiry and daemon restart;
 - consume exactly once under duplicate call submission;
-- wrong principal/workspace/channel/assurance;
+- wrong principal/workspace/channel/**assurance** — the channel half by
+  `a_decision_on_a_channel_the_request_excludes_is_refused_by_name`, the assurance half by
+  `a_critical_action_cannot_be_decided_by_an_ordinary_session` (service) and
+  `a_critical_action_is_forbidden_to_an_ordinary_session_over_the_wire` (wire, asserting the
+  contract's own code and that the refused decision left the record pending at version 1);
 - grant revocation and policy update;
 - preview redaction and fingerprint cross-language vectors.
 - list pagination/filter/cursor scope and foreign-workspace non-disclosure;
@@ -346,9 +364,20 @@ cannot disagree, and its envelope on a refusal because the stable code is what a
   The other filters — `state`, `risk`, `effect`, requesting run/tool, and the time filters — are refused
   **by name** rather than silently ignored, because an ignored filter would return a superset of what a
   caller asked for, and on this listing that means showing prompts the client believed it had excluded.
-  Cursors are absent: a cursor synthesized from the last row's deadline would claim a stable position
-  the listing does not yet guarantee across a concurrent decision, so `has_more` is the honest fact and
-  a cursor is the next increment.
+
+  **A cursor is now served too** (`?cursor=`, answered as `next_cursor`), because `has_more` without one
+  was a dead end: the daemon told a client that more prompts awaited a decision and gave it no way to
+  fetch one — the worst of both, since the client knows work remains and cannot do it. The earlier note
+  here said a cursor "would claim a stable position the listing does not yet guarantee across a
+  concurrent decision", and **that was wrong about the position**: the order is `(expires_at, id)`,
+  `expires_at` is an immutable column and `id` is primary, so the order is total and stable. What a
+  concurrent decision changes is *membership*, not order — which is exactly why the cursor is a
+  **keyset** position (`(expires_at, id) > (last.expires_at, last.id)`) rather than an offset. An
+  offset *would* be the unstable choice: a row decided between two fetches shifts every later row by
+  one, so page two would skip an approval, and a skipped approval is a prompt nobody decides. The value
+  is opaque (a versioned base64 payload) so a client passes it back rather than constructing one, it
+  carries the channel it was minted for, and replaying it against another channel is
+  `request.invalid_cursor` rather than an empty page — because the empty page *is* the disclosure.
 - **Consumption (`CONSUMED`) and invalidation (`INVALIDATED`).** Both are reached by the exact
   tool-call reservation (`TLS-006`'s ledger) at invocation time; the ledger exists and nothing reserves
   through it, so those two edges have no caller.
@@ -366,11 +395,18 @@ cannot disagree, and its envelope on a refusal because the stable code is what a
 - **Redaction of the preview.** The preview is structured and bounded, and its values are stored
   verbatim as the record of what the user was shown — but the *producer* redacts and no producer
   exists. `TLS-005` recorded this; the shape is unchanged.
-- **Channel assurance beyond `Standard`.** `RequestContext::assurance` is read and a guest is refused,
-  but the record has no field naming a required level, so an approval needing a step-up is
-  **unrepresentable** rather than merely unenforced. `approval.assurance_insufficient` is therefore
-  reachable only through the shared ladder, and the branch is stated in `approval_service` so adding
-  the field is a change there rather than a new rule in a new place.
+- **Channel assurance is now required, and it is derived rather than configured.** The record still has
+  no field naming a *required* level, and that was the reason this bullet used to say a step-up approval
+  was "unrepresentable rather than merely unenforced". The rule is instead **derived from the record's own
+  risk**: `RequiredAssurance::required_for(risk)` makes a `Critical` action require `Elevated`, which is
+  this contract's "critical actions default to step-up in CLI/desktop/mobile" stated once. `decide`
+  enforces it after the channel check, so `approval.assurance_insufficient` — which was in the stable-error
+  list with **no producer** — is now reachable, `403`, and non-retryable, and an ordinary session can no
+  longer answer the one class of prompt the risk label exists to make a user step up for. The threshold is
+  a floor rather than a ceiling: a policy may require more, and `High` deliberately does not step up,
+  because stepping up everything above `Moderate` would make the label meaningless. **What is still
+  missing is a per-record override** — an approval may not require *more* than its risk implies, because a
+  field for that would need a producer (policy) that does not exist.
 - **The detail view's remaining named inputs.** "Related run" is served as `run_id`, and the schema
   fingerprint now is too, but the detail requirement's full list is not complete: there is no
   `output_schema` fingerprint, no artifact or content hash (nothing produces one), and no resolution of

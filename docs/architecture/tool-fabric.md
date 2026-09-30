@@ -52,6 +52,42 @@ availability          health and workspace/account prerequisites
 Descriptions and MCP annotations are untrusted hints. JARVIS derives effect and
 risk classifications from trusted manifests, built-in policy, and owner review.
 
+### Argument Validation
+
+`input_schema` is validated by `jarvis_infrastructure::tool_schema`, which
+implements a **bounded subset of JSON Schema 2020-12** and refuses any schema
+containing a keyword outside it. The refusal is the security property rather than a
+limitation: the specification says an unrecognised keyword "SHOULD be treated as an
+annotation" ([Core §6.5](https://json-schema.org/draft/2020-12/json-schema-core)),
+so a schema relying on a keyword JARVIS ignored would validate *less* than its author
+asked for while reporting success. A refusal at definition review is an
+operator-visible configuration defect; an ignored assertion admits a malformed call.
+
+The unimplemented keywords are refused **by name** so the reason is visible, and two
+are worth stating because they look like omissions: `pattern` and `patternProperties`
+need a reviewed regular-expression engine (the specification's own Security
+Considerations section names catastrophic backtracking as a denial-of-service risk),
+and `multipleOf` needs exact decimal arithmetic that `f64` cannot provide. `$ref`
+resolves against the schema's own `$defs` only — a remote reference would make
+validation perform network I/O from inside a request path.
+
+Two resource bounds are enforced, each required by a specification: a **step budget**
+charged per keyword and per `uniqueItems` comparison, and a **depth bound** covering
+schema descent, instance descent, and `$ref` hops. Both specifications require the
+latter by name ("Validators MUST NOT fall into an infinite loop", Core §13). A refused
+budget is reported as *this validator's* limit rather than as a schema violation, so a
+limit of JARVIS's is never attributed to the caller's arguments.
+
+The definition's stated `schema_fingerprint` must be the fingerprint of the schema that
+is actually enforced — `ToolSchema::confirms` is the check, and it matters because the
+fingerprint is part of the identity an approval is recorded against. A definition
+carrying one schema's fingerprint while a looser schema decided acceptance would let a
+recorded approval survive a change to the rules that decide what is accepted, which is
+the failure `ACC-024` names reached without the display name ever changing.
+
+The evidence note is
+[json-schema-validation.md](../research/integrations/json-schema-validation.md).
+
 ## Stable Identity
 
 Tool names are human-readable aliases; authorization binds a canonical tool ID,
@@ -197,7 +233,9 @@ Selection affects model context, not authorization at execution time.
 
 ## Required Tests
 
-- schema rejection before adapter invocation;
+- schema rejection before adapter invocation; **implemented** — the refusal happens at
+  definition review (`ToolSchema::parse`), so an unusable schema cannot reach a call at
+  all, and 30 tests plus 15 falsifications cover the load-time refusals;
 - tool-name and source-identity collision;
 - stale discovery cache and source replacement;
 - argument mutation after approval;

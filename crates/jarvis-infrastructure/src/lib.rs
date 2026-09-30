@@ -25,3 +25,4 @@ pub mod service;
 pub mod storage;
 pub mod time;
 pub mod tool_fingerprint;
+pub mod tool_schema;

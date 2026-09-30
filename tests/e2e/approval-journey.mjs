@@ -225,6 +225,16 @@ const APPROVAL_ID = "01930000-0000-7000-8000-0000000000f1";
 // evaluated on every read, and the two surfaces that *show* a prompt are the listing and the detail read.
 // A distinct id, because the point is that both rows exist and only one survives the read.
 const LAPSED_ID = "01930000-0000-7000-8000-0000000000f2";
+// A **third**, live approval, for the paging check. `has_more` is only true when more rows remain than
+// the page bound, and the bound is one — so a cursor cannot be reached with a single live row. Its
+// deadline is later than the first row's, so page one is unambiguously the earliest-lapsing row and the
+// cursor's position is testable rather than coincidental.
+const PAGING_ID = "01930000-0000-7000-8000-0000000000f3";
+// A **critical-risk** approval, so the composed surface can prove the step-up rule the contract states
+// ("critical actions default to step-up") is enforced by a real daemon rather than only by a service unit
+// test. Seeded rather than driven, because the risk label comes from the tool definition's review and no
+// executor sets one — the same reason the other rows are seeded.
+const CRITICAL_ID = "01930000-0000-7000-8000-0000000000f4";
 // A deadline in the past **relative to the daemon's real clock**, which is what makes this row lapsed
 // without any test-only knob. The other fixture uses 2030 for the mirror-image reason.
 const LAPSED_DEADLINE = "2020-01-01T00:00:00Z";
@@ -274,10 +284,13 @@ async function seedApproval(profile) {
       "INSERT INTO approvals (id, workspace_id, requesting_principal_id, run_id, tool_call_id, " +
         "tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, " +
         "allowed_channels_json, expires_at, scope, state, version, created_at, updated_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'high', '[\"write\"]', ?, ?, '[\"api\"]', ?, 'one_shot', " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[\"write\"]', ?, ?, '[\"api\"]', ?, 'one_shot', " +
         "'pending', 1, ?, ?)",
     );
-    const seed = (id, toolCall, deadline) =>
+    // The risk is a parameter rather than a literal because one row must be **critical** (see
+    // `CRITICAL_ID`): the step-up rule turns on the record's own risk, so a fixture that could only seed
+    // `high` rows could not exercise it at all.
+    const seed = (id, toolCall, deadline, risk) =>
       insert.run(
         id,
         run.workspace_id,
@@ -288,6 +301,7 @@ async function seedApproval(profile) {
         toolCall,
         toolIdentityDocument(),
         FINGERPRINT,
+        risk,
         "Send one email to peter@example.com",
         JSON.stringify([{ key: "to", value: "peter@example.com" }]),
         deadline,
@@ -297,11 +311,23 @@ async function seedApproval(profile) {
 
     // Far in the future: the handler reads the real clock, so a near deadline would make the decision
     // tests exercise expiry instead of the decision path.
-    seed(APPROVAL_ID, "01930000-0000-7000-8000-0000000000a1", "2030-01-01T00:00:00Z");
+    seed(APPROVAL_ID, "01930000-0000-7000-8000-0000000000a1", "2030-01-01T00:00:00Z", "high");
+    // **A third row, live and later-lapsing than the first**, so the listing has more pending rows than
+    // the paging check's bound of one — without it `has_more` is false and the cursor is unreachable,
+    // which is why the paging assertion below needs a second *live* row rather than the lapsed one. Its
+    // deadline is later so the first page is unambiguously the earliest-lapsing row, which is the order
+    // the cursor is a position in.
+    //
+    // It does **not** disturb the "exactly three live" assertion: that one reads the unbounded listing,
+    // where the paging row is one of the live rows and the count already accounts for it.
+    seed(PAGING_ID, "01930000-0000-7000-8000-0000000000a3", "2030-06-01T00:00:00Z", "high");
     // And its mirror image: already past, so the read-path sweep has something real to find. Seeded
     // rather than driven, because no path in this build sets a deadline — the `Ask` executor that would
     // does not exist, which the module docs name as absent.
-    seed(LAPSED_ID, "01930000-0000-7000-8000-0000000000a2", LAPSED_DEADLINE);
+    seed(LAPSED_ID, "01930000-0000-7000-8000-0000000000a2", LAPSED_DEADLINE, "high");
+    // The critical row, live, so the step-up refusal is reachable without disturbing the count above —
+    // it is decided (and refused) in its own section, and the listing count is asserted before it.
+    seed(CRITICAL_ID, "01930000-0000-7000-8000-0000000000a4", "2030-07-01T00:00:00Z", "critical");
     return run;
   } finally {
     database.close();
@@ -376,12 +402,16 @@ async function main() {
       );
     } else if (!Array.isArray(listed.json?.approvals)) {
       fail("the listing must contain an approvals array", listed.text);
-    } else if (listed.json.approvals.length !== 1) {
-      // Two rows are seeded — one live and one already past its deadline — so **this count is itself the
-      // listing half of the read-path expiry assertion**: a surface that offered the lapsed row would
-      // report two here before section 2c could say so precisely.
+    } else if (listed.json.approvals.length !== 3) {
+      // **Three live rows plus one past its deadline, and this count is itself the listing half of the
+      // read-path expiry assertion**: a surface that offered the lapsed row would report four here
+      // before section 2c could say so precisely. The second live row is what makes the paging check
+      // reachable, since a cursor needs more rows than the page bound, and the third is the critical one
+      // the step-up check decides — keeping this count exact is what stops any of them from becoming an
+      // unnoticed extra live row. The first view is asserted below, and it is the earliest-lapsing row,
+      // which is the order the cursor is a position in.
       fail(
-        `exactly one approval is live (the second is lapsed), got ${listed.json.approvals.length}`,
+        `exactly three approvals are live (the fourth is lapsed), got ${listed.json.approvals.length}`,
         listed.text,
       );
     } else {
@@ -426,16 +456,95 @@ async function main() {
       } else {
         pass("the listing carries the approval, its preview, its channels, and its state");
       }
-      // **`has_more` is what tells a client to keep reading.** This surface serves no cursor, so a
-      // listing that omitted the field would leave a client unable to tell a full page from a complete
-      // one — and the safe-looking assumption ("I saw it all") is the wrong one.
-      if (listed.json.has_more !== false) {
+      // **`has_more` is what tells a client to keep reading**, and `next_cursor` is how it can. A
+      // listing that reported `has_more` without a cursor would tell an operator that prompts awaited a
+      // decision and give them no way to reach one — the worst of both, because they know work remains
+      // and cannot do it.
+      //
+      // Two rows are seeded and the bound is one, so this page is genuinely bounded and must carry a
+      // cursor. Asserting the pair together is the point: `has_more: true` with no cursor is the defect,
+      // and neither field alone expresses it.
+      const boundedPage = await request(
+        record,
+        credential,
+        "GET",
+        "/api/v1/approvals?limit=1",
+      );
+      if (boundedPage.status !== 200) {
         fail(
-          `one pending approval cannot fill a page, so has_more must be false, got ${listed.json.has_more}`,
-          listed.text,
+          `a bounded listing must answer, got ${boundedPage.status}`,
+          boundedPage.text,
+        );
+      } else if (boundedPage.json?.has_more !== true) {
+        fail(
+          "a bound of one over two pending rows must report more may remain, got " +
+            JSON.stringify(boundedPage.json?.has_more),
+          boundedPage.text,
+        );
+      } else if (typeof boundedPage.json?.next_cursor !== "string") {
+        fail(
+          "**a bounded page must hand back a cursor, or has_more names work nobody can reach**",
+          boundedPage.text,
         );
       } else {
-        pass("the listing reports that it saw everything (has_more:false)");
+        // The cursor is then used the way a client would, and the next page must be **different** — a
+        // cursor that restarted from the beginning would loop forever, re-reading one prompt while the
+        // other went undecided.
+        const firstId = boundedPage.json.approvals?.[0]?.approval_id;
+        const cursor = encodeURIComponent(boundedPage.json.next_cursor);
+        const nextPage = await request(
+          record,
+          credential,
+          "GET",
+          `/api/v1/approvals?limit=1&cursor=${cursor}`,
+        );
+        const secondId = nextPage.json?.approvals?.[0]?.approval_id;
+        if (nextPage.status !== 200) {
+          fail(`a resuming page must answer, got ${nextPage.status}`, nextPage.text);
+        } else if (typeof secondId !== "string" || secondId === firstId) {
+          fail(
+            "the cursor must read a page that does not repeat the first, got " +
+              JSON.stringify({ firstId, secondId }),
+            `${boundedPage.text}\n${nextPage.text}`,
+          );
+        } else {
+          pass(
+            `a bounded page hands back a cursor, and it reads the next page (${firstId} then ${secondId})`,
+          );
+        }
+
+        // And an unusable cursor is refused by name rather than silently treated as no cursor: a silent
+        // restart looks like a legitimate page one, so a client would loop forever without learning its
+        // cursor was bad.
+        const refused = await request(
+          record,
+          credential,
+          "GET",
+          "/api/v1/approvals?cursor=v1.not-a-cursor",
+        );
+        if (refused.status !== 400 || refused.json?.error?.code !== "request.invalid_cursor") {
+          fail(
+            `an unusable cursor must be 400 request.invalid_cursor, got ${refused.status}`,
+            refused.text,
+          );
+        } else {
+          pass("an unusable cursor is refused with request.invalid_cursor rather than restarting");
+        }
+      }
+
+      const completePage = await request(record, credential, "GET", "/api/v1/approvals");
+      if (completePage.json.has_more !== false) {
+        fail(
+          `three live rows cannot fill a page of the default bound, so has_more must be false, got ${completePage.json.has_more}`,
+          completePage.text,
+        );
+      } else if (completePage.json.next_cursor !== undefined) {
+        fail(
+          "a complete page must omit the cursor, or a client follows one into an empty page",
+          completePage.text,
+        );
+      } else {
+        pass("a complete page reports has_more:false and carries no cursor");
       }
     }
 
@@ -654,6 +763,57 @@ async function main() {
         fail("a refused decision must not change the record", JSON.stringify(after));
       } else {
         pass("a fingerprint mismatch is refused by code and changes nothing");
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // 6b. A **critical** action cannot be decided by this ordinary session. The contract states
+    //     "critical actions default to step-up in CLI/desktop/mobile" and lists
+    //     `approval.assurance_insufficient` among its stable errors — a code that had **no producer**
+    //     at all before the step-up rule was enforced, so a client could key on one it never receives.
+    //     Asserted at the composed surface because the rule reads the record's own `risk` and the
+    //     daemon is the only place the whole path from a seeded row to a wire refusal exists.
+    // ---------------------------------------------------------------------
+    const criticalDecide = await request(
+      record,
+      credential,
+      "POST",
+      `/api/v1/approvals/${CRITICAL_ID}/decide`,
+      { decision: "approve", expected_version: 1, action_fingerprint: FINGERPRINT },
+      { "Idempotency-Key": idempotencyKey("critical") },
+    );
+    if (criticalDecide.status !== 403) {
+      fail(
+        `**a critical action must be forbidden to an ordinary session**, got ${criticalDecide.status}`,
+        criticalDecide.text,
+      );
+    } else if (!criticalDecide.text.includes("approval.assurance_insufficient")) {
+      fail(
+        "the refusal must carry the contract's own assurance code",
+        criticalDecide.text,
+      );
+    } else if (!criticalDecide.text.includes('"retryable":false')) {
+      fail(
+        "a stronger assurance is a different request, so re-sending this one cannot succeed",
+        criticalDecide.text,
+      );
+    } else {
+      // **Nothing changed, and the refusal is not a silent decision.** A refusal that had already
+      // written the decision would be the worst direction: the operator would see "forbidden" while
+      // the record said approved. Read back through the client's own route rather than the database,
+      // so the assertion is about what a caller can observe.
+      const after = await request(record, credential, "GET", `/api/v1/approvals/${CRITICAL_ID}`);
+      if (after.status !== 200) {
+        fail(`the critical approval must still be readable, got ${after.status}`, after.text);
+      } else if (after.json?.state !== "pending" || after.json?.version !== 1) {
+        fail(
+          "a refused decision must leave the record where it was",
+          JSON.stringify(after.json),
+        );
+      } else {
+        pass(
+          "a critical action is refused with approval.assurance_insufficient and nothing is written",
+        );
       }
     }
 

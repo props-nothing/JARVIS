@@ -17,6 +17,7 @@ import {
   parseTodoItems,
   sectionForHeading,
   traceabilityRowErrors,
+  unownedAcceptanceScenarios,
 } from "./validate-docs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -101,6 +102,39 @@ test("duplicate requirement definitions fail closed", () => {
     "- `FR-ID-001`: Duplicate definition.",
   ].join("\n");
   assert.deepEqual(duplicateProductRequirements(product), ["FR-ID-001"]);
+});
+
+test("an acceptance scenario named by no requirement is reported", () => {
+  // `ACC-007` was documented in `docs/testing/acceptance.md` and named by **no** traceability row, so
+  // nothing owned it. The validator checked only the other direction — that a row names an ACC which
+  // exists — so an unreferenced heading was invisible, and a scenario nothing schedules reads as
+  // covered because it is written down.
+  const headings = ["ACC-004", "ACC-007", "ACC-074"];
+  const table =
+    "| `NFR-COMP-001` | [Owner](o.md) | [Contract](c.md) | All | `FND-004` | `ACC-004`, `ACC-074` |";
+  assert.deepEqual(unownedAcceptanceScenarios(table, headings), ["ACC-007"]);
+
+  // Every heading owned: nothing reported, so the check cannot be satisfied by always reporting.
+  const complete =
+    "| `NFR-COMP-001` | [Owner](o.md) | [Contract](c.md) | All | `FND-004` | `ACC-004`, `ACC-007`, `ACC-074` |";
+  assert.deepEqual(unownedAcceptanceScenarios(complete, headings), []);
+});
+
+test("a scenario covered through a range is not reported as unowned", () => {
+  // **This is the false positive that made the check unusable until it was fixed.** `NFR-SEC-001`
+  // covers `ACC-070` through `ACC-073`, naming only the endpoints literally — so a bare `ACC-\d{3}`
+  // scan reported `ACC-071` and `ACC-072` as unowned while they are covered, and a reader following
+  // the message would have "fixed" a row that was already correct.
+  const headings = ["ACC-070", "ACC-071", "ACC-072", "ACC-073", "ACC-074"];
+  const ranged =
+    "| `NFR-SEC-001` | [Owner](o.md) | [Contract](c.md) | All | `FND-007` | `ACC-070` through `ACC-073` |";
+  assert.deepEqual(unownedAcceptanceScenarios(ranged, headings), ["ACC-074"]);
+
+  // The `to` spelling and a second range form both expand, because the table uses whichever reads
+  // better in a cell and a check that understood only one would silently miss the other.
+  const toForm =
+    "| `NFR-X-001` | [Owner](o.md) | [Contract](c.md) | All | `FND-007` | `ACC-070` to `ACC-074` |";
+  assert.deepEqual(unownedAcceptanceScenarios(toForm, headings), []);
 });
 
 test("traceability rows reject unknown and missing IDs", () => {

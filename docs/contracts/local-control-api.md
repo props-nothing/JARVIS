@@ -544,6 +544,7 @@ Minimum codes:
 | HTTP | Code | Retryable |
 | --- | --- | --- |
 | 400 | `request.invalid` | no |
+| 400 | `request.invalid_cursor` | no |
 | 400 | `api.host_not_allowed` | no |
 | 401 | `auth.credential_rejected` | no |
 | 403 | `api.origin_not_allowed` | no |
@@ -568,7 +569,8 @@ handle it, and a table that omitted it would be claiming to list every code the 
 leaving one out — the same defect this table's completeness check exists to catch.
 
 Every code above except one is produced by a control on this surface, and every code the surface
-produces is listed above — a property a test holds, not a claim this document makes about itself.The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
+produces is listed above — a property a test holds, not a claim this document makes about itself.
+The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
 surface, and the connector platform (`CON-004`) owns rate limiting for provider and MCP traffic.
 It stays listed so the `429` shape is fixed before a limiter is added, but a client must not
 treat "handled" as "will occur".

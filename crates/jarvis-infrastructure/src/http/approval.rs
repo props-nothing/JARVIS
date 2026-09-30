@@ -38,10 +38,13 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use jarvis_application::approval_service::{ApprovalServiceError, Decision, DecisionCommand};
+use jarvis_application::repository::approval::ApprovalCursor;
 use jarvis_application::request_context::RequestContext;
 use jarvis_domain::ids::ApprovalId;
 use jarvis_domain::time::UtcTimestamp;
-use jarvis_domain::tool::approval::{ApprovalVersion, DecisionNote, DurableApproval};
+use jarvis_domain::tool::approval::{
+    ApprovalChannel, ApprovalVersion, DecisionNote, DurableApproval,
+};
 use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_protocol::{
     ApprovalDecisionResponse, ApprovalListView, ApprovalView, CancelApprovalRequest,
@@ -54,7 +57,7 @@ use crate::time::SystemClock;
 
 /// Query parameters for the listing.
 ///
-/// **Only `limit` is accepted, and the parser refuses anything else by name.**
+/// **`limit` and `cursor` are accepted; any other key is refused by name.**
 ///
 /// That narrowing is deliberate rather than an omission. The contract's filters are "schema-defined:
 /// state, risk, effect, requesting run/tool, and created/expiry time", and this build serves the
@@ -67,22 +70,145 @@ use crate::time::SystemClock;
 /// Parsed from the URI by hand rather than with `axum`'s `Query` extractor, because that extractor
 /// needs the `query` feature and this workspace's `axum` resolves with `http1`, `json`, and `tokio`
 /// only — adding a feature to the dependency graph is a research-gate change, not a convenience.
-fn parse_limit(uri: &Uri) -> Result<Option<u32>, ()> {
+/// Why a listing query was refused.
+///
+/// Two variants rather than one, because the refusals send a client to different inputs: an unknown
+/// *filter* is a request this build does not serve, while an unusable *cursor* is a position this
+/// listing never handed out. Both are `400`, and the codes differ so a client can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryError {
+    /// A key this build does not serve, or a limit that does not parse.
+    Other,
+    /// A cursor that is not a well-formed value this build produced.
+    Cursor,
+}
+
+fn parse_list_query(uri: &Uri) -> Result<(Option<u32>, Option<ApprovalCursor>), QueryError> {
     let Some(query) = uri.query() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let mut limit = None;
+    let mut cursor = None;
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
-        let (key, value) = pair.split_once('=').ok_or(())?;
-        if key != "limit" {
-            return Err(());
+        let (key, value) = pair.split_once('=').ok_or(QueryError::Other)?;
+        match key {
+            "limit" => limit = Some(value.parse::<u32>().map_err(|_| QueryError::Other)?),
+            // **A bad cursor reports its own code, not the generic body defect.** Both are `400`, and
+            // the distinction is what tells a client which of its own inputs to fix: an unknown
+            // *filter* means the request asked for something this build does not serve, while an
+            // unusable cursor means the position it is resuming from is not one this listing handed
+            // out. Collapsing them would send a client to re-check a query string that was fine.
+            "cursor" => cursor = Some(decode_cursor(value).ok_or(QueryError::Cursor)?),
+            _ => return Err(QueryError::Other),
         }
-        limit = Some(value.parse::<u32>().map_err(|_| ())?);
     }
-    Ok(limit)
+    Ok((limit, cursor))
+}
+
+/// Encodes a page position as an opaque query value.
+///
+/// **Opaque to the client, and the encoding is the reason rather than a flourish.** The contract says
+/// the cursor is opaque, which is a promise about what a client may do with it: it may pass it back
+/// and nothing else. A readable `expires_at,id` pair would invite a client to construct one — and a
+/// constructed cursor would name a position the listing never produced, which is a way to *skip*
+/// approvals rather than merely to read them oddly. Base64-with-a-prefix also keeps the value
+/// URL-safe without percent-encoding, so a client cannot mangle it by re-encoding the query.
+///
+/// **It is not a security boundary.** Everything a cursor carries is data the client already received
+/// (the last row's expiry and identifier) plus the channel it fetched on, and the store re-applies its
+/// own workspace and channel predicates regardless of what the value claims. Opaqueness here is about
+/// honesty of use, not about hiding anything: a hand-forged cursor can only ask for a legitimate page
+/// of the caller's own view.
+fn encode_cursor(cursor: &ApprovalCursor) -> String {
+    let raw = format!(
+        "{}|{}|{}",
+        cursor.expires_at,
+        cursor.id,
+        cursor.channel.as_contract_str()
+    );
+    format!("v1.{}", base64url(raw.as_bytes()))
+}
+
+/// Decodes a cursor produced by [`encode_cursor`].
+///
+/// Returns `None` for anything that is not a well-formed cursor this build wrote, so a malformed or
+/// truncated value is a `400 request.invalid_cursor` rather than a silent restart from page one — the
+/// failure a client would never detect, because page one looks like a plausible answer.
+fn decode_cursor(value: &str) -> Option<ApprovalCursor> {
+    let encoded = value.strip_prefix("v1.")?;
+    let raw = String::from_utf8(base64url_decode(encoded)?).ok()?;
+    let mut parts = raw.split('|');
+    let expires_at = UtcTimestamp::parse(parts.next()?).ok()?;
+    let id = ApprovalId::parse(parts.next()?).ok()?;
+    let channel = ApprovalChannel::parse(parts.next()?).ok()?;
+    // A trailing segment means a field was injected into the payload, so the value is refused rather
+    // than read with the extra part ignored — reading a prefix of something is how a parser accepts
+    // a value the writer never produced.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ApprovalCursor {
+        expires_at,
+        id,
+        channel,
+    })
+}
+
+/// Encodes bytes as URL-safe base64 without padding.
+///
+/// Hand-written rather than pulled from a crate: the alphabet is fixed and tiny, and this is an
+/// encoding for one query parameter rather than a protocol. Adding `base64` for this would be a
+/// dependency decision the research gate requires evidence for, for eleven lines.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).map_or(0, |byte| u32::from(*byte));
+        let b2 = chunk.get(2).map_or(0, |byte| u32::from(*byte));
+        let packed = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((packed >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((packed >> 12) & 0x3f) as usize] as char);
+        // The two trailing characters are emitted only when their bits came from real input, which is
+        // what makes the encoding round-trip without a padding character.
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((packed >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(packed & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Decodes URL-safe base64 without padding.
+///
+/// Returns `None` for a character outside the alphabet, so a hand-edited cursor is refused rather than
+/// decoded into bytes nobody wrote.
+fn base64url_decode(value: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0_u32;
+    for character in value.bytes() {
+        let digit = match character {
+            b'A'..=b'Z' => u32::from(character - b'A'),
+            b'a'..=b'z' => u32::from(character - b'a') + 26,
+            b'0'..=b'9' => u32::from(character - b'0') + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Handles `GET /api/v1/approvals`.
@@ -96,9 +222,18 @@ pub async fn list_approvals(
     let Some(service) = state.approvals.as_ref() else {
         return runs::not_ready(request_id);
     };
-    let limit = match parse_limit(&uri) {
-        Ok(limit) => limit.unwrap_or(MAX_APPROVAL_PAGE),
-        Err(()) => {
+    let (limit, cursor) = match parse_list_query(&uri) {
+        Ok(parsed) => parsed,
+        Err(QueryError::Cursor) => {
+            return error_response_for(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "request.invalid_cursor",
+                "The page cursor is not valid for this request.",
+                false,
+            );
+        }
+        Err(QueryError::Other) => {
             return error_response_for(
                 request_id,
                 StatusCode::BAD_REQUEST,
@@ -108,13 +243,14 @@ pub async fn list_approvals(
             );
         }
     };
+    let limit = limit.unwrap_or(MAX_APPROVAL_PAGE);
     let context = context_for(&client, request_id);
     // **The clock is read once and passed to the service**, so the lapse check the listing performs and
     // the `lapsed` flag every row reports are derived from one instant. Two clock reads would let a row
     // be excluded as lapsed while another row in the same response reported `lapsed: false` against the
     // same deadline.
     let now = clock_now();
-    match service.list(&context, limit, now).await {
+    match service.list(&context, limit, cursor, now).await {
         Ok(page) => {
             let view = ApprovalListView {
                 approvals: page
@@ -124,6 +260,10 @@ pub async fn list_approvals(
                     .collect(),
                 max_page: MAX_APPROVAL_PAGE,
                 has_more: page.bounded,
+                // Rendered from the store's own position, never from `approvals.last()` here: the
+                // store knows the column the query ordered by, and deriving it in the handler would be
+                // a second definition of the order that could drift from the `ORDER BY` it must match.
+                next_cursor: page.next.as_ref().map(encode_cursor),
             };
             runs::json_response(request_id, StatusCode::OK, &view)
         }
@@ -536,7 +676,9 @@ fn approval_error_response(request_id: Option<&str>, error: &ApprovalServiceErro
         | ApprovalServiceError::FingerprintMismatch
         | ApprovalServiceError::AlreadyConsumed
         | ApprovalServiceError::StateConflict => StatusCode::CONFLICT,
-        ApprovalServiceError::Invalid { .. } => StatusCode::BAD_REQUEST,
+        ApprovalServiceError::Invalid { .. } | ApprovalServiceError::InvalidCursor => {
+            StatusCode::BAD_REQUEST
+        }
         ApprovalServiceError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error_response_for(
@@ -571,6 +713,7 @@ fn message_of(error: &ApprovalServiceError) -> &'static str {
             "The approval is not in a state this operation can act on."
         }
         ApprovalServiceError::Invalid { .. } => "The request is not valid for this endpoint.",
+        ApprovalServiceError::InvalidCursor => "The page cursor is not valid for this request.",
         ApprovalServiceError::Unauthenticated => "Authentication is required.",
         ApprovalServiceError::InsufficientAssurance => {
             "This decision requires a stronger authentication assurance."

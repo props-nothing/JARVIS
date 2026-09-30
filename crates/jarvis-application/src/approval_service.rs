@@ -49,6 +49,7 @@
 use std::sync::Arc;
 
 use jarvis_domain::ids::ApprovalId;
+use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     ApprovalActor, ApprovalChannel, ApprovalState, ApprovalVersion, DecisionNote, DurableApproval,
@@ -57,7 +58,7 @@ use jarvis_domain::tool::canonical::ActionDigest;
 
 use crate::repository::RepositoryError;
 use crate::repository::approval::{
-    ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+    ApprovalCursor, ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
 };
 use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
 
@@ -138,6 +139,14 @@ pub enum ApprovalServiceError {
     Unauthenticated,
     /// The caller proved an identity, but not at the level this operation requires.
     InsufficientAssurance,
+    /// The caller's page cursor was not bound to the query it is being used for.
+    ///
+    /// **A refusal rather than an empty page**, because the cursor carries the channel it was minted
+    /// for and the two answer different questions: an empty page would tell the caller "nothing
+    /// follows", while the truth is "this position is not meaningful against this view". Reporting
+    /// the second as the first would also let a caller probe another channel's rows by observing
+    /// whether a page came back empty.
+    InvalidCursor,
     /// The store could not be read or written.
     Storage(RepositoryError),
 }
@@ -153,6 +162,7 @@ impl ApprovalServiceError {
             // a scope refusal's code names which authority was missing, and an invalid request's names
             // what was wrong with the body.
             Self::ScopeDenied { code } | Self::Invalid { code } => code,
+            Self::InvalidCursor => "request.invalid_cursor",
             Self::Expired => "approval.expired",
             Self::FingerprintMismatch => "approval.fingerprint_mismatch",
             Self::VersionConflict { .. } => "approval.version_conflict",
@@ -185,6 +195,7 @@ impl ApprovalServiceError {
             | Self::AlreadyConsumed
             | Self::StateConflict
             | Self::Invalid { .. }
+            | Self::InvalidCursor
             | Self::Unauthenticated
             | Self::InsufficientAssurance => false,
         }
@@ -222,10 +233,17 @@ impl ApprovalService {
     /// waiting on somebody else.
     ///
     /// `bounded` tells the caller whether the store stopped at its bound, which is the fact a client
-    /// needs to decide whether to keep reading. It is reported rather than translated into a cursor
-    /// because this build serves no cursor: a page and its boundedness are honest, whereas a cursor
-    /// synthesized from the last row's expiry would claim a stable position this listing does not yet
-    /// guarantee across a concurrent decision.
+    /// needs to decide whether to keep reading — and `next` is the cursor that makes "keep reading"
+    /// possible. **The doc here used to say this build "serves no cursor" and that a cursor would
+    /// "claim a stable position this listing does not yet guarantee across a concurrent decision";
+    /// that was wrong about the position.** The listing's order is `(expires_at, id)`, which is total
+    /// and stable: `expires_at` is an immutable column and `id` is primary. What a concurrent decision
+    /// changes is *membership*, not order — so a keyset cursor is exactly as stable as the order it
+    /// names, and an offset would be the unstable choice.
+    ///
+    /// `after` resumes from a cursor a previous page produced. It is passed to the store rather than
+    /// applied here, because the bound has to run where the `LIMIT` runs: filtering a page here would
+    /// apply the limit to the wrong window.
     ///
     /// `limit` is clamped to the store's bound rather than refused, so a client asking for more
     /// receives a full page.
@@ -238,26 +256,34 @@ impl ApprovalService {
         &self,
         context: &RequestContext,
         limit: u32,
+        after: Option<ApprovalCursor>,
         at: UtcTimestamp,
     ) -> Result<ApprovalsPage, ApprovalServiceError> {
         // A guest is refused before the read, so an unauthenticated caller cannot learn anything about
         // the workspace's queue.
-        let _ = required_assurance_of(context.assurance)?;
+        let _ = assurance_of(context.assurance)?;
         let limit = limit.min(MAX_PENDING_PAGE);
+        let channel = approval_channel_of(context.channel);
+        // **A cursor for another channel is refused rather than honoured.** The cursor carries the
+        // channel it was bound to, and the store filters by *that* value; accepting one minted for a
+        // different channel would let a caller page through a view it cannot otherwise ask for, which
+        // is how a listing becomes a probe for what it excludes. Refused as an invalid request rather
+        // than as an empty page, because an empty page would answer the question the probe asked.
+        if let Some(cursor) = after
+            && cursor.channel != channel
+        {
+            return Err(ApprovalServiceError::InvalidCursor);
+        }
         let page = self
             .approvals
-            .pending_in(
-                context.workspace_id,
-                approval_channel_of(context.channel),
-                limit,
-            )
+            .pending_in(context.workspace_id, channel, limit, after)
             .await
             .map_err(ApprovalServiceError::Storage)?;
         // **The contract's "expiry is evaluated on every read", which this method did not do.** A listing
         // is the surface a *prompt* appears on, so it is the one place a lapsed record must not be offered:
         // a client that received it would render a decision the daemon then refuses as expired, and — worse
         // — the page budget would be spent on rows nobody can act on.
-        Ok(self.expire_lapsed(context, page, limit, at).await)
+        Ok(self.expire_lapsed(context, page, limit, after, at).await)
     }
 
     /// Reads one approval, scoped to the caller's workspace.
@@ -278,7 +304,7 @@ impl ApprovalService {
         approval: ApprovalId,
         at: UtcTimestamp,
     ) -> Result<DurableApproval, ApprovalServiceError> {
-        let _ = required_assurance_of(context.assurance)?;
+        let _ = assurance_of(context.assurance)?;
         let stored = self.load(context, approval).await?;
         // The channel is authorized against the record as stored, before the lapse is recorded: a caller
         // whose channel may not decide this approval must be refused the same way whether or not the
@@ -331,9 +357,17 @@ impl ApprovalService {
             fingerprint,
             note,
         } = command;
-        let _ = required_assurance_of(context.assurance)?;
+        let _ = assurance_of(context.assurance)?;
         let mut stored = self.load(context, approval).await?;
         authorize_deciding(context.channel, &stored)?;
+        // **The contract's "checks current channel and assurance against the approval request/policy",
+        // which was unimplemented.** The assurance was resolved and *recorded* but never *required*, so
+        // `approval.assurance_insufficient` sat in the contract's stable-error list with no producer,
+        // and a critical action could be decided by an ordinary session — the one prompt the risk label
+        // exists to make the user step up for. Placed here, after the channel check, because the two
+        // refusals send the user to different places: a channel refusal means "use another surface",
+        // while an assurance refusal means "prove who you are again" on the surface they are already on.
+        require_deciding_assurance(context.assurance, &stored)?;
 
         if stored.is_lapsed_at(at) {
             self.expire(context, &stored, at).await;
@@ -373,7 +407,7 @@ impl ApprovalService {
             // decision by a stepped-up caller from one by an ordinary session. Taken from the context
             // rather than from the request body, for the `BRN-024` reason: a caller-supplied assurance
             // would let whoever filled in the body choose how strong the decision looked.
-            assurance: required_assurance_of(context.assurance)?,
+            assurance: assurance_of(context.assurance)?,
             // The operator's own comment, when the request carried one. The wire comment was declared
             // with a doc saying "stored with the decision" while nothing stored it, so it reached this
             // layer and stopped — the caller's note is now part of the transition the caller authored.
@@ -423,7 +457,7 @@ impl ApprovalService {
         reason: Option<&DecisionNote>,
         at: UtcTimestamp,
     ) -> Result<DecidedApproval, ApprovalServiceError> {
-        let _ = required_assurance_of(context.assurance)?;
+        let _ = assurance_of(context.assurance)?;
         let mut stored = self.load(context, approval).await?;
         authorize_cancelling(context, &stored)?;
 
@@ -492,7 +526,7 @@ impl ApprovalService {
         context: &RequestContext,
         approval: ApprovalId,
     ) -> Result<Option<String>, ApprovalServiceError> {
-        let _ = required_assurance_of(context.assurance)?;
+        let _ = assurance_of(context.assurance)?;
         let stored = self.load(context, approval).await?;
         authorize_deciding(context.channel, &stored)?;
         let trail = self
@@ -570,6 +604,7 @@ impl ApprovalService {
         context: &RequestContext,
         mut page: ApprovalsPage,
         limit: u32,
+        after: Option<ApprovalCursor>,
         at: UtcTimestamp,
     ) -> ApprovalsPage {
         for _ in 0..=limit {
@@ -588,12 +623,19 @@ impl ApprovalService {
                 // discarded into a wrong value, it is superseded by a newer read of the same fact.
                 let _ = self.expire_on_read(context, id, at).await;
             }
+            // **The re-read resumes from the caller's own position, not from the first page.** Sweeping
+            // a page and then re-reading page one would answer a different question than the caller
+            // asked: a request for page three would receive rows from the beginning, and because the
+            // cursor it was given would then be the wrong one, the client's next fetch would jump
+            // backwards. The bound is the same `after` for every pass, so each re-read replaces exactly
+            // the window being swept.
             page = match self
                 .approvals
                 .pending_in(
                     context.workspace_id,
                     approval_channel_of(context.channel),
                     limit,
+                    after,
                 )
                 .await
             {
@@ -724,6 +766,39 @@ fn authorize_deciding(
     Ok(())
 }
 
+/// Refuses a caller whose assurance does not meet what the action's risk requires.
+///
+/// **The step-up rule, enforced rather than only recorded.** `approval.assurance_insufficient` is in
+/// the contract's stable-error list and had no producer: the assurance reached `ApprovalActor::Decided`
+/// as an audit fact while nothing compared it against a requirement, so "critical actions default to
+/// step-up" was a sentence in the contract with no code behind it. The requirement comes from
+/// [`RequiredAssurance::required_for`] — one place, so this surface and any later one cannot disagree
+/// about the threshold.
+///
+/// The comparison is [`RequiredAssurance::is_satisfied_by`], which is a ladder: an elevated caller
+/// satisfies a standard requirement. Writing it as an equality would refuse a more strongly
+/// authenticated caller, which is the one refusal no operator wants and the one that pushes toward
+/// weakening the requirement.
+///
+/// # Errors
+///
+/// Returns [`ApprovalServiceError::InsufficientAssurance`] when the caller holds less than the action
+/// requires.
+fn require_deciding_assurance(
+    held: AuthenticationAssurance,
+    stored: &DurableApproval,
+) -> Result<(), ApprovalServiceError> {
+    // A guest never reaches here — `assurance_of` refuses one before the store is read — so the
+    // refusal below can only mean "proved an identity, but not strongly enough", which is what the
+    // variant's own doc says and what makes the code's remedy ("re-authenticate harder") correct.
+    let held = assurance_of(held)?;
+    if RequiredAssurance::required_for(stored.risk).is_satisfied_by(held) {
+        Ok(())
+    } else {
+        Err(ApprovalServiceError::InsufficientAssurance)
+    }
+}
+
 /// Refuses a caller who is neither the requester nor on a permitted channel.
 fn authorize_cancelling(
     context: &RequestContext,
@@ -790,15 +865,31 @@ fn map_domain_refusal(error: &jarvis_domain::error::DomainError) -> ApprovalServ
 ///
 /// Returns [`ApprovalServiceError::Unauthenticated`] for a guest, because an anonymous caller cannot
 /// be the principal a decision is attributed to.
-fn required_assurance_of(
-    held: AuthenticationAssurance,
-) -> Result<jarvis_domain::model::exception::RequiredAssurance, ApprovalServiceError> {
-    crate::policy_service::required_assurance_of(held).map_err(|error| match error {
-        crate::policy_service::PolicyServiceError::Unauthenticated => {
-            ApprovalServiceError::Unauthenticated
-        }
-        _ => ApprovalServiceError::InsufficientAssurance,
-    })
+/// Returns the assurance a verified caller proved, refusing an anonymous one.
+///
+/// **`map_err` to a single variant rather than a `match` with a `_` arm, and the difference is the
+/// point.** The previous form matched the shared resolver's nine-variant error and mapped everything
+/// unrecognised onto [`ApprovalServiceError::InsufficientAssurance`] — an arm that **could never
+/// fire**, because `policy_service::required_assurance_of` returns only `Unauthenticated`. So the arm
+/// was unreachable code that nonetheless made the variant look produced, and nothing in the workspace
+/// produced it: the same "a refusal that can never fire is dead protection" shape as the
+/// terminal-state guard in `ApprovalState::can_transition_to`. Collapsing to `map_err` states the
+/// function's actual contract — *any* failure to resolve an assurance here means the caller proved no
+/// identity — which is true precisely because the shared resolver has one failure mode, and the test
+/// that pins it is `a_guest_is_refused_before_the_store_is_read`.
+///
+/// The rule itself is **delegated rather than restated**, so this surface and the policy surface
+/// cannot disagree about what a guest is. The real producer of
+/// [`ApprovalServiceError::InsufficientAssurance`] is [`require_deciding_assurance`], which compares
+/// a requirement against what the caller holds.
+///
+/// # Errors
+///
+/// Returns [`ApprovalServiceError::Unauthenticated`] for a guest, because an anonymous caller cannot
+/// be the principal a decision is attributed to.
+fn assurance_of(held: AuthenticationAssurance) -> Result<RequiredAssurance, ApprovalServiceError> {
+    crate::policy_service::required_assurance_of(held)
+        .map_err(|_| ApprovalServiceError::Unauthenticated)
 }
 
 #[cfg(test)]

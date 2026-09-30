@@ -87,6 +87,19 @@
       ]
     },
     {
+      "id": "json-schema-validation",
+      "todos": ["TLS-003"],
+      "evidence": "docs/research/integrations/json-schema-validation.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-09-30",
+      "revalidate_by": "2026-12-29",
+      "implementation_paths": [
+        "crates/jarvis-domain/src/tool/schema/**",
+        "crates/jarvis-domain/src/tool/schema_tests.rs"
+      ]
+    },
+    {
       "id": "mcp",
       "todos": ["TLS-008", "TLS-009", "TLS-010"],
       "evidence": "docs/research/integrations/mcp.md",
