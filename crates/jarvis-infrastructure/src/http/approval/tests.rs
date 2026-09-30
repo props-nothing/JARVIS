@@ -101,6 +101,17 @@ fn pending() -> DurableApproval {
 
 /// A router with an approval service over a seeded double.
 async fn fixture(tag: &str) -> (axum::Router, String, DurableApproval, std::path::PathBuf) {
+    fixture_seeded(tag, pending()).await
+}
+
+/// The same, over a row the caller shapes.
+///
+/// Exists because the deadline is part of the record, not a knob on the service: a test that needs a
+/// *lapsed* row has to seed one, since the handler reads the real clock and cannot be told otherwise.
+async fn fixture_seeded(
+    tag: &str,
+    approval: DurableApproval,
+) -> (axum::Router, String, DurableApproval, std::path::PathBuf) {
     let dir = temp_dir(tag);
     let destination = ClientCredentialPath::in_config_dir(&dir);
     let (registered, credential) =
@@ -109,7 +120,6 @@ async fn fixture(tag: &str) -> (axum::Router, String, DurableApproval, std::path
     clients.register(registered);
 
     let repositories = Arc::new(InMemoryRepositories::new());
-    let approval = pending();
     repositories
         .request(&approval)
         .await
@@ -503,6 +513,58 @@ async fn a_decision_body_that_carries_an_unusable_comment_is_a_bad_request() {
         );
         assert!(refused.contains("request.invalid"), "{refused}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_lapsed_read_reports_expired_and_the_listing_no_longer_offers_it() {
+    // **The contract's "expiry is evaluated on every read", asserted over the wire.** Both surfaces are
+    // checked because they are the two answers a client acts on differently: a detail read that said
+    // `pending` would render a decision the daemon refuses, and a listing that still offered the row would
+    // put a dead prompt in front of an operator — and spend its page budget on it.
+    //
+    // The row is seeded with a **past** deadline, which is the opposite of every other fixture here (those
+    // use a far-future instant so they exercise the decision path). That inversion is the point: this test
+    // is *about* the lapse, so it must not be able to pass with a deadline that has not arrived.
+    let mut lapsed = pending();
+    lapsed.expires_at = UtcTimestamp::parse("2020-01-01T00:00:00Z").expect("valid");
+    let (app, token, approval, dir) = fixture_seeded("approval-lapsed-read", lapsed).await;
+
+    let (read_status, read_body) = send(
+        &app,
+        "GET",
+        &format!("/api/v1/approvals/{}", approval.id),
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK, "{read_body}");
+    let parsed: serde_json::Value = serde_json::from_str(&read_body).expect("the body is JSON");
+    assert_eq!(
+        parsed["state"], "expired",
+        "**a read past the deadline must report the recorded lapse**: {read_body}",
+    );
+    assert_eq!(parsed["lapsed"], true, "{read_body}");
+
+    let (list_status, list_body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK, "{list_body}");
+    let listing: serde_json::Value = serde_json::from_str(&list_body).expect("the body is JSON");
+    assert_eq!(
+        listing["approvals"].as_array().map(Vec::len),
+        Some(0),
+        "**a lapsed prompt must not be offered**: {list_body}",
+    );
+    assert_eq!(
+        listing["has_more"], false,
+        "and the page is complete rather than short: {list_body}",
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -45,6 +45,21 @@ pub const MAX_STEP_TIMEOUT_MS: u64 = 3_600_000;
 /// ceiling — a caller may supply its own, and the field is optional.
 pub const DEFAULT_RUN_DEADLINE_MS: u64 = 900_000;
 
+/// The default bound on a single step's wall-clock time, in milliseconds.
+///
+/// **The same unreachability, and this one is load-bearing.** The controller derives every provider
+/// await from `(remaining deadline, step timeout)` and refuses to wait longer than the tighter of
+/// the two — but nothing in the product ever set the field, so on every real run the bound reduced
+/// to the run's whole remaining deadline. A provider that accepted the connection and then stalled
+/// held the run open for the full fifteen-minute default rather than being cut off, which is the
+/// behaviour the step timeout exists to prevent.
+///
+/// Two minutes is deliberately far below [`DEFAULT_RUN_DEADLINE_MS`]: a single model call that has
+/// produced nothing in two minutes is a stall rather than a slow answer, and cutting it off early
+/// leaves the run's *remaining* budget usable for a retry rather than spent on one wait. A caller
+/// who needs a longer single step states its own.
+pub const DEFAULT_STEP_TIMEOUT_MS: u64 = 120_000;
+
 /// The model route a policy authorized for one run.
 ///
 /// Three facts that must travel together, which is why they are one value rather than three
@@ -301,6 +316,19 @@ impl RunBudget {
         }
         self.step_timeout_ms = Some(millis);
         Ok(self)
+    }
+
+    /// Returns this budget with the default step timeout applied.
+    ///
+    /// Infallible, unlike [`with_step_timeout`](Self::with_step_timeout), because
+    /// [`DEFAULT_STEP_TIMEOUT_MS`] is a constant this module already bounds: a caller applying the
+    /// *default* would otherwise have to handle an error that cannot occur, and the natural way to
+    /// write that is `.ok()` or `.unwrap_or(budget)` — which silently drops the bound, which is the
+    /// exact defect this method exists to remove.
+    #[must_use]
+    pub const fn with_default_step_timeout(mut self) -> Self {
+        self.step_timeout_ms = Some(DEFAULT_STEP_TIMEOUT_MS);
+        self
     }
 
     /// Returns which ceiling `usage` breached, if any.

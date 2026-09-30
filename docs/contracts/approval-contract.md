@@ -165,6 +165,13 @@ Expiry is evaluated on every read/decision/reservation and by a durable expiry
 worker. Exactly one state transition/outbox event wins. Approval activity events
 are safe summaries; sensitive preview content remains referenced under policy.
 
+A read past the deadline **records** the lapse rather than merely hiding the row:
+a refusal that left the record `pending` would leave the prompt in every later
+listing. The listing therefore expires the lapsed rows in its page and re-reads
+until none remain, instead of filtering them out — a filtered page comes back
+**short**, and on this surface a short page is how a client concludes there is
+nothing left to decide.
+
 Waiting runs/workflows resume from the durable decision event. A client
 disconnect, duplicate event, or daemon restart cannot consume twice. Decision
 responses may be `200`/`202` according to generated OpenAPI, but execution result
@@ -269,11 +276,19 @@ service over the daemon's own pool. `tests/e2e/approval-journey.mjs` proves the 
 layer handler tests, which build their own `ApiState`, are structurally blind to.
 
 What that covers, against the state machine: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`, and the
-`EXPIRED` transition a lapsed read records. The server derives the deciding principal and channel from
+`EXPIRED` transition a lapsed **read** records. The server derives the deciding principal and channel from
 the authenticated request and the wire type has **no field for either**, so a client cannot assert
 them. A repeated decision is idempotent (`applied: false`) rather than an error, and a fingerprint that
 does not match the approved one is refused before the version, because a re-approval cannot fix a
 digest that still will not match.
+
+**Expiry is evaluated on every read path, not only on a decision.** `list` and `read` both take an
+instant and **record** a lapse they find, so the two surfaces that *show* a prompt cannot report a
+record the daemon then refuses as expired. The listing expires the lapsed rows in its page and re-reads
+rather than filtering them out, for the same reason the channel predicate runs inside the query: a
+short page is how a client concludes there is nothing left to decide. `tests/e2e/approval-journey.mjs`
+seeds one live row and one already past its deadline, so the count in the listing is itself the
+assertion. The contract's per-read rule was for several rounds satisfied only by `decide`.
 
 **The listing's page bound applies to the rows the caller can decide, and that is a correctness
 requirement rather than an optimisation.** `allowed_channels` is a JSON array the store tests with
@@ -337,6 +352,14 @@ cannot disagree, and its envelope on a refusal because the stable code is what a
 - **Consumption (`CONSUMED`) and invalidation (`INVALIDATED`).** Both are reached by the exact
   tool-call reservation (`TLS-006`'s ledger) at invocation time; the ledger exists and nothing reserves
   through it, so those two edges have no caller.
+- **The durable expiry worker.** The contract's Expiry rule names two evaluators — "every
+  read/decision/reservation" **and** "a durable expiry worker" — and only the first exists. Reads now
+  record every lapse they see, so a row is expired the first time anybody looks at it; but a row
+  **nobody looks at** stays `pending` in storage indefinitely, and its own `expires_at` column is the
+  only record of a deadline that has passed. That is a real gap rather than a stylistic one: a
+  workflow waiting on that approval has nothing to wake it, and the store accumulates records whose
+  state contradicts their deadline. The worker is the same shape as the run reaper and belongs with the
+  scheduler, so it is deferred to that slice rather than guessed at here.
 - **The outbox/resume signal.** Decide step 6 writes "the immutable decision and outbox/resume signal
   atomically". The transition and its audit row are written in one transaction here; the event is
   `AUT-004`'s outbox, and a waiting run's resume belongs to that slice.

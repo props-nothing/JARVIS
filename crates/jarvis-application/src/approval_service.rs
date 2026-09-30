@@ -18,11 +18,15 @@
 //!    names which surfaces may decide it, so a decision arriving on any other channel is
 //!    [`ApprovalServiceError::ScopeDenied`]; the assurance ladder is shared with policy grants so the
 //!    two cannot disagree about what `Standard` permits.
-//! 3. **Expiry is authoritative server time, evaluated on every read.** A record that lapsed while
-//!    nobody was looking still reads `pending` in storage, so a decision against a lapsed request is
-//!    [`ApprovalServiceError::Expired`] — and the record is *transitioned* to `expired` rather than
-//!    merely refused. Refusing without recording would leave the prompt in every later listing, which
-//!    is the "no legal way out" shape this project has found repeatedly.
+//! 3. **Expiry is authoritative server time, evaluated on every read.** The contract says so in as many
+//!    words — "expiry is evaluated on every read/decision/reservation" — and for several rounds only
+//!    `decide` did it. That left the two surfaces where a prompt is *shown* reporting a record the daemon
+//!    would refuse as expired: a detail read returning `pending` past its deadline, and a listing offering
+//!    a row nobody can act on and spending its page budget on it. Both now evaluate the lapse and
+//!    **record** it — a refusal that left the row `pending` would leave the prompt in every later listing,
+//!    which is the "no legal way out" shape this project has found repeatedly. The listing expires and
+//!    then **re-reads** rather than filtering, because a filtered page comes back short and a client that
+//!    receives a short list concludes there is nothing left to decide.
 //! 4. **An idempotent repeat is not an error.** A user double-tapping "approve" sends two requests,
 //!    and the second must return the original decision. Only a repeat that *differs* is a conflict,
 //!    and only a stale version is a version conflict. Collapsing these into one `Err` would make the
@@ -234,19 +238,26 @@ impl ApprovalService {
         &self,
         context: &RequestContext,
         limit: u32,
+        at: UtcTimestamp,
     ) -> Result<ApprovalsPage, ApprovalServiceError> {
         // A guest is refused before the read, so an unauthenticated caller cannot learn anything about
         // the workspace's queue.
         let _ = required_assurance_of(context.assurance)?;
         let limit = limit.min(MAX_PENDING_PAGE);
-        self.approvals
+        let page = self
+            .approvals
             .pending_in(
                 context.workspace_id,
                 approval_channel_of(context.channel),
                 limit,
             )
             .await
-            .map_err(ApprovalServiceError::Storage)
+            .map_err(ApprovalServiceError::Storage)?;
+        // **The contract's "expiry is evaluated on every read", which this method did not do.** A listing
+        // is the surface a *prompt* appears on, so it is the one place a lapsed record must not be offered:
+        // a client that received it would render a decision the daemon then refuses as expired, and — worse
+        // — the page budget would be spent on rows nobody can act on.
+        Ok(self.expire_lapsed(context, page, limit, at).await)
     }
 
     /// Reads one approval, scoped to the caller's workspace.
@@ -265,11 +276,25 @@ impl ApprovalService {
         &self,
         context: &RequestContext,
         approval: ApprovalId,
+        at: UtcTimestamp,
     ) -> Result<DurableApproval, ApprovalServiceError> {
         let _ = required_assurance_of(context.assurance)?;
         let stored = self.load(context, approval).await?;
+        // The channel is authorized against the record as stored, before the lapse is recorded: a caller
+        // whose channel may not decide this approval must be refused the same way whether or not the
+        // deadline has passed, or the refusal would leak which surface was permitted.
         authorize_deciding(context.channel, &stored)?;
-        Ok(stored)
+        drop(stored);
+        // **The contract's "expiry is evaluated on every read", which this method did not do.** A detail
+        // read is how a client checks what it is about to decide — and how an operator surface *shows* a
+        // prompt — so a lapsed record reported here would render a decision the daemon then refuses. The
+        // lapse is **recorded** and the re-read record returned, so the caller sees the state its refusal
+        // came from rather than a `pending` row that no longer means what it says.
+        //
+        // `at` is a parameter for the same reason [`Self::decide`] takes one: a read that consulted its own
+        // clock could not be replayed, and the fixture's deadline would have to be far in the future for
+        // every unrelated test.
+        self.expire_on_read(context, approval, at).await
     }
 
     /// Applies a decision to an approval.
@@ -497,6 +522,89 @@ impl ApprovalService {
             Err(RepositoryError::NotFound) => Err(ApprovalServiceError::NotFound),
             Err(error) => Err(ApprovalServiceError::Storage(error)),
         }
+    }
+
+    /// Expires a lapsed record and returns it in its **current** state.
+    ///
+    /// Called by the two read paths, which must not report a `pending` row a caller cannot act on. The
+    /// **re-read after the write** is what keeps the answer honest under a race: a concurrent decision
+    /// that won while this expiry was in flight leaves the newer state in the store, and returning the
+    /// value constructed here would report that decision as still pending.
+    ///
+    /// A record that has not lapsed is returned untouched, so the common case costs one extra read rather
+    /// than a write.
+    async fn expire_on_read(
+        &self,
+        context: &RequestContext,
+        approval: ApprovalId,
+        at: UtcTimestamp,
+    ) -> Result<DurableApproval, ApprovalServiceError> {
+        let stored = self.load(context, approval).await?;
+        if !stored.is_lapsed_at(at) {
+            return Ok(stored);
+        }
+        self.expire(context, &stored, at).await;
+        // Whichever write won, the store holds the answer — so this is the record a caller should see
+        // rather than the one this method constructed.
+        self.load(context, approval).await
+    }
+
+    /// Expires every lapsed record in `page` and re-reads until the page holds none.
+    ///
+    /// **The listing is the surface a prompt appears on, so it is the one place a lapsed record must not
+    /// be offered.** A client that received one would render a decision the daemon then refuses as
+    /// expired, and the page budget would be spent on rows nobody can act on — which is the short-page
+    /// defect a channel filter already caused here once, arriving by a different route.
+    ///
+    /// Expiring and re-reading rather than filtering the lapsed rows out is deliberate: **filtering would
+    /// return a short page**, and on a surface that serves no cursor a short page is how a client concludes
+    /// there is nothing left to decide.
+    ///
+    /// The loop is **bounded**, and hitting the bound is reported rather than looped past. Each pass that
+    /// finds a lapsed row transitions it, so the pending set strictly shrinks and the loop terminates; the
+    /// bound is `limit + 1` passes because a pass that removes a row cannot also be the (limit+1)th such
+    /// pass over a page of at most `limit` rows. A caller that hits it still receives a page whose
+    /// `bounded` flag is the store's own answer, so the fact that more may remain is not lost.
+    async fn expire_lapsed(
+        &self,
+        context: &RequestContext,
+        mut page: ApprovalsPage,
+        limit: u32,
+        at: UtcTimestamp,
+    ) -> ApprovalsPage {
+        for _ in 0..=limit {
+            let lapsed: Vec<ApprovalId> = page
+                .approvals
+                .iter()
+                .filter(|approval| approval.is_lapsed_at(at))
+                .map(|approval| approval.id)
+                .collect();
+            if lapsed.is_empty() {
+                return page;
+            }
+            for id in lapsed {
+                // A refusal here is a concurrent decision or a store fault, and both are already handled
+                // by the re-read below — the fresh page is the answer either way, so the error is not
+                // discarded into a wrong value, it is superseded by a newer read of the same fact.
+                let _ = self.expire_on_read(context, id, at).await;
+            }
+            page = match self
+                .approvals
+                .pending_in(
+                    context.workspace_id,
+                    approval_channel_of(context.channel),
+                    limit,
+                )
+                .await
+            {
+                Ok(page) => page,
+                // The store refused the re-read, so the page from before the sweep is returned rather than
+                // an empty one. An empty page would tell a client the queue is clear, which is a stronger
+                // and less true claim than "here is what was read".
+                Err(_) => return page,
+            };
+        }
+        page
     }
 
     /// Records a lapse as the `expired` transition.

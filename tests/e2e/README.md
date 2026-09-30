@@ -54,6 +54,20 @@ Four sections:
 3. **Cancelling a terminal run is a no-op.** `200`, not a fault.
 4. **A terminal run is stable across reads.**
 
+It also proves the run's **retry policy is durable**, added by `BRN-050`. The policy was
+implemented and unreachable: `RunBudget::with_retry` had no caller outside the tests, so every
+run created through the daemon recorded `max_attempts: 1` and no transient failure could ever be
+retried. Three checks, and the first is read from **storage** rather than a response, because the
+controller reads this policy when a later attempt fails — long after the create response is gone:
+
+- a run created with no stated policy records the daemon's **default** (three attempts with a
+  backoff), not one attempt;
+- a **caller-stated** policy is the one recorded, which the check above cannot establish — a
+  daemon that ignored the field entirely would still pass it;
+- a policy **outside the daemon's bounds** is refused with `request.semantic_invalid` rather than
+  clamped, because a clamped value is one the caller cannot detect and would size its own
+  reconciliation window against.
+
 ### What this harness found
 
 It is worth recording, because each was invisible to unit tests:
@@ -182,18 +196,27 @@ service — they cannot prove the daemon composition attaches one. A daemon that
 `.with_approvals` would pass every handler test while answering `503 service.not_ready` to every real
 client.
 
-It seeds one pending approval **directly into the profile's database**, because no executor exists to
-create one over the API — a request comes from a policy `Ask` decision on a tool call. The seeded row
-uses the caller's own workspace and principal, read from the run the create path wrote, so the scope is
+It seeds a pending approval **directly into the profile's database**, because no executor exists to
+create one over the API — a request comes from a policy `Ask` decision on a tool call. The seeded rows
+use the caller's own workspace and principal, read from the run the create path wrote, so the scope is
 the one the daemon resolves rather than an invented value.
 
-Sixteen checks, including the CLI's paths: the composed listing answers `200` with the approval, its
+Nineteen checks, including the CLI's paths: the composed listing answers `200` with the approval, its
 preview, its channels and state, and reports `has_more:false`; a bounded page is spent on a row the
 caller may decide; an unsupported filter is refused rather than ignored; a decision applies and records
 the **server-derived** principal and channel; a repeat answers `applied:false`; the audit trail has
 exactly one row; a fingerprint mismatch is refused with the contract's code and changes nothing;
 `approvals show` and `approvals list` print the daemon's own bodies; a refused CLI decision prints the
 daemon's own code; and the decision survives a restart.
+
+**Two rows are seeded, not one: a live approval and a second already past its deadline.** That makes the
+listing's row count the read-path expiry assertion — a surface that still offered the lapsed row would
+report two — and lets the detail read assert the recorded `expired` state directly. The lapsed row is
+checked in **storage** as well as on the wire, with one audit row, because hiding a lapsed row from the
+response would satisfy the response check alone while leaving the prompt to reappear in every later
+listing. Ordering is `expires_at ASC`, so the lapsed row sorts *first* in a `limit=1` page — which is
+also what proves the sweep **re-reads** rather than filtering: a filtered page would have come back
+short.
 
 The faithful-render check also asserts the contract's "tool source/**schema identity**": the view carries
 `tool_source_kind`, `tool_source_owner`, `tool_source_version`, and `schema_fingerprint` beside the
@@ -209,7 +232,13 @@ projection that swapped the two would fail rather than pass by coincidence.
   end-to-end test rather than another handler test.
 - **The fixture's deadline must be far in the future.** The handler reads the real clock, so a
   near deadline made the first version of the HTTP handler tests exercise the expiry path instead of
-  the decision path — a test that would start failing when the calendar moved.
+  the decision path — a test that would start failing when the calendar moved. The read-path expiry
+  checks invert this deliberately: their row carries a deadline in the **past**, which is how the
+  lapse is reachable without a test-only clock knob.
+- **The lapse has to be recorded, so the journey asserts storage.** Bypassing the listing sweep fails
+  with `exactly one approval is live (the second is lapsed), got 2`; bypassing the detail sweep fails
+  with `left: Pending, right: Expired`. A response-only assertion would be satisfied by a surface that
+  hid the row while leaving it `pending`, which is the state that makes a dead prompt reappear.
 
 ## `provider-smoke.mjs`
 

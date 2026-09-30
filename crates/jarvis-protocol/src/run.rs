@@ -69,7 +69,42 @@ pub struct CreateRunRequest {
     /// the active one, because falling back would apply rules the caller did not name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_policy: Option<ModelPolicyRef>,
+    /// How a failed model call may be retried.
+    ///
+    /// **Absent is not "no retries"** — it means the daemon's own default
+    /// ([`DEFAULT_RETRY_MAX_ATTEMPTS`]), which exists so a run is not refused by a transient provider
+    /// failure. A caller that wants no retries must say so explicitly with `max_attempts: 1`, and
+    /// the two are **different requests**: an absent field asks JARVIS to decide, while `1` is a
+    /// caller who has decided. A field defaulted to "no retry" could not express the second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryRequest>,
 }
+
+/// A caller's retry policy for one run.
+///
+/// A `deny_unknown_fields` struct with three bounded fields rather than a free-form object, so a
+/// typo in a field name is refused instead of silently leaving the bound at its default — the same
+/// reason the rest of this surface refuses unknown fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryRequest {
+    /// The total number of attempts allowed, including the first.
+    pub max_attempts: u32,
+    /// The delay before the second attempt, in milliseconds. Zero means no delay.
+    #[serde(default)]
+    pub base_backoff_ms: u64,
+    /// The ceiling the backoff may grow to, in milliseconds. Zero disables growth.
+    #[serde(default)]
+    pub max_backoff_ms: u64,
+}
+
+/// The daemon's default attempt count for a create-run request that names no retry policy.
+///
+/// **This constant is the wire vocabulary's copy, and the domain owns the authoritative default.**
+/// The two are compared in `jarvis-infrastructure`, the one crate that depends on both, because the
+/// documented flow is `Protocol --> Domain` and neither crate may depend on the other. The number is
+/// stated here as well so a client can read the default it is getting without importing the domain.
+pub const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 /// The public input of a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +488,65 @@ mod tests {
             request.model_policy.is_none(),
             "an absent policy means the active one, not a parse failure",
         );
+    }
+
+    #[test]
+    fn a_create_request_with_no_retry_field_leaves_the_decision_to_the_daemon() {
+        // **Absent is not "no retries".** The field is optional and this is the ordinary case, so
+        // it must parse and must be distinguishable from an explicit `max_attempts: 1`. If the type
+        // defaulted it to `none()`, a caller asking for no retries and a caller asking JARVIS to
+        // decide would arrive as the same request — and the daemon could not tell them apart.
+        let json = r#"{
+            "input": {"type":"text","text":"hello"},
+            "runtime": "jarvis-native"
+        }"#;
+        let request: CreateRunRequest = serde_json::from_str(json).expect("parses");
+        assert!(
+            request.retry.is_none(),
+            "an absent retry policy must stay absent rather than becoming a defaulted one",
+        );
+    }
+
+    #[test]
+    fn a_create_request_carries_the_callers_retry_policy() {
+        // The three fields travel as one value because they are one policy: an attempt count with
+        // no backoff is a different retry schedule, and splitting them into three optional fields
+        // would let a caller set one and silently receive defaults for the others.
+        let json = r#"{
+            "input": {"type":"text","text":"hello"},
+            "runtime": "jarvis-native",
+            "retry": {"max_attempts": 2, "base_backoff_ms": 100, "max_backoff_ms": 500}
+        }"#;
+        let request: CreateRunRequest = serde_json::from_str(json).expect("parses");
+        let retry = request.retry.expect("the policy is carried");
+        assert_eq!(retry.max_attempts, 2);
+        assert_eq!(retry.base_backoff_ms, 100);
+        assert_eq!(retry.max_backoff_ms, 500);
+
+        // The backoffs default, because "no delay" is the only sensible reading of an omitted one
+        // and the domain's own constructor is the gate that checks their order.
+        let minimal = r#"{
+            "input": {"type":"text","text":"hello"},
+            "runtime": "jarvis-native",
+            "retry": {"max_attempts": 1}
+        }"#;
+        let request: CreateRunRequest = serde_json::from_str(minimal).expect("parses");
+        let retry = request.retry.expect("the policy is carried");
+        assert_eq!(retry.base_backoff_ms, 0);
+        assert_eq!(retry.max_backoff_ms, 0);
+    }
+
+    #[test]
+    fn an_unknown_retry_field_is_rejected() {
+        // A typo in a retry field must be refused rather than silently leaving a bound at its
+        // default: `max_attempt` (singular) would otherwise produce a run with the *daemon's*
+        // policy while the caller believed it had set its own.
+        let json = r#"{
+            "input": {"type":"text","text":"hello"},
+            "runtime": "jarvis-native",
+            "retry": {"max_attempt": 3}
+        }"#;
+        assert!(serde_json::from_str::<CreateRunRequest>(json).is_err());
     }
 
     #[test]

@@ -207,10 +207,11 @@ against it would prove only self-consistency.
 **Two questions this work surfaced:**
 
 1. Should the controller retry a retryable provider error? **Now yes, under a policy
-   that defaults to no retry** — see the retry section below. It was deferred here
-   because a retry without a recorded attempt would duplicate a side effect, and the
+   that a run records and a caller may state** — see the retry section below. It was deferred
+   here because a retry without a recorded attempt would duplicate a side effect, and the
    model-call repository already models a retry as an *attempt* of one logical call,
-   which is what the implementation uses.
+   which is what the implementation uses. The policy was for a while unreachable from a real
+   request (`BRN-050` fixed it); the default is now a bounded three attempts rather than none.
 2. Where does a run that suspends go? `Waiting` exists in the machine and the
    controller does not enter it, because **nothing suspends and resumes yet** —
    approvals and timers are later milestones. Entering `Waiting` with nothing to wait

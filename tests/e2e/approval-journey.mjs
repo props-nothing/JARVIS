@@ -220,6 +220,14 @@ function idempotencyKey(label) {
 }
 
 const APPROVAL_ID = "01930000-0000-7000-8000-0000000000f1";
+// A **second** approval whose deadline is already past when the daemon reads it. Seeded alongside the
+// first so the read-path expiry can be asserted at the composed surface: the contract says expiry is
+// evaluated on every read, and the two surfaces that *show* a prompt are the listing and the detail read.
+// A distinct id, because the point is that both rows exist and only one survives the read.
+const LAPSED_ID = "01930000-0000-7000-8000-0000000000f2";
+// A deadline in the past **relative to the daemon's real clock**, which is what makes this row lapsed
+// without any test-only knob. The other fixture uses 2030 for the mirror-image reason.
+const LAPSED_DEADLINE = "2020-01-01T00:00:00Z";
 const FINGERPRINT = `sha256:${"ab".repeat(32)}`;
 // The schema fingerprint the seeded tool identity carries. A **distinct** value from the action
 // fingerprint, because the two are different facts: the schema identifies the tool's input contract while
@@ -262,32 +270,38 @@ async function seedApproval(profile) {
     if (!run) {
       throw new Error("no run exists to attach the approval to");
     }
-    database
-      .prepare(
-        "INSERT INTO approvals (id, workspace_id, requesting_principal_id, run_id, tool_call_id, " +
-          "tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, " +
-          "allowed_channels_json, expires_at, scope, state, version, created_at, updated_at) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?, 'high', '[\"write\"]', ?, ?, '[\"api\"]', ?, 'one_shot', " +
-          "'pending', 1, ?, ?)",
-      )
-      .run(
-        APPROVAL_ID,
+    const insert = database.prepare(
+      "INSERT INTO approvals (id, workspace_id, requesting_principal_id, run_id, tool_call_id, " +
+        "tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, " +
+        "allowed_channels_json, expires_at, scope, state, version, created_at, updated_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'high', '[\"write\"]', ?, ?, '[\"api\"]', ?, 'one_shot', " +
+        "'pending', 1, ?, ?)",
+    );
+    const seed = (id, toolCall, deadline) =>
+      insert.run(
+        id,
         run.workspace_id,
         // The requester is the same principal the client resolves to, so the cancellation path — where
         // the requester may always withdraw its own request — is genuinely exercised.
         run.principal_id,
         run.id,
-        "01930000-0000-7000-8000-0000000000a1",
+        toolCall,
         toolIdentityDocument(),
         FINGERPRINT,
         "Send one email to peter@example.com",
         JSON.stringify([{ key: "to", value: "peter@example.com" }]),
-        // Far in the future: the handler reads the real clock, so a near deadline would make the
-        // decision tests exercise expiry instead of the decision path.
-        "2030-01-01T00:00:00Z",
+        deadline,
         "2026-09-27T12:00:00Z",
         "2026-09-27T12:00:00Z",
       );
+
+    // Far in the future: the handler reads the real clock, so a near deadline would make the decision
+    // tests exercise expiry instead of the decision path.
+    seed(APPROVAL_ID, "01930000-0000-7000-8000-0000000000a1", "2030-01-01T00:00:00Z");
+    // And its mirror image: already past, so the read-path sweep has something real to find. Seeded
+    // rather than driven, because no path in this build sets a deadline — the `Ask` executor that would
+    // does not exist, which the module docs name as absent.
+    seed(LAPSED_ID, "01930000-0000-7000-8000-0000000000a2", LAPSED_DEADLINE);
     return run;
   } finally {
     database.close();
@@ -363,7 +377,13 @@ async function main() {
     } else if (!Array.isArray(listed.json?.approvals)) {
       fail("the listing must contain an approvals array", listed.text);
     } else if (listed.json.approvals.length !== 1) {
-      fail(`exactly one approval is pending, got ${listed.json.approvals.length}`, listed.text);
+      // Two rows are seeded — one live and one already past its deadline — so **this count is itself the
+      // listing half of the read-path expiry assertion**: a surface that offered the lapsed row would
+      // report two here before section 2c could say so precisely.
+      fail(
+        `exactly one approval is live (the second is lapsed), got ${listed.json.approvals.length}`,
+        listed.text,
+      );
     } else {
       const view = listed.json.approvals[0];
       const problems = [];
@@ -420,6 +440,52 @@ async function main() {
     }
 
     // ---------------------------------------------------------------------
+    // 2c. **The contract's "expiry is evaluated on every read"**, proved at the composed surface. Two
+    //     rows are pending in the store and only one is live, so the assertions below cannot pass by
+    //     accident: a surface that ignored the deadline would report two.
+    //
+    //     Both halves matter and they fail differently. A **detail read** that said `pending` would render
+    //     a decision the daemon then refuses as expired — the caller would see a prompt, act on it, and be
+    //     told no. A **listing** that still offered the row would put a dead prompt in front of an operator
+    //     and spend page budget on it, which is the short-page defect a channel filter caused here once,
+    //     arriving by a different route.
+    //
+    //     The row is expired, not merely hidden: filtering the lapsed rows out would return a *short*
+    //     page, and on a surface that serves no cursor a short page is how a client concludes there is
+    //     nothing left to decide. So the assertion is on the stored state below, not only on the response.
+    // ---------------------------------------------------------------------
+    const lapsedDetail = await request(record, credential, "GET", `/api/v1/approvals/${LAPSED_ID}`);
+    if (lapsedDetail.status !== 200) {
+      fail(`a lapsed detail read must still answer 200, got ${lapsedDetail.status}`, lapsedDetail.text);
+    } else if (lapsedDetail.json?.state !== "expired") {
+      fail(
+        "**a read past the deadline must report the recorded lapse, not `pending`** — a client that saw " +
+          "`pending` would render a decision the daemon refuses",
+        `state=${lapsedDetail.json?.state} of ${lapsedDetail.text}`,
+      );
+    } else if (lapsedDetail.json?.lapsed !== true) {
+      fail(`an expired approval must report itself lapsed, got ${lapsedDetail.json?.lapsed}`, lapsedDetail.text);
+    } else {
+      pass("a detail read past the deadline reports the lapse rather than a decidable `pending`");
+    }
+
+    const lapsedRow = await readRow(profile, LAPSED_ID);
+    if (lapsedRow?.state !== "expired") {
+      fail(
+        "**the lapse must be recorded, not only hidden from the response** — a `pending` row would " +
+          "reappear in every later listing",
+        JSON.stringify(lapsedRow),
+      );
+    } else if ((await countTransitions(profile, LAPSED_ID)) !== 1) {
+      fail(
+        `the lapse must leave exactly one audit row, got ${await countTransitions(profile, LAPSED_ID)}`,
+        JSON.stringify(lapsedRow),
+      );
+    } else {
+      pass("the lapse is durable and audited, so the prompt cannot reappear");
+    }
+
+    // ---------------------------------------------------------------------
     // 2b. A page of one is spent on the row this channel may decide. The seeded approval permits
     //     `api`, which is this client's channel, so a bound of one must return it rather than an
     //     empty page.
@@ -433,9 +499,16 @@ async function main() {
         boundedPage.text,
       );
     } else if (boundedPage.json.approvals[0].approval_id !== APPROVAL_ID) {
-      fail("the bounded page must contain the decidable approval", boundedPage.text);
+      // Ordering is by `expires_at ASC`, so the lapsed row comes *first* in the store's page. Getting the
+      // live approval here therefore proves the sweep **re-read** rather than filtering: a filtered page
+      // would have come back short and this row would be missing entirely.
+      fail(
+        "the bounded page must contain the live approval — order is `expires_at ASC`, so the lapsed row " +
+          "sorted first and a sweep that filtered rather than re-read would have returned a short page",
+        boundedPage.text,
+      );
     } else {
-      pass("a bounded page is spent on a row the caller may decide");
+      pass("a bounded page is spent on a row the caller may decide, after the lapsed row is swept out");
     }
 
     // An unknown filter is refused rather than ignored: ignoring one would return a superset of what

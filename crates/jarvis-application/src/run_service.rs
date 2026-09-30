@@ -40,6 +40,7 @@ use jarvis_domain::model::routing::{
 };
 use jarvis_domain::model::stream::{Role, RouteRequirements};
 use jarvis_domain::run::budget::{RunBudget, RunRoute};
+use jarvis_domain::run::retry::RetryPolicy;
 use jarvis_domain::run::state::RunState;
 
 use crate::cancellation::CancellationScope;
@@ -409,6 +410,52 @@ impl std::fmt::Debug for RunService {
     }
 }
 
+/// The choices a caller may state when creating a run.
+///
+/// A struct rather than further parameters on `create`, and the bound forced the question rather
+/// than the convenience: the signature was already seven arguments, and `clippy`'s
+/// `too_many_arguments` fired at the eighth. Grouping them is the better answer anyway, because the
+/// two fields are **both optional caller statements about the same decision** — which policy
+/// governs the run, and how a failed call may be retried — and a call site that passed them
+/// positionally could transpose them without the compiler noticing, since both are `Option`.
+#[derive(Debug, Default, Clone)]
+pub struct RunOptions {
+    /// The policy version the caller pinned, or `None` for the workspace's active policy.
+    ///
+    /// Absent means "govern this run by the workspace's active policy", which is the only
+    /// resolution a client could have named — the policy identifier is derived from the workspace,
+    /// and the workspace is resolved server-side.
+    pub policy: Option<PolicyVersionRef>,
+    /// How a failed model call may be retried, or `None` for the daemon's default.
+    ///
+    /// **`None` is not "no retries".** It means the caller left the decision to JARVIS, which
+    /// applies [`RetryPolicy::default_for_run`]; a caller wanting no retries states
+    /// [`RetryPolicy::none`], which is a decision rather than an absence.
+    pub retry: Option<RetryPolicy>,
+}
+
+impl RunOptions {
+    /// The ordinary case: no pinned policy and the daemon's default retry policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns these options with a pinned policy version.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Option<PolicyVersionRef>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Returns these options with a caller-stated retry policy.
+    #[must_use]
+    pub fn with_retry(mut self, retry: Option<RetryPolicy>) -> Self {
+        self.retry = retry;
+        self
+    }
+}
+
 impl RunService {
     /// Builds a service over the given ports.
     #[must_use]
@@ -472,7 +519,7 @@ impl RunService {
         conversation_id: Option<ConversationId>,
         objective: &str,
         idempotency_key: &str,
-        requested_policy: Option<PolicyVersionRef>,
+        options: RunOptions,
         spawn: &dyn RunSpawner,
     ) -> Result<CreatedRun, RunServiceError> {
         if objective.is_empty() || objective.len() > MAX_OBJECTIVE_BYTES || objective.contains('\0')
@@ -502,7 +549,7 @@ impl RunService {
         // unusable until an operator wrote a policy — while silently applying a permissive one
         // would attribute a decision to nobody. Instead the run records **no** policy, and the
         // controller holds nothing back while recording every label.
-        let resolved = self.resolve_policy(context, requested_policy).await?;
+        let resolved = self.resolve_policy(context, options.policy).await?;
 
         // The route is selected **before** the budget is finished, because the model the run may
         // call is one of the decision's outputs. It is selected before the run exists, so a policy
@@ -514,7 +561,7 @@ impl RunService {
         let route = self
             .select_route(context, resolved.clone(), OBJECTIVE_SENSITIVITY, created_at)
             .await?;
-        let budget = budget_for(created_at, resolved, route)?;
+        let budget = budget_for(created_at, resolved, route, options.retry)?;
 
         // The key is checked *before* anything is created, because a replay must not
         // leave an orphan conversation behind. The digest is over the inputs that
@@ -1264,10 +1311,18 @@ pub const DELIVERY_PROFILE_MIN_SAMPLES: usize = MIN_PROFILE_SAMPLES;
 /// held back without re-deriving it from a policy that may since have been archived; a run created
 /// with no policy records none, which is a fact an operator can act on rather than a permissive
 /// default they cannot see.
+///
+/// `retry` is the policy the **caller** named, and `None` does not mean "no retries": it means the
+/// caller left the decision to JARVIS, which applies [`RetryPolicy::default_for_run`]. **Before
+/// this argument existed the retry policy was unreachable in production** — `with_retry` had no
+/// caller outside the tests, so every run created through the daemon recorded `max_attempts: 1` and
+/// the retry path `BRN-008` built could never fire. A caller that wants no retries passes
+/// [`RetryPolicy::none`], which is a decision rather than an absence.
 fn budget_for(
     created_at: jarvis_domain::time::UtcTimestamp,
     resolved: Option<(PolicyVersionRef, PolicyRules)>,
     route: Option<RunRoute>,
+    retry: Option<RetryPolicy>,
 ) -> Result<RunBudget, RunServiceError> {
     let budget = RunBudget::expiring_after(created_at, DEFAULT_RUN_BUDGET_MS).map_err(|error| {
         // A fixed message rather than the budget error's own text: the error is a bound on a
@@ -1278,6 +1333,22 @@ fn budget_for(
             "The run's time budget could not be established.",
         )
     })?;
+    let budget = budget.with_retry(retry.unwrap_or_else(RetryPolicy::default_for_run));
+    // The step timeout is applied here for the same reason the deadline is, and `BRN-051` recorded
+    // what its absence cost: the controller derives every provider await from
+    // `(remaining deadline, step timeout)` and takes the tighter of the two, and **nothing in the
+    // product ever set the field** — so on every real run the bound reduced to the run's whole
+    // remaining deadline, and a provider that accepted the connection and then stalled held the run
+    // for the full fifteen-minute default instead of being cut off at two minutes.
+    //
+    // **The output ceiling is deliberately NOT defaulted here, and that is a decision rather than an
+    // omission.** `exceeded_by` is unreachable because nothing sets `max_output_tokens`, but a value
+    // would not constrain anything either: the OpenAI-compatible adapter does not forward the ceiling
+    // to the provider, so a provider would still produce an over-long answer and JARVIS would then
+    // **discard** it. That converts a working answer into a failed run without ever asking the
+    // provider to be shorter. The two halves belong together and are named as absent rather than
+    // half-implemented — see the evidence note in `TODO.md` under `BRN-051`.
+    let budget = budget.with_default_step_timeout();
     Ok(match resolved {
         Some((reference, rules)) => {
             let budget = budget.with_policy(reference, rules.maximum_sensitivity);

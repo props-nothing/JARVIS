@@ -135,17 +135,34 @@ controller sent `limits.deadline: null` unconditionally, so an adapter honouring
 `limits.deadline` had nothing to honour and a provider was free to wait
 indefinitely. The controller now also bounds the provider `open` and each frame
 wait by the tighter of the remaining deadline and the step timeout, so a budget is
-an actual bound rather than a value carried in a request. The **token and cost
+an actual bound rather than a value carried in a request. **The step half of that
+was inert until `BRN-051`:** nothing in the product set `step_timeout_ms`, so on
+every real run the `min` reduced to the run's whole remaining deadline and a provider
+that accepted the connection and then stalled held the run for its full fifteen minutes.
+`budget_for` now applies `DEFAULT_STEP_TIMEOUT_MS` (two minutes), which is strictly below
+the deadline default so it can be the term that binds. The **token and cost
 ceilings are enforced** as well: usage is captured from either arrival path (a
 `usage.updated` frame or the terminal's block, whichever comes last) and checked
 against the ceilings before a run may complete, so a breach fails the run and
 discards its output. A ceiling with no reported usage cannot breach — refusing on
 an absent value would fail every run against a provider that omits usage, so the
 gap is reported through `budget_is_verifiable` rather than hidden. **Not done:**
-usage is not summed across a run's calls, there is no turn/token/byte/concurrency/
-retry budget, and the routing consequences this section lists ("latency and cost
-budgets" as a routing input) remain open — routing still does not consider a
-budget when selecting a route.
+usage is not summed across a run's calls, there is no turn/byte/concurrency budget, and the
+routing consequences this section lists ("latency and cost budgets" as a routing input)
+remain open — routing still does not consider a budget when selecting a route. A **retry
+budget** in the sense of a spend limit is also absent, though a *retry policy* is now stated
+per run and settable per request (`BRN-050`, below).
+
+**The output ceiling's `BRN-051` half is deliberately unimplemented, and the reason is worth
+recording because the obvious fix makes things worse.** `RunBudget::max_output_tokens` is checked by
+`exceeded_by` and nothing sets the field, so the check cannot fire. The apparent remedy — default the
+ceiling the way the step timeout is defaulted — was implemented and then **reverted**, because the
+two halves of "enforce a ceiling" are missing: the OpenAI-compatible adapter **does not forward
+`limits.max_output_tokens`** to the provider, so no provider would ever be asked to be shorter. A
+defaulted ceiling would therefore let a provider produce an over-long answer and then **discard** it,
+converting a working answer into a failed run while constraining nothing. A default is only
+appropriate once the adapter forwards the limit; until then the absent ceiling is the honest state,
+and `budget_is_verifiable` is the function written to say so.
 
 ## Normalized Events
 
@@ -331,9 +348,36 @@ again.
 **Not done:** no fallback. This section's fallback list — a second route satisfying the
 same capabilities and data policy — needs a capability inventory and candidate routes,
 neither of which exists (`BRN-003` is the model provider, `BRN-010` the data policy).
-The retry policy is also not yet settable per request: it is a field on the run's
-budget, defaulting to no retry, and the `CreateRunRequest` schema has no typed override
-for it.
+
+### The policy is now reachable from a request (`BRN-048`)
+
+The retry machinery above was, for a while, **unreachable in production**. `RetryPolicy`,
+`RetryDecision`, the `FailureSite` boundary, and the retry-chain storage all existed and were
+tested — but the only caller of `RunBudget::with_retry` was a test file, so every run created
+through the daemon recorded `max_attempts: 1` and `RetryDecision::decide` answered `DoNotRetry`
+for every failure. The tests that proved retries worked did so by constructing a budget no
+request could produce. That is the same defect class as a doc comment naming a function that
+does not exist, one level up: the capability was real, documented, and unreachable.
+
+`CreateRunRequest.retry` closes it. Three design points carry the weight:
+
+- **Absent ≠ none.** The field is optional and the wire type never defaults it, so
+  `max_attempts: 1` (a caller who decided) and an omitted field (a caller who left it to
+  JARVIS) stay different requests. A field defaulted to `none()` would collapse them, and the
+  daemon would then be unable to tell a caller who disabled retries from one who did not care.
+- **The default is bounded and named.** `RetryPolicy::default_for_run` is three attempts with a
+  250ms base and a 2s ceiling; the attempt count is published on the wire as
+  `DEFAULT_RETRY_MAX_ATTEMPTS` and the two are compared in `jarvis-infrastructure`, the one
+  crate that depends on both. A client sizes its reconciliation window from the published
+  number, so the two drifting apart would leave a client concluding a call failed while the
+  daemon was still retrying it.
+- **Out-of-range is refused, not clamped.** Validation happens at the trust boundary with
+  `request.semantic_invalid`, because a value the daemon silently clamped is one the caller
+  cannot detect and would size its own expectations against.
+
+The retry **safety** boundary is unchanged and unaffected by this: `FailureSite` remains a
+required input to the decision, the ambiguity rule is still checked first, and a request the
+provider accepted is still never retried.
 
 ## The First Adapter
 

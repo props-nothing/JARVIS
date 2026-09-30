@@ -109,9 +109,13 @@ pub async fn list_approvals(
         }
     };
     let context = context_for(&client, request_id);
-    match service.list(&context, limit).await {
+    // **The clock is read once and passed to the service**, so the lapse check the listing performs and
+    // the `lapsed` flag every row reports are derived from one instant. Two clock reads would let a row
+    // be excluded as lapsed while another row in the same response reported `lapsed: false` against the
+    // same deadline.
+    let now = clock_now();
+    match service.list(&context, limit, now).await {
         Ok(page) => {
-            let now = clock_now();
             let view = ApprovalListView {
                 approvals: page
                     .approvals
@@ -146,7 +150,9 @@ pub async fn read_approval(
         return not_found(request_id);
     };
     let context = context_for(&client, request_id);
-    match service.read(&context, approval_id).await {
+    // One instant for the lapse check and the rendered `lapsed` flag, for the reason the listing states.
+    let now = clock_now();
+    match service.read(&context, approval_id, now).await {
         Ok(approval) => {
             // **Detail reads the trail, and a listing does not.** This is where the contract puts "prior
             // decision metadata": the operator's own note on a decision lives on that decision's

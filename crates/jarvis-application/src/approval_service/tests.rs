@@ -168,7 +168,7 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     let (service, _repositories, _approval) = fixture().await;
 
     let visible = service
-        .list(&context(RequestChannel::Cli), 50)
+        .list(&context(RequestChannel::Cli), 50, now())
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -179,7 +179,7 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     assert!(!visible.bounded, "one row cannot fill a page of fifty");
 
     let hidden = service
-        .list(&context(RequestChannel::Voice), 50)
+        .list(&context(RequestChannel::Voice), 50, now())
         .await
         .expect("the listing runs");
     assert!(
@@ -228,7 +228,7 @@ async fn a_page_is_not_short_changed_by_rows_the_caller_cannot_decide() {
     // **A page of one.** The channel filter must run before the bound, so the one row returned is the
     // one the caller can decide — not the excluded row that happened to lapse sooner.
     let page = service
-        .list(&context(RequestChannel::Cli), 1)
+        .list(&context(RequestChannel::Cli), 1, now())
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -268,7 +268,7 @@ async fn a_full_page_reports_that_more_may_remain() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let full = service
-        .list(&context(RequestChannel::Cli), 2)
+        .list(&context(RequestChannel::Cli), 2, now())
         .await
         .expect("the listing runs");
     assert_eq!(full.approvals.len(), 2, "the page respects its bound");
@@ -280,7 +280,7 @@ async fn a_full_page_reports_that_more_may_remain() {
     // And the complement, on the same store: a page the store had nothing beyond reports complete —
     // which is the half that makes the first assertion meaningful rather than a constant.
     let complete = service
-        .list(&context(RequestChannel::Cli), 3)
+        .list(&context(RequestChannel::Cli), 3, now())
         .await
         .expect("the listing runs");
     assert_eq!(complete.approvals.len(), 3);
@@ -405,7 +405,7 @@ async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
     assert_eq!(error.code(), "approval.expired");
 
     let stored = service
-        .read(&context(RequestChannel::Cli), approval.id)
+        .read(&context(RequestChannel::Cli), approval.id, now())
         .await
         .expect("the record is still readable");
     assert_eq!(
@@ -415,13 +415,102 @@ async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
     );
 
     let listing = service
-        .list(&context(RequestChannel::Cli), 50)
+        .list(&context(RequestChannel::Cli), 50, now())
         .await
         .expect("the listing runs");
     assert!(
         listing.approvals.is_empty(),
         "an expired request must not appear as pending: {listing:?}",
     );
+}
+
+#[tokio::test]
+async fn a_detail_read_expires_a_lapsed_request_rather_than_reporting_it_pending() {
+    // **The contract's "expiry is evaluated on every read", which only `decide` did.** A detail read is how
+    // a client checks what it is about to decide and how an operator surface *shows* a prompt, so a lapsed
+    // record reported here renders a decision the daemon then refuses — and the caller cannot tell that from
+    // a record it is still allowed to act on.
+    //
+    // The assertion is on the **state**, not only on a flag: a read that computed `lapsed: true` while the
+    // stored row stayed `pending` would leave the prompt in every later listing, which is the "no legal way
+    // out" shape this project has found repeatedly.
+    let (service, _repositories, approval) = fixture().await;
+    let read = service
+        .read(&context(RequestChannel::Cli), approval.id, later())
+        .await
+        .expect("the record is readable after its deadline");
+    assert_eq!(
+        read.state(),
+        ApprovalState::Expired,
+        "**a read past the deadline must record the lapse and report it**, not hand back `pending`",
+    );
+    // And the state is durable rather than a projection of this call, so a second read at a *later* instant
+    // finds the transition already recorded.
+    let again = service
+        .read(&context(RequestChannel::Cli), approval.id, later())
+        .await
+        .expect("readable");
+    assert_eq!(again.state(), ApprovalState::Expired);
+    assert_eq!(
+        again.version(),
+        read.version(),
+        "the second read must not write a second expiry transition",
+    );
+}
+
+#[tokio::test]
+async fn a_listing_expires_lapsed_rows_and_does_not_return_a_short_page() {
+    // **The listing is the surface a prompt appears on, so a lapsed row must never be offered.** Two
+    // lapsed rows and one live row, with a page bound of two: expiring and re-reading returns the live row
+    // plus... whatever the store has, and — critically — the page is **not** short. Filtering the lapsed
+    // rows out instead would return one row where two were asked for, and on a surface with no cursor a
+    // short page is how a client concludes the queue is empty.
+    let repositories = Arc::new(InMemoryRepositories::new());
+    for index in 0..2 {
+        let mut lapsed = pending();
+        lapsed.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(60 + index));
+        // A deadline **before** the instant the listing is evaluated at, so the row is lapsed by the
+        // caller's own clock rather than by the fixture's `later()`.
+        lapsed.expires_at = UtcTimestamp::parse("2026-09-27T11:00:00Z").expect("parses");
+        repositories
+            .request(&lapsed)
+            .await
+            .expect("the lapsed row is inserted");
+    }
+    let mut live = pending();
+    live.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(70));
+    repositories.request(&live).await.expect("inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+
+    let page = service
+        .list(&context(RequestChannel::Cli), 2, now())
+        .await
+        .expect("the listing runs");
+    assert_eq!(
+        page.approvals.len(),
+        1,
+        "the one live row is what remains, and the page is not padded with lapsed ones: {page:?}",
+    );
+    assert_eq!(page.approvals[0].id, live.id);
+    assert!(
+        !page.bounded,
+        "**the store read everything it could return**, so the page is complete rather than short: {page:?}",
+    );
+
+    // Both lapsed rows were **recorded** as expired, which is the half a filter would have skipped — and
+    // the half that keeps them out of every later listing and off the expiry worker's queue.
+    for index in 0..2 {
+        let lapsed_id = ApprovalId::from_uuid(uuid::Uuid::from_u128(60 + index));
+        let stored = service
+            .read(&context(RequestChannel::Cli), lapsed_id, now())
+            .await
+            .expect("readable");
+        assert_eq!(
+            stored.state(),
+            ApprovalState::Expired,
+            "a lapsed row must be transitioned, not merely filtered out of the page",
+        );
+    }
 }
 
 #[tokio::test]
@@ -612,7 +701,7 @@ async fn a_foreign_workspace_record_is_not_found_and_is_indistinguishable_from_a
     let mut elsewhere = context(RequestChannel::Cli);
     elsewhere.workspace_id = WorkspaceId::from_uuid(uuid::Uuid::from_u128(42));
     let foreign = service
-        .read(&elsewhere, approval.id)
+        .read(&elsewhere, approval.id, now())
         .await
         .expect_err("another workspace's record is not readable");
 
@@ -620,6 +709,7 @@ async fn a_foreign_workspace_record_is_not_found_and_is_indistinguishable_from_a
         .read(
             &context(RequestChannel::Cli),
             ApprovalId::from_uuid(uuid::Uuid::from_u128(999)),
+            now(),
         )
         .await
         .expect_err("an absent identifier is not found");
@@ -697,7 +787,7 @@ async fn a_third_party_may_not_cancel_on_a_channel_the_request_excludes() {
 
     // And the record is untouched.
     let stored = service
-        .read(&context(RequestChannel::Cli), approval.id)
+        .read(&context(RequestChannel::Cli), approval.id, now())
         .await
         .expect("readable");
     assert_eq!(stored.state(), ApprovalState::Pending);
@@ -735,7 +825,7 @@ async fn an_over_long_or_control_bearing_cancel_reason_is_refused() {
     // The record is untouched, which is the half that matters: a refused request must not have
     // cancelled anything.
     let stored = service
-        .read(&context(RequestChannel::Cli), approval.id)
+        .read(&context(RequestChannel::Cli), approval.id, now())
         .await
         .expect("readable");
     assert_eq!(stored.state(), ApprovalState::Pending);

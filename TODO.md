@@ -1592,9 +1592,10 @@ Foundation TODO remains incomplete.
   error. Both new behaviours were falsified: disabling the retryable branch fails 5 tests, and
   disabling the ambiguity rule fails 2. 18 domain tests, 9 controller tests, and 1 adapter
   round-trip. **Not done:** **no fallback** — this needs a capability inventory and candidate
-  routes (`BRN-003`, `BRN-010`), so the contract's fallback list is not implemented; the retry
-  policy is not settable per request (it is a field on the run's budget, defaulting to no
-  retry, and `CreateRunRequest` has no typed override); and the disconnect case remains open.
+  routes (`BRN-003`, `BRN-010`), so the contract's fallback list is not implemented. The retry
+  policy **is now settable per request** (`BRN-050`: `CreateRunRequest.retry`, defaulting to a
+  bounded three-attempt policy when absent), so the earlier "no typed override" gap is closed;
+  the disconnect case remains open.
   **Cancellation and disconnect are now implemented and proved end to end, and the proof
   found four defects.** The disconnect case had been deferred three times because nothing
   exercised it: `jarvis ask` follows a run to its terminal, so a client that *disappears* is
@@ -3625,6 +3626,97 @@ Foundation TODO remains incomplete.
     stronger one, since a file that was counted while still passing is exactly how this hid.
   1014 workspace tests (unchanged); both doc gates green (18 fail-closed tests, +2); all five
   journeys pass (clean-machine, install, release, disconnect, policy-surface). **DO NOT COMMIT.**
+- [x] `BRN-050` Make the run's retry policy settable on a request, because it was implemented and
+  **unreachable**: `RunBudget::with_retry` had no caller outside the tests, so every run created
+  through the daemon recorded `max_attempts: 1` and `RetryDecision::decide` answered `DoNotRetry`
+  for every failure.
+  Evidence: `BRN-008` built `RetryPolicy`, the pure `decide` function, the `FailureSite` boundary,
+  the retry-chain storage (`logical_call_id` + `attempt`), and a suite of tests proving a transient
+  pre-acceptance failure leaves the run live for a second attempt. **None of it could fire from a
+  real request.** `grep 'with_retry'` over `crates/` returned five hits, all in test files, and
+  `budget_for` — the one place a created run's budget is built — called
+  `RunBudget::expiring_after` and folded the policy and route in but never a retry policy. The
+  tests passed because they built their budget directly; a test that constructs its own input
+  cannot discover that no request produces that input. This is the same class as a doc comment
+  naming a function that does not exist, one level up: the capability was real, documented, tested,
+  and unreachable.
+  - **The wire field is optional and is never defaulted** (`CreateRunRequest.retry`, a
+    `deny_unknown_fields` `RetryRequest` of three numbers). **Absent is not "no retries"**: an
+    omitted field means the caller left the decision to JARVIS, while `max_attempts: 1` is a caller
+    who has decided. A field with `#[serde(default)]` pointing at `RetryPolicy::none()` would
+    collapse the two into one request, and the daemon would then be unable to distinguish a client
+    that disabled retries from one that did not care — so the type keeps them apart and the
+    *service* supplies the default. Asserted both ways by
+    `a_callers_retry_policy_is_recorded_and_explicitly_disabling_it_is_honoured`.
+  - **The daemon's default is bounded, named, and published.**
+    `jarvis_domain::run::retry::RetryPolicy::default_for_run` is **3 attempts, 250ms base, 2s
+    ceiling**; the attempt count is mirrored on the wire as
+    `jarvis_protocol::run::DEFAULT_RETRY_MAX_ATTEMPTS` so a client can size its waiting and
+    reconciliation window from the number the daemon will actually use. The two are compared in
+    `jarvis-infrastructure` — the only crate that depends on both, since the documented flow is
+    `Protocol --> Domain` — by `the_advertised_default_retry_attempts_is_the_one_the_daemon_applies`,
+    which also asserts the default **permits a retry**, because a default of one attempt would make
+    the published field meaningless and reintroduce the same unreachability.
+  - **Out-of-range is refused, not clamped**, at the trust boundary with
+    `request.semantic_invalid`. A clamped attempt count or a base above its ceiling is a policy the
+    caller did not ask for and cannot detect — and it would size its own window against the number
+    it sent. `parse_retry_policy` maps each `RetryError` variant to a message naming the bound that
+    moved, because an operator's next step differs by which one it was.
+  - **Falsified in both directions.** Ignoring the caller's policy (`with_retry(default_for_run())`)
+    fails `a_callers_retry_policy_is_recorded...` with `left: 3 attempts, right: 2`; ignoring the
+    default (`with_retry(none())`) fails
+    `a_created_run_carries_a_retry_policy_a_transient_failure_can_use` and the pre-existing
+    deadline test with `left: max_attempts 1, right: 3`. The second confirms the defect was real:
+    the old code took the `none()` branch for every run.
+  - **The retry safety boundary is untouched.** `FailureSite` is still a required input, the
+    ambiguity rule is still checked first, and an accepted request is still never retried — this
+    change only lets a request *reach* the policy that was already enforcing those rules.
+  - 46 run-service tests (+2), 3 protocol wire tests (+3), 1 cross-crate agreement test (+2), 106
+    HTTP tests (+1). Docs synced: `local-control-api.md` names the field and the absent-versus-
+    `1` distinction, and `model-gateway.md`'s "not settable per request" claim is replaced by the
+    section explaining what was unreachable and why.
+  - **Still not done:** **fallback** (needs a capability inventory and candidate routes), the
+    disconnect case, and a turn/byte/concurrency budget. A caller still cannot set the retry policy
+    on an *existing* run, only at creation.
+- [x] `BRN-051` Make the run's **step timeout** reachable, and record why the output ceiling's
+  counterpart is deliberately left alone. Found by sweeping every `with_*` setter on a value type a
+  request builds and counting **production** callers, the technique `BRN-050` produced.
+  Evidence: the sweep listed eight domain setters; `with_context_tokens` had 0 production callers,
+  `with_step_timeout` had 0, and `with_correlation`/`with_deadline`/`with_revision`/`with_route`/
+  `with_policy` each had at least one. The **consumers** settled which mattered:
+  `RunController::wait_bound` derives every provider await from
+  `(remaining deadline, step_timeout)` and takes the tighter of the two, and `RunBudget::exceeded_by`
+  compares reported usage against `max_output_tokens`. Both fields were read by real code and set by
+  nothing.
+  - **The step timeout was the load-bearing one.** `DEFAULT_STEP_TIMEOUT_MS` (two minutes) is now
+    applied by `budget_for`, so a provider that accepts the connection and then stalls is cut off at
+    two minutes instead of holding the run for the fifteen-minute default. It is deliberately
+    **strictly below** `DEFAULT_RUN_BUDGET_MS`, because a step bound at or above the run's own
+    deadline could never be the term the `min` picks — the same "a default that cannot bind is
+    decorative" test the retry default carries.
+  - **The output ceiling was implemented, then reverted, and that is the substantive finding.**
+    Defaulting `max_output_tokens` makes `exceeded_by` fire and looks like the obvious parallel fix.
+    It is wrong: the OpenAI-compatible adapter **does not forward `limits.max_output_tokens`** to the
+    provider, so no provider is ever asked to be shorter — a defaulted ceiling would let a provider
+    produce an over-long answer and then have JARVIS **discard** it, converting a working answer into
+    a failed run while constraining nothing. The absent ceiling is the honest state until the adapter
+    forwards the limit, and that is recorded in `model-gateway.md` rather than left as an omission.
+    **A default is only correct when the thing it bounds can actually be told to comply.**
+  - **Falsified:** removing `with_default_step_timeout()` fails
+    `a_created_run_bounds_a_single_step_tighter_than_the_run_itself` ("**a single step must be
+    bounded**") and the whole-budget assertion with `left: step_timeout_ms None, right: Some(120000)`.
+    The output-ceiling default was falsified in the same way before being reverted, so the decision to
+    drop it rests on a demonstrated mechanism rather than on a guess.
+  - 47 run-service tests (+1, and the deadline test now compares the whole budget so a new default
+    cannot be added without it failing). `local-control-api.md` and `model-gateway.md` synced.
+  - **Still not done, each with its reason:** `max_output_tokens` reachable (needs the adapter to
+    forward it — a two-part change), `with_context_tokens` never called (`max_context_tokens` is read
+    with `DEFAULT_CONTEXT_TOKENS`, so this is a *configurability* gap rather than an unreachability
+    one: absent and 8192 do the same thing), `max_cost_microunits` absent (there is no pricing
+    catalog to bound against), `budget_is_verifiable` uncalled (the contract requires an unverified
+    ceiling be *not reported as enforced*, which no surface does yet), and the context ceiling is not
+    constrained by the routed model's attested window — `CapabilityDescriptor::max_context_tokens`
+    still has neither producer nor consumer.
 - [x] `BRN-011` Measure and record incremental-delivery capability per model
   (time to first token **and** chunk spread) rather than a streaming boolean, and
   fail a route selection when a pinned model reports streaming but delivers its
@@ -4404,7 +4496,18 @@ Dependencies: Milestone 2 exit gate.
     reporting "stale version" would send the user to do exactly that.
   - **Expiry is evaluated on every read and the lapse is *recorded*.** A record that lapsed while
     nobody was looking still reads `pending` in storage, so a refusal that did not write the `expired`
-    transition would leave a prompt nobody can decide in every later listing.
+    transition would leave a prompt nobody can decide in every later listing. **For several rounds only
+    `decide` did this**, while the module's own doc rule 3 and the contract both said "every
+    read/decision/reservation" — so the two surfaces that *show* a prompt reported a record the daemon
+    then refuses. `list` and `read` now take the instant and sweep it. The listing **expires and
+    re-reads** rather than filtering, because a filtered page comes back short and on a cursor-less
+    surface a short page is how a client concludes there is nothing left to decide — the same defect
+    the channel filter caused here once, by a different route. **Falsified twice**: with the listing
+    sweep bypassed the service test reads `left: 2, right: 1` (the lapsed rows returned) and the journey
+    fails `exactly one approval is live (the second is lapsed), got 2`; with the detail sweep bypassed
+    it fails `left: Pending, right: Expired`. The journey seeds **two** rows, one already past its
+    deadline, so the listing's count is itself the assertion, and asserts the stored state and audit
+    row rather than only the response — hiding a lapsed row would satisfy the response check alone.
   - **A version conflict from the store maps to `approval.version_conflict`, not to a storage code.**
     `RepositoryError::VersionConflict` would otherwise reach a client as `storage.version_conflict`
     under a `500` — telling it the daemon faulted when its own view was merely stale, which is the one
@@ -4435,7 +4538,7 @@ Dependencies: Milestone 2 exit gate.
     `the_reported_page_bound_is_the_one_the_store_enforces`, the same arrangement
     `MAX_RUN_INPUT_BYTES`/`MAX_OBJECTIVE_BYTES` uses. **Falsified**: setting `MAX_APPROVAL_PAGE` to
     `201` fails it with `left: 201, right: 200`.
-  - `tests/e2e/approval-journey.mjs` (16 checks) seeds a pending approval directly — no executor exists
+  - `tests/e2e/approval-journey.mjs` (19 checks) seeds a pending approval directly — no executor exists
     to create one over the API — and proves the composed surface answers, a decision records the
     server-derived actor, a repeat reports `applied:false`, the audit trail has one row, a fingerprint
     mismatch changes nothing, **the CLI's `show`, `list`, and a refused decision reach the same
@@ -4493,13 +4596,16 @@ Dependencies: Milestone 2 exit gate.
     second literal would let one be raised alone while the domain still refused the longer value — which
     reads to a caller as an unexplained `request.invalid`.
   - **Not implemented, named in the contract's own Implementation Status section:** the grant-revoke
-    route (no standing-grant store), approval creation (no executor, so nothing calls `request`), list
-    filters and cursors, `CONSUMED`/`INVALIDATED` (they need a reservation through the ledger), the
-    outbox/resume signal (`AUT-004`), preview redaction (the producer redacts; there is no producer),
-    assurance beyond `Standard` (the record has no field for a required level, so a step-up approval is
-    unrepresentable), the detail view's remaining named inputs (`output_schema` fingerprint, artifact
-    and content hashes, connector account/resource resolution — each needs a producer that does not
-    exist), cross-language fingerprint vectors, and generated OpenAPI.
+    route (no standing-grant store), approval creation (no executor, so nothing calls `request`), the
+    **durable expiry worker** (the contract names two evaluators and only per-read exists, so a row
+    nobody reads stays `pending` with a passed deadline — it belongs with the scheduler `AUT-002`
+    adds, as another instance of the reaper that slice owns), list filters and cursors, `CONSUMED`/`INVALIDATED` (they
+    need a reservation through the ledger), the outbox/resume signal (`AUT-004`), preview redaction
+    (the producer redacts; there is no producer), assurance beyond `Standard` (the record has no field
+    for a required level, so a step-up approval is unrepresentable), the detail view's remaining named
+    inputs (`output_schema` fingerprint, artifact and content hashes, connector account/resource
+    resolution — each needs a producer that does not exist), cross-language fingerprint vectors, and
+    generated OpenAPI.
 - [ ] `TLS-014` Implement plugin package provenance/signature verification,
   compatibility validation, install-disabled, staged update/rollback, disable,
   data-retention choice, and removal.

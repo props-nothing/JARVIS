@@ -279,6 +279,40 @@ async function readEvents(record, credential, runId) {
 }
 
 /**
+ * Reads one run's stored budget from the profile's own database.
+ *
+ * The budget is read from **storage** rather than from a response, because the retry policy is
+ * consulted by the controller when a later attempt fails — long after the create response is gone
+ * — so a policy that reached the wire and not the row would be lost exactly when it is needed.
+ * `node:sqlite` is opened read-only here: this harness never writes, it only reads what the daemon
+ * wrote.
+ */
+async function readStoredBudget(profile, runId) {
+  const path = join(profile, "data", "db", "jarvis.sqlite");
+  if (!existsSync(path)) {
+    throw new Error(`the profile has no database at ${path}`);
+  }
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import("node:sqlite"));
+  } catch (error) {
+    throw new Error(`this journey needs Node's built-in node:sqlite module: ${error.message}`);
+  }
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = database
+      .prepare("SELECT budget_json FROM agent_runs WHERE id = ?")
+      .get(runId);
+    if (!row) {
+      throw new Error(`no run row for ${runId}`);
+    }
+    return JSON.parse(row.budget_json);
+  } finally {
+    database.close();
+  }
+}
+
+/**
  * Parses SSE frames into `{id, event, data}` objects.
  *
  * A parser rather than an assertion on raw text, so a frame that is present but malformed
@@ -350,6 +384,84 @@ async function main() {
     // ---------------------------------------------------------------------
     const abandoned = await createRun(record, credential, "abandon me");
     pass(`a run was created and is received: ${abandoned.run_id}`);
+
+    // ---------------------------------------------------------------------
+    // 1a. The run's retry policy is **durable**, and a created run gets the daemon's default.
+    //
+    // `BRN-050`: the retry policy was implemented and unreachable — `RunBudget::with_retry` had no
+    // caller outside the tests, so every run recorded `max_attempts: 1` and no transient failure
+    // could ever be retried. Asserted against the **stored** row rather than a response, because
+    // the controller reads this policy from storage when a later attempt fails, long after the
+    // create response is gone.
+    // ---------------------------------------------------------------------
+    const defaultBudget = await readStoredBudget(profile, abandoned.run_id);
+    if (defaultBudget?.retry?.max_attempts !== 3) {
+      fail(
+        "**a run created with no stated retry policy must record the daemon's default**, not one " +
+          "attempt — a policy of one makes the retry path unreachable from a real request",
+        JSON.stringify(defaultBudget),
+      );
+    } else if (!(defaultBudget.retry.base_backoff_ms > 0)) {
+      fail("the default retry policy must carry a backoff", JSON.stringify(defaultBudget.retry));
+    } else {
+      pass("a created run records the daemon's default retry policy in its durable budget");
+    }
+
+    // And a **caller-stated** policy is the one recorded — the other half, because a daemon that
+    // ignored the field entirely would pass the check above.
+    const statedRun = await request(
+      record,
+      credential,
+      "POST",
+      "/api/v1/runs",
+      {
+        conversation_id: null,
+        input: { type: "text", text: "state my own retry policy" },
+        runtime: "jarvis-native",
+        retry: { max_attempts: 2, base_backoff_ms: 40, max_backoff_ms: 160 },
+      },
+      { "Idempotency-Key": idempotencyKey("retry-stated") },
+    );
+    if (statedRun.status !== 202 || !statedRun.json?.run_id) {
+      fail(`a stated retry policy must be accepted: ${statedRun.status}`, statedRun.text);
+    } else {
+      const stored = await readStoredBudget(profile, statedRun.json.run_id);
+      if (stored?.retry?.max_attempts !== 2 || stored.retry.base_backoff_ms !== 40) {
+        fail(
+          "**a caller's own retry policy must be the one recorded**, not the daemon's default",
+          JSON.stringify(stored?.retry),
+        );
+      } else {
+        pass("a caller's stated retry policy is the one the durable budget records");
+      }
+    }
+
+    // A policy outside the daemon's bounds is **refused rather than clamped**: a clamped value is
+    // one the caller did not ask for and cannot detect, and it would size its own reconciliation
+    // window against the number it sent.
+    const outOfRange = await request(
+      record,
+      credential,
+      "POST",
+      "/api/v1/runs",
+      {
+        conversation_id: null,
+        input: { type: "text", text: "too many attempts" },
+        runtime: "jarvis-native",
+        retry: { max_attempts: 9 },
+      },
+      { "Idempotency-Key": idempotencyKey("retry-range") },
+    );
+    if (outOfRange.status !== 422) {
+      fail(
+        `an out-of-range retry policy must be refused, got ${outOfRange.status}`,
+        outOfRange.text,
+      );
+    } else if (!outOfRange.text.includes("request.semantic_invalid")) {
+      fail("the refusal must carry the contract's own code", outOfRange.text);
+    } else {
+      pass("a retry policy outside the daemon's bounds is refused with the contract's code");
+    }
 
     // A partial events read, then the connection is dropped. The harness reads the stream
     // with a socket it destroys rather than one it lets finish, so the disconnect is a

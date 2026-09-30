@@ -21,8 +21,8 @@ use jarvis_domain::time::UtcTimestamp;
 use uuid::Uuid;
 
 use super::{
-    CREATE_OPERATION, CreatedRun, MAX_OBJECTIVE_BYTES, RunCancellationRegistry, RunPorts,
-    RunService, RunServiceError, RunSpawner, api_request_context,
+    CREATE_OPERATION, CreatedRun, MAX_OBJECTIVE_BYTES, RunCancellationRegistry, RunOptions,
+    RunPorts, RunService, RunServiceError, RunSpawner, api_request_context,
 };
 use crate::model::ScriptedProvider;
 use crate::repository::conversation::ConversationRepository as _;
@@ -178,7 +178,14 @@ async fn create_with_policy(
 ) -> CreatedRun {
     fixture
         .service
-        .create(&context(), None, text, key, policy, &fixture.spawner)
+        .create(
+            &context(),
+            None,
+            text,
+            key,
+            RunOptions::new().with_policy(policy),
+            &fixture.spawner,
+        )
         .await
         .expect("the run is created")
 }
@@ -312,7 +319,14 @@ impl crate::model::ModelProvider for RecordingProvider {
 async fn create(fixture: &Fixture, text: &str, key: &str) -> CreatedRun {
     fixture
         .service
-        .create(&context(), None, text, key, None, &fixture.spawner)
+        .create(
+            &context(),
+            None,
+            text,
+            key,
+            RunOptions::new(),
+            &fixture.spawner,
+        )
         .await
         .expect("the run is created")
 }
@@ -355,7 +369,7 @@ async fn one_clients_idempotency_key_cannot_replay_another_clients_run() {
             None,
             "the second client's question",
             "shared-key",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await;
@@ -460,12 +474,172 @@ async fn a_created_run_carries_a_bounded_deadline_so_it_cannot_hang_forever() {
         stored.created_at,
         super::DEFAULT_RUN_BUDGET_MS,
     )
-    .expect("the default is in range");
+    .expect("the default is in range")
+    // **The retry policy is part of the budget, and it now comes from the create path.** This
+    // assertion used to compare against a budget with no policy at all, which passed only because
+    // `budget_for` never set one — the retry machinery was unreachable in production. Comparing the
+    // whole value is what makes that reachability an assertion rather than a claim.
+    .with_retry(jarvis_domain::run::retry::RetryPolicy::default_for_run())
+    // And the same for the step timeout (`BRN-051`): it is applied by the create path now, and
+    // comparing the whole budget is what makes that an assertion rather than a claim. The field was
+    // read by a real consumer — `RunController::wait_bound` — and set by nothing.
+    .with_default_step_timeout();
     assert_eq!(stored.budget, expected);
     assert!(
         deadline > stored.created_at,
         "{deadline} {0}",
         stored.created_at
+    );
+}
+
+/// A created run's **step timeout** is bounded, so a stalled provider cannot hold the run open.
+///
+/// `BRN-051`. The controller derives every provider await from `(remaining deadline, step timeout)`
+/// and takes the tighter of the two — but with the field unset on every real run, the bound reduced
+/// to the run's whole remaining deadline. A provider that accepted the connection and then sent
+/// nothing held the run for fifteen minutes rather than being cut off, which is precisely what the
+/// step timeout exists to prevent.
+///
+/// Asserted on the **stored** budget, because the controller loads the budget when it derives a
+/// wait: a bound that reached the response and not the row would be lost the moment the run
+/// outlived the request.
+#[tokio::test]
+async fn a_created_run_bounds_a_single_step_tighter_than_the_run_itself() {
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+
+    let step = stored
+        .budget
+        .step_timeout_ms
+        .expect("**a single step must be bounded**");
+    assert_eq!(
+        step,
+        jarvis_domain::run::budget::DEFAULT_STEP_TIMEOUT_MS,
+        "the recorded step bound must be the daemon's default",
+    );
+    // The property that gives the default its meaning: if the step bound were not **strictly**
+    // tighter than the run's own deadline, the `min` in `wait_bound` would always pick the deadline
+    // and the step timeout would be decorative even when set.
+    assert!(
+        step < super::DEFAULT_RUN_BUDGET_MS,
+        "the step bound ({step}ms) must be strictly tighter than the run's deadline \
+         ({}ms), or it can never bind",
+        super::DEFAULT_RUN_BUDGET_MS,
+    );
+    // And the bound must actually **bind**, which is a statement about the two values together
+    // rather than about the field: `wait_bound` takes the tighter of the step timeout and the time
+    // left, so a step bound at or above the remaining time would never be the one that fires. A run
+    // that has just been created therefore has strictly more time left than one step is allowed.
+    assert!(
+        matches!(
+            stored.budget.status_at(stored.created_at),
+            jarvis_domain::run::budget::BudgetStatus::Remaining { millis, .. } if millis > step
+        ),
+        "a freshly created run must have more time left ({:?}) than one step is allowed ({step}ms), \
+         or the step bound can never be the one that binds",
+        stored.budget.status_at(stored.created_at),
+    );
+}
+
+/// A run created through the daemon carries a **retry policy that permits a retry**.
+///
+/// This is the round's central assertion, and it is the one that distinguishes a reachable feature
+/// from a documented one. `BRN-008` built `RetryPolicy`, `RetryDecision`, the `FailureSite`
+/// boundary, and the retry-chain storage — and **nothing in production ever set a policy**, so every
+/// run recorded `max_attempts: 1` and `decide` answered `DoNotRetry` for every failure. The tests
+/// that exercised retries did so through `RunBudget::with_retry`, which appears nowhere outside a
+/// test file.
+///
+/// Asserted on the **stored** budget rather than the returned one, because the controller reads the
+/// policy from storage when a later attempt needs it: a policy that reached the response and not the
+/// row would be lost the moment the run outlived the request.
+#[tokio::test]
+async fn a_created_run_carries_a_retry_policy_a_transient_failure_can_use() {
+    use jarvis_domain::run::retry::RetryPolicy;
+
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+
+    assert_eq!(
+        stored.budget.retry,
+        RetryPolicy::default_for_run(),
+        "a run created with no stated policy must carry the daemon's default, not `none` — a \
+         policy of one attempt makes the retry path unreachable",
+    );
+    assert!(
+        stored.budget.retry.max_attempts > 1,
+        "the default must permit a second attempt, or a transient failure is fatal by accident",
+    );
+}
+
+/// A caller's stated retry policy is the one recorded, including "do not retry".
+///
+/// Two directions, because they fail differently: a caller's policy being **ignored** would leave
+/// the run on the default and retrying when it was told not to, while `max_attempts: 1` being
+/// **confused with absence** would retry a run whose caller deliberately disabled it. The second is
+/// the one a defaulted field would get wrong, which is why the wire type makes the field optional
+/// and never defaults it to `none`.
+#[tokio::test]
+async fn a_callers_retry_policy_is_recorded_and_explicitly_disabling_it_is_honoured() {
+    use jarvis_domain::run::retry::RetryPolicy;
+
+    let fixture = fixture();
+    let wanted = RetryPolicy::new(2, 100, 500).expect("2 attempts with a 100ms base is in range");
+    let created = fixture
+        .service
+        .create(
+            &context(),
+            None,
+            "hello",
+            "key-retry",
+            RunOptions::new().with_retry(Some(wanted)),
+            &fixture.spawner,
+        )
+        .await
+        .expect("the run is created");
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+    assert_eq!(
+        stored.budget.retry, wanted,
+        "a caller's own retry policy must be the one recorded",
+    );
+
+    // And a caller who explicitly asked for no retries keeps that decision rather than receiving the
+    // daemon's default — the distinction the optional wire field exists to preserve.
+    let created = fixture
+        .service
+        .create(
+            &context(),
+            None,
+            "again",
+            "key-no-retry",
+            RunOptions::new().with_retry(Some(RetryPolicy::none())),
+            &fixture.spawner,
+        )
+        .await
+        .expect("the run is created");
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("the run is durable");
+    assert_eq!(
+        stored.budget.retry.max_attempts, 1,
+        "**`max_attempts: 1` is a decision, not an absent field** — substituting the default here \
+         would retry a run whose caller disabled retries",
     );
 }
 
@@ -584,7 +758,7 @@ async fn the_same_key_with_different_input_is_a_conflict() {
             None,
             "something else",
             "key-1",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await
@@ -599,7 +773,14 @@ async fn a_missing_idempotency_key_is_refused_before_any_write() {
     let fixture = fixture();
     let error = fixture
         .service
-        .create(&context(), None, "hello", "", None, &fixture.spawner)
+        .create(
+            &context(),
+            None,
+            "hello",
+            "",
+            RunOptions::new(),
+            &fixture.spawner,
+        )
         .await
         .expect_err("the key is required");
     assert_eq!(error.code(), "request.invalid");
@@ -621,7 +802,7 @@ async fn an_empty_objective_is_refused_and_an_over_long_one_too() {
                 None,
                 &objective,
                 "key-1",
-                None,
+                RunOptions::new(),
                 &fixture.spawner,
             )
             .await
@@ -912,7 +1093,7 @@ async fn a_create_into_a_foreign_conversation_is_not_found() {
             None,
             "theirs",
             "their-key",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await
@@ -924,7 +1105,7 @@ async fn a_create_into_a_foreign_conversation_is_not_found() {
             Some(foreign_conversation),
             "mine",
             "my-key",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await
@@ -947,7 +1128,7 @@ async fn an_existing_conversation_is_continued_rather_than_replaced() {
             Some(first.conversation_id),
             "second question",
             "key-2",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await
@@ -1107,7 +1288,7 @@ async fn a_named_policy_that_does_not_exist_is_refused_rather_than_substituted()
             None,
             "hello",
             "key-1",
-            Some(absent),
+            RunOptions::new().with_policy(Some(absent)),
             &fixture.spawner,
         )
         .await
@@ -1490,7 +1671,7 @@ async fn a_spent_single_use_grant_no_longer_admits_a_second_run() {
             None,
             "hello again",
             "key-2",
-            None,
+            RunOptions::new(),
             &fixture.spawner,
         )
         .await
@@ -1565,7 +1746,14 @@ async fn a_policy_that_admits_no_compliant_route_refuses_creation_and_creates_no
 
     let error = fixture
         .service
-        .create(&context(), None, "hello", "key-1", None, &fixture.spawner)
+        .create(
+            &context(),
+            None,
+            "hello",
+            "key-1",
+            RunOptions::new(),
+            &fixture.spawner,
+        )
         .await
         .expect_err("content above the ceiling has no compliant route");
 

@@ -233,9 +233,21 @@ Idempotency-Key: 0195f4f0-18dc-729b-bb34-07e8c7627f21
   "conversation_id": null,
   "input": {"type":"text","text":"hello"},
   "runtime": "jarvis-native",
-  "model_policy": {"policy_id":"scripted-test","version":1}
+  "model_policy": {"policy_id":"scripted-test","version":1},
+  "retry": {"max_attempts": 3, "base_backoff_ms": 250, "max_backoff_ms": 2000}
 }
 ```
+
+The optional `retry` object sets how a **retryable model-call failure before provider
+acceptance** may be repeated. An **absent** field is not "no retries": it means the daemon
+applies its own default, whose attempt count is published as `DEFAULT_RETRY_MAX_ATTEMPTS` so
+a client can size its own waiting and reconciliation window against the number the daemon
+will actually use. A caller that wants no retries states `"max_attempts": 1` — a decision,
+which the daemon records and honours rather than replacing with the default. A value outside
+the daemon's bounds is refused with `request.semantic_invalid` rather than clamped, because a
+clamped policy is one the caller did not ask for and cannot detect. Only the *pre-acceptance*
+failures in the model-gateway retry list are eligible; an ambiguous accepted request is never
+retried without provider idempotency.
 
 `Idempotency-Key` is required and scoped to authenticated principal, resolved
 workspace/profile, client credential, operation, and API major. Its digest is

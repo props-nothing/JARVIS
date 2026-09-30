@@ -2300,6 +2300,88 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_advertised_default_retry_attempts_is_the_one_the_daemon_applies() {
+        // The same cross-crate arrangement as the objective bound above, for the same reason and
+        // with a sharper failure. `jarvis_protocol::run::DEFAULT_RETRY_MAX_ATTEMPTS` is what a
+        // **client** is told it will get when it sends no retry policy, and
+        // `jarvis_domain::run::retry::DEFAULT_MAX_ATTEMPTS` is what the **daemon** actually applies.
+        // Neither crate can compare them: `jarvis-application` does not depend on `jarvis-protocol`,
+        // and a domain crate may not know the wire vocabulary at all. This crate depends on both.
+        //
+        // The failure this prevents is a client that sizes its own timeout or reconciliation window
+        // from the documented default while the daemon attempts a different number of times — so
+        // the daemon is still retrying after the client has concluded the call failed.
+        assert_eq!(
+            jarvis_protocol::run::DEFAULT_RETRY_MAX_ATTEMPTS,
+            jarvis_domain::run::retry::DEFAULT_MAX_ATTEMPTS,
+            "the advertised default attempt count and the applied one must be the same number",
+        );
+        // And the applied default must actually permit a retry: a "default" of one attempt would
+        // make the advertised field meaningless and leave the retry path unreachable again.
+        assert!(
+            jarvis_domain::run::retry::RetryPolicy::default_for_run().max_attempts > 1,
+            "the daemon's default retry policy must permit at least one retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_policy_outside_the_daemons_bounds_is_refused_before_a_run_exists() {
+        // The policy is validated at the trust boundary rather than left to the domain constructor,
+        // and the difference is observable: a value the daemon cannot honour must be **refused**,
+        // not clamped. A clamped attempt count is one the caller did not ask for and cannot detect,
+        // and the caller would size its own reconciliation window against the number it sent.
+        //
+        // Three refusals, each for a different bound, because a single case would not distinguish
+        // "validates the attempt count" from "validates anything". The last one is the ordering
+        // rule: a base above the ceiling is a schedule that never applies its ceiling.
+        let (app, token) = runs_fixture("retry-bounds").await;
+        let cases = [
+            (
+                r#"{"max_attempts":0}"#,
+                "zero attempts is a policy that cannot run at all",
+            ),
+            (
+                r#"{"max_attempts":6}"#,
+                "one attempt over the daemon's maximum must be refused",
+            ),
+            (
+                r#"{"max_attempts":3,"base_backoff_ms":5000,"max_backoff_ms":100}"#,
+                "a base above the ceiling is a schedule the ceiling never reaches",
+            ),
+        ];
+        for (retry, why) in cases {
+            let body = format!(
+                r#"{{"conversation_id":null,"input":{{"type":"text","text":"hello"}},"runtime":"jarvis-native","retry":{retry}}}"#
+            );
+            let (status, text) =
+                send(&app, "POST", "/api/v1/runs", &run_headers(&token), &body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{why}: {text}");
+            assert!(
+                text.contains("request.semantic_invalid"),
+                "the refusal must carry the contract's own code: {why}: {text}",
+            );
+        }
+
+        // And a policy **inside** the bounds is accepted, so the refusals above are a bound rather
+        // than a field the daemon rejects in every form. Without this half the test would pass
+        // against a handler that refused the whole field.
+        let (status, text) = send(
+            &app,
+            "POST",
+            "/api/v1/runs",
+            &run_headers(&token),
+            r#"{"conversation_id":null,"input":{"type":"text","text":"hello"},"runtime":"jarvis-native","retry":{"max_attempts":2,"base_backoff_ms":50,"max_backoff_ms":200}}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a policy within the bounds must be accepted: {text}",
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("retry-bounds"));
+    }
+
+    #[tokio::test]
     async fn a_create_names_the_created_resource_in_a_location_header() {
         // The contract's create step requires "a `Location` header", and the daemon sent none —
         // so a client had a `202` it could see and no addressable resource. Every client would

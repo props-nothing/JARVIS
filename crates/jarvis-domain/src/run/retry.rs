@@ -63,6 +63,24 @@ pub const MAX_ATTEMPTS: u32 = 5;
 /// The largest accepted backoff, in milliseconds.
 pub const MAX_BACKOFF_MS: u64 = 60_000;
 
+/// The attempt count a run is given when its creator named no retry policy.
+///
+/// **This is the authoritative default**, and it exists because the absence of a policy was
+/// previously indistinguishable from a policy of one attempt. [`RetryPolicy::none`] remains the
+/// default for the *field*, so a budget that was never given a policy still records
+/// `max_attempts: 1` — but a run *created through the daemon* is given this policy instead, so the
+/// retry machinery `BRN-008` built is reachable rather than theoretical.
+///
+/// Three attempts, not unlimited: a local provider that fails twice for a transport reason is very
+/// unlikely to succeed a third time, and every attempt spends the run's deadline.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// The delay before a second attempt under [`RetryPolicy::default_for_run`], in milliseconds.
+pub const DEFAULT_BASE_BACKOFF_MS: u64 = 250;
+
+/// The ceiling that backoff may grow to under [`RetryPolicy::default_for_run`], in milliseconds.
+pub const DEFAULT_MAX_BACKOFF_MS: u64 = 2_000;
+
 impl RetryPolicy {
     /// A policy that never retries.
     ///
@@ -75,6 +93,25 @@ impl RetryPolicy {
             max_attempts: 1,
             base_backoff_ms: 0,
             max_backoff_ms: 0,
+        }
+    }
+
+    /// The policy a run is created with when its creator named none.
+    ///
+    /// Distinct from [`RetryPolicy::none`] on purpose. `none()` is the default for the *field*,
+    /// so a budget nothing configured reads back as a recorded fact; this is the policy the
+    /// **daemon** applies to a run it creates, so the retry machinery is reachable from a real
+    /// request rather than only from a test.
+    ///
+    /// Constructed directly rather than through [`RetryPolicy::new`] so it is a `const` and cannot
+    /// fail: the three values are the bounds this module already enforces, and a fallible
+    /// constructor here would force every caller to handle an error that cannot occur.
+    #[must_use]
+    pub const fn default_for_run() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_backoff_ms: DEFAULT_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
         }
     }
 

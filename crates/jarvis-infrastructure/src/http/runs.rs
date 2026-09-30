@@ -32,17 +32,18 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use jarvis_application::repository::run::RunRuntime;
 use jarvis_application::request_context::RequestContext;
-use jarvis_application::run_service::{CreatedRun, RunService, RunServiceError};
+use jarvis_application::run_service::{CreatedRun, RunOptions, RunService, RunServiceError};
 use jarvis_domain::ids::{
     ConversationId, CorrelationId, ModelDataPolicyId, PrincipalId, RequestId, RunId, WorkspaceId,
 };
 use jarvis_domain::model::policy::PolicyVersionRef;
+use jarvis_domain::run::retry::{RetryError, RetryPolicy};
 use jarvis_domain::run::state::RunState;
 use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
     CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
-    MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RunEventFrame,
-    RunView, SseEvent,
+    MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RetryRequest,
+    RunEventFrame, RunView, SseEvent,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for};
@@ -234,13 +235,14 @@ pub async fn create_run(
         None => None,
     };
 
-    // The policy reference is parsed rather than ignored. Before this the field was accepted and
-    // never read, so a caller's stated policy had no effect while the request succeeded — a
-    // failure mode indistinguishable, from the client's side, from the policy being applied.
-    // A malformed identifier is refused here, because every field the contract makes required is
-    // one the daemon must act on or reject.
-    let requested_policy = match parse_policy_reference(command.model_policy.as_ref()) {
-        Ok(reference) => reference,
+    // Both optional caller statements are validated **before** any run exists, and they are one
+    // helper because they share a property that matters: each is a field the daemon must act on or
+    // refuse. Before this the policy was accepted and never read — a failure indistinguishable, from
+    // the client's side, from the policy being applied — and the retry bounds would have been a
+    // value the domain constructor refused *after* the budget was built, or worse, one silently
+    // clamped to something the caller did not ask for and cannot detect.
+    let requested = match parse_run_options(&command) {
+        Ok(options) => options,
         Err(message) => {
             return error_response_for(
                 request_id,
@@ -259,13 +261,49 @@ pub async fn create_run(
             conversation,
             input,
             &key,
-            requested_policy,
+            requested,
             state.spawner.as_ref(),
         )
         .await
     {
         Ok(created) => created_response(request_id, &created),
         Err(error) => service_error_response(request_id, &error),
+    }
+}
+
+/// Parses the caller's optional statements about the run, or names what was wrong with them.
+///
+/// Returns one [`RunOptions`] rather than two `Result`s so the handler validates both in one place
+/// and cannot handle one and forget the other — the same reason the fields are grouped on the
+/// service side.
+fn parse_run_options(command: &CreateRunRequest) -> Result<RunOptions, &'static str> {
+    let policy = parse_policy_reference(command.model_policy.as_ref())?;
+    let retry = parse_retry_policy(command.retry)?;
+    Ok(RunOptions::new().with_policy(policy).with_retry(retry))
+}
+
+/// Parses the client's retry policy, when one was supplied.
+///
+/// `None` means the caller left the retry decision to JARVIS, which is **not** the same as asking
+/// for no retries — that is `max_attempts: 1`, and the field's own doc draws the distinction. The
+/// message names the bound that was violated rather than echoing the rejected number, because an
+/// operator's next step differs by which bound moved.
+fn parse_retry_policy(request: Option<RetryRequest>) -> Result<Option<RetryPolicy>, &'static str> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    match RetryPolicy::new(
+        request.max_attempts,
+        request.base_backoff_ms,
+        request.max_backoff_ms,
+    ) {
+        Ok(policy) => Ok(Some(policy)),
+        Err(RetryError::AttemptsOutOfRange) => {
+            Err("The retry attempt count must be between 1 and the daemon's maximum.")
+        }
+        Err(RetryError::BackoffOutOfRange) => {
+            Err("The retry backoff must be ordered and within the daemon's maximum.")
+        }
     }
 }
 
