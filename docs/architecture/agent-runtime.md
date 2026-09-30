@@ -350,6 +350,16 @@ total estimated. And a run whose calls recorded nothing reports **no** usage obj
 rather than a zeroed one — "consumed nothing" and "nothing was measured" are different
 facts, which is the same rule `has_any_counter` exists to keep apart.
 
+**The ceiling check is a per-call comparison, and today that is also the run total.**
+`ask_model`'s retry loop retries only failures the provider reported *before accepting*
+the call, and such a failure cannot have consumed anything — so at most one call in a run
+can report usage, and `exceeded_by` against it is the run's whole consumption. The
+distinction matters because it will stop being true the moment a run can make two
+reporting calls (a tool loop, a provider fallback, a multi-turn continuation), at which
+point the check would bound one call while presenting as a run bound. The read side of
+closing that (`Usage::summed`, `load_run_calls`) now exists; the check should move onto
+the accumulated figure when a second reporting call becomes reachable, not before.
+
 **Still open:** `budget_is_verifiable` remains *uncalled*, so a ceiling the provider left
 unmeasurable is still not **reported** as unverified. The read path that makes it
 reportable now exists — a run's summed usage is available where a response is built — but

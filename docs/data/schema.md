@@ -977,6 +977,26 @@ held file lock in `lifecycle::InstanceGuard`. A row-level lease is a distinct me
 holder and expiry, reclaimable after a crash) and is still unimplemented; a later slice should add
 it with a caller attached rather than keep it in case.
 
+**`diagnostic_events` has no production writer either, and the reason is a genuine design question
+rather than an omission.** The migration describes it as "bounded, safe operational findings produced
+by doctor and startup checks", and there is no insert outside `#[cfg(test)]`. Two things have to be
+decided before it can have one, and neither is answerable by looking at the table:
+
+- **Where the finding is produced.** `jarvis doctor` runs in the **CLI** process
+  (`apps/jarvis-cli`, over `jarvis_infrastructure::diagnostics`), while the table is opened by the
+  **daemon**. A CLI finding is written into the same SQLite file the daemon owns, which is the same
+  ownership question `InstanceGuard` answers for the file lock — so "the CLI writes a row" is a
+  decision about concurrent writers, not a missing `INSERT`.
+- **Whether a passing check belongs there.** Its severity constraint is
+  `CHECK (severity IN ('info', 'warning', 'error'))` — `Ok` is deliberately absent, so the table is
+  for findings worth keeping, not for a run's output. That is a reasonable design, and it means
+  "record the doctor run" is not what this table is for.
+
+So this is named rather than wired: the checks exist, the table exists, and what is missing is a
+decision about which process records which findings and at what severity. Asserting the heading as
+though a writer existed would be the `BRN-058` defect in the other direction — a reader concluding a
+capability exists because a document names it.
+
 ## Critical Constraints and Indexes
 
 - Foreign keys include workspace where practical to prevent cross-workspace

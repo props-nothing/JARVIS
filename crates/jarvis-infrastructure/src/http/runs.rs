@@ -43,7 +43,7 @@ use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
     CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
     MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RetryRequest,
-    RunEventFrame, RunUsageView, RunView, SseEvent,
+    RunEventFrame, RunLimitsView, RunUsageView, RunView, SseEvent,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for};
@@ -391,6 +391,17 @@ pub async fn read_run(
                     estimated_cost_microunits: usage.estimated_cost_microunits,
                     currency: usage.currency,
                 }),
+                // The ceilings `usage` is compared against, from the run's own stored budget — the
+                // same value the controller's `exceeded_by` reads, so a client cannot be shown a
+                // limit the daemon did not enforce. Omitted entirely when neither is set, which is
+                // the fresh-install case before a policy supplies one.
+                limits: stored
+                    .budget
+                    .has_consumption_ceiling()
+                    .then_some(RunLimitsView {
+                        max_output_tokens: stored.budget.max_output_tokens,
+                        max_cost_microunits: stored.budget.max_cost_microunits,
+                    }),
             },
         ),
         Err(error) => service_error_response(request_id, &error),

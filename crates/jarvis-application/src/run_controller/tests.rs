@@ -2112,6 +2112,29 @@ async fn a_retry_with_no_budget_delay_still_completes_and_costs_nothing() {
         .expect("the retry succeeds");
     assert_eq!(outcome.state, RunState::Completed);
     assert_eq!(provider.opens_seen(), 2);
+
+    // **At most one call of a run can report usage, and this is the test that pins it.** The run made
+    // two calls, and the retried first one failed *before the provider accepted it* — so it consumed
+    // nothing and recorded no usage. That is what makes the controller's per-call ceiling check a
+    // check of the run's whole consumption today: it cannot see two reporting calls, because a run
+    // can only reach a second call through a pre-acceptance failure.
+    //
+    // Asserted here rather than described, because the fact is load-bearing for `BRN-058`'s summing
+    // work and for the claim in `agent-runtime.md`. If a future change lets a retry follow an
+    // accepted call — or adds a tool loop, a provider fallback, or a multi-turn continuation — this
+    // fails, and the failing test is the signal that `exceeded_by` must move onto the summed figure.
+    let calls = fixture
+        .repositories
+        .load_run_calls(context().workspace_id, run())
+        .await
+        .expect("the run's calls load");
+    assert_eq!(calls.len(), 2, "the run made two calls: {calls:?}");
+    let reporting = calls.iter().filter(|call| call.usage.is_some()).count();
+    assert_eq!(
+        reporting, 0,
+        "neither call reported usage here, and the invariant is that at most ONE can in any run: \
+         a second reporting call would make the per-call ceiling check wrong",
+    );
 }
 
 #[tokio::test]

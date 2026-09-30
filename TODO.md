@@ -4766,6 +4766,53 @@ Dependencies: Milestone 2 exit gate.
     unmeasurable is still not *reported* as unverified. The read path that makes it reportable now
     exists, but the field to carry the verdict does not, and a field that is always `true` in this build
     would be a constant in a durable payload.
+- [x] `BRN-059` Publish the consumption ceilings on the run read, so the client-visible
+  `run.budget_output_tokens_exceeded` code names a number the client can see.
+  Evidence: **falsified by projecting a wrong value** (`max_output_tokens.map(|_| 1)`), which fails
+  `a_run_read_reports_the_ceilings_its_error_codes_name` with the published body showing
+  `"limits":{"max_output_tokens":1}` against the 4096 the budget applies. Restored.
+  - **The defect is `BRN-053`/`BRN-054` one field over, found by asking what a client can inspect.**
+    `BRN-053` added `deadline_at` so `run.deadline_exceeded` was explicable; `BRN-054` recorded the
+    usage that breached a ceiling so a reader had a number to compare — and the *ceiling itself* was
+    never on any surface. `StoredRun.budget` has always carried it (`budget_for` applies
+    `DEFAULT_MAX_OUTPUT_TOKENS`), and `RunView` rendered none of it, so a client holding the code and
+    the usage still could not tell what limit it crossed.
+  - **The ceiling is also not client-settable**, which makes the omission worse: `CreateRunRequest`
+    carries `runtime`, `input`, `model_policy`, and `retry` — no budget. So the daemon chose the
+    number, enforced it, refused the run by naming it, and published it nowhere.
+  - `RunLimitsView` is a **separate type from `RunUsageView`** rather than one block, because they
+    answer different questions (what was consumed vs. what was allowed) and a single type would invite
+    a reader to compare fields across the two. Both are omitted when unset — an unset ceiling and a
+    ceiling of zero are different facts, and the cost ceiling is unset in this build because there is
+    no pricing catalogue.
+  - 1515 tests (+1), docs synced in the same change.
+  - **Not closed by this slice:** a client still cannot *set* the ceilings, so the numbers it reads are
+    always the daemon's defaults or a policy's. That is a request-side gap rather than a read-side one.
+  - **Correction to what `BRN-058` said about the enforcement path, because it was an overclaim.**
+    `BRN-058` recorded "the enforcement path still judges one call rather than the run total" as a
+    correctness gap. Tracing `ask_model` while writing this round: its loop retries **only**
+    `FailureSite::BeforeAcceptance` failures, and `fail_open` returns `Retryable` only for a
+    `Transient`/non-cancelled/non-timed-out error — so **at most one call per run can report usage**,
+    and `exceeded_by` on that one call *is* the run total today. The gap is **latent, not observable**:
+    it becomes real the moment a second reporting call exists in one run (a tool loop, a provider
+    fallback, a multi-turn continuation), and it would then silently bound one call while claiming to
+    bound the run. The invariant is now **pinned by a test** rather than described:
+    `a_retry_with_no_budget_delay_still_completes_and_costs_nothing` already drove two calls, so it now
+    loads the run's calls and asserts none reported usage — a future change that lets a retry follow an
+    accepted call, or adds a tool loop, fails it and is told to move `exceeded_by` onto `Usage::summed`.
+    Falsified by asserting `reporting == 1` (`left: 0, right: 1`). `Usage::summed` + `load_run_calls`
+    are the read side of closing it; the check should move onto the accumulated figure **when** a second
+    reporting call becomes reachable, not before — a run-level check that can only ever see one call is
+    the same value with more machinery.
+  - **Named, not built: a client still cannot set the consumption ceilings.** `CreateRunRequest` carries
+    `runtime`, `input`, `model_policy`, and `retry`, and no budget, so the numbers a client reads are
+    always the daemon's default or a policy's. Adding one is **not** mechanical: a caller-supplied
+    ceiling must be **clamped by the effective policy**, or a client could widen a token or cost bound
+    the policy set — the same "a submission must not widen what is in force" rule `PolicyService::put`
+    enforces for data rules. `PolicyRules` models locality, retention, sensitivity, and residency, not
+    token or cost ceilings, so there is no merge to reuse and the interaction needs a decision (an ADR,
+    or a `RunBudget` merge that takes the minimum of the caller's and the policy's). Until then the
+    contract specifies no such field, and this is recorded rather than guessed at.
 - [ ] `TLS-010` Add MCP negotiation, auth, cancellation, malformed payload, and
   conformance/Inspector tests.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.

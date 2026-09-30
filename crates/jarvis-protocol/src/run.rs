@@ -213,6 +213,29 @@ pub struct RunUsageView {
     pub currency: Option<String>,
 }
 
+/// The consumption ceilings a run is judged against.
+///
+/// **`run.budget_output_tokens_exceeded` names a number a client could not see.** The code is
+/// client-visible and `BRN-054` made the run's consumed usage readable so a reader could compare
+/// against it — but the *ceiling* half was never on any surface, so a client holding the code and
+/// the usage still could not tell what limit it had crossed. `RunView` carried `deadline_at` for the
+/// same reason `BRN-053` added it, and the consumption ceilings were the omission right beside it.
+///
+/// Each field is optional and omitted when unset, because "no ceiling" and "a ceiling of zero" are
+/// different facts — the same rule `RunBudget` itself follows. A ceiling of zero is not expressible
+/// through `budget_for` today, and `0` here would read as "an answer of any length breaches", which
+/// is a claim nobody configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLimitsView {
+    /// The maximum output tokens allowed across the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// The maximum estimated cost allowed across the run, in millionths of the billing unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_microunits: Option<u64>,
+}
+
 /// An authenticated read of one run.
 ///
 /// Deliberately bounded: it carries state, identity, the optimistic version, and
@@ -278,6 +301,13 @@ pub struct RunView {
     /// to the per-call event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RunUsageView>,
+    /// The consumption ceilings this run is judged against.
+    ///
+    /// The other half of `usage`: `usage` says what the run consumed, and this says what it was
+    /// allowed to. Both are needed for `run.budget_output_tokens_exceeded` to be explicable, since
+    /// the code names a breach of a limit nothing on the wire named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RunLimitsView>,
 }
 
 /// The data body of one streamed run event.
@@ -676,6 +706,7 @@ mod tests {
             error_code: None,
             deadline_at: None,
             usage: None,
+            limits: None,
         };
         let json = serde_json::to_string(&view).expect("serializes");
         assert!(json.contains(r#""version":1"#), "{json}");
@@ -685,6 +716,7 @@ mod tests {
         assert!(!json.contains("error_code"), "{json}");
         assert!(!json.contains("deadline_at"), "{json}");
         assert!(!json.contains("usage"), "{json}");
+        assert!(!json.contains("limits"), "{json}");
         assert!(!json.contains("prompt"), "{json}");
     }
 
@@ -706,6 +738,7 @@ mod tests {
             error_code: Some("run.deadline_exceeded".to_owned()),
             deadline_at: Some("2026-09-20T12:50:10Z".to_owned()),
             usage: None,
+            limits: None,
         };
         let json = serde_json::to_string(&view).expect("serializes");
         assert!(

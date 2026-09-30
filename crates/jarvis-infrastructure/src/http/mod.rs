@@ -2846,6 +2846,41 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_run_read_reports_the_ceilings_its_error_codes_name() {
+        // `run.budget_output_tokens_exceeded` is a client-visible code that names a number no surface
+        // carried. `BRN-054` made the run's *consumed* usage readable so a reader could compare
+        // against it, but the *ceiling* was never on the wire — so a client holding the code and the
+        // usage still could not tell what limit it had crossed. `RunView` carried `deadline_at` for
+        // the same reason, and this is the omission right beside it.
+        //
+        // `budget_for` applies `DEFAULT_MAX_OUTPUT_TOKENS`, so every created run has a token ceiling
+        // and this asserts the positive case rather than a conditional.
+        let (app, token) = runs_fixture("runs-limits").await;
+        let run_id = create_run(&app, &token, "hello").await;
+        let body = read_run_until_terminal(&app, &token, &run_id).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let limits = &parsed["limits"];
+        assert!(
+            limits.is_object(),
+            "the run read must carry the ceilings its error codes name: {body}",
+        );
+        assert_eq!(
+            limits["max_output_tokens"],
+            jarvis_domain::run::budget::DEFAULT_MAX_OUTPUT_TOKENS,
+            "the published ceiling must be the one budget_for applied: {body}",
+        );
+        // The cost ceiling is **absent** in this build, because `budget_for` sets no pricing
+        // catalogue. Asserted so the field cannot become a constant `null` that reads as a limit:
+        // an absent ceiling and a ceiling of zero are different facts, and only the first is true.
+        assert!(
+            limits.get("max_cost_microunits").is_none(),
+            "an unset cost ceiling must be omitted, not reported as zero: {body}",
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir("runs-limits"));
+    }
+
     /// Reads a run until it reports a terminal state, returning the last body.
     ///
     /// Polling rather than sleeping, for the reason the event-stream tests give: the run is driven on

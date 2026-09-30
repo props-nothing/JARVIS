@@ -488,15 +488,35 @@ only in the write direction. `record_outcome` serialized `usage_json` and `estim
 on every write and **no `SELECT` ever named either column**, while the architecture requires the
 durable run record to carry "model/tool usage and budget state" and says the token and cost halves are
 implemented. So a run's consumption existed in the store and was reachable by no caller: the ceilings
-were judged against the one live report the controller held in memory, which makes a ceiling documented
-as "across the run" a bound on a **single call**. Both columns are now selected, `StoredModelCall`
+were judged against the one live report the controller held in memory, so nothing could tell what a
+*billed* run had spent once the call was over. Both columns are now selected, `StoredModelCall`
 carries them, and the run read sums them.
+
+That comparison being per-call is, **today**, also a comparison of the run total — `ask_model`'s retry
+loop retries only failures the provider reported *before accepting* the call, and such a failure
+consumed nothing, so at most one call per run can report usage. The distinction is worth stating
+because it will stop holding the moment a run can make two reporting calls (a tool loop, a provider
+fallback, a multi-turn continuation), and the check would then bound one call while presenting as a
+bound on the run.
 
 The object is **omitted** for a run whose calls recorded nothing, rather than sent as zeroes: a run
 whose provider reports no usage and a run that consumed nothing are different facts, and "unknown is
 not zero" applies to a durable statement about a run exactly as it applies to the per-call event.
 `provider_reported` is `false` when **any** contributing call was estimated rather than reported,
 because the field claims every value in the block came from the provider.
+
+The read also carries a `limits` object — `max_output_tokens` and `max_cost_microunits` — which is the
+other half of the same requirement, and the half that was missing when `usage` was added. Every
+consumption-ceiling code is **client-visible** (`run.budget_output_tokens_exceeded`,
+`run.budget_cost_exceeded`), and a client that received one could see what the run consumed but not
+what limit it had crossed, because no surface named the ceiling the daemon enforced. This is the
+`BRN-053` shape one field over: that round added `deadline_at` so `run.deadline_exceeded` was
+explicable, and left the consumption ceilings beside it unnamed.
+
+Both fields are optional and each is omitted when unset, because "no ceiling" and "a ceiling of zero"
+are different facts — `0` would read as "any answer breaches", which nobody configured. The values
+come from the run's own stored budget, the same one `RunBudget::exceeded_by` reads, so a client cannot
+be shown a limit the daemon did not enforce.
 
 ## Common Error Envelope
 

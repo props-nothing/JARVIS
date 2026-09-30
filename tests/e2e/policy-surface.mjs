@@ -1007,6 +1007,28 @@ async function main() {
       (total, row) => total + (row.input_tokens ?? 0),
       0,
     );
+    // The ceilings the run was judged against. `run.budget_output_tokens_exceeded` is client-visible,
+    // so a client must be able to see what limit it crossed — and `budget_for` applies a default, so
+    // every created run has a token ceiling and this is a positive assertion rather than a
+    // conditional. The cost ceiling is absent in this build (no pricing catalogue), and asserting
+    // that omission is what stops the field becoming a constant `null` that reads as a limit.
+    const limits = runUsage.json?.limits;
+    if (!limits || typeof limits.max_output_tokens !== "number") {
+      fail(
+        "the run read must carry the token ceiling its error code names, got " +
+          JSON.stringify(limits),
+      );
+    } else if (limits.max_output_tokens <= 0) {
+      fail(`a published ceiling must be a real bound, got ${limits.max_output_tokens}`);
+    } else if ("max_cost_microunits" in limits) {
+      fail(
+        "an unset cost ceiling must be omitted rather than reported as zero, got " +
+          JSON.stringify(limits),
+      );
+    } else {
+      pass(`the run read reports its output ceiling: ${limits.max_output_tokens} token(s)`);
+    }
+
     if (runUsage.status !== 200) {
       fail(`the settled run must be readable, got ${runUsage.status}`, runUsage.text);
     } else if (runUsage.json?.state !== "completed") {
