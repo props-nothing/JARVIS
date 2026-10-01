@@ -606,6 +606,21 @@ impl TrustStore {
         self.keys.iter().any(|(id, _)| id == key_id)
     }
 
+    /// Returns the verifying key for `key_id`, when it is trusted.
+    ///
+    /// **A reader rather than a public field, so a caller cannot substitute a key.** The store was
+    /// written to make "the anchor is compiled in" structural, and handing out the key material is
+    /// what a verifier in another module needs to perform the check itself — `TLS-014`'s package
+    /// verifier does exactly that. Returning an owned `VerifyingKey` (which is `Copy`) rather than a
+    /// reference keeps the store's interior private while still letting the caller verify.
+    #[must_use]
+    pub fn verifying_key(&self, key_id: &str) -> Option<VerifyingKey> {
+        self.keys
+            .iter()
+            .find(|(id, _)| id == key_id)
+            .map(|(_, key)| *key)
+    }
+
     /// Returns the number of trusted keys.
     #[must_use]
     pub fn len(&self) -> usize {

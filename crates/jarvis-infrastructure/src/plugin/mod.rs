@@ -799,3 +799,12 @@ pub fn contains_control(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Package provenance and signature verification: the gate *before* extraction (`TLS-014`).
+///
+/// A sibling module rather than more arms here, because it answers a different question. This module
+/// validates a **document** — field shapes, path safety, a canonical digest *string* — and trusts
+/// nothing in the `package` block, because those are claims about bytes nobody has looked at. The
+/// verifier looks at them, and it needs the crypto and the trust store this module deliberately does
+/// not depend on.
+pub mod verify;

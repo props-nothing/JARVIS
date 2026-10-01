@@ -6428,7 +6428,72 @@ Dependencies: Milestone 2 exit gate.
     demand a step-up.
 - [ ] `TLS-014` Implement plugin package provenance/signature verification,
   compatibility validation, install-disabled, staged update/rollback, disable,
-  data-retention choice, and removal.
+  data-retention choice, and removal. **The *provenance and signature verification*
+  half is done; the installer half (extraction, install-disabled, staged
+  update/rollback, disable, data retention, removal) remains, and it waits on a
+  decision the contract has not made.**
+  Evidence: `jarvis_infrastructure::plugin::verify` — `PluginPackageVerifier`,
+  `VerifiedPluginPackage`, `PluginVerificationError`, and
+  `PluginSourceIdentity` getting its **first production producer** through
+  `VerifiedPluginPackage::identity_for`. The contract's sentence this makes true is
+  *"package bytes are verified before extraction or execution"*: `PluginManifest::parse`
+  validates the *document*, and this module checks the *bytes*.
+  - **The one check the module exists for is the binding, and it is falsified.**
+    The threat is not a tampered package with no signature — it is a **manifest
+    pointing at another package's honest signature**: the attacker ships bytes and a
+    signature they legitimately control, plus a manifest claiming both, and every
+    check in isolation passes. `VerifiedPluginPackage` is built only by
+    `verify(manifest, bytes, envelope)`, so a caller cannot obtain the derived values
+    without supplying the claim they must match. Removing the
+    `key_id != value_ref` comparison fails
+    `a_manifest_pointing_at_another_packages_signature_is_refused` and **only** that
+    test — 14 pass, 1 fails — which is what makes it the load-bearing check rather
+    than one of five.
+  - **The signature scheme is JARVIS-defined, and choosing it was the decision.**
+    The contract's example illustrates `sigstore-bundle`, but adopting Sigstore is a
+    *new external integration*, which `AGENTS.md`'s research gate requires current
+    official evidence for before any implementation edit. This build reuses the
+    primitive the release pipeline already established and whose evidence is already
+    accepted: `Ed25519` over the package bytes, a sidecar `SignatureEnvelope`, a
+    compiled-in `TrustStore`. `MAX_PACKAGE_SIGNATURE_BYTES` is an **alias** of the
+    release bound rather than a second literal with the same value.
+  - **The kind is refused by name, and that is fail-closed in the direction that
+    matters.** `SignatureReference::kind` stays an open string upstream — pinning it
+    in the manifest validator would refuse a kind a future verifier supports — so the
+    *verifier* refuses an unverifiable kind. Ignoring it and verifying whatever
+    envelope arrives would accept a manifest declaring an unimplemented scheme
+    because some *other* scheme happened to verify its bytes: a silent downgrade.
+  - **⚠ A value with no producer, found by writing the code.** The `From<ReleaseError>`
+    impl had no consumer while `parse_envelope` duplicated the release primitive's
+    size bound and malformed-envelope handling — a private function and a `From` impl
+    both existing, neither exercised. Routing parsing through
+    `SignatureEnvelope::parse(..).map_err(PluginVerificationError::from)` gives the
+    mapping its caller and the bound one home. The adapter tests now cover it because
+    the bound moved out of this module.
+  - **What verification does *not* claim, stated because the temptation is to
+    overclaim it.** `VerifiedPluginPackage` is a statement about bytes, not an
+    authorization: it grants nothing, and `identity_for` establishes that the bytes
+    are the ones the identity names — not that a publisher is honest. The `id`,
+    `publisher`, `version`, and `protocol` fields remain claims taken from the
+    manifest.
+  - **Not reimplemented, deliberately.** The envelope parse, the size bound, the
+    algorithm constant, the base64url codec, and the trust store all come from
+    `jarvis_infrastructure::release`, so there is one Ed25519 implementation and one
+    trust concept. The only new crypto-adjacent code is `sha256_digest` over
+    in-memory bytes, which the release module has no equivalent of (its helper hashes
+    a path) — and re-reading the package after the bound check would be a second
+    chance for the two reads to disagree.
+  - 15 verifier tests. 1699 workspace tests. All gates green. **DO NOT COMMIT.**
+  - **Not done, and named.** **No extraction**, which is the remaining half of this
+    item and the reason the checkbox stays open: the contract says "verified before
+    extraction" but **never names an archive format**, so the extractor's subject is
+    undecided. Inventing one silently is the mistake this note exists to avoid — the
+    package format is a contract decision, not a first-implementer's convenience.
+    Also absent: install-disabled enforcement (the lifecycle *table* forbids
+    `Verified -> Enabled`, but nothing drives it), staged update/rollback, the
+    disable/remove/retention operations, and any `PluginGrant` store. `ACC-026` needs
+    those plus supervision, so it remains unproven; the verification and
+    manifest-validation halves of it are what now have evidence.
 - [x] `TLS-015` Implement plugin grants, scoped launch environment, process
   supervision, resource limits, health, crash-loop quarantine, and audit. **The
   *grant store* half is done and its consumer is wired — the one seam

@@ -280,21 +280,65 @@ stop; two tests falsified it. The schema dimension is carried by the whole ident
 `carry_forward_to` compares separately, so it is not re-derived in the expansion check. Continuity remains
 an *input*: `TLS-015` may still refuse a carry-forward even when all four conditions hold.
 
+**Package provenance and signature verification** is implemented
+(`jarvis_infrastructure::plugin::verify`) — the gate the contract's *"package bytes are verified before
+extraction or execution"* describes. `PluginManifest::parse` validates the *document*; this module checks
+the *bytes*, and the split is deliberate: a digest string and a signature reference are claims a document
+makes about bytes nobody has looked at yet.
+
+Four checks, and their order is the security property:
+
+1. **the size bound**, before anything is hashed or parsed;
+2. **the signature kind**, refused **by name** when it is not
+   `PACKAGE_SIGNATURE_KIND` (`ed25519-detached`) — a manifest declaring a scheme this build cannot verify
+   must not pass because some *other* scheme happened to verify its bytes, which would be a silent
+   downgrade;
+3. **the digest**, computed from the bytes and compared against the manifest's declared value — the
+   equality is what makes the digest a fact rather than an echo;
+4. **the signature** over the bytes, against a key in a `TrustStore`, with the envelope's algorithm
+   compared against the release primitive's constant so an algorithm downgrade is refused rather than
+   attempted;
+5. **the binding**: the verified key id must be the identity the manifest declares.
+
+**The binding is the check this module exists for.** The threat is not a tampered package with no
+signature — it is a **manifest pointing at another package's honest signature**: the attacker ships bytes
+and a signature they legitimately control, plus a manifest claiming both. Every other check passes in
+isolation. `VerifiedPluginPackage` is therefore built only by
+`PluginPackageVerifier::verify(manifest, bytes, envelope)` — a caller cannot obtain the derived values
+without having supplied the claim they must match — and
+`a_manifest_pointing_at_another_packages_signature_is_refused` is the test that fails when the comparison
+is removed.
+
+`VerifiedPluginPackage::identity_for` is what gives `PluginSourceIdentity` its **first production
+producer**: `package_digest` and `signature_identity` come from the verification rather than the document,
+so an identity describes bytes that were checked. `id`, `publisher`, `version`, and `protocol` remain
+claims taken from the manifest — verification establishes that the bytes are the ones this identity names,
+not that a publisher is honest.
+
+**The signature scheme is JARVIS-defined, and the choice is recorded rather than implied.** The contract's
+example illustrates `"kind":"sigstore-bundle"`, but adopting Sigstore would be a *new external
+integration*, which `AGENTS.md`'s research gate requires current official evidence for before any
+implementation edit. This build instead reuses the primitive the release pipeline already established and
+whose evidence is already accepted: an `Ed25519` signature over the package bytes, a sidecar
+`SignatureEnvelope`, and a compiled-in `TrustStore`. `SignatureReference::kind` stays an open string
+upstream — pinning it in the manifest validator would refuse a kind a future verifier supports — so the
+*verifier* is what refuses an unverifiable kind, by name.
+
 **Not implemented, and each is a named slice:**
 
-- **package provenance and signature verification** (`TLS-014`). The `package` block carries the digest,
-  the signature reference, and the source so a verifier has a typed value to check; **nothing in this
-  module trusts them.** The contract's rule that "package bytes are verified before extraction or
-  execution" is `TLS-014`'s, and the archive traversal/symlink rules (contract test 3) belong beside the
-  extractor that would perform them.
+- **extraction** (`TLS-014`, remaining). The contract's rule is *"verified before extraction"*, and this
+  module is the verification half; the extractor is a separate concern with its own failure modes —
+  symlink and junction targets, permission broadening, reserved device names — which need an archive
+  format **the contract does not name**. Inventing one silently is the mistake this note exists to avoid:
+  the package format is a decision for the contract, not for the first module to need it.
 - **process supervision** (`TLS-015`). The `resource_limits` block is validated here; enforcing a
   timeout, capturing bounded streams, quarantining a crash loop, and revoking a short-lived credential
   are the supervisor's, which does not exist.
 - **installation, grants, and lifecycle** (`TLS-014`/`TLS-015`). The contract's lifecycle states and its
   "installation creates no grant" rule are prose here; no installer, no grant store, and no health
-  transition writer exists. **`PluginManifest::parse` grants nothing** — it produces a validated
-  document, which is exactly what the contract says a parsed manifest is. `PluginGrant` is the *shape* a
-  grant store would persist and `carry_forward_to` the rule it would apply; **no store reads or writes it
-  yet**, so the grant model is the contract's vocabulary with no producer and no consumer — scaffolding in
-  AGENTS.md's sense, stated as such rather than implied to be wired.
+  transition writer exists. **`PluginManifest::parse` grants nothing**, and neither does verification:
+  `VerifiedPluginPackage` is a statement about bytes, not an authorization. `PluginGrant` is the *shape*
+  a grant store would persist and `carry_forward_to` the rule it would apply; **no store reads or writes
+  it yet**, so the grant model remains the contract's vocabulary with no producer and no consumer —
+  scaffolding in AGENTS.md's sense, stated as such rather than implied to be wired.
 
