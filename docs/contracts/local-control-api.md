@@ -628,6 +628,15 @@ Minimum codes:
 | 400 | `run.budget_malformed` | no |
 | 400 | `run.budget_step_timeout_out_of_range` | no |
 | 400 | `run.budget_context_tokens_out_of_range` | no |
+| 400 | `tool.grant_unknown_tool` | no |
+| 400 | `tool.grant_unknown_effect` | no |
+| 400 | `tool.grant_invalid_scope` | no |
+| 400 | `tool.grant_exists` | no |
+| 400 | `tool.grant_scope` | no |
+| 400 | `tool.grant_effect` | no |
+| 400 | `tool.grant_risk_ceiling` | no |
+| 400 | `tool.grant_sensitivity_ceiling` | no |
+| 400 | `tool.deny_rule_invalid` | no |
 | 401 | `auth.credential_rejected` | no |
 | 403 | `api.origin_not_allowed` | no |
 | 403 | `api.forwarded_header_not_allowed` | no |
@@ -640,6 +649,7 @@ Minimum codes:
 | 404 | `resource.not_found` | no |
 | 404 | `approval.not_found` | no |
 | 404 | `model.policy_not_found` | no |
+| 404 | `tool.grant_not_found` | no |
 | 409 | `idempotency.conflict` | no |
 | 409 | `resource.version_conflict` | yes |
 | 409 | `stream.replay_unavailable` | no |
@@ -649,6 +659,7 @@ Minimum codes:
 | 409 | `approval.already_consumed` | no |
 | 409 | `approval.state_conflict` | no |
 | 409 | `jarvis.invalid_policy_layer` | no |
+| 409 | `tool.grant_version_conflict` | yes |
 | 413 | `request.too_large` | no |
 | 415 | `request.media_type_unsupported` | no |
 | 422 | `request.semantic_invalid` | no |
@@ -656,6 +667,7 @@ Minimum codes:
 | 429 | `request.rate_limited` | yes, after declared delay |
 | n/a | `stream.overrun` | yes, immediately |
 | 503 | `service.not_ready` | yes |
+| 503 | `tool.pipeline_unavailable` | yes |
 | 500 | `internal.failure` | conditionally |
 | 500 | `storage.not_found` | no |
 | 500 | `storage.conflict` | no |

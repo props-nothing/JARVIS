@@ -159,28 +159,74 @@ pub trait ToolCatalog: Send + Sync {
     fn capabilities(&self) -> Vec<String>;
 }
 
+/// The future a [`ToolGrantSource`] returns.
+///
+/// A named alias rather than an inline `Pin<Box<dyn Future>>` at each declaration, so the port's two
+/// methods cannot drift into two different shapes — the same reason [`ToolExecutionFuture`] exists.
+pub type GrantReadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GrantRead, RepositoryError>> + Send + 'a>>;
+
+/// What one authorization read found.
+///
+/// **One value for the pair rather than two calls**, and the reason is consistency rather than tidiness:
+/// the grants and the deny rules are read for the same decision, so two independent reads could observe
+/// the store at two instants — with the consequence that a grant written between them would be seen while
+/// its matching deny rule was not. A rule that refuses can only narrow, so the failure is a call refused
+/// that the operator expected to be allowed, or worse the reverse if the reads were ordered the other way.
+/// One read, one instant, one decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRead {
+    /// The grants held by the principal, unscoped beyond principal and workspace.
+    pub grants: Vec<Grant>,
+    /// The deny rules that apply in the workspace.
+    pub deny_rules: Vec<DenyRule>,
+}
+
+impl GrantRead {
+    /// Returns a read that grants nothing and refuses nothing.
+    ///
+    /// The **fail-closed empty**, named rather than written inline so a caller reading a construction site
+    /// can see that nothing was authorized on purpose. It is not a safe default for a source: an adapter
+    /// that returned this on a read failure would report a broken store as a policy that denies everything,
+    /// which is why [`ToolGrantSource::read`] returns a `Result` rather than this value on error.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            grants: Vec::new(),
+            deny_rules: Vec::new(),
+        }
+    }
+}
+
 /// The grants and deny rules in force for one principal in one workspace.
 ///
-/// Deliberately **not** a repository over stored grants: there is no grant store yet (`TLS-015`
-/// owns the plugin grant lifecycle), and inventing a table here would be a second definition of
-/// what a grant is beside the domain's `Grant`. This port is the seam a store will implement, and
-/// today an adapter answers from configuration.
+/// **Asynchronous, because this reads durable state.** The port was synchronous while the only adapter
+/// answered from compiled configuration — an in-process list. `TLS-015`'s grant store makes it a database
+/// read, and the change is the port's rather than the adapter's: an adapter cannot make a synchronous
+/// method asynchronous, so a store behind a synchronous port would have to block a runtime worker thread
+/// (or bridge runtimes, which deadlocks under load). The signature follows the dependency, which is the
+/// same reason `ToolCallRepository` is a port rather than an in-memory map.
+///
+/// It is deliberately **not** a repository over stored grants: choosing which grant matches is the policy
+/// evaluator's job, and a source that pre-filtered could filter wrongly — the argument
+/// `PolicyInputs::grants` records. What an adapter may do is answer the two dimensions it owns, principal
+/// and workspace, and return the rest.
 pub trait ToolGrantSource: Send + Sync {
-    /// Returns the grants held by `principal` in `workspace`.
+    /// Returns the grants and deny rules in force for `principal` in `workspace`.
     ///
-    /// **All** of them, not the matching one: choosing the match is the policy evaluator's job, and
-    /// a source that pre-filtered could filter wrongly — the same argument `PolicyInputs::grants`
-    /// records.
-    fn grants_for(&self, principal: PrincipalId, workspace: WorkspaceId) -> Vec<Grant>;
-
-    /// Returns the deny rules that apply in `workspace`.
+    /// **One method rather than two**, so a decision cannot see a grant written after the deny rules were
+    /// read — see [`GrantRead`] for why that ordering matters.
     ///
-    /// Defaulted to none so an adapter that has no deny rules does not have to write an empty
-    /// method. The **fail-closed direction is unaffected**: an empty deny list does not allow
-    /// anything, because a grant is still required.
-    fn deny_rules(&self, _workspace: WorkspaceId) -> Vec<DenyRule> {
-        Vec::new()
-    }
+    /// It returns **all** the grants, not the matching one: choosing the match is the policy evaluator's
+    /// job, and a source that pre-filtered could filter wrongly — the argument `PolicyInputs::grants`
+    /// records. What an adapter may do is answer the two dimensions it owns, principal and workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError`] when a durable store cannot be read. **A read failure is deliberately
+    /// not "no grants"**: both lead to a refusal, but only one is a transient fault an operator should see,
+    /// and collapsing them would make an unreachable store look like a policy that refuses everything.
+    fn read(&self, principal: PrincipalId, workspace: WorkspaceId) -> GrantReadFuture<'_>;
 }
 
 /// Why an argument document could not be accepted.
@@ -889,8 +935,13 @@ impl ToolCallService {
         let digest = self.fingerprint_of(definition, workspace, principal, arguments)?;
 
         // Step 4: evaluate. Deterministic, pure, and the only authorization layer.
-        let grants = self.grants.grants_for(principal, workspace);
-        let deny_rules = self.grants.deny_rules(workspace);
+        let grants = self
+            .grants
+            .read(principal, workspace)
+            .await
+            .map_err(ToolServiceError::Storage)?;
+        let grants_read = grants.grants;
+        let deny_rules = grants.deny_rules;
         let approvals = self
             .approval_records(workspace, principal, &definition.identity)
             .await?;
@@ -913,7 +964,7 @@ impl ToolCallService {
             },
             &PolicyInputs {
                 now,
-                grants: &grants,
+                grants: &grants_read,
                 approvals: &approvals,
                 deny_rules: &deny_rules,
             },

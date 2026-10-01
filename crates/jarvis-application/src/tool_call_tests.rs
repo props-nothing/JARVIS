@@ -245,8 +245,18 @@ struct Grants {
 }
 
 impl ToolGrantSource for Grants {
-    fn grants_for(&self, _principal: PrincipalId, _workspace: WorkspaceId) -> Vec<Grant> {
-        self.grants.clone()
+    fn read(
+        &self,
+        _principal: PrincipalId,
+        _workspace: WorkspaceId,
+    ) -> crate::tool_call::GrantReadFuture<'_> {
+        let grants = self.grants.clone();
+        Box::pin(async move {
+            Ok(crate::tool_call::GrantRead {
+                grants,
+                deny_rules: Vec::new(),
+            })
+        })
     }
 }
 
@@ -693,12 +703,21 @@ struct DenyingGrants {
 }
 
 impl ToolGrantSource for DenyingGrants {
-    fn grants_for(&self, _principal: PrincipalId, _workspace: WorkspaceId) -> Vec<Grant> {
-        Vec::new()
-    }
-
-    fn deny_rules(&self, _workspace: WorkspaceId) -> Vec<jarvis_domain::tool::policy::DenyRule> {
-        self.rules.clone()
+    fn read(
+        &self,
+        _principal: PrincipalId,
+        _workspace: WorkspaceId,
+    ) -> crate::tool_call::GrantReadFuture<'_> {
+        let rules = self.rules.clone();
+        // The grants are empty and the rules are the fixture's: this double exists to prove the deny rule
+        // is consulted **before** anything else, so it supplies no grant at all — a grant present here
+        // would make the assertion satisfiable by the grant path rather than by the rule.
+        Box::pin(async move {
+            Ok(crate::tool_call::GrantRead {
+                grants: Vec::new(),
+                deny_rules: rules,
+            })
+        })
     }
 }
 

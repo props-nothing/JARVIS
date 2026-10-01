@@ -103,9 +103,14 @@ pub fn definition() -> Result<ToolDefinition, DomainError> {
         "Returns the current UTC instant from the daemon's own clock.",
         vec![Effect::ReadOnly],
         // Low, and the label is honest: reading a clock is not consequential. The policy evaluator
-        // uses it for the read-only-and-low-risk fast path, which is what lets this tool run without
-        // a prompt — the one arm of policy that allows without a grant, and it requires BOTH
-        // conditions rather than either.
+        // uses it for the read-only-and-low-risk fast path, which is what lets this tool be allowed
+        // without a prompt — and it requires BOTH conditions rather than either.
+        //
+        // **The fast path is a condition on the tool's default, not a bypass of the grant step.** The
+        // evaluator resolves a grant at step 3 and refuses `NoGrant` before the default is ever
+        // consulted, so this tool is allowed because `NativeReadOnlyGrants` grants it — not because it
+        // reads a clock. `a_request_with_no_grant_anywhere_is_denied_rather_than_allowed` is the
+        // assertion that holds that line.
         Risk::Low,
         Vec::new(),
         // **`Allow`, and it is the one value the fast path accepts.** Policy's read-only fast path

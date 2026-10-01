@@ -32,6 +32,7 @@ pub mod migrate;
 pub mod repositories;
 pub mod schema;
 pub mod tool_call_repository;
+pub mod tool_grant_repository;
 
 pub use backup::{Backup, create as create_backup, restore as restore_backup};
 pub use connection::{

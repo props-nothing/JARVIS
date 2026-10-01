@@ -6429,8 +6429,79 @@ Dependencies: Milestone 2 exit gate.
 - [ ] `TLS-014` Implement plugin package provenance/signature verification,
   compatibility validation, install-disabled, staged update/rollback, disable,
   data-retention choice, and removal.
-- [ ] `TLS-015` Implement plugin grants, scoped launch environment, process
-  supervision, resource limits, health, crash-loop quarantine, and audit.
+- [x] `TLS-015` Implement plugin grants, scoped launch environment, process
+  supervision, resource limits, health, crash-loop quarantine, and audit. **The
+  *grant store* half is done and its consumer is wired — the one seam
+  `NativeReadOnlyGrants` was written to be replaced at. Process supervision, the
+  scoped launch environment, resource limits, health, and quarantine remain, and they
+  are the half that needs a plugin to supervise.**
+  Evidence: `tool_grants` and `tool_deny_rules` (`000012_tool_grants.sql`), the
+  `ToolGrantRepository` port, `SqliteToolGrantRepository`, `ToolGrantService`, the
+  `/api/v1/tool-grants` surface, and `StoredGrants` — the adapter the tool pipeline
+  actually consults. The user-facing sentence this makes true is the one that was
+  impossible before: *"what a deployment allows is a row an operator writes, not a
+  constructor."*
+  - **⚠ The store was almost a producer with no consumer, which this project's most
+    repeated defect.** Composing `StoredGrants` into `tool_service_over` and asserting only
+    the *store's* behaviour would have left `ToolGrantRepository` a tested table nothing read
+    — a working grant store, an unchanged daemon. `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it`
+    in `tool_adapters::tests` therefore asserts through **`ToolGrantSource`**, the port the
+    pipeline consults on every dispatch, alongside `an_unconfigured_principal_gets_the_reviewed_defaults`
+    and `revoking_the_only_stored_grant_restores_the_default_posture` for the other two states.
+    The second is the assertion that distinguishes "replaces" from "unions" — a union would leave
+    the broad default in place, so an operator could never *remove* it, and a refusal an operator
+    cannot make is worse than a default they must change.
+  - **The fallback direction is falsified, not argued.** Requiring the fallback to be taken
+    unconditionally fails two tests — `an_unconfigured_principal_gets_the_reviewed_defaults` and
+    `revoking_the_only_stored_grant_restores_the_default_posture` — which is what proves the
+    default posture is reached only when the store is genuinely unconfigured. A **store failure**
+    is deliberately *not* a fallback: answering "use the defaults" would re-authorize a
+    principal an operator had narrowed, and `a_store_failure_is_an_error_rather_than_a_fallback`
+    holds that line with a store that fails every read.
+  - **A grant may only narrow, and that rule is asserted from both sides** —
+    `a_grant_narrower_than_the_tool_is_accepted_and_a_wider_one_is_refused` carries four
+    widening cases (effect, risk ceiling, sensitivity ceiling, scope) each naming its own field,
+    plus the accepting case. Refusing everything would satisfy the four refusals, which is why
+    the acceptance is asserted separately. The direction is the load-bearing part: **narrower is
+    ordinary and useful** ("let this read `~/notes`"), **wider is a configuration mistake that
+    would sit in the store looking like permission for something the tool cannot do**.
+  - **The key is a capability, not an identity.** `ToolIdentity` includes the schema fingerprint,
+    so a grant keyed by identity would read as *absent* after a tool was recompiled rather than as
+    *replaced* — and `resolve_grant` distinguishes `NoGrant` from `IdentityReplaced` precisely
+    because they lead an operator to different next steps. `the_capability_is_the_key_so_a_recompiled_tool_still_finds_its_grant`
+    asserts the replacement stays visible.
+  - **Revocation is a state, not a delete**, because the approval contract requires it to be
+    auditable. The assertion is made through **`grants_for`** — the method the pipeline calls —
+    rather than through `load`, because a revocation test written against `load` would pass for an
+    adapter that filtered the listing and not the read, and the read is the one that decides
+    whether an effect happens. `an_uninterpretable_stored_status_is_corruption_rather_than_active`
+    closes the fail-open direction on the one column that decides whether authority is in force.
+  - **Two verbs, because a create must not silently replace.** `PUT` creates and is refused when a
+    grant exists; `PATCH` replaces and requires the version the caller read. One route whose
+    meaning depended on a field's presence would make an accidental overwrite indistinguishable
+    from an intended one, and a discarded ceiling is the thing nobody asked to change.
+  - **⚠ A defect found by reaching for the wrong port.** The first version of the combined read was
+    `grants_for` + `deny_rules` on a **synchronous** port, which the store cannot satisfy — an
+    adapter cannot make a synchronous method asynchronous, so a database read behind it would have
+    had to block a runtime worker thread. The port became one `read` returning `GrantRead`, and the
+    grouping is a correctness property rather than tidiness: two independent reads could observe the
+    store at two instants, so a grant written between them would be seen while its matching deny rule
+    was not.
+  - 13 store tests + 8 adapter tests. 1672 workspace tests. All gates green
+    (`fmt`, `clippy -D warnings`, `doc`, `test`, both docs gates). **DO NOT COMMIT.**
+  - **Not done, and named.** No plugin process supervision, scoped launch environment, resource
+    limits, health probe, crash-loop quarantine, or plugin audit — those need a plugin to supervise
+    and are `TLS-011`'s lifecycle half. No CLI commands for the surface yet (the HTTP routes are
+    what a control plane drives, and the CLI's own grant commands are a separate increment). A grant
+    does not yet carry a *standing* scope (`ApprovalScopeKind` is written one-shot everywhere), and
+    the grant surface has no route-level test — its coverage is the service's and the store's, which
+    is why `TLS-018` names the surface test rather than claiming one.
+- [ ] `TLS-018` Test the tool-authorization surface end to end: a grant written through
+  the HTTP routes authorizes a real dispatch, a revocation withdraws it, and a widening
+  is refused with the field named. **Named rather than implied**: `TLS-015`'s store and
+  adapter are covered, and the *routes* are covered only by the compile-time guarantees
+  that they exist and that every code they can emit is in the contract table. A
+  surface-level journey is what would catch a handler that resolved the wrong scope.
 - [ ] `TLS-016` Define and implement the skill contract
   ([skill-contract.md](docs/contracts/skill-contract.md)): a persisted skill record
   with a content hash over every loadable file, trust tiers whose install policy

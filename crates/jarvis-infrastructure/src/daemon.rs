@@ -234,6 +234,14 @@ pub struct RunningDaemon {
     /// root is the layer unit tests are structurally blind to: a daemon that never attached this service
     /// would answer `service.not_ready` to every real client while every handler test passed.
     approvals: Arc<jarvis_application::approval_service::ApprovalService>,
+    /// The tool-authorization surface's use cases.
+    ///
+    /// **Built over the same catalog the tool pipeline resolves against**, so a grant an operator writes
+    /// names a definition the executor can actually dispatch — two catalogs would let a grant be stored for
+    /// a tool no call can reach, which reads as authority and confers nothing. Composed here for the reason
+    /// `approvals` records: the composition root is where a missing service is invisible to a handler test
+    /// and visible to every real client.
+    tool_grants: Arc<jarvis_application::tool_grant_service::ToolGrantService>,
     recovery: RecoverySummary,
     /// What the tool-call recovery pass settled.
     ///
@@ -331,7 +339,8 @@ impl RunningDaemon {
             )
             .with_runs(Arc::clone(&self.runs))
             .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory))
-            .with_approvals(Arc::clone(&self.approvals)),
+            .with_approvals(Arc::clone(&self.approvals))
+            .with_tool_grants(Arc::clone(&self.tool_grants)),
         ))
     }
 
@@ -526,12 +535,16 @@ pub async fn start(
         .delivery_campaigns(DEFAULT_WORKSPACE)
         .await
         .unwrap_or_default();
+    // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_over` for why
+    // composing it twice would let a grant written through one surface be invisible to the pipeline the
+    // other resolves against.
+    let (tools, tool_grants) = tool_fabric_over(database.pool().clone())?;
     let ports = run_ports(
         Arc::clone(&repositories),
         delivery_campaigns.clone(),
         config.provider.clone(),
-        database.pool().clone(),
-    )?;
+        tools,
+    );
     let report = jarvis_application::recovery::reconcile(
         &ports.runs,
         crate::time::SystemClock::new()
@@ -552,37 +565,13 @@ pub async fn start(
     }
     let recovery = report.summary;
 
-    // **The tool-call pass runs in the same window as the run pass, and for the same reason.** A call
-    // that reached the provider and then lost its daemon stayed `EXECUTING` for ever, and the next
-    // attempt's reservation found it and answered `InFlight` — telling a caller to wait on a process that
-    // is gone. Recovery converts that dead in-flight call into a `RECONCILING` work item, which is the
-    // state that says "the outcome is unknown and must be established before this is repeated".
-    //
-    // It cannot run before the run pass, because the two are independent and ordering them would imply a
-    // dependency that does not exist. It runs before readiness for the reason the run pass does: readiness
-    // is defined as "recovery classification completed", and a client reaching a daemon that has not
-    // settled its stranded calls would be told to wait on them.
-    //
-    // The ledger repository is its own value because the ledger port is implemented by
-    // `SqliteToolCallRepository` rather than by `SqliteRepositories` — a separate struct so the tool-call
-    // storage can be handed to a caller without the whole repository bundle, and built over the same pool
-    // so both see one database.
-    let ledger: Arc<dyn jarvis_application::repository::tool_call::ToolCallRepository> = Arc::new(
-        crate::storage::tool_call_repository::SqliteToolCallRepository::new(
-            database.pool().clone(),
-        ),
-    );
-    let tool_report = jarvis_application::tool_recovery::reconcile_tool_calls(
-        &ledger,
-        crate::time::SystemClock::new()
-            .now()
-            .map_err(|_| StartupError::Recovery)?,
-    )
-    .await
-    .map_err(|_| StartupError::Recovery)?;
-    if tool_report.incomplete_store {
-        return Err(StartupError::Recovery);
-    }
+    // **The tool-call pass runs in the same window as the run pass, and for the same reason.** A call that
+    // reached the provider and then lost its daemon stayed `EXECUTING` for ever, and the next attempt's
+    // reservation found it and answered `InFlight` — telling a caller to wait on a process that is gone.
+    // Recovery converts that dead in-flight call into a `RECONCILING` work item, which is the state that
+    // says "the outcome is unknown and must be established before this is repeated". See
+    // `reconcile_tool_calls_over` for why it runs here and why an incomplete store is a failed startup.
+    let tool_report = reconcile_tool_calls_over(&database).await?;
 
     // 5. Publish discovery before readiness, so a ready daemon is always
     // discoverable.
@@ -641,6 +630,11 @@ pub async fn start(
     // approval composition is one concern and reads better named.
     let approvals = approval_service_over(&database);
 
+    // **The tool pipeline and its authorization surface, over one catalog.** Both are composed by
+    // `tool_fabric_over`, and both are attached: a pipeline without the surface could not be configured
+    // by a client, and a surface without the pipeline would write grants nothing reads. Returns the pair
+    // because neither is meaningful alone — which is the whole reason the grant store exists.
+
     Ok(RunningDaemon {
         listener,
         discovery_path: config.discovery_path(),
@@ -651,6 +645,7 @@ pub async fn start(
         policies,
         inventory,
         approvals,
+        tool_grants,
         recovery,
         tool_recovery: tool_report,
         guard,
@@ -699,8 +694,8 @@ fn run_ports(
     repositories: Arc<SqliteRepositories>,
     delivery_campaigns: Vec<jarvis_application::repository::model_call::ModelDeliverySamples>,
     provider: Option<Arc<dyn jarvis_application::model::ModelProvider>>,
-    pool: sqlx::SqlitePool,
-) -> Result<jarvis_application::run_service::RunPorts, StartupError> {
+    tools: Arc<jarvis_application::tool_call::ToolCallService>,
+) -> jarvis_application::run_service::RunPorts {
     use jarvis_application::run_service::RunPorts;
 
     // A configured provider is used as-is; otherwise the deterministic default. The fallback is
@@ -710,7 +705,7 @@ fn run_ports(
     let provider: Arc<dyn jarvis_application::model::ModelProvider> =
         provider.unwrap_or_else(|| Arc::new(crate::model_providers::scripted_provider()));
 
-    Ok(RunPorts {
+    RunPorts {
         runs: Arc::clone(&repositories)
             as Arc<dyn jarvis_application::repository::run::RunRepository>,
         conversations: Arc::clone(&repositories)
@@ -730,18 +725,16 @@ fn run_ports(
                 as Arc<dyn jarvis_application::repository::policy::ModelDataPolicyRepository>,
         ),
         delivery_campaigns,
-        // **The tool pipeline, composed from the daemon's own catalog and stores.**
+        // **The tool pipeline, composed by the caller and shared with the authorization surface.**
         //
-        // This is what turns the tool fabric from a set of tested values into a capability the
-        // daemon exercises: before this, `ToolRegistry`, `ToolSchema`, and `action_fingerprint` had
-        // no production caller and every run's tool intent ended `run.tools_not_implemented`. The
-        // composition is the whole of `tool_service_over`, and it is done here rather than inside a
-        // route handler so the same pipeline serves every surface.
-        tools: Some(tool_service_over(
-            pool,
-            Arc::new(crate::time::SystemClock::new()),
-        )?),
-    })
+        // This is what turns the tool fabric from a set of tested values into a capability the daemon
+        // exercises: before it, `ToolRegistry`, `ToolSchema`, and `action_fingerprint` had no production
+        // caller and every run's tool intent ended `run.tools_not_implemented`. It is passed in rather than
+        // built here so the pipeline a run dispatches through and the catalog a grant is written against are
+        // the **same** value — composing it twice would give the two a catalog each, and a grant written
+        // through one surface would be invisible to the pipeline the other resolves against.
+        tools: Some(tools),
+    }
 }
 
 /// Builds the governed tool-call pipeline over the daemon's catalog and stores.
@@ -750,25 +743,55 @@ fn run_ports(
 /// native tools, the ledger and approvals are the SQLite stores, and the validator and hasher are
 /// the two functions that had no production caller. Nothing here is a double.
 ///
-/// The grants source **denies everything it cannot show a grant for**, and the one tool this build
-/// ships is allowed anyway because the domain's policy grants the low-risk read-only fast path
-/// without a grant. So a consequential tool added later is *refused until a grant is configured* —
-/// the fail-closed direction — rather than permitted because no grant store exists yet.
+/// **What authorizes a tool, and the correction this paragraph needed.** The grant source emits a
+/// reviewed grant **only** for a native, low-risk, read-only definition — and a grant is not optional:
+/// the evaluator resolves one at step 3 and refuses the call `NoGrant` when none applies, before the
+/// tool's declared default is ever consulted. So the `Allow` hint these tools declare is reachable
+/// **only through** the grant, and an earlier version of this doc claimed the opposite — that the
+/// domain "grants the low-risk read-only fast path without a grant", which
+/// `a_request_with_no_grant_anywhere_is_denied_rather_than_allowed` falsifies. The fast path is a
+/// *condition on the default*, not a bypass of the grant step.
+///
+/// Two consequences an operator should read off that: this build's only tool (`clock.now@1`) is
+/// allowed because `NativeReadOnlyGrants` grants it, not because it reads a clock; and a
+/// consequential tool added later is refused outright until a grant exists **and** is asked about
+/// when one does.
+///
+/// **And the third consequence, which is the point of this round: that default is now configurable.**
+/// The reviewed grants are the *unconfigured posture*, and a stored grant replaces them for its
+/// principal — so "always ask about `email.send`, never ask about `clock.now`" is a row an operator
+/// writes through the control plane rather than a constructor somebody changes. See
+/// `tool_adapters::StoredGrants` for why an empty store falls back rather than denying everything, and
+/// why a store *failure* is an error rather than a fallback.
+///
+/// # Why this returns a pair
+///
+/// The pipeline and its authorization surface are composed from **one** catalog and one pool, and
+/// neither is meaningful alone: a pipeline without the surface is unconfigurable, and a surface without
+/// the pipeline writes grants nothing reads. Returning them together is what makes that dependency
+/// structural rather than a comment, and it is why this replaced `tool_service_over`.
 ///
 /// # Errors
 ///
 /// Returns [`StartupError`] when a reviewed native definition is inconsistent. That is a
 /// packaging fault rather than a runtime one, and refusing startup is right: a daemon whose catalog
 /// cannot be built would answer every tool call `tool.not_found` while appearing healthy.
-fn tool_service_over(
+fn tool_fabric_over(
     pool: sqlx::SqlitePool,
-    clock: Arc<dyn jarvis_domain::clock::Clock>,
-) -> Result<Arc<jarvis_application::tool_call::ToolCallService>, StartupError> {
+) -> Result<
+    (
+        Arc<jarvis_application::tool_call::ToolCallService>,
+        Arc<jarvis_application::tool_grant_service::ToolGrantService>,
+    ),
+    StartupError,
+> {
     use crate::tool_adapters::{
-        FingerprintHasher, NativeReadOnlyGrants, RegistryCatalog, SchemaValidator,
+        FingerprintHasher, NativeReadOnlyGrants, RegistryCatalog, SchemaValidator, StoredGrants,
     };
     use jarvis_application::tool_call::ToolCallService;
+    use jarvis_application::tool_grant_service::ToolGrantService;
 
+    let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
     let definitions = crate::native_tools::definitions().map_err(|_| {
         // A construction refusal from a reviewed definition is a packaging defect, reported as a
         // config fault so an operator knows to look at the build rather than at the request.
@@ -785,21 +808,25 @@ fn tool_service_over(
             input_schema: Some(tool.input_schema),
         })
         .collect();
-    let catalog = RegistryCatalog::new(
-        tools
-            .iter()
-            .map(|tool| (tool.definition.clone(), tool.input_schema.clone())),
-    );
+    let catalog =
+        Arc::new(RegistryCatalog::new(tools.iter().map(|tool| {
+            (tool.definition.clone(), tool.input_schema.clone())
+        })));
     // A reviewed grant is emitted **only** for a native, low-risk, read-only definition, and its own
-    // ceilings restate those bounds so the evaluator re-checks them per call. See
-    // `NativeReadOnlyGrants` for why the daemon must hold a grant at all rather than relying on the
-    // read-only fast path.
-    let grants = NativeReadOnlyGrants::new(tools);
+    // ceilings restate those bounds so the evaluator re-checks them per call.
+    let defaults = NativeReadOnlyGrants::new(tools.clone());
+    // **One store handle, shared by the source and the surface.** The source reads it on every dispatch
+    // and the surface writes it from a client, so a second handle would let the two disagree about what
+    // is configured — the same argument the catalog's single list records.
+    let store: Arc<dyn jarvis_application::repository::tool_grant::ToolGrantRepository> = Arc::new(
+        crate::storage::tool_grant_repository::SqliteToolGrantRepository::new(pool.clone()),
+    );
+    let grants = StoredGrants::new(Arc::clone(&store), defaults, &tools);
     let executor = crate::native_tools::NativeExecutor::new(Arc::clone(&clock));
     let ledger = crate::storage::tool_call_repository::SqliteToolCallRepository::new(pool.clone());
     let approvals = crate::storage::approval_repository::SqliteApprovalRepository::new(pool);
-    Ok(Arc::new(ToolCallService::new(
-        Arc::new(catalog),
+    let pipeline = Arc::new(ToolCallService::new(
+        Arc::clone(&catalog) as Arc<dyn jarvis_application::tool_call::ToolCatalog>,
         Arc::new(grants),
         Arc::new(SchemaValidator::new()),
         Arc::new(FingerprintHasher::new()),
@@ -807,7 +834,51 @@ fn tool_service_over(
         Arc::new(ledger),
         Arc::new(approvals),
         clock,
-    )))
+    ));
+    // The surface resolves against **the catalog the pipeline dispatches through**, which is what makes
+    // "a grant names a tool that can actually run" a property of the composition rather than of two lists
+    // being kept in step.
+    let surface = Arc::new(ToolGrantService::new(store, catalog));
+    Ok((pipeline, surface))
+}
+
+/// Settles the tool calls left stranded by the previous shutdown.
+///
+/// **The pass cannot run before the run pass, because the two are independent** — ordering them would imply
+/// a dependency that does not exist. It runs **before readiness** for the reason the run pass does:
+/// readiness is defined as "recovery classification completed", and a client reaching a daemon that has not
+/// settled its stranded calls would be told to wait on them.
+///
+/// The ledger repository is its own value because the ledger port is implemented by
+/// `SqliteToolCallRepository` rather than by `SqliteRepositories` — a separate struct so the tool-call
+/// storage can be handed to a caller without the whole repository bundle — and it is built over the same
+/// pool so both see one database.
+///
+/// # Errors
+///
+/// Returns [`StartupError::Recovery`] when the clock cannot report, the scan cannot be read, or the store
+/// was **not fully settled**. The last is a failed startup rather than a warning because a run left behind
+/// is one nothing else will look at: readiness claims recovery completed, and it has not.
+async fn reconcile_tool_calls_over(
+    database: &crate::storage::connection::Database,
+) -> Result<jarvis_application::tool_recovery::ToolRecoveryReport, StartupError> {
+    let ledger: Arc<dyn jarvis_application::repository::tool_call::ToolCallRepository> = Arc::new(
+        crate::storage::tool_call_repository::SqliteToolCallRepository::new(
+            database.pool().clone(),
+        ),
+    );
+    let report = jarvis_application::tool_recovery::reconcile_tool_calls(
+        &ledger,
+        crate::time::SystemClock::new()
+            .now()
+            .map_err(|_| StartupError::Recovery)?,
+    )
+    .await
+    .map_err(|_| StartupError::Recovery)?;
+    if report.incomplete_store {
+        return Err(StartupError::Recovery);
+    }
+    Ok(report)
 }
 
 /// Formats the loopback base URL for a bound address.

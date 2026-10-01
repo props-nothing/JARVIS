@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod error;
 pub mod policy;
 pub mod run;
+pub mod tool_grant;
 
 pub use approval::{
     ApprovalDecisionResponse, ApprovalListView, ApprovalView, CancelApprovalRequest,
@@ -29,4 +30,8 @@ pub use run::{
     MAX_CANCEL_REASON_BYTES, MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME,
     RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunInput, RunLimitsView, RunLinks,
     RunUsageView, RunView, SseEvent, event_type,
+};
+pub use tool_grant::{
+    DenyRuleCreatedView, DenyRuleView, GrantView, ToolDenyRuleListView, ToolGrantListView,
+    WriteDenyRuleRequest, WriteToolGrantRequest,
 };

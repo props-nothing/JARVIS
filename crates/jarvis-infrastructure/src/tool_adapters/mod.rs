@@ -23,15 +23,18 @@
 //! disagree, and the hasher is the only producer of the digest an approval binds to.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use jarvis_application::repository::tool_grant::{StoredDenyRule, ToolGrantRepository};
 use jarvis_application::tool_call::{
-    ActionFingerprint, ResolvedTool, ToolArgumentRefusal, ToolArgumentValidator, ToolCatalog,
-    ToolGrantSource,
+    ActionFingerprint, GrantRead, ResolvedTool, ToolArgumentRefusal, ToolArgumentValidator,
+    ToolCatalog, ToolGrantSource,
 };
 use jarvis_domain::ids::{PrincipalId, WorkspaceId};
 use jarvis_domain::tool::call::ToolArguments;
 use jarvis_domain::tool::canonical::{ActionDigest, FingerprintInput};
 use jarvis_domain::tool::definition::ToolDefinition;
+use jarvis_domain::tool::identity::ToolIdentity;
 use jarvis_domain::tool::policy::{DenyRule, Grant};
 
 use crate::tool_fingerprint::action_fingerprint;
@@ -156,23 +159,26 @@ impl ConfiguredGrants {
 }
 
 impl ToolGrantSource for ConfiguredGrants {
-    fn grants_for(&self, principal: PrincipalId, workspace: WorkspaceId) -> Vec<Grant> {
+    fn read(
+        &self,
+        principal: PrincipalId,
+        workspace: WorkspaceId,
+    ) -> jarvis_application::tool_call::GrantReadFuture<'_> {
         // Filtered by the two dimensions the *source* can decide, and no further: the identity, the
         // scopes, the effects, and the ceiling are the evaluator's to match, and pre-matching them
         // here would be a second authorization rule beside the domain's — the defect the policy
         // module's own doc names.
-        self.grants
+        let grants = self
+            .grants
             .iter()
             .filter(|grant| grant.principal == principal && grant.workspace == workspace)
             .cloned()
-            .collect()
-    }
-
-    fn deny_rules(&self, _workspace: WorkspaceId) -> Vec<DenyRule> {
+            .collect();
         // A deny rule may name no workspace at all, in which case it applies everywhere, so
         // filtering by workspace here would drop the broadest refusals — the direction that loses a
         // restriction. The evaluator already treats an unnamed dimension as "not a constraint".
-        self.deny_rules.clone()
+        let deny_rules = self.deny_rules.clone();
+        Box::pin(async move { Ok(GrantRead { grants, deny_rules }) })
     }
 }
 
@@ -264,8 +270,13 @@ impl NativeReadOnlyGrants {
 }
 
 impl ToolGrantSource for NativeReadOnlyGrants {
-    fn grants_for(&self, principal: PrincipalId, workspace: WorkspaceId) -> Vec<Grant> {
-        self.tools
+    fn read(
+        &self,
+        principal: PrincipalId,
+        workspace: WorkspaceId,
+    ) -> jarvis_application::tool_call::GrantReadFuture<'_> {
+        let grants: Vec<Grant> = self
+            .tools
             .iter()
             .filter(|tool| Self::qualifies(&tool.definition))
             .map(|tool| Grant {
@@ -288,11 +299,167 @@ impl ToolGrantSource for NativeReadOnlyGrants {
                 // domain's own `Grant::expires_at` doc names as legitimate.
                 expires_at: None,
             })
-            .collect()
+            .collect();
+        let deny_rules = self.deny_rules.clone();
+        // Answered without an await, because the reviewed grants are compiled configuration — an
+        // in-process list. The async signature is the port's, so this adapter pays one boxing per call
+        // and no I/O, which is the right trade for a source that will be replaced by the store.
+        Box::pin(async move { Ok(GrantRead { grants, deny_rules }) })
+    }
+}
+
+/// A grant source over the durable grant store, with the reviewed grants as a fallback.
+///
+/// **This is the adapter that makes tool authorization configurable**, and the sentence it exists to make
+/// true is the user-facing one: *what a deployment allows is a row an operator can write, not a
+/// constructor.* Before it, `NativeReadOnlyGrants` was the only source, so "always ask about `email.send`
+/// but never ask about `clock.now`" could be expressed only by changing code.
+///
+/// # The fallback, stated explicitly because it is a policy decision rather than an oversight
+///
+/// A stored grant **replaces** the reviewed defaults for that principal; with none stored, the defaults
+/// apply. The rule is chosen rather than incidental, and both alternatives are worse:
+///
+/// - **"Stored grants only"** would make a fresh profile allow nothing at all — including the daemon's own
+///   read-only clock tool — so a new install's first tool call would be refused with `NoGrant` and the
+///   only way to fix it would be to author a grant before the product worked. That reads as a broken
+///   install rather than as a policy.
+/// - **"Union of both"** would make the reviewed grants unauditable: an operator who wrote a narrow grant
+///   for `clock.now` could not *remove* the broad default, because the default would still be there — and
+///   a refusal an operator cannot make is worse than a default they have to change.
+///
+/// So the reviewed grants are the **default posture of an unconfigured principal**, and the first stored
+/// grant switches that principal to explicit configuration. The transition is per-principal, so two
+/// principals of one workspace are configured independently.
+///
+/// # A store failure is an error, not a fallback
+///
+/// The read is propagated rather than degraded, and the direction matters: answering "use the defaults"
+/// when the store is unreachable would **re-authorize** a principal an operator had narrowed, and
+/// answering "nothing" would refuse work they had configured. Neither is true, so the call is reported as
+/// a storage fault — an operator sees a broken store, which is what it is.
+pub struct StoredGrants {
+    store: Arc<dyn ToolGrantRepository>,
+    defaults: NativeReadOnlyGrants,
+    /// The catalog's identities, grouped by capability.
+    ///
+    /// **Needed because a stored deny rule names a capability and the evaluator compares identities.** A
+    /// rule that refused "every tool with the `destructive` effect" is stored by effect alone and needs no
+    /// expansion, but a rule naming one capability must become one rule per identity that currently offers
+    /// it — and a capability nothing offers expands to nothing, correctly, because a refusal for a tool
+    /// that is not installed has no call to refuse.
+    ///
+    /// Grouping here rather than querying the catalog per rule keeps the conversion a pure function of
+    /// values, and it means the expansion sees **the same definitions the catalog resolves** — a second
+    /// list would let a rule refuse an identity the daemon can no longer dispatch, which reads as a
+    /// refusal that does nothing.
+    identities_by_capability: BTreeMap<String, Vec<ToolIdentity>>,
+}
+
+impl StoredGrants {
+    /// Builds a source over the store, with `defaults` as the unconfigured posture.
+    ///
+    /// Takes the tools as well as the store because the deny-rule conversion needs the catalog's
+    /// identities; see [`Self::identities_by_capability`] for why the expansion cannot be done from the
+    /// rule alone.
+    #[must_use]
+    pub fn new(
+        store: Arc<dyn ToolGrantRepository>,
+        defaults: NativeReadOnlyGrants,
+        tools: &[ResolvedTool],
+    ) -> Self {
+        let mut identities_by_capability: BTreeMap<String, Vec<ToolIdentity>> = BTreeMap::new();
+        for tool in tools {
+            identities_by_capability
+                .entry(tool.definition.identity.capability.to_string())
+                .or_default()
+                .push(tool.definition.identity.clone());
+        }
+        Self {
+            store,
+            defaults,
+            identities_by_capability,
+        }
     }
 
-    fn deny_rules(&self, _workspace: WorkspaceId) -> Vec<DenyRule> {
-        self.deny_rules.clone()
+    /// Expands one stored rule into the rules the evaluator can apply.
+    ///
+    /// Three shapes, and each is a different statement:
+    ///
+    /// - **a capability and effects** — one rule per identity offering that capability, each carrying the
+    ///   effects, so the refusal is scoped to the tool the operator named *and* the effects they named;
+    /// - **a capability alone** — one rule per identity offering it, with no effect constraint, which
+    ///   refuses that tool entirely;
+    /// - **no capability** — the rule already names only principal, workspace, and effects, which are the
+    ///   dimensions the domain's `DenyRule` carries, so it is passed through unchanged. This is the "refuse
+    ///   every destructive tool" form and it must not be expanded, or it would become a rule per tool.
+    fn expand_rule(&self, stored: StoredDenyRule) -> Vec<DenyRule> {
+        let Some(capability) = stored.capability.as_deref() else {
+            return vec![stored.rule];
+        };
+        let Some(identities) = self.identities_by_capability.get(capability) else {
+            // **A capability no installed tool offers refuses nothing, and dropping it is the honest
+            // reading.** The alternative — keeping a rule with no identity — would be a rule the
+            // evaluator's own `matches` reports as naming nothing, which is the same outcome reached by a
+            // path a reader cannot check, and it would also be *invisible* in the listing as an active
+            // refusal. An operator sees the rule they wrote; a rule for an uninstalled tool simply has no
+            // effect until the tool is installed.
+            return Vec::new();
+        };
+        identities
+            .iter()
+            .map(|identity| DenyRule {
+                identity: Some(identity.clone()),
+                principal: stored.rule.principal,
+                workspace: stored.rule.workspace,
+                effects: stored.rule.effects.clone(),
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for StoredGrants {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The store is not printed: it holds a connection pool, and the interesting fact is the type.
+        formatter
+            .debug_struct("StoredGrants")
+            .field("default_tools", &self.defaults.granted_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolGrantSource for StoredGrants {
+    fn read(
+        &self,
+        principal: PrincipalId,
+        workspace: WorkspaceId,
+    ) -> jarvis_application::tool_call::GrantReadFuture<'_> {
+        Box::pin(async move {
+            // **One instant for both reads.** The grants and the deny rules are read for one decision, and
+            // two independent reads could observe the store at two instants — a grant written between them
+            // would be seen while its matching refusal was not. `GrantRead` exists to make that
+            // unrepresentable, so the pair is assembled here rather than returned as two calls.
+            let grants = self.store.grants_for(workspace, principal).await?;
+            // The stored rules are capability-keyed, and the evaluator compares identities — so a rule
+            // naming a capability must be narrowed to the identities that currently offer it. The
+            // defaults' own rules are already identity-shaped.
+            let mut deny_rules = self.defaults.deny_rules.clone();
+            for stored in self.store.deny_rules(workspace).await? {
+                deny_rules.extend(self.expand_rule(stored));
+            }
+            // The stored grants **replace** the defaults for this principal; see the type's doc.
+            let grants = if grants.is_empty() {
+                // Answered through the trait so the defaults and the store cannot build a grant two
+                // different ways — a second construction site is how the two would drift about expiry.
+                match self.defaults.read(principal, workspace).await {
+                    Ok(read) => read.grants,
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                grants
+            };
+            Ok(GrantRead { grants, deny_rules })
+        })
     }
 }
 
@@ -382,3 +549,7 @@ impl ActionFingerprint for FingerprintHasher {
         action_fingerprint(input)
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

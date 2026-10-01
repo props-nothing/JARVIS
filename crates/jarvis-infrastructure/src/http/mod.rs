@@ -26,7 +26,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, get, post};
+use axum::routing::{MethodRouter, delete, get, patch, post, put};
 use axum::{Json, Router};
 use jarvis_application::model::ModelProvider;
 use jarvis_application::policy_service::PolicyService;
@@ -42,6 +42,7 @@ use crate::auth::credential::CredentialError;
 pub mod approval;
 pub mod policy;
 pub mod runs;
+pub mod tool_grant;
 
 pub use runs::{RequestScope, resolve_scope, wire_state};
 
@@ -148,6 +149,13 @@ pub struct ApiState {
     /// Optional for the same reason the two above are, and the routes are routable without it so a
     /// client receives `service.not_ready` rather than the unknown-route refusal.
     pub approvals: Option<Arc<jarvis_application::approval_service::ApprovalService>>,
+    /// The tool-authorization surface's service, absent when no storage is configured.
+    ///
+    /// **This is what makes tool authorization configurable from a client**, which is the whole point of
+    /// the grant store: without a surface, an operator's only way to change what the daemon allows would be
+    /// a database console. Optional for the same reason the three above are, and routable without it so a
+    /// client receives `service.not_ready` rather than the unknown-route refusal.
+    pub tool_grants: Option<Arc<jarvis_application::tool_grant_service::ToolGrantService>>,
     /// The candidate inventory an effective-route probe evaluates.
     ///
     /// Absent when no provider is configured, because a probe with no candidates would report
@@ -290,6 +298,7 @@ impl ApiState {
             runs: None,
             policies: None,
             approvals: None,
+            tool_grants: None,
             inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -343,6 +352,16 @@ impl ApiState {
         approvals: Arc<jarvis_application::approval_service::ApprovalService>,
     ) -> Self {
         self.approvals = Some(approvals);
+        self
+    }
+
+    /// Attaches the tool-authorization surface's service.
+    #[must_use]
+    pub fn with_tool_grants(
+        mut self,
+        tool_grants: Arc<jarvis_application::tool_grant_service::ToolGrantService>,
+    ) -> Self {
+        self.tool_grants = Some(tool_grants);
         self
     }
 
@@ -520,6 +539,45 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route(
             "/api/v1/approvals/{approval_id}/cancel",
             authenticated(post(approval::cancel_approval)),
+        )
+        // **The tool-authorization surface.** Routable without storage, like the four above, so a client
+        // receives `service.not_ready` rather than the unknown-route refusal — and this is what makes tool
+        // authorization configurable from a control plane rather than only from a database console.
+        //
+        // The deny-rule routes come **before** the `{grant_id}` route, because `deny-rules` would otherwise
+        // be captured as a grant identifier: `axum` matches in declaration order, and a path segment that
+        // happens to look like a resource is the classic way a literal route becomes unreachable.
+        .route(
+            "/api/v1/tool-grants",
+            authenticated(get(tool_grant::list_tool_grants)),
+        )
+        .route(
+            "/api/v1/tool-grants",
+            authenticated(put(tool_grant::create_tool_grant)),
+        )
+        .route(
+            "/api/v1/tool-grants",
+            authenticated(patch(tool_grant::replace_tool_grant)),
+        )
+        .route(
+            "/api/v1/tool-grants/deny-rules",
+            authenticated(get(tool_grant::list_deny_rules)),
+        )
+        .route(
+            "/api/v1/tool-grants/deny-rules",
+            authenticated(post(tool_grant::add_deny_rule)),
+        )
+        .route(
+            "/api/v1/tool-grants/deny-rules/{rule_id}",
+            authenticated(delete(tool_grant::remove_deny_rule)),
+        )
+        .route(
+            "/api/v1/tool-grants/{grant_id}",
+            authenticated(get(tool_grant::read_tool_grant)),
+        )
+        .route(
+            "/api/v1/tool-grants/{grant_id}/revoke",
+            authenticated(post(tool_grant::revoke_tool_grant)),
         )
         .fallback(unknown_route)
         .layer(middleware::from_fn(reject_browser_origin))
@@ -1149,6 +1207,10 @@ fn production_codes_from_services(
         // itself. Four of the six had no table row, so a client meeting one on a `500` was reading a
         // code this contract does not list.
         "repository/mod.rs",
+        // **The tool-authorization surface's service**, whose `tool.grant_*`, `tool.deny_rule_invalid`,
+        // `tool.pipeline_unavailable`, and `storage.query_failed` values reach a client directly — one code
+        // per refusal shape, which is the point of the enum rather than a flattened `request.invalid`.
+        "tool_grant_service.rs",
     ] {
         let path = repository.join("crates/jarvis-application/src").join(name);
         // `expect` rather than `panic!`: the workspace denies `panic` even in a test, because a
@@ -4592,8 +4654,8 @@ pub(crate) mod tests {
         let repository = repository_root();
         let (mut carried, service_modules) = super::production_codes_from_services(&repository);
         assert_eq!(
-            service_modules, 4,
-            "all four code-producing modules must be scanned"
+            service_modules, 5,
+            "all five code-producing modules must be scanned"
         );
         assert!(
             carried.len() >= 20,
@@ -5368,13 +5430,14 @@ pub(crate) mod tests {
     /// silently stopped matching. Both are asserted here rather than at each call site so a new
     /// caller cannot forget one.
     ///
-    /// The count is `4`, not "the three services": `repository/mod.rs` is a fourth producer of the
-    /// same kind, and asserting a number rather than a constant is deliberate — adding a file to the
-    /// scan without updating this fails loudly, which is how the omission was noticed.
+    /// The count is `5`, and asserting a **number** rather than a constant is deliberate: adding a file to
+    /// the scan without updating this fails loudly, which is how the omission was noticed. The five are the
+    /// three services plus `repository/mod.rs` (which owns `storage.*`) and `tool_grant_service.rs` (which
+    /// owns `tool.grant_*`).
     fn carried_codes() -> std::collections::BTreeSet<String> {
         let (carried, service_modules) = super::production_codes_from_services(&repository_root());
         assert_eq!(
-            service_modules, 4,
+            service_modules, 5,
             "every code-producing module must be scanned"
         );
         assert!(
@@ -5429,11 +5492,12 @@ pub(crate) mod tests {
         // The scan's list, kept here as literals so this test fails if the list and its own doc
         // disagree — reading it from the scanner would make this check assert the scanner against
         // itself.
-        const SCANNED: [&str; 4] = [
+        const SCANNED: [&str; 5] = [
             "approval_service.rs",
             "policy_service.rs",
             "run_service.rs",
             "repository/mod.rs",
+            "tool_grant_service.rs",
         ];
         // The exclusions, each with the fact that decides it. `run_controller.rs` and `model.rs` are
         // the two that carry a client-visible code onto a *field* rather than an envelope; the other

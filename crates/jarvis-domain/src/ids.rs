@@ -241,6 +241,24 @@ identifier!(
      not express an approval that was requested before its call existed."
 );
 
+identifier!(
+    ToolGrantId,
+    "tool_grant",
+    "Identifies one durable, operator-configured tool grant. It needs an identity of its \
+     own rather than being named by the tool it grants, because a grant is *revoked* and a \
+     revocation is bound to the exact grant version it withdraws — revoking 'the file read \
+     grant' would be ambiguous the moment the grant was edited, and an operator withdrawing \
+     one configuration must not silently withdraw a replacement they had not read."
+);
+identifier!(
+    ToolDenyRuleId,
+    "tool_deny_rule",
+    "Identifies one durable deny rule. A refusal must be removable by naming it, and naming \
+     it by its contents would make two rules with the same fields indistinguishable — so \
+     removing one would remove both, which is the direction that silently restores an \
+     authority an operator had refused."
+);
+
 /// Generates identifiers for domain records.
 ///
 /// The port is injected so production code uses real `UUIDv7` values while tests

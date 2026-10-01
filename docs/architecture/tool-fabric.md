@@ -125,6 +125,37 @@ Inputs include:
 Outputs are `ALLOW`, `ASK`, or `DENY` with machine reason codes, human summary,
 constraints, expiry, and audit metadata. The model cannot modify the decision.
 
+### Grants Are Configuration, Not Code
+
+**A grant is a durable row an operator writes, and this section exists because it was not always so.** For
+several milestones the only grant source was a constructor in `jarvis-infrastructure`, so the answer to "may
+this principal use this tool without asking?" was compiled in — and a user who wanted "never ask about the
+clock, always ask about outbound mail" had no way to say it. The store is `tool_grants` (plus
+`tool_deny_rules`), reached through `ToolGrantRepository` and served at `/api/v1/tool-grants`.
+
+Four properties of it are load-bearing rather than incidental:
+
+- **A grant may only narrow.** It confers a subset of the tool's declared scopes and effects, and its risk and
+  sensitivity ceilings must not exceed the definition's. A grant *wider* than the tool is refused, because it
+  would sit in the store looking like permission for something the tool cannot do. The narrowing direction is
+  the ordinary one: "let this read `~/notes`, not the whole home directory" is exactly what a grant is for.
+- **The key is a capability, not an identity.** `ToolIdentity` includes the schema fingerprint, so a grant
+  keyed by identity would read as *absent* after a tool was recompiled rather than as *replaced* — and those
+  two lead an operator to different next steps, which is why `resolve_grant` distinguishes them. The stored
+  identity is compared, never used as the key.
+- **Revocation is a state, not a delete.** A revoked row stays readable, because the approval contract
+  requires that revoking "cannot erase historical audit" — and the evaluator's read filters it in the query,
+  so a withdrawn grant cannot reach policy through a code path that forgot to check.
+- **A store failure is an error, not a fallback.** Answering "use the defaults" for an unreachable store would
+  re-authorize a principal an operator had narrowed. The reviewed grants are the posture of an *unconfigured*
+  principal, and one stored grant replaces them for that principal — which is what makes the store
+  authoritative rather than a source of extra permissions.
+
+**The tool pipeline consults this store on every dispatch**, through the same `ToolGrantSource` port it has
+always used. The reviewed grants remain as the unconfigured posture so a fresh profile is not a profile that
+refuses its own read-only tools; see `StoredGrants` for why an empty store falls back and why a *failure* does
+not.
+
 ## Approval Binding
 
 An approval request contains a safe preview and an action fingerprint over:

@@ -17,4 +17,5 @@ pub mod run_controller;
 pub mod run_service;
 pub mod testing;
 pub mod tool_call;
+pub mod tool_grant_service;
 pub mod tool_recovery;

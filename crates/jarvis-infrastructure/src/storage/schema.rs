@@ -28,10 +28,24 @@ use super::error::StorageError;
 /// | 4 | `000004_model_data_policy.sql` — the policy store |
 /// | 5 | `000005_model_policy_exceptions.sql` — policy exceptions |
 /// | 6 | `000006_model_call_delivery_profile.sql` — a call's last-output instant and delta count |
+/// | 7 | `000007_idempotency_principal_scope.sql` — the principal on an idempotency record |
+/// | 8 | `000008_approvals.sql` — durable approvals and their transition trail |
+/// | 9 | `000009_tool_call_ledger.sql` — the tool-call ledger and its trail |
+/// | 10 | `000010_approval_decision_assurance.sql` — the assurance a decision proved |
+/// | 11 | `000011_policy_version_layers.sql` — a policy version's layer provenance |
+/// | 12 | `000012_tool_grants.sql` — the configurable tool-grant store and deny rules |
+///
+/// **The table above was five rows short until this round, and the constant's own paragraph warned
+/// about exactly that.** Migrations `000007` through `000011` were each added without a row, so the
+/// list a reader consults to learn what this build writes ended at version 6 while
+/// `TARGET_SCHEMA_VERSION` read 9. The constant itself is derived from nothing, so a *forgotten bump*
+/// is caught by a test — but a *forgotten row* is silent, which is what the previous paragraph's own
+/// remedy ("each bump now names its migration here") did not prevent. Completing the table is the
+/// repair; `a_fresh_database_migrates_and_reports_the_target_version` is what guards the constant.
 ///
 /// The minimum reader stays at `1`: every later migration is purely additive, so a binary that
 /// understands only the initial schema can still read a database that has the added tables.
-pub const TARGET_SCHEMA_VERSION: i64 = 9;
+pub const TARGET_SCHEMA_VERSION: i64 = 12;
 
 /// The lowest schema version this binary can still read.
 ///

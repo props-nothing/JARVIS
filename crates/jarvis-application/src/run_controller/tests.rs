@@ -4079,13 +4079,13 @@ impl crate::tool_call::ToolExecutor for RecordingNative {
 struct FixtureGrants;
 
 impl crate::tool_call::ToolGrantSource for FixtureGrants {
-    fn grants_for(
+    fn read(
         &self,
         principal: PrincipalId,
         workspace: WorkspaceId,
-    ) -> Vec<jarvis_domain::tool::policy::Grant> {
+    ) -> crate::tool_call::GrantReadFuture<'_> {
         use jarvis_domain::tool::classification::{Effect, Risk};
-        vec![jarvis_domain::tool::policy::Grant {
+        let grants = vec![jarvis_domain::tool::policy::Grant {
             identity: read_definition().identity,
             workspace,
             principal,
@@ -4094,7 +4094,13 @@ impl crate::tool_call::ToolGrantSource for FixtureGrants {
             risk_ceiling: Risk::Low,
             sensitivity_ceiling: jarvis_domain::model::policy::Sensitivity::Public,
             expires_at: None,
-        }]
+        }];
+        Box::pin(async move {
+            Ok(crate::tool_call::GrantRead {
+                grants,
+                deny_rules: Vec::new(),
+            })
+        })
     }
 }
 
