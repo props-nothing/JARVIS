@@ -95,5 +95,56 @@ pub fn schema_fingerprint_of(schema: &str) -> jarvis_domain::tool::identity::Sch
 /// the prefix cannot be confused with a document that merely starts with the same letters.
 pub const SCHEMA_DOMAIN_SEPARATOR: &str = "tool-schema:\0";
 
+/// The domain separator for a skill content hash.
+///
+/// Its own prefix, distinct from [`SCHEMA_DOMAIN_SEPARATOR`], so a skill's content hash cannot collide
+/// with a schema fingerprint over the same bytes — the same separation every derived digest in this crate
+/// uses, and the reason a content hash can be compared against a stored grant without a type tag.
+pub const SKILL_DOMAIN_SEPARATOR: &str = "skill-content:\0";
+
+/// Computes the content hash of a skill's body **and every reference file it can load**.
+///
+/// **This is the computation `SkillContentHash`'s doc claimed and its constructor cannot perform.** The
+/// domain owns the hash's *shape* and the meaning of its coverage; hashing is a concrete implementation, so
+/// it lives here for the same reason `schema_fingerprint_of` does — `jarvis_domain` depends on no hashing
+/// crate. The domain type's `from_bytes` is therefore the wire/parse path, and this is the derivation, the
+/// arrangement `SchemaFingerprint` has.
+///
+/// **Takes the body and the references together, and that signature is the point.** The contract says
+/// *"`content_hash` covers every file the skill can load, not only the entry body"*, because a reference
+/// file a procedure loads on demand is part of the procedure — a skill whose body is unchanged but whose
+/// reference changed is a **different** skill, which is what makes ADR-0012's decision 5 enforceable. A
+/// function taking only the body could not express that, and a caller assembling the input itself would be
+/// free to forget the references. Here the omitted argument is not expressible.
+///
+/// **Each file is fed with its name and a separator**, for two reasons that are both correctness rather
+/// than tidiness:
+///
+/// - **Order independence.** The references are a `BTreeSet`, so iteration is canonical and two equal
+///   skills hash identically regardless of the order a caller inserted them. A `Vec` would make the hash a
+///   function of listing order, and the contract's section 8 binds a grant to the hash.
+/// - **No concatenation ambiguity.** Feeding `a` and `b` with no delimiter would let one file whose content
+///   is `a` followed by `b` hash the same as two files `a` and `b`. The name is included because moving
+///   content between `index.md` and `reference/setup.md` is a different procedure, and a hash over content
+///   alone would call it the same one.
+#[must_use]
+pub fn skill_content_hash(
+    body: &str,
+    references: &jarvis_domain::skill::SkillReferences,
+) -> jarvis_domain::skill::SkillContentHash {
+    let mut hasher = Sha256::new();
+    hasher.update(SKILL_DOMAIN_SEPARATOR.as_bytes());
+    hasher.update(b"body\n");
+    hasher.update(body.as_bytes());
+    for reference in references.iter() {
+        hasher.update(b"\nref\n");
+        hasher.update(reference.name().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(reference.content().as_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    jarvis_domain::skill::SkillContentHash::from_bytes(digest)
+}
+
 #[cfg(test)]
 mod tests;

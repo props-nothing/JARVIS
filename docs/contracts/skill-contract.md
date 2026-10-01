@@ -231,3 +231,70 @@ flowchart LR
 - a sensitive candidate is not written without confirmation;
 - a revoked skill is absent from the index for new runs and its prior runs are
   unchanged.
+
+## 11. Implementation Status
+
+**Implemented**: the *authority-narrowing invariant* (section 3) as a type, its trust-tier
+policy (section 4), the skill record's identity fields (section 2), and the content hash's
+**coverage rule**.
+
+- **The invariant is `jarvis_domain::skill::SkillCatalogNarrowing`.** Its only operation is
+  `narrow(&granted)`, which either returns a catalog that is a subset of the principal's
+  grants or returns **every** expansion that prevented it, each naming its own dimension and
+  code (`skill.ungranted_tool`, `skill.added_scope`, `skill.added_effect`, `skill.raised_risk`,
+  `skill.raised_sensitivity`, `skill.relaxed_approval`, `skill.extended_timeout`,
+  `skill.raised_attempts`). There is no accessor that hands back the declaration un-narrowed,
+  because such an accessor is how a caller would load a skill without consulting the rule.
+- **`ACC-085` is evidenced in the domain**, and the complement it demands is asserted
+  separately: `a_strict_subset_of_the_grant_is_accepted` and
+  `a_skill_that_declares_the_whole_authority_is_accepted` exist so the eight refusals cannot be
+  satisfied by an implementation that refuses everything — the same control the plugin
+  verifier's accepting case provides. `a_relaxed_approval_is_refused` asserts **both**
+  directions in one test, because that predicate's reversal is the quietest: the domain orders
+  `Allow < Ask < Deny`, so a declared posture *below* the granted one is the demotion
+  `approval_required → automatic`, and a comparison written the other way accepts exactly that
+  case. Every refusal test asserts the **code** rather than only `is_err`, so a reversed subset
+  test fails on the dimension it reversed rather than passing on a refusal for another reason.
+- **A dangerous verdict is not overridable, and the implementation makes that absolute rather
+  than configured.** `SkillTier::may_override` does not consult its `explicit_override`
+  parameter for `ScanVerdict::Dangerous` at all, so no caller can pass a flag that overrides it.
+  `a_dangerous_verdict_is_never_overridable_at_any_tier` asserts the property over **every tier
+  and both states of the flag**, which makes it a statement about the rule rather than about one
+  tier. `a_caution_verdict_is_overridable_only_by_an_explicit_recorded_override_at_community`
+  asserts the full matrix, so a rule that flipped one cell fails on the cell.
+- **The content hash covers every file the skill can load**, which is the property section 8's
+  grant binding and ADR-0012's decision 5 depend on.
+  `jarvis_infrastructure::tool_fingerprint::skill_content_hash` takes the body **and the
+  references together**, so "hash the body alone" is not expressible at a call site — a function
+  taking only the body could not satisfy this section, and a caller assembling the input itself
+  would be free to forget the references. Each file is fed with its name and a separator, so
+  order-independent (the references are a `BTreeSet`) **and** concatenation-unambiguous:
+  `the_skill_content_hash_separates_files_from_their_concatenation` is the test for the second.
+  Removing the reference loop fails `the_skill_content_hash_changes_when_only_a_reference_changes`
+  and the concatenation test, and nothing else.
+- **The tier comes from the resolved source, never from the skill**, which is why `SkillTier` has
+  no parser from skill content: the installer assigns it from where it actually fetched the
+  skill, and a wire field naming one is ignored rather than honoured. `SkillName`, `SkillSource`,
+  and `ScanVerdict` all parse **fail-closed** — an unknown source does not become `Authored` and
+  an unknown verdict does not become `Clean`, the same direction `Risk::parse` records.
+
+**Not implemented, and each is a named slice:**
+
+- **Progressive disclosure** (section 6) — the three manifest levels. The index/body/reference
+  shape is `MEM-011`'s and needs a context-manifest writer; the domain has no business holding
+  a token budget.
+- **Install, scan, and quarantine** (section 5) — the scan pipeline, the content-hash cache, the
+  quarantine state, and the provenance lockfile. `SkillTier::is_scan_gated` and
+  `may_override` are the *policy*; nothing performs a scan yet.
+- **Learning writes and the review job** (section 7) — `skill.author`, `skill.patch`,
+  `skill.delete`, `memory.promote`, and the durable review workflow. These are `MEM-012` and
+  `MEM-013`.
+- **The skill store and load path.** No table, no loader, and no revocation writer exists, so
+  `SkillCatalogNarrowing` currently has **no production caller** — it is the invariant the
+  future loader must consult, and it is stated as such rather than implied to be wired. This is
+  the "value with a producer and no consumer" shape this project keeps recording; here it is
+  deliberate, because the loader is a larger slice and the invariant is the piece that must be
+  right before it exists.
+- **`SkillCapability` binds an exact `ToolIdentity`, so a recompiled tool is a different
+  capability** — but nothing yet *resolves* a skill's declared identity against the catalog, which
+  is the loader's job. The comparison is the invariant; the resolution is not built.

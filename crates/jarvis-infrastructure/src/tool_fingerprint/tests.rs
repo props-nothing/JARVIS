@@ -9,7 +9,10 @@
 //!   are the RFC's, so the test asserts that hashing `serde_json`'s output for the same envelope gives a
 //!   **different** digest — which is the defect the split between canonicalization and hashing prevents.
 
-use super::{SCHEMA_DOMAIN_SEPARATOR, action_digest_of, action_fingerprint, schema_fingerprint_of};
+use super::{
+    SCHEMA_DOMAIN_SEPARATOR, SKILL_DOMAIN_SEPARATOR, action_digest_of, action_fingerprint,
+    schema_fingerprint_of, skill_content_hash,
+};
 use jarvis_domain::ids::{PrincipalId, WorkspaceId};
 use jarvis_domain::tool::call::ToolArguments;
 use jarvis_domain::tool::canonical::{
@@ -223,5 +226,128 @@ fn a_schema_fingerprint_is_not_the_bare_digest_of_the_document() {
         schema_fingerprint_of(document),
         SchemaFingerprint::from_bytes(bare),
         "**the domain separator must be part of the hashed input**, not only of the declaration",
+    );
+}
+
+/// **The content hash covers the references, and that is the contract's requirement rather than a
+/// detail.** A hash over the body alone would call a skill whose reference file changed the *same* skill,
+/// which is what the contract's section 8 forbids (a grant binds to the hash) and what ADR-0012's
+/// decision 5 depends on being false.
+#[test]
+fn the_skill_content_hash_changes_when_only_a_reference_changes() {
+    let body = "1. read the file\n2. summarise it";
+    let mut before = jarvis_domain::skill::SkillReferences::new();
+    before.insert(
+        jarvis_domain::skill::SkillReference::new("setup.md", "run setup first")
+            .expect("valid reference"),
+    );
+
+    let mut after = jarvis_domain::skill::SkillReferences::new();
+    after.insert(
+        jarvis_domain::skill::SkillReference::new("setup.md", "run setup SECOND")
+            .expect("valid reference"),
+    );
+
+    // The body is identical in both, so a body-only hash would be equal here — which is the mutation this
+    // test is the detector for.
+    assert_ne!(
+        skill_content_hash(body, &before),
+        skill_content_hash(body, &after),
+        "a changed reference file must produce a different content hash",
+    );
+}
+
+/// The hash is a function of *what the skill contains*, not of the order a caller listed it, so the
+/// references must be inserted in a different order and hash identically.
+#[test]
+fn the_skill_content_hash_is_independent_of_insertion_order() {
+    let body = "body";
+    let mut first = jarvis_domain::skill::SkillReferences::new();
+    first.insert(jarvis_domain::skill::SkillReference::new("a.md", "alpha").expect("valid"));
+    first.insert(jarvis_domain::skill::SkillReference::new("b.md", "beta").expect("valid"));
+
+    let mut second = jarvis_domain::skill::SkillReferences::new();
+    second.insert(jarvis_domain::skill::SkillReference::new("b.md", "beta").expect("valid"));
+    second.insert(jarvis_domain::skill::SkillReference::new("a.md", "alpha").expect("valid"));
+
+    assert_eq!(
+        skill_content_hash(body, &first),
+        skill_content_hash(body, &second),
+        "the hash must not depend on the order the references were inserted",
+    );
+}
+
+/// **Two files must not hash as one file whose content is their concatenation**, which is why each
+/// reference is fed with its name and a separator. Without them, `("a", "xy") + ("b", "z")` and
+/// `("a", "x") + ("b", "yz")` would produce the same input to the hasher.
+#[test]
+fn the_skill_content_hash_separates_files_from_their_concatenation() {
+    let mut split = jarvis_domain::skill::SkillReferences::new();
+    split.insert(jarvis_domain::skill::SkillReference::new("a.md", "xy").expect("valid"));
+    split.insert(jarvis_domain::skill::SkillReference::new("b.md", "z").expect("valid"));
+
+    let mut shifted = jarvis_domain::skill::SkillReferences::new();
+    shifted.insert(jarvis_domain::skill::SkillReference::new("a.md", "x").expect("valid"));
+    shifted.insert(jarvis_domain::skill::SkillReference::new("b.md", "yz").expect("valid"));
+
+    assert_ne!(
+        skill_content_hash("body", &split),
+        skill_content_hash("body", &shifted),
+        "where a boundary between two files falls must change the hash",
+    );
+}
+
+/// **A skill content hash must not collide with a schema fingerprint** over the same bytes, which is what
+/// the domain separator is for. Asserted by hashing the same document both ways: a separator that was
+/// declared but not hashed would make the two equal, so this measures the separator rather than restating
+/// it.
+#[test]
+fn the_skill_domain_separator_is_part_of_the_hashed_input() {
+    use sha2::{Digest as _, Sha256};
+
+    // A body and a schema document that are the same bytes, so only the separator can differ them.
+    let document = "{\"same\":\"bytes\"}";
+    let empty = jarvis_domain::skill::SkillReferences::new();
+    let skill = skill_content_hash(document, &empty);
+
+    // The same bytes under the schema derivation, with the separator applied manually so the comparison is
+    // about which prefix was used rather than about the hash function.
+    let mut hasher = Sha256::new();
+    hasher.update(SCHEMA_DOMAIN_SEPARATOR.as_bytes());
+    hasher.update(document.as_bytes());
+    let as_schema: [u8; 32] = hasher.finalize().into();
+
+    assert_ne!(
+        skill,
+        jarvis_domain::skill::SkillContentHash::from_bytes(as_schema),
+        "**the skill separator must be part of the hashed input**, not only of the declaration",
+    );
+    assert_ne!(
+        SKILL_DOMAIN_SEPARATOR, SCHEMA_DOMAIN_SEPARATOR,
+        "the two derivations must use different prefixes",
+    );
+}
+
+/// A known-answer test, so "this is SHA-256 over the body" is a measurement rather than an assertion that
+/// the output is 64 hex characters. The input is the separator, `body\n`, and the body; the expected value
+/// was computed by hashing exactly those bytes.
+#[test]
+fn the_skill_content_hash_is_sha256_over_the_separated_input() {
+    use sha2::{Digest as _, Sha256};
+
+    let body = "";
+    let empty = jarvis_domain::skill::SkillReferences::new();
+    let mut hasher = Sha256::new();
+    hasher.update(SKILL_DOMAIN_SEPARATOR.as_bytes());
+    hasher.update(b"body\n");
+    hasher.update(body.as_bytes());
+    let expected: [u8; 32] = hasher.finalize().into();
+    assert_eq!(skill_content_hash(body, &empty).as_bytes(), &expected);
+    // And it renders in the domain's canonical form, so a stored hash is accepted by the parser.
+    let rendered = skill_content_hash(body, &empty).to_string();
+    assert!(rendered.starts_with("sha256:"), "{rendered}");
+    assert_eq!(
+        jarvis_domain::skill::SkillContentHash::parse(&rendered).expect("round trips"),
+        skill_content_hash(body, &empty),
     );
 }

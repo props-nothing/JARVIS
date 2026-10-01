@@ -6663,6 +6663,57 @@ Dependencies: Milestone 2 exit gate.
   approval requirement, or change an effect classification — is implemented as a
   tested refusal against a skill that declares the expansion, not only against a
   conforming one. See [ADR-0012](docs/adr/0012-governed-learning-loop.md).
+  **The *authority-narrowing invariant*, the *trust-tier policy*, and the *content
+  hash's coverage rule* are done; the store, the loader, the scan pipeline, and the
+  learning tools remain.**
+  Evidence: `jarvis_domain::skill` — `SkillCatalogNarrowing`, `SkillCapability`,
+  `SkillExpansion`, `SkillTier`, `SkillName`, `SkillContentHash`,
+  `SkillReferences` — plus `jarvis_infrastructure::tool_fingerprint::skill_content_hash`.
+  The contract's section 3 sentence this makes true is *"An implementation that
+  cannot prove it is not complete"*: the invariant is now a type whose only
+  operation either returns a subset of the principal's grants or the reason it was
+  refused.
+  - **⚠ The direction is the whole point, and each dimension is falsified by its own
+    reversal.** Eight dimensions, all **subset or `<=` in the narrowing sense**: an
+    ungranted tool, an added scope, an added effect, a raised risk ceiling, a raised
+    sensitivity ceiling, a relaxed approval, an extended timeout, a raised attempt
+    count. Reversing the scope subset and the approval comparison fails **11 of 22**
+    tests — including `a_strict_subset_of_the_grant_is_accepted`, which is the
+    complement the contract's section 10 demands ("a skill that declares a subset is
+    accepted"). A refusal test that only checked `is_err` would have passed for the
+    reversal, so every one asserts the **code** instead.
+  - **`a_relaxed_approval_is_refused` asserts both directions in one test**, because
+    that predicate's reversal is the quietest: the domain orders `Allow < Ask < Deny`,
+    so a declared posture *below* the granted one is the demotion
+    `approval_required -> automatic`. The complement — a skill declaring a **stricter**
+    posture, which is a legitimate narrowing — is in the same test so the pair cannot
+    drift.
+  - **A dangerous scan verdict is not overridable, and the implementation makes that
+    absolute rather than configured.** `SkillTier::may_override` does not consult its
+    `explicit_override` parameter for `ScanVerdict::Dangerous` at all, so no caller can
+    pass a flag that overrides it. Asserted over **every tier and both states of the
+    flag**, which is what makes it a statement about the rule rather than about one
+    tier; the caution matrix is asserted cell by cell for the same reason.
+  - **The content hash covers every loadable file, and the signature is what enforces
+    it.** `skill_content_hash(body, references)` takes both, because a function taking
+    only the body could not satisfy the contract's *"not only the entry body"* and a
+    caller assembling the input would be free to forget the references. Removing the
+    reference loop fails exactly two tests:
+    `the_skill_content_hash_changes_when_only_a_reference_changes` and
+    `the_skill_content_hash_separates_files_from_their_concatenation`.
+  - **The hash reuses the domain's derived-digest type rather than adding a fourth
+    `sha256:<hex>` carrier.** Three types already carry that rule and the plugin module
+    records the drift risk; what the contract names separately is the hash's *coverage*,
+    not its spelling. The computation lives in infrastructure because `jarvis_domain`
+    depends on no hashing crate — the same split `SchemaFingerprint` records.
+  - 22 domain tests + 5 derivation tests. All gates green. **DO NOT COMMIT.**
+  - **Not done, and named.** **No store and no loader**, so `SkillCatalogNarrowing`
+    has no production caller yet — it is the invariant the future loader must consult,
+    stated as such rather than implied to be wired. Also absent: progressive disclosure
+    (section 6), the scan pipeline and quarantine (section 5), the provenance lockfile,
+    the learning tools and review job (section 7, `MEM-012`/`MEM-013`), and the
+    resolution of a declared `ToolIdentity` against the catalog. `ACC-085`'s domain
+    half is evidenced; `ACC-084` and `ACC-086` through `ACC-089` are not.
 
 ## Milestone 4: Memory
 
