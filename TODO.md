@@ -5955,7 +5955,51 @@ Dependencies: Milestone 2 exit gate.
     are still plain constants because their parameter lists are fixed (the builder exists for the listing,
     whose predicates vary). The cursor's bindings remain hand-assembled pipe segments — extracting them
     into a versioned struct is the other half of the `BRN-080` residual and is untouched here.
-- [ ] `TLS-011` Define plugin manifest and process supervision contract.
+- [~] `TLS-011` Define plugin manifest and process supervision contract. **The manifest is defined as
+  types and validated; process supervision is `TLS-015` and is not implemented.**
+  Evidence: `jarvis_infrastructure::plugin` — `PluginManifest::parse` plus the field rules, the
+  `PluginManifestError` code set, and 16 tests including the contract's own example read from the
+  document (contract test 1: "schema, compatibility range, platform, and unknown-field validation").
+  - **The finding: the contract was accepted with no value behind it, so nothing refused a manifest whose
+    executable escaped its root.** `docs/contracts/plugin-manifest.md` is `ACCEPTED` and lists ten
+    required contract tests, and the module tree had no `plugin` — so contract test 1 had no subject and
+    the entrypoint rule ("executable paths are package-relative, canonicalized, and cannot escape the
+    verified installation root") was a sentence with nothing enforcing it. This is the definition half of
+    the slice, and it is the half `TLS-014`/`TLS-015` must build on rather than re-derive.
+  - **Every field rule is one whose failure is a filesystem, execution, or log-integrity fault.** The
+    path rule is the one that matters most, and each clause defends a distinct way two strings name one
+    file or one string leaves the package: an absolute path or leading separator, a `..` traversal
+    (refused, not resolved — resolving discards the fact that the manifest asked to leave), an empty or
+    `.` segment, a Windows drive/ADS colon, a **reserved device name matched on the stem** (so `con.txt`
+    is refused and `console.log` is not), and a trailing dot or space (which Windows strips). The
+    reserved-name check being stem-based is the half a whole-name or extension-ignoring check gets wrong.
+  - **`id` and `publisher` are slugs; `name` is display text.** The contract's "display name or
+    executable filename never identifies a plugin" is what makes `id` the field a grant is compared
+    against, so it is held to a bounded lowercase slug rather than free text; `name` is bounded and
+    control-free but otherwise unrestricted, because it is not an identity. A control character is
+    refused in the name because it would corrupt a terminal or a log line.
+  - **The digest requires its `sha256:` prefix.** A bare digest could be any algorithm, and comparing one
+    against a `SHA-256` is the same defect `SchemaFingerprint` refuses — the prefix is what makes two
+    digests comparable.
+  - **⚠ The contract's own example carries a documented placeholder (`"sha256:..."`).** The golden-fixture
+    test reads the example from the document, so it must substitute exactly that one value — and asserts
+    the placeholder is still present, so if the contract changes, the fixture fails rather than silently
+    parsing a different document. `$schema` is **modelled** rather than refused as an unknown field
+    (`deny_unknown_fields` would otherwise reject the contract's own example) and is **not dereferenced**:
+    honouring a URL from an untrusted document is how a manifest chooses its own validator.
+  - **Falsified:** disabling the trailing-dot rule fails `an_executable_that_escapes_the_package_is_refused`
+    with `bin/rt. must be refused: a trailing dot Windows strips`. ⚠ **A first mutation that disabled the
+    explicit `..` check did NOT fail the test**, because `..` also ends with `.` and the trailing-dot rule
+    caught it — two rules overlap on that input (defence in depth), so the `..` branch is now written out
+    with a comment saying it is *stated* rather than inferred from a character class that happens to cover
+    it. **A mutation that survives because another rule covers the same input is not a missing guard.**
+  - **Not done, and named** (in the contract's new Implementation Status section): package provenance and
+    signature verification, and the archive traversal/symlink rules (`TLS-014`, contract test 3);
+    process supervision — timeouts, bounded capture, crash-loop quarantine, credential revocation
+    (`TLS-015`); and installation, grants, and the lifecycle states (both slices). `parse` grants nothing:
+    it produces a validated document, which is exactly what the contract says a parsed manifest is.
+  - 1614 workspace tests (+16: infra 713). 205 TODO IDs (+1). All gates green (fmt, clippy, test, doc,
+    both docs gates). **DO NOT COMMIT.**
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
   revoke, and resume use cases for API and CLI with channel assurance checks. Owns

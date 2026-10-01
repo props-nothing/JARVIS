@@ -19,6 +19,7 @@ pub mod install;
 pub mod lifecycle;
 pub mod model_providers;
 pub mod paths;
+pub mod plugin;
 pub mod profile;
 pub mod release;
 pub mod service;

@@ -192,3 +192,52 @@ Before `TLS-011` or an extension adapter is complete, test:
 10. redacted diagnostics and no daemon failure under hostile plugin behavior.
 
 These tests provide evidence for `ACC-026` and `FR-PLG-001`/`FR-PLG-002`.
+
+## Implementation Status
+
+**Implemented**: the manifest as types, parsed and validated by
+`jarvis_infrastructure::plugin::PluginManifest::parse`. This is `TLS-011`'s *definition* half — the
+document the contract describes, as a value a reader and a writer share. It enforces the field rules
+whose failure is a filesystem, execution, or log-integrity fault rather than a cosmetic one:
+
+- **schema and unknown fields.** `schema_version` must be one this build understands, and
+  `deny_unknown_fields` refuses a top-level field the type does not model, because the contract says
+  "unknown top-level fields fail until a compatible schema version defines extension behavior";
+- **source identity.** `id` and `publisher` are slugs, not free text — the contract's rule that "display
+  name or executable filename never identifies a plugin" is what makes `id` the field a grant is
+  compared against, so it cannot carry control characters or unbounded length. `name` is display text:
+  bounded and control-free, but otherwise unrestricted;
+- **the entrypoint path.** `executable` and `working_directory` are package-relative paths that cannot
+  escape their root — no absolute path, no `..` traversal, no empty or `.` segment, no Windows
+  drive/ADS colon, no reserved device name (matched on the stem, so `con.txt` is caught and
+  `console.log` is not), and no trailing dot or space (which Windows strips, making two strings name one
+  file). Every one of those is a way two strings name one file or one string leaves the package;
+- **the package digest.** `sha256:<64 lowercase hex>` with the algorithm prefix required, so a bare
+  digest that could be any algorithm is refused rather than compared as though it were `SHA-256`;
+- **the supervision limits.** Non-zero and bounded, because a zero limit is a refusal wearing a limit's
+  name and an unbounded one is the hang the limit exists to prevent;
+- **the protocol kind** is one of the two this build supports (`jarvis-runtime`, `mcp-stdio`); anything
+  else "requires an accepted contract and evidence note" and is refused by name rather than carried as
+  an opaque string.
+
+`configuration_schema` is carried as a bounded JSON object and required to *be* an object; JARVIS does
+not interpret a plugin's own configuration schema here. The `$schema` keyword the contract's example
+carries is modelled and validated as a bounded reference — it is **not** fetched or honoured, because
+accepting a URL from an untrusted document and resolving it is how a manifest would choose its own
+validator.
+
+**Not implemented, and each is a named slice:**
+
+- **package provenance and signature verification** (`TLS-014`). The `package` block carries the digest,
+  the signature reference, and the source so a verifier has a typed value to check; **nothing in this
+  module trusts them.** The contract's rule that "package bytes are verified before extraction or
+  execution" is `TLS-014`'s, and the archive traversal/symlink rules (contract test 3) belong beside the
+  extractor that would perform them.
+- **process supervision** (`TLS-015`). The `resource_limits` block is validated here; enforcing a
+  timeout, capturing bounded streams, quarantining a crash loop, and revoking a short-lived credential
+  are the supervisor's, which does not exist.
+- **installation, grants, and lifecycle** (`TLS-014`/`TLS-015`). The contract's lifecycle states and its
+  "installation creates no grant" rule are prose here; no installer, no grant store, and no health
+  transition writer exists. **`PluginManifest::parse` grants nothing** — it produces a validated
+  document, which is exactly what the contract says a parsed manifest is.
+
