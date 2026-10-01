@@ -333,6 +333,54 @@ deadline, which this build does not create, since `budget_for` gives every run o
 A recovered run's code comes from the same `RecoveryAction` that builds its recovery event
 payload, so the row and the event agree.
 
+**The codes `error_code` carries, which are a vocabulary of their own.** They never travel in an
+error envelope — they are a field on a `200` — so the minimum-code table above does not list them,
+and an earlier revision of this contract left the set undefined. That is the defect `BRN-073`
+recorded: roughly half of these were documented in no file at all, because each was mentioned only
+where the code that produced it happened to be discussed. They are listed here because a client
+branches on the field, and a value a client branches on needs a list.
+
+| Code | Meaning |
+| --- | --- |
+| `run.no_model_served` | No configured model could serve the run. |
+| `run.model_call_failed` | The model call did not complete. |
+| `run.stream_interrupted` | The model stream ended before it finished. |
+| `run.stream_rejected` | The model stream was refused as invalid. |
+| `run.tools_not_implemented` | The run needed a tool and this build has none. |
+| `run.output_not_persisted` | Produced output could not be recorded. |
+| `run.clock_unavailable` | The clock could not provide an instant. |
+| `run.deadline_exceeded` | The run exceeded its wall-clock budget. |
+| `run.budget_output_tokens_exceeded` | The run exceeded its output-token ceiling. |
+| `run.budget_cost_exceeded` | The run exceeded its cost ceiling. |
+| `run.context_budget_unusable` | The run's context ceiling could not be turned into a budget. |
+| `run.context_message_unlabelled` | A stored message carried a sensitivity label JARVIS does not write. |
+| `run.context_item_too_large` | A context item was too large to be a candidate. |
+| `run.context_objective_dropped` | The run's own objective had to be dropped to fit the budget. |
+| `run.cancelled` | The run was cancelled. Carried on a `failed` row only if a cancellation settled a run whose outcome was already failure; a `cancelled` run's `error_code` is **null**. |
+| `run.interrupted_by_restart` | A restart left the run nonterminal and recovery could not resume it. |
+| `model.provider_unavailable` | The provider could not be reached. |
+| `model.provider_timeout` | The provider did not answer within the step bound. |
+| `model.provider_authentication` | The provider rejected the credential. |
+| `model.provider_rate_limited` | The provider refused for rate or quota. |
+| `model.provider_request_invalid` | The provider rejected the request as malformed. |
+| `model.provider_malformed` | The provider's response could not be interpreted. |
+| `model.provider_refused` | The provider refused without a more specific reason. |
+| `model.provider_no_route` | No provider route matched. |
+| `model.provider_cancelled` | The provider reported the call cancelled. |
+
+The `model.provider_*` names are `ProviderError`'s own codes, reached through the controller, and the
+`run.*` ones come from four producers: `ControllerError`, `AssemblyError`, `BudgetLimit`, and
+`RecoveryAction`. A client should branch on the value rather than the prefix, and should treat an
+unrecognized code as a failure to surface rather than to interpret — which is what the namespace rule
+in [the error-envelope conventions](common-conventions.md#error-envelope) guarantees it can do.
+
+**These are deliberately *not* in the minimum-code table above.** They carry no HTTP status, and the
+test that holds that table complete is scoped to codes the surface puts in an envelope for a non-2xx
+response. Adding them there would have broken the table's own invariant — every row has a status —
+for values that never have one. `the_minimum_code_table_names_every_code_this_surface_produces` and
+`every_code_an_application_service_error_carries_is_in_the_contract_table` both read this contract,
+and neither compares against this table, which is why the omission survived until `BRN-073`.
+
 ### Cancellation
 
 `POST /api/v1/runs/{run_id}/cancel` requires an `Idempotency-Key` and accepts:
@@ -547,6 +595,9 @@ Minimum codes:
 | 400 | `request.invalid_cursor` | no |
 | 400 | `api.host_not_allowed` | no |
 | 400 | `jarvis.context_candidates_unbounded` | no |
+| 400 | `run.budget_malformed` | no |
+| 400 | `run.budget_step_timeout_out_of_range` | no |
+| 400 | `run.budget_context_tokens_out_of_range` | no |
 | 401 | `auth.credential_rejected` | no |
 | 403 | `api.origin_not_allowed` | no |
 | 403 | `api.forwarded_header_not_allowed` | no |

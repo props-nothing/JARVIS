@@ -1113,6 +1113,25 @@ pub fn credential_status(error: CredentialError) -> StatusCode {
 /// implementations carry twenty codes, not two. The scan below reads the services' own source, so
 /// it finds what the hand list was standing in for.
 ///
+/// **Which files belong here is a decision about the envelope, and it is the narrow set on purpose.**
+/// `jarvis-application` defines `code()` in nine files. The four below are the ones whose values
+/// reach the error **envelope** — the three services, plus `repository/mod.rs`, whose `storage.*`
+/// values arrive through every service's `Storage(_)` arm. The other five do not reach it, and naming
+/// them here would be wrong rather than thorough:
+///
+/// - `run_controller.rs` and `model.rs` carry `run.*` and `model.provider_*` onto the **run
+///   resource's `error_code` field** — a durable column a client reads on a `200`, not an envelope.
+///   They are reachable (a failed run's code is client-visible) and are covered by the run
+///   contract's own documentation rather than by this table.
+/// - `context_assembly.rs`, `recovery.rs`, and `tool_recovery.rs` have no HTTP production reference
+///   at all in this build.
+///
+/// So the scope is "reaches the envelope", and the residual is real: a **fifth** envelope producer
+/// added later is invisible until named, which is the shape `BRN-069` recorded one level up and
+/// `BRN-071` widened rather than eliminated. `the_envelope_producers_are_the_files_this_scan_reads`
+/// fails if a `code()` implementation appears in a file this list omits and that file is reachable
+/// from this surface, so the omission cannot recur silently.
+///
 /// Returns the codes and the number of files read, so a caller can assert the scan was not vacuous.
 #[cfg(test)]
 fn production_codes_from_services(
@@ -1128,8 +1147,7 @@ fn production_codes_from_services(
         // hiding.** `repository/mod.rs` owns `RepositoryError::code()`, whose `storage.*` values
         // reach a client through every service's `Storage(_)` arm — a `500` carrying the storage code
         // itself. Four of the six had no table row, so a client meeting one on a `500` was reading a
-        // code this contract does not list. The scan was scoped to three files because those were
-        // the three services; the repository is a fourth producer of the same kind and belongs here.
+        // code this contract does not list.
         "repository/mod.rs",
     ] {
         let path = repository.join("crates/jarvis-application/src").join(name);
@@ -1138,11 +1156,10 @@ fn production_codes_from_services(
         let text = std::fs::read_to_string(&path).expect("the service source reads");
         files_read += 1;
         // The production half only: a test may name a code it does not produce, and counting
-        // assertions would make this test quote itself.
-        let production = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => &text[..],
-        };
+        // assertions would make this test quote itself. Stripped by brace-matching rather than by
+        // truncating at the first marker — `context_assembly.rs` declares its test module mid-file,
+        // and a truncating helper hides everything below it. `strip_test_items` carries the reasoning.
+        let production = strip_test_items(&text);
         for found in production.match_indices('"') {
             let rest = &production[found.0 + 1..];
             let Some(end) = rest.find('"') else { continue };
@@ -1153,6 +1170,64 @@ fn production_codes_from_services(
         }
     }
     (carried, files_read)
+}
+
+/// Strips every `#[cfg(test)]` item from `text`, by brace-matching rather than truncating.
+///
+/// **Truncating at the first marker is wrong, and this is the second place in this project it has
+/// mattered.** `context_assembly.rs` declares its test module *mid-file* (`#[cfg(test)] #[path =
+/// "..."] mod tests;` at line 51, with the whole type under test below it), so a truncating helper
+/// hides every `fn code(` after that point — the exact defect `BRN-066` found in the Node finder
+/// whose `productionHalf` cut at `indexOf("#[cfg(test)]")`, and it produced a missed file rather
+/// than a false positive because the cut removes definitions instead of adding them.
+///
+/// Both forms are handled: a declaration (`mod tests;`) ends at its semicolon, and an inline block
+/// ends at its matching brace. The four files `production_codes_from_services` reads happen to have
+/// trailing test modules, so their results were never wrong — but a helper that is only correct for
+/// the inputs it currently receives is a landmine for the next caller, which is why this is one
+/// function rather than two truncations.
+///
+/// `#[cfg(test)]` because its only callers are tests: it reads the workspace's own source, so it has
+/// no production use.
+#[cfg(test)]
+fn strip_test_items(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at..];
+        let brace = after.find('{');
+        let semicolon = after.find(';');
+        let end = match (brace, semicolon) {
+            // A declaration: the item ends at the attribute's own semicolon form.
+            (Some(brace), Some(semicolon)) if semicolon < brace => semicolon + 1,
+            (Some(brace), _) => {
+                let bytes = after.as_bytes();
+                let mut depth = 0_i32;
+                let mut index = brace;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                index += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    index += 1;
+                }
+                index
+            }
+            (None, Some(semicolon)) => semicolon + 1,
+            (None, None) => after.len(),
+        };
+        rest = after.get(end..).unwrap_or("");
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -4618,7 +4693,7 @@ pub(crate) mod tests {
         let cases = service_code_cases();
         assert_eq!(
             cases.len(),
-            12,
+            14,
             "the case list must drive every mapped refusal",
         );
         for (label, response, code, status, retryable) in cases {
@@ -4712,6 +4787,32 @@ pub(crate) mod tests {
                 "storage.query_failed",
                 500,
                 true,
+            ),
+            // **The `run.budget_*` family, which `BRN-075` found reaching a `400` while three
+            // separate scans each assumed it could not reach a client at all.** They arrive through
+            // `RunServiceError::Invalid`, whose `code` field is filled from `budget_for`'s
+            // `error.code()` — a *passed-through* value, so no scan of a mapper's own literals can see
+            // it. Driving the mapper is what makes them visible, which is why these cases exist rather
+            // than only a table row.
+            (
+                "a run whose stored budget could not be read",
+                crate::http::runs::service_error_response_for_test(&RunServiceError::invalid(
+                    "run.budget_malformed",
+                    "The run's time budget could not be established.",
+                )),
+                "run.budget_malformed",
+                400,
+                false,
+            ),
+            (
+                "a run budget whose step timeout is out of range",
+                crate::http::runs::service_error_response_for_test(&RunServiceError::invalid(
+                    "run.budget_step_timeout_out_of_range",
+                    "The run's time budget could not be established.",
+                )),
+                "run.budget_step_timeout_out_of_range",
+                400,
+                false,
             ),
         ]
     }
@@ -4873,6 +4974,222 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn the_run_error_code_vocabulary_is_the_one_the_producers_emit() {
+        // **The set `BRN-073` found undocumented: the codes a run resource's `error_code` field
+        // carries.** They never travel in an error envelope — they are a field on a `200` — so the
+        // minimum-code table does not list them, and both completeness tests are scoped to the
+        // envelope. Nothing compared them to anything, and roughly half were in no document at all:
+        // each was mentioned only where the code producing it happened to be discussed, so a client
+        // reading `run.stream_interrupted` had nothing to look up.
+        //
+        // The producers are five types reached from the run controller, and this test holds the
+        // contract's list to all of them.
+        //
+        // **The scan reads each file's whole production half, not a window from its `code()`
+        // marker**, and that is a correction to `BRN-073`'s version. A fixed window looked precise and
+        // was not: `run.context_objective_dropped` is produced at a *call site* (`Step::failed(..,
+        // "run.context_objective_dropped")`), not in `code()`, so a 2400-byte window from the marker
+        // missed it — and the miss surfaced only when `BRN-074` added the reverse comparison and the
+        // forward one then reported the missing value as *unproduced*. Scanning the file needs the
+        // event types subtracted, because `run.context_building` and `run.planning` live in the same
+        // file and are events rather than codes. See `run_error_code_set` for the subtraction, the
+        // exclusions, and the one value that is both.
+        let producers = run_error_code_set();
+        let emitted = &producers.field_codes;
+        let emitted_everything = &producers.every_value;
+        assert!(
+            emitted.len() >= 20,
+            "the producers must have been read: {emitted:?}",
+        );
+
+        let document = contract_document();
+        // The run resource's own table, which has **no status column** — its rows are
+        // `| `code` | meaning |`, unlike the minimum-code table's `| 500 | `code` | no |`. Parsed by
+        // that shape so the two tables in one file cannot be confused for each other.
+        let listed: std::collections::BTreeSet<String> = document
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| `")?;
+                let (code, _) = rest.split_once('`')?;
+                code.contains('.').then(|| code.to_owned())
+            })
+            .collect();
+        assert!(
+            listed.len() >= 20,
+            "the run error-code table must have been parsed: {listed:?}",
+        );
+
+        // The comparison runs **both** ways, and the second direction is not the one `BRN-073`
+        // recorded as impossible. That note said the reverse could not be checked because event types
+        // share the `run.*` prefix — `run.context_building` is an event, not a code — and that is true
+        // of a comparison against *every* `run.*` literal in these files. It is **not** true of a
+        // comparison against this table's own list, because the table is authored: it contains only
+        // codes, so a row that no producer emits is a stale row, and `BRN-074` checks exactly that
+        // over each producer's whole production half rather than a fixed window from its `code()`
+        // marker. The earlier reasoning was wrong in the narrowing direction — it generalised "cannot
+        // tell codes from event types in arbitrary source" into "cannot check the reverse at all".
+        let undocumented: Vec<&String> = emitted.iter().filter(|c| !listed.contains(*c)).collect();
+        assert!(
+            undocumented.is_empty(),
+            "every code a run error_code producer emits must be documented in the run error-code \
+             table, because a client branches on the field and a code outside it is nowhere to look: \
+             {undocumented:?}",
+        );
+        let unproduced: Vec<&String> = listed
+            .iter()
+            .filter(|c| !emitted_everything.contains(*c))
+            .collect();
+        assert!(
+            unproduced.is_empty(),
+            "every code the run error-code table documents must be emitted by a producer, because a \
+             row for a value nothing produces sends a client looking for a cause that cannot occur: \
+             {unproduced:?}",
+        );
+    }
+
+    /// The values the run-resource code producers can write, split by what a client can meet.
+    ///
+    /// Extracted from `the_run_error_code_vocabulary_is_the_one_the_producers_emit` so the test reads
+    /// as the two comparisons it makes. Three distinctions are encoded here and each was learned from
+    /// a failure:
+    ///
+    /// - **`field_codes` vs `every_value`.** One value is both an event type and a code:
+    ///   `run.cancelled` names a streamed event *and* is what `ControllerError::Cancelled` reports.
+    ///   Subtracting event types for both comparisons dropped it from the reverse check and made a
+    ///   correct table look stale; not subtracting them at all made the forward check treat event
+    ///   names as undocumented codes. So `every_value` answers "can a producer write this" and
+    ///   `field_codes` answers "is this a code rather than an event name", and each direction uses
+    ///   the one it needs.
+    /// - **Whole production halves, not `code()` windows.** `run.context_objective_dropped` is passed
+    ///   as an argument at a call site rather than returned from `code()`, so a windowed scan missed
+    ///   it — and only the reverse comparison revealed the miss.
+    /// - **Exclusions, checked for staleness.** A file can hold a namespaced value destined for
+    ///   somewhere other than this field, and an exclusion that stops being produced fails rather than
+    ///   lingering.
+    #[cfg(test)]
+    struct RunCodeProducers {
+        /// Codes a client can meet on the run resource's `error_code` field.
+        field_codes: std::collections::BTreeSet<String>,
+        /// Every namespaced value any producer can write, including event types.
+        every_value: std::collections::BTreeSet<String>,
+    }
+
+    /// Reads the run-resource code producers, applying the three distinctions documented above.
+    #[cfg(test)]
+    fn run_error_code_set() -> RunCodeProducers {
+        // Namespaced values these files produce that never reach `error_code`, each with the fact that
+        // decides it. Checked for staleness below, so an entry cannot outlive the value it excuses.
+        //
+        // **The reason column was corrected by `BRN-075`, and the correction is the interesting part.**
+        // It said these are "a BudgetError from run construction; never stored as a run outcome", which
+        // is true and was read as "never client-visible". It is not: `budget_for` maps a `BudgetError`'s
+        // code into `RunServiceError::invalid(error.code(), ..)`, so each of the three reaches a client
+        // in a **400 envelope** — a third route a client can meet, invisible to this field's list, to
+        // the four-file envelope scan (which reads the mappers' *own* literals, not codes passed
+        // through), and to the surface literal scan. The exclusion from *this* list is right for the
+        // reason now stated; the three are documented as envelope rows instead.
+        const NOT_THE_FIELDS: [(&str, &str); 3] = [
+            (
+                "run.budget_malformed",
+                "reaches a client as a 400 envelope via budget_for, not as a run outcome",
+            ),
+            (
+                "run.budget_step_timeout_out_of_range",
+                "reaches a client as a 400 envelope via budget_for, not as a run outcome",
+            ),
+            (
+                "run.budget_context_tokens_out_of_range",
+                "reaches a client as a 400 envelope via budget_for, not as a run outcome",
+            ),
+        ];
+
+        let root = repository_root();
+        let producers: [&str; 5] = [
+            "crates/jarvis-application/src/run_controller.rs",
+            "crates/jarvis-application/src/model.rs",
+            "crates/jarvis-domain/src/run/budget.rs",
+            "crates/jarvis-application/src/context_assembly.rs",
+            "crates/jarvis-domain/src/run/recovery.rs",
+        ];
+
+        // The `run.*` values that are event types, read from the protocol's own constants rather than
+        // listed here.
+        let mut event_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let protocol = std::fs::read_to_string(root.join("crates/jarvis-protocol/src/run.rs"))
+            .expect("the protocol source reads");
+        let event_module = protocol
+            .find("pub mod event_type {")
+            .expect("the protocol declares its event types in a module");
+        let module_body = &protocol[event_module..];
+        let module_end = module_body.find("\n}").unwrap_or(module_body.len());
+        // Each constant is `pub const NAME: &str = "value";`, so the value is between the first pair of
+        // quotes on the line.
+        for line in protocol[event_module..event_module + module_end].lines() {
+            if let Some((_, rest)) = line.split_once(": &str = \"")
+                && let Some((value, _)) = rest.split_once('"')
+            {
+                event_types.insert(value.to_owned());
+            }
+        }
+        assert!(
+            event_types.len() >= 8,
+            "the event types must have been read from the protocol: {event_types:?}",
+        );
+
+        let mut field_codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut every_value: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut produced_but_excluded: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut unreadable: Vec<String> = Vec::new();
+        for path in producers {
+            let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+                unreadable.push(format!("{path} (unreadable)"));
+                continue;
+            };
+            let production = super::strip_test_items(&text);
+            for found in production.match_indices('"') {
+                let rest = &production[found.0 + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let candidate = &rest[..end];
+                if !jarvis_protocol::is_owned_code(candidate) {
+                    continue;
+                }
+                every_value.insert(candidate.to_owned());
+                if event_types.contains(candidate) {
+                    continue;
+                }
+                if NOT_THE_FIELDS.iter().any(|(code, _)| *code == candidate) {
+                    produced_but_excluded.insert(candidate.to_owned());
+                } else {
+                    field_codes.insert(candidate.to_owned());
+                }
+            }
+        }
+        assert!(
+            unreadable.is_empty(),
+            "every producer must be readable, or this test is not checking what it claims: \
+             {unreadable:?}",
+        );
+        // Each exclusion must still name something the scan found, so a code that is deleted or
+        // renamed cannot leave a stale permission behind — the same check the envelope-producer test
+        // makes of its own list.
+        let stale: Vec<&str> = NOT_THE_FIELDS
+            .iter()
+            .map(|(code, _)| *code)
+            .filter(|code| !produced_but_excluded.contains(*code))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these codes are excluded from the field's vocabulary but are no longer produced, so the \
+             exclusion is stale: {stale:?}",
+        );
+        RunCodeProducers {
+            field_codes,
+            every_value,
+        }
+    }
+
     /// The repository root, derived from this crate's manifest directory.
     ///
     /// One place, so the four tests that read a source or contract file cannot disagree about how
@@ -4939,6 +5256,125 @@ pub(crate) mod tests {
                 code.contains('.').then(|| code.to_owned())
             })
             .collect()
+    }
+
+    #[test]
+    fn the_envelope_producers_are_the_files_this_scan_reads() {
+        // **The file list is the next hand list, and `BRN-072` makes it checkable.** `jarvis-application`
+        // defines `code()` in nine files; `production_codes_from_services` names four, because those
+        // are the four whose values reach the error envelope. The other five are a deliberate
+        // exclusion — `run_controller.rs` and `model.rs` carry `run.*` and `model.provider_*` onto the
+        // run resource's `error_code` field rather than into an envelope, and the remaining three have
+        // no HTTP production reference at all.
+        //
+        // Without this test that reasoning lives only in a comment, and a sixth envelope producer
+        // added later is invisible exactly as `repository/mod.rs` was between `BRN-067` and `BRN-071`:
+        // the scan silently reads four files while another one starts emitting codes. The check is
+        // mechanical — every file in `jarvis-application` that defines `code()` must be **either** in
+        // the scan's list **or** named in this test's exclusion list with a reason — so the only way to
+        // add a producer is to decide which it is.
+        //
+        // The scan's list, kept here as literals so this test fails if the list and its own doc
+        // disagree — reading it from the scanner would make this check assert the scanner against
+        // itself.
+        const SCANNED: [&str; 4] = [
+            "approval_service.rs",
+            "policy_service.rs",
+            "run_service.rs",
+            "repository/mod.rs",
+        ];
+        // The exclusions, each with the fact that decides it. `run_controller.rs` and `model.rs` are
+        // the two that carry a client-visible code onto a *field* rather than an envelope; the other
+        // three have no HTTP production reference.
+        const EXCLUDED: [(&str, &str); 5] = [
+            (
+                "run_controller.rs",
+                "carries run.* onto the run resource's error_code field, read on a 200",
+            ),
+            (
+                "model.rs",
+                "carries model.provider_* through the controller onto the same error_code field",
+            ),
+            (
+                "context_assembly.rs",
+                "no HTTP production reference in this build",
+            ),
+            ("recovery.rs", "no HTTP production reference in this build"),
+            (
+                "tool_recovery.rs",
+                "no HTTP production reference in this build",
+            ),
+        ];
+
+        let root = repository_root().join("crates/jarvis-application/src");
+        let mut defines_code: Vec<String> = Vec::new();
+        for entry in walkdir(&root) {
+            let relative = entry
+                .strip_prefix(&root)
+                .expect("the walk yields paths under the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Test files are not producers, and a `code()` in one is an assertion helper.
+            if relative.ends_with("tests.rs") || relative.contains("/tests/") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&entry).expect("the application source reads");
+            let production = super::strip_test_items(&text);
+            // `fn code(` and not `code(`: an assertion `assert_eq!(error.code(), ..)` is not a
+            // definition, and the test items have already been stripped.
+            if production.contains("fn code(") {
+                defines_code.push(relative);
+            }
+        }
+        assert!(
+            defines_code.len() >= 9,
+            "the walk must have found the code() definitions: {defines_code:?}",
+        );
+
+        for file in &defines_code {
+            let scanned = SCANNED.iter().any(|name| file == name);
+            let excluded = EXCLUDED.iter().any(|(name, _)| file == name);
+            assert!(
+                scanned || excluded,
+                "{file} defines code() and is neither scanned nor excluded with a reason. Either its \
+                 values reach the error envelope and it belongs in production_codes_from_services, or \
+                 they do not and it belongs in EXCLUDED — the choice is the point, and leaving it \
+                 unmade is what hid repository/mod.rs.",
+            );
+            assert!(
+                !(scanned && excluded),
+                "{file} is both scanned and excluded, which means one of the two lists is stale",
+            );
+        }
+        // And the exclusion list must not name a file that no longer defines code(), so a moved or
+        // renamed producer cannot leave a stale permission behind.
+        for (name, _) in EXCLUDED {
+            assert!(
+                defines_code.iter().any(|file| file == name),
+                "{name} is excluded but no longer defines code(), so the exclusion is stale",
+            );
+        }
+    }
+
+    /// Walks `root` recursively, yielding every `.rs` file.
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Collects every namespaced code literal in this surface's production half.

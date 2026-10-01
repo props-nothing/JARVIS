@@ -5523,6 +5523,177 @@ Dependencies: Milestone 2 exit gate.
     contracts' tables and by `BRN-065`'s namespace check.
   - 1582 workspace tests (unchanged). 193 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
     docs gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-072` Make the scan's **file list** a checkable decision rather than a comment, and fix the
+  truncation bug the new check exposed in the helper reading that list.
+  Evidence: `the_envelope_producers_are_the_files_this_scan_reads` with its `SCANNED`/`EXCLUDED` lists,
+  `strip_test_items` (brace-matching, moved to module level), the `walkdir` helper, and the corrected
+  `production_codes_from_services` doc that now states the scope as a decision.
+  - **The finding: `jarvis-application` defines `code()` in nine files and the scan read four.** The
+    other five were excluded by reasoning that lived only in prose, so the next envelope producer would
+    be invisible exactly as `repository/mod.rs` was between `BRN-067` and `BRN-071`. The reasoning turns
+    out to be **correct** — `run_controller.rs` and `model.rs` carry `run.*` and `model.provider_*`
+    through `ControllerError::Provider(error) => error.code()` onto the **run resource's `error_code`
+    field**, read on a `200`, not into an envelope; and `context_assembly.rs`, `recovery.rs`, and
+    `tool_recovery.rs` have no HTTP production reference at all. Being correct is not the same as being
+    checkable, so it is now a test: a `code()` in a file that is neither scanned nor excluded fails,
+    naming the file and the decision it needs.
+  - **The check exposed a real bug in the helper it was checking.** `context_assembly.rs` declares its
+    test module **mid-file** (`#[cfg(test)] #[path = "..."] mod tests;` at line 51, with the type under
+    test below it), so a helper that truncates at the first `#[cfg(test)]` hides every `fn code(` after
+    that point — which is why the walk first reported 8 files rather than 9. That is the identical
+    defect `BRN-066` found in the Node finder's `productionHalf`, reproduced in Rust four rounds later,
+    and it fails in the **quiet** direction: the cut removes definitions rather than adding them, so the
+    file is simply absent rather than wrong. `strip_test_items` now brace-matches each item — a
+    declaration ends at its semicolon, an inline block at its matching brace — and is used by both the
+    scan and the walk.
+  - **The four scanned files were never affected, and that is luck rather than design.** Their test
+    modules are trailing (`#[cfg(test)]` within three lines of EOF), so truncation happened to be
+    correct for them. A helper that is only right for the inputs it currently receives is a landmine for
+    the next caller, which is why the fix is one shared function rather than two truncations.
+  - **Both lists are checked in both directions.** Every `code()` file must be scanned or excluded
+    (the omission case), no file may be both (the stale case), and every excluded name must still define
+    `code()` (the renamed-or-moved case). Falsified by renaming the `context_assembly.rs` entry: the test
+    fails naming that file and stating that the choice is the point.
+  - **Not done, and named.** The `EXCLUDED` list is itself hand-maintained — a file that stops defining
+    `code()` fails the third assertion, but a *new* file that defines `code()` and reaches the envelope
+    still needs a human to move it from `EXCLUDED` to `SCANNED`, because no test can decide reachability
+    mechanically. That judgement is now one line in one place rather than a sentence in a doc comment,
+    which is the improvement this round could make; eliminating it would need type-level evidence that
+    the code reaches `ErrorEnvelope::new`, which the workspace does not have.
+  - 1583 workspace tests (+1). 194 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs
+    gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-073` Document the **run resource's `error_code` vocabulary** — the codes that are a field on
+  a `200` rather than an error envelope — and make the list checkable against its four producers.
+  Found by continuing `BRN-072`'s trail: it closed the envelope producers, and the codes those rounds
+  excluded turned out to have no enumerated home at all.
+  Evidence: the run error-code table in `docs/contracts/local-control-api.md` and
+  `the_run_error_code_vocabulary_is_the_one_the_producers_emit` in `jarvis-infrastructure`'s `http` tests.
+  - **The finding: a whole client-visible vocabulary with no list.** `error_code` on a run resource can
+    carry about twenty-five values, and two completeness tests had been built around the envelope set
+    without either noticing that the *other* set was undefined. Nine were in **no document at all** —
+    `run.stream_interrupted`, `run.output_not_persisted`, `run.clock_unavailable`,
+    `run.context_budget_unusable`, `run.context_message_unlabelled`, `run.context_item_too_large`,
+    `model.provider_unavailable`, `model.provider_timeout`, `model.provider_malformed` — and the rest
+    were mentioned only where the code producing them happened to be discussed, which is not a list. A
+    client reading `run.stream_interrupted` had nowhere to look.
+  - **Why neither existing check could see it.** Both read this contract for a table whose rows carry a
+    status, and these values never have one — they are not an envelope for a non-2xx response. So the
+    codes a client branches on most often (a run that failed) were the least documented, and the
+    omission was structural rather than an oversight: no test was even looking at the right shape.
+  - **The four producers are named in the guard, and the codes are read from their `code()` bodies.**
+    `ControllerError` (9), `ProviderError` (9), `BudgetLimit` (2), `AssemblyError` (3), and
+    `RecoveryAction` (1) — the last four reached through the first. Reading each body rather than
+    transcribing its arms means a new arm fails the test, which is the fix `BRN-067` and `BRN-071`
+    applied to the envelope set, now applied where they could not see.
+  - **The comparison is deliberately one-directional, and the reason is stated in the test.** Every
+    emitted code must be documented; the reverse is not asserted, because event types share the `run.*`
+    prefix — `run.context_building` is an event, not a code — and the two cannot be told apart
+    mechanically. Requiring the listed set to be a subset of the emitted one would fail on a correct
+    document, and a test that fails when the document is right is worse than no test. The direction that
+    matters is kept: a value a client can meet is never undocumented.
+  - **Falsified:** removing the `run.clock_unavailable` row makes the guard fail naming exactly that
+    code. Restoring it returns the gate to `0`.
+  - **Not done, and named.** The event types that share the `run.*` prefix are still not enumerated
+    anywhere, so a client cannot look up `run.context_building` either — a smaller gap than this round
+    closed and a different one, since an unrecognized event is skipped rather than misread, whereas an
+    unrecognized failure code is a cause a client must act on. The one-directional comparison also means
+    a **stale** row (documenting a code no producer emits) is not caught here; `BRN-065`'s namespace
+    check would reject such a code if it ever reached the envelope, but nothing checks the field's list
+    for rows nothing can produce.
+  - 1584 workspace tests (+1). 195 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs
+    gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-074` Close the residual `BRN-073` named and **correct that round's own "impossible" claim** —
+  the run error-code table is now checked in **both** directions, and the reverse one found a real miss
+  in the forward scan.
+  Evidence: `run_error_code_set` and its `RunCodeProducers` struct in `jarvis-infrastructure`'s `http`
+  tests, the bidirectional comparison in `the_run_error_code_vocabulary_is_the_one_the_producers_emit`,
+  and the `NOT_THE_FIELDS` exclusion list with its staleness check.
+  - **`BRN-073` said the reverse comparison was impossible; that was wrong in the narrowing direction.**
+    It reasoned that event types share the `run.*` prefix — `run.context_building` is an event, not a
+    code — and concluded the listed set could not be checked against the emitted one. That is true of a
+    comparison against *every* `run.*` literal in arbitrary source, and false of a comparison against the
+    table's **own** list, which is authored: it contains only codes, so a row nothing produces is a stale
+    row. The earlier note generalised "cannot tell codes from event types in source" into "cannot check
+    the reverse at all", and the distinction is worth keeping because it is the difference between an
+    unbuildable check and a buildable one.
+  - **The reverse check found a miss in the forward scan immediately.** `run.context_objective_dropped`
+    is produced at a **call site** — `Step::failed(.., "run.context_objective_dropped")` — not returned
+    from any `code()`, and `BRN-073`'s scan read a fixed window from each `code()` marker. So the table
+    was right and the scan was wrong, and the only reason it surfaced is that the new direction asked a
+    question the old one could not: "does every documented code have a producer?" reported the missing
+    value as *unproduced*. A windowed scan looked precise and was not; the scan now reads each file's
+    whole production half, stripping test items by brace-matching.
+  - **A whole-file scan needs two subtractions, and one of them is a single value.** Event names live in
+    the same files as codes, so they are subtracted — and they are read from `jarvis-protocol`'s own
+    `event_type` constants rather than listed. Budget-construction codes (`run.budget_malformed` and the
+    two range errors) are `run.*` values that never reach `error_code`, so they are excluded by a
+    `NOT_THE_FIELDS` list whose every entry is checked to still be produced.
+  - **`run.cancelled` is both an event type and a code, and getting that wrong broke the check twice in
+    opposite directions.** Subtracting event types for both comparisons dropped it from the reverse set
+    and made a *correct* table report `run.cancelled` as stale; not subtracting them at all made the
+    forward check read event names as undocumented codes. Hence two sets: `every_value` answers "can a
+    producer write this", `field_codes` answers "is this a code rather than an event name", and each
+    comparison uses the one it needs. This is the same shape as `BRN-072`'s `SCANNED`/`EXCLUDED` one
+    level down — a value that is two things at once needs to be accounted for as both.
+  - **Falsified in two directions, each naming its own failure.** Inserting a stale row
+    (`run.a_stale_row`) fails `a row for a value nothing produces sends a client looking for a cause that
+    cannot occur`; renaming an entry in `NOT_THE_FIELDS` fails `these codes are excluded from the
+    field's vocabulary but are no longer produced, so the exclusion is stale`. Restoring each returns the
+    gate to `0`.
+  - **Not done, and named.** The event types themselves are still not enumerated as a contract list, so a
+    client cannot look up `run.context_building` — the smaller half of `BRN-073`'s residual, unchanged
+    here because an unrecognized event is skipped while an unrecognized failure code is a cause a client
+    must act on. The `NOT_THE_FIELDS` list is hand-maintained like every other exclusion in this
+    workspace, with the same mitigation: it cannot go stale silently.
+  - 1584 workspace tests (unchanged). 196 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
+    docs gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-075` Document a **third route a code can reach a client** that three separate scans each
+  assumed did not exist — the `run.budget_*` codes, which arrive in a `400` envelope through a value
+  *passed into* a mapper rather than written in one.
+  Evidence: three `400` rows in `docs/contracts/local-control-api.md`'s minimum-code table, two new cases
+  in `the_service_codes_status_and_retryable_column_are_what_the_mappers_send`, and the corrected
+  `NOT_THE_FIELDS` reason in `run_error_code_set`.
+  - **The finding: a code passed *through* a mapper is invisible to every scan of the mappers.** `budget_for`
+    calls `RunServiceError::invalid(error.code(), ..)` — the code is an *argument*, so it appears as a
+    literal in `run_service.rs` (which the envelope scan reads) but not in any `code()` body (which is
+    what the four-file scan looks for), and `RunServiceError::Invalid` reaches the surface as a **`400`**
+    through a mapper whose arms name no such code. It was invisible to the surface literal scan, to the
+    envelope-producer scan, and to the run-field list — each for a different structural reason, and each
+    for the same reason in spirit: all three look for *authored* code literals at a known place.
+  - **A true exclusion reason was read as a stronger claim than it made, including by me.** `BRN-074`
+    excluded these three with "a BudgetError from run construction; never stored as a run outcome" — which
+    is correct, and I then reasoned from it as though it meant "never client-visible". They are visible,
+    on a `400`. The exclusion from the *field's* list is right; the inference drawn from it was not, and
+    the reason column now says where they do go.
+  - **The guard is the mapper cross-check, not a scan**, which is why the fix had to include cases rather
+    than only rows. `the_service_codes_status_and_retryable_column_are_what_the_mappers_send` drives the
+    real `service_error_response` and asserts the status and both table columns; adding the two
+    `RunServiceError::invalid` cases is what makes the three rows checkable at all. A scan over source
+    cannot see a value that is only ever passed as an argument, so *driving the mapper* is the only
+    instrument that reaches this class.
+  - **Two of my three readings this round were wrong, both through too-narrow searches.** I reported
+    `expiring_after` as having no callers (my pattern was `\.expiring_after\(`, missing the `::` path
+    form — it is called in production at `run_service.rs:1387`) and the `DEFAULT_RUN_DEADLINE_MS ≤
+    MAX_STEP_TIMEOUT_MS` ordering as unasserted (`the_defaults_are_bounded_and_finite` asserts it). The
+    third reading — that the exclusion reason overstated its claim — was right. Recorded because the
+    failure mode is the same one the memory notes describe for scanners: **a pattern that misses a
+    syntactic form reports absence, and absence reads as a clean result.**
+  - **The invariant the near-miss exposed is real even though the assertion already existed.**
+    `budget_for` relies on `DEFAULT_RUN_DEADLINE_MS` being inside `MAX_STEP_TIMEOUT_MS` for every run a
+    client creates; if the ordering inverted, every `POST /runs` would fail with a `400` carrying
+    `run.budget_step_timeout_out_of_range`. The test that asserts it predates this round, so nothing was
+    broken — but it is the reason these three codes need rows rather than a note.
+  - **Falsified:** removing the `run.budget_malformed` row makes the mapper check fail with
+    `the table must list run.budget_malformed as 400, because that is what the mapper sends: None`.
+    Restoring it returns the gate to `0`.
+  - **Not done, and named.** The class this round found is not closed: a code passed *into* any mapper
+    from any source is still only covered where a case was written by hand, and nothing enumerates those
+    pass-through sites. A mechanical check would need to know which `error.code()` calls feed a
+    client-visible field or envelope — the same type-level evidence `BRN-072` recorded as unavailable.
+    The two `run.budget_context_tokens_out_of_range` and `run.budget_step_timeout_out_of_range` rows are
+    likewise covered by cases written for them rather than by a scan.
+  - 1584 workspace tests (unchanged). 197 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
+    docs gates), all four journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
