@@ -226,6 +226,21 @@ carries is modelled and validated as a bounded reference — it is **not** fetch
 accepting a URL from an untrusted document and resolving it is how a manifest would choose its own
 validator.
 
+**The lifecycle is a state machine** (`jarvis_domain::plugin::PluginState`). The nine states above are
+the variants, and the operations are the legal edges; `TLS-015`'s supervisor consults this table rather
+than re-deriving it, the same arrangement `ApprovalState` and `RunState` use. Two of the contract's
+rules are encoded as **absent** edges rather than as checks a caller could forget:
+
+- **install never enables.** `Verified -> Enabled` is not an edge, so a verified package's only target is
+  `InstalledDisabled` — the contract's "install without enabling" is structural, and an installer that
+  enabled on install would be a code change against the table rather than a flag.
+- **nothing re-enables a quarantined plugin directly.** `Quarantined -> Enabled` is absent; the only exit
+  from quarantine is `Disabled`, from which an operator re-enables. That is *stronger* than the contract's
+  "never silently re-enables on package update": because no transition reaches `Enabled` from
+  `Quarantined` at all, a supervisor that forgot to compare the package version still cannot re-enable
+  one. A running plugin (`Enabled` or `Unhealthy`) also cannot be removed directly — it must be disabled
+  or quarantined first, so a child process is stopped before the package it runs against is taken away.
+
 **Not implemented, and each is a named slice:**
 
 - **package provenance and signature verification** (`TLS-014`). The `package` block carries the digest,

@@ -5956,7 +5956,8 @@ Dependencies: Milestone 2 exit gate.
     whose predicates vary). The cursor's bindings remain hand-assembled pipe segments — extracting them
     into a versioned struct is the other half of the `BRN-080` residual and is untouched here.
 - [~] `TLS-011` Define plugin manifest and process supervision contract. **The manifest is defined as
-  types and validated; process supervision is `TLS-015` and is not implemented.**
+  types and validated, and the lifecycle state machine is implemented; process supervision is `TLS-015`
+  and is not implemented.**
   Evidence: `jarvis_infrastructure::plugin` — `PluginManifest::parse` plus the field rules, the
   `PluginManifestError` code set, and 16 tests including the contract's own example read from the
   document (contract test 1: "schema, compatibility range, platform, and unknown-field validation").
@@ -5996,10 +5997,48 @@ Dependencies: Milestone 2 exit gate.
   - **Not done, and named** (in the contract's new Implementation Status section): package provenance and
     signature verification, and the archive traversal/symlink rules (`TLS-014`, contract test 3);
     process supervision — timeouts, bounded capture, crash-loop quarantine, credential revocation
-    (`TLS-015`); and installation, grants, and the lifecycle states (both slices). `parse` grants nothing:
-    it produces a validated document, which is exactly what the contract says a parsed manifest is.
+    (`TLS-015`); and installation and grants (both slices). The *lifecycle state machine* is now
+    implemented below; what is missing is every producer that would move a plugin between its states.
+    `parse` grants nothing: it produces a validated document, which is exactly what the contract says a
+    parsed manifest is.
   - 1614 workspace tests (+16: infra 713). 205 TODO IDs (+1). All gates green (fmt, clippy, test, doc,
     both docs gates). **DO NOT COMMIT.**
+  - **The plugin lifecycle state machine is now implemented** — the nine contract states and the
+    operations between them as a domain table, which `TLS-015`'s supervisor consults rather than
+    re-derives. Evidence: `jarvis_domain::plugin::PluginState` (`can_transition_to`, `allowed_targets`,
+    `parse`, and the classification predicates) and six tests, including the exhaustive edge set and the
+    two absent edges the contract turns on.
+  - **The two rules that belong to the table, not to a caller.** The contract states "install without
+    enabling" and "quarantine … never silently re-enables on package update"; both are encoded as
+    **absent** edges rather than checks, for the reason `ApprovalState` records: a guard written as an
+    early return is a branch that can be silently deleted, while an edge that does not exist cannot be
+    walked. `Verified -> Enabled` simply is not a target, so an installer that enabled on install would
+    be a code change against the table; `Quarantined -> Enabled` is absent too, which is **stronger** than
+    the contract asks — no transition reaches `Enabled` from `Quarantined`, so a supervisor that forgot to
+    compare the package version still cannot re-enable a quarantined plugin. The only exit is `Disabled`.
+  - **A running plugin cannot be removed directly.** `Enabled`/`Unhealthy` have no edge to `Removing`;
+    they must be disabled or quarantined first, so the child process is stopped before the package it runs
+    against is taken away — the mechanical form of the contract's "stop child processes on
+    disable/removal". The test asserts both halves (a running plugin may not be removed, a stopped one
+    may), so it is not vacuous.
+  - **The edges are asserted as a written-out set, not sampled**, the same technique the `ApprovalState`
+    and `RunState` tables use — a removed edge would silently forbid a legal operation and an added one
+    would silently permit an operation the contract never named.
+  - **⚠ `Enabled` and `Unhealthy` have the same target *set* but are not the same arm.** Clippy's
+    `match_same_arms` fired on `InstalledDisabled`/`Disabled` (which genuinely share targets) and I merged
+    those — but merging `Enabled`/`Unhealthy` would have made `Enabled -> Enabled` and
+    `Unhealthy -> Unhealthy` legal, the self-transition the table refuses. The comment says why the two
+    pairs are treated differently, because "clippy said these arms are identical" is true of one pair and
+    would be a defect for the other.
+  - **Falsified both rules.** Adding `Verified -> Enabled` fails the edge-set and totality tests; adding
+    `Quarantined -> Enabled` fails with `quarantined -> enabled legality must be false` and the
+    `allowed_targets` cross-check. Each restored to `0`.
+  - 1620 workspace tests (+6: domain 507). 205 TODO IDs (unchanged — the item is `[~]`). All gates green
+    (fmt, clippy, test, doc, both docs gates). **DO NOT COMMIT.**
+  - **Not done, and named.** The machine is states and edges only: no persisted record, no supervisor, no
+    health probe, no crash-loop counter, and no audit emission (`TLS-015`). Nothing moves a plugin between
+    these states yet — the same "a complete domain capability with no producer" that `TLS-002`'s registry
+    recorded, and `TLS-015` is its first consumer.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
   revoke, and resume use cases for API and CLI with channel assurance checks. Owns

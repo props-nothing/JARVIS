@@ -23,6 +23,7 @@ pub mod context;
 pub mod error;
 pub mod ids;
 pub mod model;
+pub mod plugin;
 pub mod run;
 pub mod time;
 pub mod tool;
