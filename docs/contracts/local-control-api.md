@@ -546,13 +546,28 @@ Minimum codes:
 | 400 | `request.invalid` | no |
 | 400 | `request.invalid_cursor` | no |
 | 400 | `api.host_not_allowed` | no |
+| 400 | `jarvis.context_candidates_unbounded` | no |
 | 401 | `auth.credential_rejected` | no |
 | 403 | `api.origin_not_allowed` | no |
 | 403 | `api.forwarded_header_not_allowed` | no |
+| 403 | `approval.scope_denied` | no |
+| 403 | `approval.channel_not_allowed` | no |
+| 403 | `approval.assurance_insufficient` | no |
+| 403 | `model.exception_required` | no |
+| 403 | `model.policy_unsatisfied` | no |
+| 403 | `jarvis.context_candidates_unbounded` | no |
 | 404 | `resource.not_found` | no |
+| 404 | `approval.not_found` | no |
+| 404 | `model.policy_not_found` | no |
 | 409 | `idempotency.conflict` | no |
 | 409 | `resource.version_conflict` | yes |
 | 409 | `stream.replay_unavailable` | no |
+| 409 | `approval.version_conflict` | yes |
+| 409 | `approval.expired` | no |
+| 409 | `approval.fingerprint_mismatch` | no |
+| 409 | `approval.already_consumed` | no |
+| 409 | `approval.state_conflict` | no |
+| 409 | `jarvis.invalid_policy_layer` | no |
 | 413 | `request.too_large` | no |
 | 415 | `request.media_type_unsupported` | no |
 | 422 | `request.semantic_invalid` | no |
@@ -568,6 +583,26 @@ begun with `200`, so there is no status left to carry it. It is listed here beca
 handle it, and a table that omitted it would be claiming to list every code the surface produces while
 leaving one out — the same defect this table's completeness check exists to catch.
 
+**The rows below the `api.*` and `request.*` codes travel on an application service error's
+`code()`** rather than appearing as a literal in the surface's own source, so they reach a client
+without a source scan of the surface finding them. They are listed here because a client branches on
+them exactly as it does on the rest, and because the list is otherwise incomplete in a way nothing
+can see: `BRN-067` found thirteen of them absent, and `jarvis.context_candidates_unbounded` — a `403`
+this surface returns — was in **no document anywhere in the repository**, so a client meeting it had
+nothing to read. The statuses are the mapping functions' own arms (`approval_error_response`,
+`policy_error_response`, `service_error_response`) and the retryability is each error type's own
+`retryable()`, so the two cannot disagree about whether a second attempt could succeed.
+
+`jarvis.context_candidates_unbounded` appears **twice**, because two routes carry it with different
+statuses: on the create-run route it is a refusal of an authorized request, so it is a `403`, while on
+the policy-evaluate route it is the submitted ruleset being unusable, so it is a `400`. That is not two
+codes wearing one name: the same fact — too many candidates were offered to evaluate — is a different
+answer depending on what the caller asked for, which is the same reasoning that makes
+`resource.version_conflict` a `409` on a write and a field on a `200` read. Both rows are present
+rather than one row plus a sentence, because a status a client must handle belongs in the column the
+client reads; an earlier revision of this table had the `403` only in prose, and the test that drives
+the mappers against the table is what caught it.
+
 Every code above except one is produced by a control on this surface, and every code the surface
 produces is listed above — a property a test holds, not a claim this document makes about itself.
 The exception is `request.rate_limited`, which is **reserved**: no rate limiter exists on this
@@ -580,8 +615,18 @@ above are JARVIS's own and are named in
 [the error-envelope conventions](common-conventions.md#error-envelope), which also states the rule
 this surface relies on: a code outside JARVIS's namespaces is replaced by `jarvis.internal` at the
 emission boundary rather than forwarded. That replacement happens in `jarvis_protocol::ErrorEnvelope::new`,
-so a code in this table cannot be altered between being written here and reaching a client, and a
-code this table does not list cannot reach a client at all — it arrives as `jarvis.internal`.
+so a code in this table cannot be altered between being written here and reaching a client.
+
+The replacement is **not** a completeness check, and an earlier revision of this paragraph said it
+was. It read "a code this table does not list cannot reach a client at all — it arrives as
+`jarvis.internal`", which is false in the direction that matters: fourteen codes in this table are
+produced by an application service error's `code()`, so they cross the boundary with a namespace
+`ErrorEnvelope::new` accepts and a table row it never consulted. The boundary enforces *whose* code a
+value is; only this table's completeness test enforces *whether the table names it*, and until
+`BRN-067` that test read the surface's own literals and a two-item hand list, so it saw neither these
+fourteen nor the orphan among them. A reader who trusted the old sentence would have concluded that a
+code missing from the table was unreachable and stopped looking — which is exactly how
+`jarvis.context_candidates_unbounded` stayed undocumented.
 
 **`409 resource.version_conflict` covers a stale durable precondition, on every route that has one.**
 The run routes supply the version they read on every transition, so a concurrent advance is refused as

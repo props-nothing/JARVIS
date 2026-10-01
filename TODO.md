@@ -5291,6 +5291,192 @@ Dependencies: Milestone 2 exit gate.
     only through a generic bound.
   - 1579 workspace tests (−3: the deleted dead tests). 23 validator tests (unchanged). All gates green
     (fmt, clippy, test, doc, both docs gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-067` Make the code table's completeness check able to see **the codes that reach a client
+  through an application service error's `code()`**, list the fourteen it was hiding, and correct the
+  false claim in `BRN-065`'s own contract sentence. Found by reviewing `BRN-065` rather than by a new
+  sweep, because the defect was in that round's reasoning: it added a boundary that enforces *whose*
+  code a value is, and then wrote as though that also enforced *whether anyone had written the code
+  down*.
+  Evidence: the new `every_code_an_application_service_error_carries_is_in_the_contract_table` test
+  (which scans `approval_service.rs`, `policy_service.rs`, and `run_service.rs` for owned codes and
+  compares them against the table), fourteen added rows in `docs/contracts/local-control-api.md`, the
+  corrected completeness paragraph in the same document, and `jarvis.context_candidates_unbounded`
+  documented in `docs/contracts/model-data-policy.md`.
+  - **The defect: the table claimed to be complete and was missing fourteen codes.** The surface maps
+    three application error types onto the envelope through `error.code()` —
+    `ApprovalServiceError`, `PolicyServiceError`, and `RunServiceError` — and their codes appear as
+    literals in `jarvis-application`, not in the surface, so the surface's own literal scan finds none
+    of them. `CODES_CARRIED_BY_ERROR_TYPES` was the compensation, and it was **a hand-written
+    two-item list** (`idempotency.conflict`, `resource.version_conflict`) against three `code()`
+    implementations returning far more. Thirteen of the produced codes were absent from the table.
+  - **One of them was in no document anywhere in the repository.**
+    `jarvis.context_candidates_unbounded` is a `code()` value on both `PolicyServiceError` and
+    `RunServiceError` — the route selector refusing to *examine* its input because more candidates
+    were offered than `jarvis_domain::context::budget::MAX_CANDIDATES` (ten thousand) allows. It
+    reaches a client as a **`403` on create-run** (the same code is a `400` on policy evaluate) and
+    was named in zero Markdown files. A client meeting it had nothing to read. It now has a row and a
+    paragraph explaining why it is `jarvis.*` rather than folded into `model.policy_unsatisfied` —
+    folding it would tell a caller its policy excluded every model, sending it to edit a policy that
+    was never read.
+  - **The false claim was `BRN-065`'s, and it was false in the direction that hides this class.** That
+    round added the sentence *"a code this table does not list cannot reach a client at all — it
+    arrives as `jarvis.internal`"*. That is not what the boundary does: `ErrorEnvelope::new` replaces a
+    code whose **namespace** it does not own, and every one of these fourteen codes is in an owned
+    namespace, so they cross it untouched and a table row is never consulted. A reader trusting the
+    sentence would conclude that a code missing from the table was unreachable and stop looking —
+    which is precisely how the orphan survived `BRN-065`'s own review of this file.
+  - **The guard scans the services' source rather than extending the hand list**, for the reason
+    `BRN-064` recorded: a hand-maintained list is a second thing to drift, and three consecutive
+    rounds found the drift had been in the direction of silence. It reads the same namespaced string
+    literals the surface scan reads, over the three files that own the mappers, and asserts the result
+    is a **subset of the table**. It also asserts it read all three files and found at least twenty
+    codes, so a scan that silently stopped finding anything fails rather than passes — the vacuous-scan
+    failure every fixture in this workspace exists to catch.
+  - **Falsified in both directions.** Removing the `model.exception_required` row makes the guard fail
+    naming exactly that code; introducing an unlisted code into `run_service.rs` makes it fail naming
+    the new one, which proves the scan reads real source rather than a copied list. Restoring each
+    returns the gate to `0`.
+  - **A mutation nearly hid behind a stale build, and the lesson is a build one.** `Copy-Item -Force`
+    restores a file's **original timestamp**, so restoring `run_service.rs` after a mutation left cargo
+    reusing the artifact compiled from the mutated source — a test then failed against code that was no
+    longer on disk, which reads as "my restore did not work" when in fact the file was already correct
+    and the *binary* was stale. Fixed by touching the file; the durable fix is to verify a restore by
+    content (`git diff` clean) **and** to expect one stale-artifact failure rather than re-editing a
+    file that is already right.
+  - **Not done, and named.** The scan is a literal scan over three files, so a code built by
+    `format!` from parts, or carried in a fourth file added later, is still invisible — the same
+    boundary the surface scan has. `PolicyServiceError`'s variant doc names a code
+    (`jarvis.invalid_policy_layer`) that its `code()` can only receive from the caller, so the guard
+    covers it through the `Contradictory { code }` arm's call sites rather than by construction. And
+    the `409`/`403` statuses now recorded in the table for `approval.*` and `model.*` codes are taken
+    from the mapping functions' arms, which no test yet compares against the table the way
+    `resource.version_conflict` and `service.not_ready` are compared.
+  - 1580 workspace tests (+1). 189 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs
+    gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-068` Hold the code table's **other two columns** to the mappers that produce them — the
+  follow-up `BRN-067` named and deliberately left undone. That round added the fourteen missing rows
+  and took each status from the mapping function it read, but nothing compared the two, so a row
+  could name a code correctly and state the wrong status or the wrong retryability with every gate
+  green.
+  Evidence: `the_service_codes_status_and_retryable_column_are_what_the_mappers_send` plus its
+  `service_code_cases`, `run_service_code_cases`, `policy_and_approval_code_cases`, and
+  `assert_mapper_row` helpers, the `status_cells` table reader, two `pub(crate)` test accessors
+  (`policy_error_response_for_test`, `approval_error_response_for_test`), and the corrected
+  `jarvis.context_candidates_unbounded` rows in `docs/contracts/local-control-api.md`.
+  - **The test drives ten refusals through the three real mapping functions** and asserts three
+    things at once for each: the status the mapper returned, the `retryable` flag in the body it
+    sent, and *both columns of the table*. The three comparisons are the point — asserting the
+    mapper's answer beside the document's is what makes this a cross-check rather than a document
+    agreeing with itself, and it is the same shape the existing `resource.version_conflict` and
+    `service.not_ready` checks already had for two codes.
+  - **It caught a real inconsistency on its first run, in my own `BRN-067` edit.**
+    `jarvis.context_candidates_unbounded` has **two** statuses — `403` on create-run, `400` on
+    policy evaluate — and `BRN-067` put the `403` in a **row** and the `400` in **prose**. A status a
+    client must handle belongs in the column a client reads, so the table now has both rows and the
+    prose says why. This is the same defect class one layer on: not a missing row, but a present fact
+    recorded where nothing can check it.
+  - **The prose-first version would have looked correct to every existing gate.** The completeness
+    test compares *codes*, so a code listed at one of its two statuses satisfies it; only driving the
+    mapper that sends the other status shows the disagreement. That is why the follow-up was worth
+    doing rather than declaring the table finished.
+  - **The status reader returns a set per code, not one value.** A last-row-wins map would have
+    silently dropped the `400` for the two-status code and failed against a document that was already
+    right — so the fix had to be in the reader before the fix could be in the table, and the
+    assertion became membership rather than equality. Worth recording because the obvious
+    `BTreeMap<String, String>` is wrong here and would have produced a false failure that reads like
+    a real one.
+  - **Falsified in both directions.** Changing `model.policy_unsatisfied`'s row from `403` to `404`
+    fails `the table must list model.policy_unsatisfied as 403 ... Some({"404"})`; flipping
+    `approval.version_conflict`'s `Retryable` cell from `yes` to `no` fails `the table's Retryable
+    column must agree with the mapper's own retryable()`. Restoring each returns the gate to `0`.
+  - **Not done, and named.** The ten cases cover every code the three mappers produce **that the test
+    names**, not every variant: `ApprovalServiceError::Storage`, the `Invalid`/`ScopeDenied` carried
+    codes other than the ones exercised, and `RunServiceError`'s `NotFoundException` and storage arms
+    are reached in this build only through a repository the fixture would have to be broken to
+    produce, so they are unasserted here and are covered by their own `code()` tests in
+    `jarvis-application`. The scan is still a literal scan, so a code built by `format!` from parts
+    remains invisible — the boundary `BRN-067` also recorded.
+  - 1581 workspace tests (+1). All gates green (fmt, clippy, test, doc, both docs gates), all four
+    journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-069` Delete the hand list `BRN-067` left behind, now that a scan supersedes it — a loose
+  end in my own previous round, found by asking what the list was still for.
+  Evidence: `CODES_CARRIED_BY_ERROR_TYPES` removed; the extraction of `production_codes_from_services`
+  (the scan) plus the `carried_codes`, `listed_codes`, `contract_document`, and `repository_root` test
+  helpers; and the corrected doc comments on `production_codes` that had described the list as the
+  mechanism.
+  - **`BRN-067` added a scan and left the hand list it replaced in place.** Two mechanisms for one
+    fact is exactly the shape this project keeps finding: they agree today and drift tomorrow, and
+    `BRN-067`'s whole finding was that this list had drifted. The list also kept a **false claim**
+    alive in its doc — that the two codes it named are "invisible to a scan" — while both are string
+    literals in `approval_service.rs`/`policy_service.rs`/`run_service.rs`, which is precisely what
+    the new scan reads. Verified by grepping the two codes' literals before deleting.
+  - **The completeness test now unions two scans rather than a scan and a list.** `production_codes`
+    reads this surface's own literals (correctly scoped — widening it would stop describing *this*
+    surface) and `production_codes_from_services` reads the services' `code()` values; the union is
+    what the table is compared against. So a newly carried code is covered without anyone remembering
+    to add it, which was the defect, **fixed in both places rather than one**.
+  - **Four duplication sites collapsed into shared helpers** while doing this: `repository_root`,
+    `contract_document`, `listed_codes`, and `carried_codes`. Three tests were each re-deriving the
+    repository root and re-reading the contract, which is a disagreement waiting to happen — a wrong
+    number of `.parent()` calls reads as "the file is missing" rather than as a bug. The two vacuity
+    guards (all three files read, at least twenty codes found) moved into `carried_codes` so a new
+    caller cannot forget one.
+  - **Falsified:** adding a new unlisted code to `approval_service.rs` makes
+    `the_minimum_code_table_names_every_code_this_surface_produces` fail naming it — which it could
+    not do before this round, because the test read literals in the surface and a two-item list. The
+    scan-based version catches a service-carried code with no list at all.
+  - **Not done, and named.** The scan is still a literal scan over three named files, so a **fourth**
+    service file added later is invisible until it is added to the list in `production_codes_from_services`,
+    and a code built by `format!` from parts remains invisible — both recorded by `BRN-067` and both
+    unchanged here. The file list is itself now a hand-maintained list, which is the same shape one
+    level up; replacing it would mean discovering application source files rather than naming them,
+    and that is a deliberate step not taken in this round.
+  - 1581 workspace tests (unchanged). All gates green (fmt, clippy, test, doc, both docs gates), all
+    four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-070` Correct a **false reachability claim** my own `BRN-069` note made: that
+  `RunServiceError::Controller(error).code()` yields `run.*` to a client. It does not — nothing
+  constructs that variant — and three of the nine `run.*` codes its arms name are in no document.
+  Evidence: the corrected variant doc in `crates/jarvis-application/src/run_service.rs`, the corrected
+  500 arm in `crates/jarvis-infrastructure/src/http/runs.rs`, the corrected `production_codes` note in
+  `crates/jarvis-infrastructure/src/http/mod.rs`, and
+  `a_controller_failure_is_recorded_on_the_run_rather_than_reported_to_the_submitter` in
+  `crates/jarvis-application/src/run_service/tests.rs`.
+  - **The finding: a variant with a producer in the type system and none in the program.**
+    `RunServiceError::Controller(ControllerError)` appears in exactly three places — the three match
+    arms of its own `code()`, `retryable()`, and `message()`. There is no `From<ControllerError>` impl,
+    no construction site in any crate, and **not even a test** builds it. So nine `run.*` codes reach a
+    reader through three arms that cannot execute.
+  - **It is unconstructed because the design says so, and the discard is explicit.** `spawn_run` states
+    the reason where it drops the controller's return value: *"The outcome is deliberately not
+    propagated: the run's terminal state is durable and is what a client reads, so a controller error is
+    already recorded as the run's state rather than needing a channel to nowhere."* So a controller
+    failure becomes the run's own `error_code` — which the contract does document as client-visible
+    (`run.no_model_served`, `run.deadline_exceeded`, `run.budget_*`) — rather than an error returned to
+    whoever submitted the run.
+  - **Three of the nine are in no document at all.** `run.stream_interrupted`,
+    `run.output_not_persisted`, and `run.clock_unavailable` are named in zero Markdown files. This is
+    the same gap `BRN-067` closed for the table, in the other place a code can live: on a durable field
+    read by the run resource rather than in an error envelope. They are reachable in the sense that
+    matters — they can land on a run's stored row — so a client can meet a code with nothing to read.
+  - **The correction is recorded rather than the variant deleted, and the reason is which decision is
+    whose.** Removing it would change the run-creation API's error shape, which is a design choice for
+    whoever next works on that route, not for a sweep about reachability. What this round owes a reader
+    is the truth: the doc now says nothing constructs it and why, the 500 arm says its `code()` arm is
+    unreachable, and the `production_codes` note that claimed it "would yield `run.*`" says what is
+    actually so.
+  - **The guard asserts the delegation, not a call-graph absence.** A test asserting "nothing constructs
+    this" would fail the moment someone *correctly* wires it; the test instead pins what must hold either
+    way — a controller failure reports the controller's own code, message, and retryability rather than
+    a variant name — so it stays true if the variant becomes live and is the right failure if it is
+    deleted. Naming it as the delegation is the honest form of a guard over an unreachable arm.
+  - **Not done, and named.** The nine codes are **not** added to the control API's minimum-code table,
+    because they do not arrive in an error envelope — they arrive on the run resource's `error_code`
+    field, which that table's completeness test is scoped to the envelope and must not be widened to
+    cover. Whether they need their own documented list is the same open question as the missing
+    `run.stream_interrupted`; it is named here rather than resolved, because inventing a second table
+    is a contract change and this round was a correction.
+  - 1582 workspace tests (+1). 192 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs
+    gates), all four journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

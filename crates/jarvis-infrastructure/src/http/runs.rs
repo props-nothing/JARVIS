@@ -1184,6 +1184,12 @@ fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> 
         // `resource.version_conflict` for a precondition and `internal.failure` for a `500`. So a
         // client was told the server had faulted when its own view was merely stale, which is the one
         // case where retrying after a re-read succeeds.
+        // A controller failure is a `500`, and the status is right. The variant's `code()` arm is
+        // **unreachable**, though: nothing constructs `RunServiceError::Controller`, because a run's
+        // outcome is reported on the run's own durable row rather than to the submitter — the
+        // controller's error is recorded as the run's terminal state. So this arm keeps a `500` shape
+        // for a variant that would be a server fault if it ever occurred, while the codes it would
+        // carry (`run.*`) reach a client through the run resource's `error_code` field instead.
         RunServiceError::Storage(_) | RunServiceError::Controller(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }

@@ -141,6 +141,25 @@ pub enum RunServiceError {
     /// Storage failed.
     Storage(RepositoryError),
     /// The run was created but could not be driven to a terminal state.
+    ///
+    /// **⚠ Nothing constructs this variant, and its `code()`/`retryable()`/`message()` arms are
+    /// therefore unreachable.** Recorded here rather than deleted, because both options are real and
+    /// the choice is not this module's to make quietly:
+    ///
+    /// It was written for the case where a caller submits a run and wants to hear that the controller
+    /// could not finish it. That is **deliberately not** how a run's outcome is reported. The run's
+    /// terminal state is durable and is what a client reads, so a controller failure is already
+    /// recorded on the run's own row — `spawn_run` states this where it discards the outcome: *"The
+    /// outcome is deliberately not propagated: the run's terminal state is durable and is what a
+    /// client reads, so a controller error is already recorded as the run's state rather than needing
+    /// a channel to nowhere."* The nine `run.*` codes this variant would carry are delivered that way
+    /// instead: the run resource's `error_code` field, which this contract documents as
+    /// client-visible.
+    ///
+    /// So the variant is a claim the surface makes about itself that nothing fulfils — a variant with
+    /// a producer in the type system and none in the program. It is kept rather than removed only
+    /// because removing it is a decision about the run-creation API's error shape, which belongs with
+    /// whoever next works on that route rather than in a sweep.
     Controller(ControllerError),
     /// The policy named for the run does not exist in the caller's scope.
     ///

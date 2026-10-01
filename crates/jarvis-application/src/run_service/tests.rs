@@ -2038,3 +2038,34 @@ fn an_attested_profile_carries_a_revalidation_window_the_freshness_check_honours
         "a profile must not stay fresh indefinitely",
     );
 }
+
+#[test]
+fn a_controller_failure_is_recorded_on_the_run_rather_than_reported_to_the_submitter() {
+    // **The reachability fact behind `RunServiceError::Controller`, which `BRN-070` recorded.**
+    // Nothing constructs that variant: a runner submits a run, the controller drives it, and the
+    // controller's failure becomes the run's own durable terminal state rather than an error
+    // returned to the submitter. The variant's doc says so, and this test is what keeps the claim
+    // from being a sentence.
+    //
+    // Asserted as the *delegation* rather than as a textual "nothing calls this", because the two
+    // failures worth distinguishing are opposite. If someone later wires a controller failure to the
+    // submitter (which would make the variant live and change its status to a `500`), the delegation
+    // below is what must keep holding — the code a client reads must still be the controller's own,
+    // not a variant name. If instead someone deletes the variant, this test fails to compile, which
+    // is the right signal: the decision belongs with the run-creation API's error shape.
+    let error = RunServiceError::Controller(crate::run_controller::ControllerError::NoModelServed);
+    assert_eq!(
+        error.code(),
+        "run.no_model_served",
+        "a controller failure must report the controller's own code, not a variant name",
+    );
+    assert_eq!(
+        error.message(),
+        "No model is available to serve this run.",
+        "and the message must be the one the controller composed for a client",
+    );
+    assert!(
+        !error.retryable(),
+        "a run that found no model is not fixed by resending the same request",
+    );
+}

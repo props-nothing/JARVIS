@@ -664,6 +664,15 @@ fn not_found(request_id: Option<&str>) -> Response {
 /// The status follows the code rather than the other way round, because the contract's stable-error
 /// list is what a client keys on — and `retryable` is the service's own answer, so the two cannot
 /// disagree about whether a second attempt could succeed.
+///
+/// Exposed to the crate so a test can drive the mapping directly: an approval with a stale version
+/// or one that has lapsed has to be constructed, and reaching it through the surface would test how
+/// the fixture seeds a record rather than what this function decides.
+#[cfg(test)]
+pub(crate) fn approval_error_response_for_test(error: &ApprovalServiceError) -> Response {
+    approval_error_response(None, error)
+}
+
 fn approval_error_response(request_id: Option<&str>, error: &ApprovalServiceError) -> Response {
     let status = match error {
         ApprovalServiceError::NotFound => StatusCode::NOT_FOUND,

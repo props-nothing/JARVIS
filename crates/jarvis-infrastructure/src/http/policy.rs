@@ -688,6 +688,15 @@ fn context_for(client: &AuthenticatedClient, request_id: Option<&str>) -> Reques
 /// A refusal is deliberately absent from this mapping: an unsatisfied policy is a `200` with a
 /// body, handled by the caller, and routing it here would give a client a status that says the
 /// request failed.
+///
+/// Exposed to the crate so a test can drive the mapping directly: a policy that contradicts an
+/// earlier layer has to be constructed, and reaching it through the surface would test how the
+/// fixture builds rules rather than what this function decides.
+#[cfg(test)]
+pub(crate) fn policy_error_response_for_test(error: &PolicyServiceError) -> Response {
+    policy_error_response(None, error)
+}
+
 fn policy_error_response(request_id: Option<&str>, error: &PolicyServiceError) -> Response {
     let status = match error {
         PolicyServiceError::NoActivePolicy | PolicyServiceError::PolicyNotFound => {

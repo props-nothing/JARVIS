@@ -1105,20 +1105,44 @@ pub fn credential_status(error: CredentialError) -> StatusCode {
     }
 }
 
-/// The codes this surface produces that do not appear as a literal in its own source.
+/// Reads the codes the application services carry onto the envelope through their `code()`.
 ///
-/// Every envelope this module and its children build names its code inline, which is what the
-/// parity test scans for — but two codes travel on an **error type's `code()`** instead of
-/// appearing as a literal here: `idempotency.conflict` on `RunServiceError` and
-/// `resource.version_conflict` on `RepositoryError`. Both reach the envelope through
-/// `service_error_response`/`policy_error_response`, so they are produced by this surface while
-/// being invisible to a scan of it.
+/// Extracted so both directions of the table check use **one** scan rather than two lists. The
+/// completeness test previously compensated for what a scan of *this* surface cannot see with a
+/// hand-written two-item constant, and `BRN-067` found that list had drifted: the three `code()`
+/// implementations carry twenty codes, not two. The scan below reads the services' own source, so
+/// it finds what the hand list was standing in for.
 ///
-/// Naming them rather than widening the scan: a scan that also read other crates would find every
-/// code in the workspace and stop describing *this* surface, which is the thing the test is about.
+/// Returns the codes and the number of files read, so a caller can assert the scan was not vacuous.
 #[cfg(test)]
-const CODES_CARRIED_BY_ERROR_TYPES: [&str; 2] =
-    ["idempotency.conflict", "resource.version_conflict"];
+fn production_codes_from_services(
+    repository: &std::path::Path,
+) -> (std::collections::BTreeSet<String>, usize) {
+    let mut carried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files_read = 0;
+    for name in ["approval_service.rs", "policy_service.rs", "run_service.rs"] {
+        let path = repository.join("crates/jarvis-application/src").join(name);
+        // `expect` rather than `panic!`: the workspace denies `panic` even in a test, because a
+        // panic in production is the hazard the rule exists against and a test is not exempt.
+        let text = std::fs::read_to_string(&path).expect("the service source reads");
+        files_read += 1;
+        // The production half only: a test may name a code it does not produce, and counting
+        // assertions would make this test quote itself.
+        let production = match text.find("#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => &text[..],
+        };
+        for found in production.match_indices('"') {
+            let rest = &production[found.0 + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let candidate = &rest[..end];
+            if jarvis_protocol::is_owned_code(candidate) {
+                carried.insert(candidate.to_owned());
+            }
+        }
+    }
+    (carried, files_read)
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1132,10 +1156,12 @@ pub(crate) mod tests {
     use crate::storage::repositories::SqliteRepositories;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use jarvis_application::policy_service::PolicyService;
+    use jarvis_application::approval_service::ApprovalServiceError;
+    use jarvis_application::policy_service::{PolicyService, PolicyServiceError};
     use jarvis_application::repository::policy::ModelDataPolicyRepository;
     use jarvis_application::repository::run::RunRepository as _;
     use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
+    use jarvis_application::run_service::RunServiceError;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4336,40 +4362,21 @@ pub(crate) mod tests {
             modules >= 3,
             "the surface must have been scanned: {modules} modules",
         );
-        for carried in super::CODES_CARRIED_BY_ERROR_TYPES {
-            produced.insert(carried.to_owned());
+        // And the codes this surface produces **through an error type's `code()`**, which a scan of
+        // this surface cannot see. They came from a hand-written list until `BRN-069`; the scan is
+        // used here instead, so a newly carried code is covered without anyone remembering to add it
+        // — which is `BRN-067`'s defect, fixed in both places rather than one.
+        for code in carried_codes() {
+            produced.insert(code);
         }
 
-        let document = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .expect("the crate lives two levels under the repository root")
-                .join("docs/contracts/local-control-api.md"),
-        )
-        .expect("the contract reads");
+        let document = contract_document();
 
         // The **table rows** only, not the whole document. A code named in prose is not a listed
         // code — the paragraph above the table has to be able to say that `auth.invalid` was
         // removed, and a scan over the whole file cannot tell that sentence from a row. Extracted
         // by shape (`| 401 | `code` | no |`) so a reworded paragraph cannot pass as a table.
-        let listed: std::collections::BTreeSet<String> = document
-            .lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix("| ")?.trim_start();
-                // A status cell is three digits, or `n/a` for a code delivered in an event stream
-                // rather than as a status. The next cell is the code in backticks. Anything else on
-                // the line is a different table.
-                let (status, rest) = rest.split_once(" | ")?;
-                if !is_status_cell(status) {
-                    return None;
-                }
-                // The code sits between the first pair of backticks.
-                let (_, after) = rest.split_once('`')?;
-                let (code, _) = after.split_once('`')?;
-                code.contains('.').then(|| code.to_owned())
-            })
-            .collect();
+        let listed = listed_codes(&document);
         assert!(
             listed.len() >= 14,
             "the table must have been parsed: {listed:?}",
@@ -4409,7 +4416,7 @@ pub(crate) mod tests {
             "the contract marks a stale precondition retryable after a re-read",
         );
         assert!(
-            jarvis_application::run_service::RunServiceError::Conflict.retryable(),
+            RunServiceError::Conflict.retryable(),
             "and the surface must agree, which it did not: it reached a client as retryable:false \
              on a 500",
         );
@@ -4489,17 +4496,31 @@ pub(crate) mod tests {
             produced.len() >= 10,
             "the scan must have found the surface's codes: {produced:?}",
         );
-        for carried in super::CODES_CARRIED_BY_ERROR_TYPES {
-            // Carried on error types rather than written here, so the scan cannot see them; they
-            // reach the same constructor and must survive it for the same reason.
-            let envelope = jarvis_protocol::ErrorEnvelope::new(carried, "m", false);
-            assert_eq!(
-                envelope.code(),
-                carried,
-                "{carried} reaches a client as a different code",
-            );
+        // The codes this surface produces **through an error type's `code()`**, which the scan above
+        // cannot see because they are not literals here. They came from a hand-written list until
+        // `BRN-069`; the services' own source is read instead, so a newly carried code is covered
+        // without anyone remembering to add it — the defect `BRN-067` found, fixed in both places
+        // rather than one.
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the crate lives two levels under the repository root")
+            .to_path_buf();
+        let (mut carried, service_modules) = super::production_codes_from_services(&repository);
+        assert_eq!(
+            service_modules, 3,
+            "all three service modules must be scanned"
+        );
+        assert!(
+            carried.len() >= 20,
+            "the service scan must have found the carried codes: {carried:?}",
+        );
+        // `produced` is the surface's own literals plus the carried ones, because both reach the
+        // same constructor and must survive it for the same reason.
+        for code in produced {
+            carried.insert(code);
         }
-        for code in &produced {
+        for code in &carried {
             let envelope = jarvis_protocol::ErrorEnvelope::new(code.as_str(), "m", false);
             assert_eq!(
                 envelope.code(),
@@ -4533,6 +4554,266 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_code_an_application_service_error_carries_is_in_the_contract_table() {
+        // **The half the completeness test could not see, and the reason `BRN-065`'s own contract
+        // sentence was false.** The surface maps three application error types onto the envelope
+        // through their `code()`: `ApprovalServiceError`, `PolicyServiceError`, and
+        // `RunServiceError`. Their codes never appear as literals in this surface's source, so
+        // `production_codes` — which scans for literals — finds none of them, and
+        // `CODES_CARRIED_BY_ERROR_TYPES` — a hand-written two-item list, deleted by `BRN-069` once
+        // the scan below replaced it. The three
+        // `code()` implementations return far more than two codes, so the table was missing thirteen
+        // of them, and one of those (`jarvis.context_candidates_unbounded`, a `403` this surface
+        // returns) was in no document anywhere.
+        //
+        // Scanned from the services' own source rather than extended by hand, for the reason
+        // `BRN-064` recorded: a hand-maintained list is a second thing to drift, and this is the
+        // third round to find that the drift was in the direction of silence. The scan reads the
+        // same namespaced string literals `production_codes` reads, over the three files that own
+        // the mappers, and the assertion compares them against the table the contract says is
+        // complete.
+        let carried = carried_codes();
+
+        let document = contract_document();
+        let listed = listed_codes(&document);
+
+        let unlisted: Vec<&String> = carried.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "every code an application service error carries must be in the contract's table, \
+             because a client branches on it and a code outside the table is documented nowhere: \
+             {unlisted:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_service_codes_status_and_retryable_column_are_what_the_mappers_send() {
+        // **The other two columns, which `BRN-067` recorded from the mappers' arms and did not
+        // check.** That round added the rows that were missing and took each status from the
+        // mapping function it read, but nothing compares the two — so a row could name a code
+        // correctly and state the wrong status or the wrong retryability, and the table would
+        // disagree with the daemon with every gate green. The existing retryability check has
+        // exactly this shape for two codes (`resource.version_conflict`, `service.not_ready`) and
+        // asserts the *implementation's* answer beside the table's, which is what makes it a
+        // cross-check rather than a document agreeing with itself.
+        //
+        // The mappers are driven **directly** rather than through a route, because a run whose
+        // policy is unsatisfied, an approval with a stale version, and a policy whose rules
+        // contradict all have to be constructed — and a test that reached them through the HTTP
+        // surface would be testing how the fixture builds state rather than what the mapping
+        // decides. `service_error_response_for_test` already exists for this reason; the approval
+        // and policy mappers are reached the same way and are private to this module tree.
+        let document = contract_document();
+        let rows = retryable_cells(&document);
+        let statuses = status_cells(&document);
+
+        let cases = service_code_cases();
+        assert_eq!(
+            cases.len(),
+            10,
+            "the case list must drive every mapped refusal",
+        );
+        for (label, response, code, status, retryable) in cases {
+            assert_mapper_row(response, label, code, status, retryable, &rows, &statuses).await;
+        }
+    }
+
+    /// Every application-service refusal this surface maps, as the cases a test drives.
+    ///
+    /// Each entry is an error type's own variant, so the code, the status, and the flag all come
+    /// from code rather than from the document. `resource.version_conflict` is carried by two of
+    /// the three types, so asserting it from both proves the two mappers agree with each other as
+    /// well as with the table. Extracted from the test so the test reads as the loop over the cases
+    /// and a new case cannot be added with a weaker check than its neighbours.
+    fn service_code_cases() -> Vec<(
+        &'static str,
+        axum::response::Response,
+        &'static str,
+        u16,
+        bool,
+    )> {
+        let mut cases = run_service_code_cases();
+        cases.extend(policy_and_approval_code_cases());
+        cases
+    }
+
+    /// The `RunServiceError` refusals, as cases.
+    ///
+    /// Split from the policy and approval cases because the combined list exceeds the function
+    /// length bound the workspace enforces, and the split follows the type boundary the cases
+    /// already had rather than an arbitrary one.
+    fn run_service_code_cases() -> Vec<(
+        &'static str,
+        axum::response::Response,
+        &'static str,
+        u16,
+        bool,
+    )> {
+        let run_refusal = RunServiceError::PolicyUnsatisfied {
+            code: "model.policy_unsatisfied",
+            message: "No model satisfies the model data policy in force.",
+        };
+        let run_stale = RunServiceError::Conflict;
+        let run_unbounded = RunServiceError::PolicyUnsatisfied {
+            code: "jarvis.context_candidates_unbounded",
+            message: "Too many model candidates were offered to evaluate.",
+        };
+        vec![
+            (
+                "a run whose policy refuses every model",
+                crate::http::runs::service_error_response_for_test(&run_refusal),
+                run_refusal.code(),
+                403,
+                run_refusal.retryable(),
+            ),
+            (
+                "a run meeting a stale precondition",
+                crate::http::runs::service_error_response_for_test(&run_stale),
+                run_stale.code(),
+                409,
+                run_stale.retryable(),
+            ),
+            (
+                "a run offered too many candidates to examine",
+                crate::http::runs::service_error_response_for_test(&run_unbounded),
+                run_unbounded.code(),
+                403,
+                run_unbounded.retryable(),
+            ),
+        ]
+    }
+
+    /// The `PolicyServiceError` and `ApprovalServiceError` refusals, as cases.
+    fn policy_and_approval_code_cases() -> Vec<(
+        &'static str,
+        axum::response::Response,
+        &'static str,
+        u16,
+        bool,
+    )> {
+        vec![
+            (
+                "a policy whose submitted rules contradict an earlier layer",
+                crate::http::policy::policy_error_response_for_test(
+                    &PolicyServiceError::Contradictory {
+                        code: "jarvis.invalid_policy_layer",
+                    },
+                ),
+                "jarvis.invalid_policy_layer",
+                409,
+                false,
+            ),
+            (
+                "a policy evaluate offered too many candidates to examine",
+                crate::http::policy::policy_error_response_for_test(
+                    &PolicyServiceError::CandidatesUnbounded { offered: 10_001 },
+                ),
+                "jarvis.context_candidates_unbounded",
+                400,
+                false,
+            ),
+            (
+                "a policy that does not exist",
+                crate::http::policy::policy_error_response_for_test(
+                    &PolicyServiceError::PolicyNotFound,
+                ),
+                "model.policy_not_found",
+                404,
+                false,
+            ),
+            (
+                "an approval with a stale version",
+                crate::http::approval::approval_error_response_for_test(
+                    &ApprovalServiceError::VersionConflict {
+                        expected: 3,
+                        actual: 4,
+                    },
+                ),
+                "approval.version_conflict",
+                409,
+                true,
+            ),
+            (
+                "an approval the caller is not permitted to inspect",
+                crate::http::approval::approval_error_response_for_test(
+                    &ApprovalServiceError::ScopeDenied {
+                        code: "approval.scope_denied",
+                    },
+                ),
+                "approval.scope_denied",
+                403,
+                false,
+            ),
+            (
+                "an approval that lapsed",
+                crate::http::approval::approval_error_response_for_test(
+                    &ApprovalServiceError::Expired,
+                ),
+                "approval.expired",
+                409,
+                false,
+            ),
+            (
+                "an approval carrying a step-up requirement the caller does not meet",
+                crate::http::approval::approval_error_response_for_test(
+                    &ApprovalServiceError::InsufficientAssurance,
+                ),
+                "approval.assurance_insufficient",
+                403,
+                false,
+            ),
+        ]
+    }
+
+    /// Asserts one mapper's response against its own fields and against the contract's two columns.
+    ///
+    /// Extracted from the test so the table reads as the list of cases rather than as a hundred
+    /// lines of assertion, and so the three comparisons it makes — the mapper against the
+    /// assertion, the body against the mapper's own `retryable()`, and both against the document —
+    /// are written once. A fourth case then cannot be added with a weaker check than the others.
+    async fn assert_mapper_row(
+        response: axum::response::Response,
+        label: &str,
+        code: &str,
+        status: u16,
+        retryable: bool,
+        rows: &std::collections::BTreeMap<String, String>,
+        statuses: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    ) {
+        assert_eq!(
+            response.status().as_u16(),
+            status,
+            "{label}: the mapper and the assertion must agree on the status for {code}",
+        );
+        let body = read_body_text(response).await;
+        assert!(
+            body.contains(&format!(r#""code":"{code}""#)),
+            "{label} must carry {code}: {body}",
+        );
+        assert_eq!(
+            body.contains(r#""retryable":true"#),
+            retryable,
+            "{label}: the mapper's own retryable() and the body it sent disagree for {code}",
+        );
+        // The document must say the same as the code, in both columns. A code may be listed at more
+        // than one status, so the status check is membership rather than equality: the document must
+        // carry the status this mapper sends, and equality would forbid the second status the other
+        // route genuinely uses.
+        assert!(
+            statuses
+                .get(code)
+                .is_some_and(|set| set.contains(&status.to_string())),
+            "the table must list {code} as {status}, because that is what the mapper sends: {:?}",
+            statuses.get(code),
+        );
+        assert_eq!(
+            rows.get(code).map(String::as_str),
+            Some(if retryable { "yes" } else { "no" }),
+            "the table's Retryable column must agree with the mapper's own retryable() for {code}",
+        );
+    }
+
+    #[test]
     fn the_domain_and_protocol_namespace_sets_are_the_same_rule() {
         // Two spellings of one rule is how the contract's list came to disagree with the codes it
         // governed. `BRN-065` exists because a documented set lived apart from the set the wire
@@ -4559,6 +4840,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// The repository root, derived from this crate's manifest directory.
+    ///
+    /// One place, so the four tests that read a source or contract file cannot disagree about how
+    /// many levels up the root is — a disagreement that would surface as a test reading the wrong
+    /// file rather than as a failure to find one.
+    fn repository_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the crate lives two levels under the repository root")
+            .to_path_buf()
+    }
+
+    /// Reads the local control API contract.
+    fn contract_document() -> String {
+        std::fs::read_to_string(repository_root().join("docs/contracts/local-control-api.md"))
+            .expect("the contract reads")
+    }
+
+    /// The codes the application services carry onto the envelope, as an asserted scan.
+    ///
+    /// Wraps [`super::production_codes_from_services`] with the two guards that make its result
+    /// trustworthy: all three files were read, and enough codes were found that the scan cannot have
+    /// silently stopped matching. Both are asserted here rather than at each call site so a new
+    /// caller cannot forget one.
+    fn carried_codes() -> std::collections::BTreeSet<String> {
+        let (carried, service_modules) = super::production_codes_from_services(&repository_root());
+        assert_eq!(
+            service_modules, 3,
+            "all three service modules must be scanned"
+        );
+        assert!(
+            carried.len() >= 20,
+            "the service scan must have found the carried codes: {carried:?}",
+        );
+        carried
+    }
+
+    /// The codes named by the contract's table rows, ignoring prose.
+    ///
+    /// A code named in prose is not a listed code — the paragraph above the table has to be able to
+    /// say that `auth.invalid` was removed, and a scan over the whole file cannot tell that sentence
+    /// from a row. Extracted by shape (`| 401 | `code` | no |`) so a reworded paragraph cannot pass
+    /// as a table.
+    fn listed_codes(document: &str) -> std::collections::BTreeSet<String> {
+        document
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| ")?.trim_start();
+                // A status cell is three digits, or `n/a` for a code delivered in an event stream
+                // rather than as a status. The next cell is the code in backticks. Anything else on
+                // the line is a different table.
+                let (status, rest) = rest.split_once(" | ")?;
+                if !is_status_cell(status) {
+                    return None;
+                }
+                // The code sits between the first pair of backticks.
+                let (_, after) = rest.split_once('`')?;
+                let (code, _) = after.split_once('`')?;
+                code.contains('.').then(|| code.to_owned())
+            })
+            .collect()
+    }
+
     /// Collects every namespaced code literal in this surface's production half.
     ///
     /// Extracted so the table test reads as an assertion rather than as a scanner.
@@ -4566,12 +4911,21 @@ pub(crate) mod tests {
     /// **The namespace list is a deliberate restriction, and the comment here used to misstate it.**
     /// It said "plus `model.` and `run.`, which reach the envelope through the service error types
     /// this surface maps" — but neither is on the list, and the surface genuinely can send both:
-    /// `RunServiceError::Controller(error) => error.code()` yields `run.*` and
+    /// `RunServiceError::Controller(error) => error.code()` would yield `run.*` and
     /// `Self::Storage(error) => error.code()` yields `storage.*`, neither of which this scan sees.
-    /// Those families travel on **error types**, so they are invisible to a source scan here for the
-    /// same reason `idempotency.conflict` was — and `CODES_CARRIED_BY_ERROR_TYPES` names the two the
-    /// table must list. The others are a real gap in coverage rather than a claim, so the list now
-    /// says what it is: the literals written *in* this surface, and nothing more.
+    /// (`Controller`'s arm is in fact **unreachable** — nothing constructs it, so the `run.*` codes
+    /// travel on the run resource's `error_code` field instead — which is a correction to the note
+    /// that stood here, and it does not change the point: the families reach a client through an
+    /// error type's `code()` rather than as a literal in this surface.)
+    /// Those families travel on **error types**, so they are invisible to a source scan of *this*
+    /// surface, and the list above says what it is: the literals written *in* this surface, and
+    /// nothing more.
+    ///
+    /// **What closed that gap is [`production_codes_from_services`], not a widened restriction.**
+    /// The carried codes are read from the services' own source by a second scanner, so this
+    /// function can stay scoped to the surface — which is the thing it is about — while the codes
+    /// that reach the envelope from a service are still found. The two sets are unioned by the
+    /// callers that need both, and the union is what the table is compared against.
     fn production_codes() -> (std::collections::BTreeSet<String>, usize) {
         let surface = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/http");
         let mut produced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -4630,6 +4984,45 @@ pub(crate) mod tests {
         cell == "n/a" || (cell.len() == 3 && cell.bytes().all(|byte| byte.is_ascii_digit()))
     }
 
+    /// Reads the table's first cell — the status column — for each listed code.
+    ///
+    /// Returns **every** status a code is listed with, not one: `jarvis.context_candidates_unbounded`
+    /// is a `403` on create-run and a `400` on policy evaluate, so a map that kept one value would
+    /// silently drop the other and a caller asserting the dropped one would fail against a document
+    /// that was already right. The set makes a code with two rows expressible and still makes a
+    /// disagreement detectable, which a last-row-wins map would not.
+    ///
+    /// Separate from [`retryable_cells`] because the status and the flag answer different questions
+    /// and a table could get one right and the other wrong.
+    fn status_cells(
+        document: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for line in document.lines() {
+            let Some(rest) = line.strip_prefix("| ") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some((status, rest)) = rest.split_once(" | ") else {
+                continue;
+            };
+            if !is_status_cell(status) {
+                continue;
+            }
+            let Some((_, after)) = rest.split_once('`') else {
+                continue;
+            };
+            let Some((code, _)) = after.split_once('`') else {
+                continue;
+            };
+            out.entry(code.to_owned())
+                .or_default()
+                .insert(status.to_owned());
+        }
+        out
+    }
+
     /// Reads the table's third cell — the `Retryable` column — for each listed code.
     ///
     /// Extracted from the table test so the code comparison and the flag comparison are separate
@@ -4666,14 +5059,7 @@ pub(crate) mod tests {
         //
         // A column nothing reads is the same failure as a constant nothing enforces: it reads as a
         // statement about the daemon while being a statement about the document.
-        let document = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(std::path::Path::parent)
-                .expect("the crate lives two levels under the repository root")
-                .join("docs/contracts/local-control-api.md"),
-        )
-        .expect("the contract reads");
+        let document = contract_document();
 
         let column = retryable_cells(&document);
         assert!(
@@ -4696,7 +5082,7 @@ pub(crate) mod tests {
             "the contract marks a stale precondition retryable after a re-read",
         );
         assert!(
-            jarvis_application::run_service::RunServiceError::Conflict.retryable(),
+            RunServiceError::Conflict.retryable(),
             "and the surface must agree, which it did not: a stale precondition reached a client as \
              retryable:false on a 500",
         );
@@ -4740,9 +5126,8 @@ pub(crate) mod tests {
         // Asserted through `service_error_response`, which is the function that decides, because a
         // route-level test would have to win a race to produce the conflict at all — and a test that
         // cannot reliably reach its subject proves nothing about it.
-        let response = crate::http::runs::service_error_response_for_test(
-            &jarvis_application::run_service::RunServiceError::Conflict,
-        );
+        let response =
+            crate::http::runs::service_error_response_for_test(&RunServiceError::Conflict);
         assert_eq!(
             response.status(),
             StatusCode::CONFLICT,
@@ -4752,7 +5137,7 @@ pub(crate) mod tests {
         // The conflict the adapter actually produces must become that variant, and this is the half
         // a status assertion cannot see: a `From` impl that still collapsed it into `Storage` would
         // pass any test that constructed the variant directly.
-        let mapped: jarvis_application::run_service::RunServiceError =
+        let mapped: RunServiceError =
             jarvis_application::repository::RepositoryError::VersionConflict {
                 expected: 1,
                 actual: 2,
@@ -4760,13 +5145,13 @@ pub(crate) mod tests {
             .into();
         assert_eq!(
             mapped,
-            jarvis_application::run_service::RunServiceError::Conflict,
+            RunServiceError::Conflict,
             "the adapter's version conflict must map to the conflict variant, not to Storage",
         );
         assert_eq!(mapped.code(), "resource.version_conflict");
         assert_eq!(
             mapped.code(),
-            jarvis_application::policy_service::PolicyServiceError::VersionConflict {
+            PolicyServiceError::VersionConflict {
                 expected: 1,
                 actual: 2,
             }

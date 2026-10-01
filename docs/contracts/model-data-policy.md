@@ -223,7 +223,20 @@ model.evidence_missing
 model.evidence_stale
 model.exception_required
 model.exception_expired
+jarvis.context_candidates_unbounded
 ```
+
+`jarvis.context_candidates_unbounded` belongs in this list although it is not a `model.*` code. It is
+the route selector refusing to *examine* its input rather than refusing the input: more candidates
+were offered than `jarvis_domain::context::budget::MAX_CANDIDATES` (ten thousand) allows, so no verdict
+was reached and none can be reported. It is deliberately **not** folded into
+`model.policy_unsatisfied`, because that code tells a caller its policy excludes every model — sending
+them to edit a policy that was never read — and it belongs to this list rather than to a generic
+request code because the candidate set is assembled from the policy route store, not from the request
+body the caller sent. It is named in
+[the local control API's code table](local-control-api.md) as well, because that is where a client
+reads statuses: this contract gives the code, and that one gives the `403` (create-run) and `400`
+(policy evaluate) that carry it.
 
 If evidence expires while a run is waiting, re-evaluate before the next model
 call. Hard policy fails closed. A soft preference can use a compliant fallback
