@@ -5477,6 +5477,52 @@ Dependencies: Milestone 2 exit gate.
     is a contract change and this round was a correction.
   - 1582 workspace tests (+1). 192 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs
     gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-071` Close the gap `BRN-069` named — extend the code scan to the fourth producer,
+  `repository/mod.rs` — and list the six `storage.*` codes it immediately found missing, one of which
+  the contract itself called unlisted while the surface was producing it.
+  Evidence: `repository/mod.rs` added to `production_codes_from_services` with the file-count guard
+  raised to 4, six `storage.*` rows and a corrected paragraph in `docs/contracts/local-control-api.md`,
+  and two `storage.*` cases in the `service_code_cases` cross-check.
+  - **The scan's own file list was the hand-maintained list `BRN-069` named, and it was hiding a
+    family.** `production_codes_from_services` named three service files. `RepositoryError::code()` —
+    six `storage.*` values that reach a client through every service's `Storage(_)` arm on a `500` —
+    lives in a fourth, `repository/mod.rs`. Adding it made the completeness test fail immediately
+    naming all six: `["storage.conflict", "storage.not_found", "storage.query_failed",
+    "storage.row_corrupted", "storage.transition_refused", "storage.version_conflict"]`.
+  - **The contradiction was already written down, in the negative.** The contract's own paragraph said
+    the run-side conflict *"was reported as a `500` carrying `storage.version_conflict`, a code this
+    table does not list"* — stating as fact that the table omitted a code the surface produced, in the
+    document whose table claims to list every code the surface produces. `BRN-067`'s sentence about
+    completeness was corrected in `BRN-071`; this paragraph is the same claim one paragraph over and
+    was left standing. It is corrected rather than deleted, because the history it records is why the
+    row now exists.
+  - **The status is derived, and the derivation is why the delegation matters.** All six arrive on a
+    `500` carrying the storage code rather than `internal.failure`, because a `Storage(_)` arm
+    delegates `code()` and `retryable()` to the repository error. So `storage.query_failed` is the
+    **only** retryable row — the repository answers "may this be sent again unchanged?" and a transport
+    failure is the sole outcome a blind resend fixes — while a corrupted row is an answer, not a fault.
+    Recording that required reading the repository's own `retryable()`, not guessing from the code name.
+  - **Interception is per variant and per route, and it does not make the rows wrong.**
+    `storage.version_conflict` is intercepted by all four services (as `resource.version_conflict` or
+    `approval.version_conflict`) and `storage.not_found` by every service's `From`, so a client should
+    never meet either on a `500` — which is a property of the routes that exists today, not of type
+    safety, since `Storage(_)` is `pub` and one `map_err` bypasses every interception. Listing them is
+    the conservative choice for codes a scan proves the surface can produce.
+  - **The mapper cross-check now covers the storage family too**, so the six rows are not just present
+    but asserted against the implementations: the two cases chosen are the ones where
+    `RepositoryError::retryable()` answers differently, which is the distinction the delegation exists
+    to preserve and the one a table-only check cannot see.
+  - **Falsified:** removing the `storage.row_corrupted` row makes the completeness test fail naming
+    exactly that code. Restoring it returns the gate to `0` (verified by `git diff --numstat`).
+  - **Not done, and named.** The scan is still a list of four filenames rather than a discovery of
+    every file that implements `code()` for a type reaching the envelope — so a fifth producer added
+    later is invisible until named, which is the same shape `BRN-069` recorded one level up and
+    `BRN-071` did not eliminate, only widened. `jarvis_domain`'s own `code()` values (`tool.*`,
+    `approval.*` from `DurableApproval`) reach the surface through domain error types rather than
+    through these four files and remain out of this scan's scope; they are covered by their own
+    contracts' tables and by `BRN-065`'s namespace check.
+  - 1582 workspace tests (unchanged). 193 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
+    docs gates), all four journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

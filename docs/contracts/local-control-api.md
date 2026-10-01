@@ -576,6 +576,12 @@ Minimum codes:
 | n/a | `stream.overrun` | yes, immediately |
 | 503 | `service.not_ready` | yes |
 | 500 | `internal.failure` | conditionally |
+| 500 | `storage.not_found` | no |
+| 500 | `storage.conflict` | no |
+| 500 | `storage.transition_refused` | no |
+| 500 | `storage.row_corrupted` | no |
+| 500 | `storage.version_conflict` | no |
+| 500 | `storage.query_failed` | yes |
 
 The `n/a` status is not a missing value. It marks the one code the surface delivers **inside** an event
 stream rather than as a status line: by the time `stream.overrun` is sent the response has already
@@ -638,6 +644,18 @@ own view was merely stale — the one case where a retry after a re-read succeed
 `Retryable` marker is a **client-facing** decision ("may I retry after refreshing?") and is
 deliberately not the repository's own answer for the same condition, which asks whether the identical
 write may be resent unchanged and says no.
+
+The six `storage.*` rows are the repository's own codes, and they are here because a client meets them.
+They arrive on a `500` carrying the storage code rather than `internal.failure`, through a service's
+`Storage(_)` arm — which is deliberate: the arm delegates `code()` and `retryable()` to the repository
+error, so a client can tell a driver failure it may retry from corruption it may not. `storage.query_failed`
+is the **only** retryable one, because the repository answers \"may this be sent again unchanged?\" and
+the sole outcome a blind resend fixes is the transport failure. The others are answers, not faults:
+`storage.version_conflict` would be a `409 resource.version_conflict` on any route that intercepts it —
+all four do — so a `500` carrying it can only come from an un-intercepted path, and it is listed so the
+code is never undocumented whichever route produces it. **An earlier revision of this document called
+`storage.version_conflict` \"a code this table does not list\"** while this surface was producing it, which
+is the contradiction `BRN-071` removed rather than restated.
 
 **Codes reaching the envelope from an error type are not visible to a scan of this surface.** A code
 carried by a variant's `code()` — `idempotency.conflict`, `run.*` from the controller, `storage.*`

@@ -1120,7 +1120,18 @@ fn production_codes_from_services(
 ) -> (std::collections::BTreeSet<String>, usize) {
     let mut carried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut files_read = 0;
-    for name in ["approval_service.rs", "policy_service.rs", "run_service.rs"] {
+    for name in [
+        "approval_service.rs",
+        "policy_service.rs",
+        "run_service.rs",
+        // **The file `BRN-069` named as the gap in this scan, and `BRN-071` found the codes it was
+        // hiding.** `repository/mod.rs` owns `RepositoryError::code()`, whose `storage.*` values
+        // reach a client through every service's `Storage(_)` arm — a `500` carrying the storage code
+        // itself. Four of the six had no table row, so a client meeting one on a `500` was reading a
+        // code this contract does not list. The scan was scoped to three files because those were
+        // the three services; the repository is a fourth producer of the same kind and belongs here.
+        "repository/mod.rs",
+    ] {
         let path = repository.join("crates/jarvis-application/src").join(name);
         // `expect` rather than `panic!`: the workspace denies `panic` even in a test, because a
         // panic in production is the hazard the rule exists against and a test is not exempt.
@@ -1158,6 +1169,7 @@ pub(crate) mod tests {
     use axum::http::{Request, StatusCode};
     use jarvis_application::approval_service::ApprovalServiceError;
     use jarvis_application::policy_service::{PolicyService, PolicyServiceError};
+    use jarvis_application::repository::RepositoryError;
     use jarvis_application::repository::policy::ModelDataPolicyRepository;
     use jarvis_application::repository::run::RunRepository as _;
     use jarvis_application::request_context::{AuthenticationAssurance, RequestChannel};
@@ -4501,15 +4513,11 @@ pub(crate) mod tests {
         // `BRN-069`; the services' own source is read instead, so a newly carried code is covered
         // without anyone remembering to add it — the defect `BRN-067` found, fixed in both places
         // rather than one.
-        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the crate lives two levels under the repository root")
-            .to_path_buf();
+        let repository = repository_root();
         let (mut carried, service_modules) = super::production_codes_from_services(&repository);
         assert_eq!(
-            service_modules, 3,
-            "all three service modules must be scanned"
+            service_modules, 4,
+            "all four code-producing modules must be scanned"
         );
         assert!(
             carried.len() >= 20,
@@ -4610,7 +4618,7 @@ pub(crate) mod tests {
         let cases = service_code_cases();
         assert_eq!(
             cases.len(),
-            10,
+            12,
             "the case list must drive every mapped refusal",
         );
         for (label, response, code, status, retryable) in cases {
@@ -4679,6 +4687,31 @@ pub(crate) mod tests {
                 run_unbounded.code(),
                 403,
                 run_unbounded.retryable(),
+            ),
+            // **The `storage.*` family, which `BRN-071` found missing from the table.** A `Storage(_)`
+            // arm delegates `code()` and `retryable()` to the repository error, so a client reads the
+            // storage code on a `500` — and six of those codes had no row, with the contract calling
+            // one of them "a code this table does not list" while the surface produced it. These are
+            // the two arms of `RepositoryError::retryable()` that answer differently, which is the
+            // distinction the delegation exists to preserve: a transport failure may be resent, a
+            // corrupted row may not.
+            (
+                "a run whose row could not be interpreted",
+                crate::http::runs::service_error_response_for_test(&RunServiceError::Storage(
+                    RepositoryError::Corrupted { column: "state" },
+                )),
+                "storage.row_corrupted",
+                500,
+                false,
+            ),
+            (
+                "a run whose store could not be reached",
+                crate::http::runs::service_error_response_for_test(&RunServiceError::Storage(
+                    RepositoryError::Query,
+                )),
+                "storage.query_failed",
+                500,
+                true,
             ),
         ]
     }
@@ -4862,14 +4895,18 @@ pub(crate) mod tests {
     /// The codes the application services carry onto the envelope, as an asserted scan.
     ///
     /// Wraps [`super::production_codes_from_services`] with the two guards that make its result
-    /// trustworthy: all three files were read, and enough codes were found that the scan cannot have
+    /// trustworthy: every file was read, and enough codes were found that the scan cannot have
     /// silently stopped matching. Both are asserted here rather than at each call site so a new
     /// caller cannot forget one.
+    ///
+    /// The count is `4`, not "the three services": `repository/mod.rs` is a fourth producer of the
+    /// same kind, and asserting a number rather than a constant is deliberate — adding a file to the
+    /// scan without updating this fails loudly, which is how the omission was noticed.
     fn carried_codes() -> std::collections::BTreeSet<String> {
         let (carried, service_modules) = super::production_codes_from_services(&repository_root());
         assert_eq!(
-            service_modules, 3,
-            "all three service modules must be scanned"
+            service_modules, 4,
+            "every code-producing module must be scanned"
         );
         assert!(
             carried.len() >= 20,
@@ -5137,12 +5174,11 @@ pub(crate) mod tests {
         // The conflict the adapter actually produces must become that variant, and this is the half
         // a status assertion cannot see: a `From` impl that still collapsed it into `Storage` would
         // pass any test that constructed the variant directly.
-        let mapped: RunServiceError =
-            jarvis_application::repository::RepositoryError::VersionConflict {
-                expected: 1,
-                actual: 2,
-            }
-            .into();
+        let mapped: RunServiceError = RepositoryError::VersionConflict {
+            expected: 1,
+            actual: 2,
+        }
+        .into();
         assert_eq!(
             mapped,
             RunServiceError::Conflict,
@@ -5165,7 +5201,7 @@ pub(crate) mod tests {
         // client-facing one, and the table row is what a client reads.
         assert!(mapped.retryable());
         assert!(
-            !jarvis_application::repository::RepositoryError::VersionConflict {
+            !RepositoryError::VersionConflict {
                 expected: 1,
                 actual: 2,
             }
