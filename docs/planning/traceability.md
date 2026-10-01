@@ -49,6 +49,12 @@ verification itself rather than a product wire or persistence contract.
 | `FR-MEM-004` | [Memory/context](../architecture/memory-context.md) | [Data schema](../data/schema.md) | 4 | `MEM-003`, `MEM-004`, `MEM-005`, `MEM-006` | `ACC-030`, `ACC-032`, `ACC-035`, `ACC-036` |
 | `FR-CTX-001` | [Memory/context](../architecture/memory-context.md) | [Data schema](../data/schema.md) | 2/4 | `BRN-006`, `MEM-008` | `ACC-035` |
 | `FR-CTX-002` | [Memory/context](../architecture/memory-context.md), [identity](../architecture/identity-workspaces.md) | [Common](../contracts/common-conventions.md) | 4 | `MEM-005`, `MEM-008`, `MEM-009` | `ACC-032`, `ACC-033`, `ACC-035` |
+| `FR-SKL-001` | [Memory/context](../architecture/memory-context.md), [tool fabric](../architecture/tool-fabric.md) | [Skill](../contracts/skill-contract.md), [tool](../contracts/tool-contract.md) | 4/6 | `MEM-011`, `MEM-012`, `AUT-007`, `BRN-082` | `ACC-084` |
+| `FR-SKL-002` | [Model gateway](../architecture/model-gateway.md), [workflows/events](../architecture/workflows-events.md) | [Skill](../contracts/skill-contract.md) | 2/6 | `BRN-082`, `AUT-007` | `ACC-088`, `ACC-089` |
+| `FR-SKL-003` | [Tool fabric](../architecture/tool-fabric.md), [security](../architecture/security.md) | [Skill](../contracts/skill-contract.md), [tool](../contracts/tool-contract.md) | 3 | `TLS-016` | `ACC-085` |
+| `FR-SKL-004` | [Tool fabric](../architecture/tool-fabric.md), [security](../architecture/security.md) | [Skill](../contracts/skill-contract.md) | 3 | `TLS-016` | `ACC-086` |
+| `FR-SKL-005` | [Memory/context](../architecture/memory-context.md), [retention](../data/retention.md) | [Skill](../contracts/skill-contract.md) | 4 | `MEM-012`, `MEM-013` | `ACC-087` |
+| `NFR-SKL-001` | [Tool fabric](../architecture/tool-fabric.md), [security](../architecture/security.md) | [Skill](../contracts/skill-contract.md) | 3/4 | `TLS-016`, `MEM-011` | `ACC-084`, `ACC-085` |
 | `FR-EVT-001` | [Workflows/events](../architecture/workflows-events.md) | [Event](../contracts/event-envelope.md) | 6 | `AUT-001` | `ACC-044`, `ACC-074` |
 | `FR-EVT-002` | [Workflows/events](../architecture/workflows-events.md), [storage](../architecture/storage-data.md) | [Event](../contracts/event-envelope.md) | 6 | `AUT-001` | `ACC-041`, `ACC-042`, `ACC-044` |
 | `FR-EVT-003` | [Workflows/events](../architecture/workflows-events.md) | [Event](../contracts/event-envelope.md) | 6 | `AUT-001`, `AUT-006` | `ACC-044` |

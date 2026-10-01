@@ -39,6 +39,7 @@ documents.
 - [Model stream](contracts/model-stream.md)
 - [Model data policy](contracts/model-data-policy.md)
 - [Canonical tools](contracts/tool-contract.md)
+- [Skills](contracts/skill-contract.md)
 - [Process plugin manifest](contracts/plugin-manifest.md)
 - [Approvals](contracts/approval-contract.md)
 - [Event envelope](contracts/event-envelope.md)

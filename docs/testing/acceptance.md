@@ -495,3 +495,68 @@ without raising reconciliation errors, and guaranteed surfaces are bounded and
 ordered.
 No aggregate becomes falsely terminal, loses workspace ownership, duplicates an
 effect, or is silently rewritten by an incompatible older binary.
+
+## Learning and Skills
+
+### `ACC-084`: Governed Learning Write
+
+From a workspace with learning disabled, complete a task and verify that no skill
+or memory was written: the review either does not run or produces proposals only.
+Enable the learning grant, complete a comparable task, and verify that each write —
+skill author, patch, delete, and memory promotion — reaches the canonical tool
+path and records a policy decision, an idempotency key, and an outcome. Attempt to
+reach the skill store or the memory store through any path that is not a canonical
+tool call and verify it does not exist. Retry a review after a simulated crash and
+verify one skill, not two.
+
+### `ACC-085`: Skill Authority Narrowing
+
+Load a skill that declares a tool the principal's grant does not include and verify
+the tool is not added to the call's catalog, the skill does not load, or the load
+fails closed with a typed diagnostic. Load a skill that declares a raised risk
+ceiling, a demoted approval requirement, a changed effect classification, and an
+added scope; each is refused. Load a skill that declares a subset of the granted
+tools and verify the catalog narrows and the narrower call still succeeds — so the
+refusal cannot be satisfied by refusing every skill.
+
+### `ACC-086`: Skill Supply Chain and Binding
+
+Install a skill from a community source and verify it is scanned before use, its
+resolved source and content hash are recorded, and a dangerous verdict quarantines
+it — absent from the index, not loadable by name, and still present on disk and
+inspectable. Change one reference file a procedure loads on demand without changing
+the entry body and verify the content hash changes and the prior grant no longer
+applies. Attempt to re-point a declared tool to a different implementation behind
+an unchanged skill name and verify the schema-fingerprint mismatch requires a new
+grant.
+
+### `ACC-087`: Learning Inspection and Consent
+
+Inspect the learned set and verify each entry shows what was learned, which run it
+came from, and its evidence. Correct an entry and verify the correction is recorded
+with lineage. Delete an entry and verify it is absent for new runs while a
+completed run that used it is unchanged. Submit a sensitive candidate and verify it
+is not written without confirmation, and that a candidate derived from hidden
+reasoning is never stored. Disable learning for the workspace and verify no further
+writes occur. Export the learned set with provenance.
+
+### `ACC-088`: Learning Review Durability
+
+Start a post-turn learning review and terminate the daemon at each wait state —
+before candidate extraction, between extraction and policy, and while a staged
+write awaits approval. Restart and verify the review resumes to an explicit
+resumable or failed state rather than being lost, that no side effect occurred
+twice, and that a staged write is refused if its target changed before approval.
+Cancel a running review and verify it reaches a durable terminal state and performs
+no write.
+
+### `ACC-089`: Auxiliary Route Cost Bound
+
+Configure an auxiliary model route different from the parent model and verify the
+review runs on that route with a digest rather than a full transcript. Run an
+auxiliary call that resolves to the parent model and verify its system prompt, tool
+definitions, and conversation prefix are byte-identical to the parent's, preserving
+the prompt-cache prefix. Set a cumulative input-token budget and verify the review
+stops before crossing it and reports that it stopped on budget rather than
+appearing to have found nothing. Verify auxiliary usage is recorded separately from
+conversation usage.

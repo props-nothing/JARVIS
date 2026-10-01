@@ -18,6 +18,69 @@ code reuse.
 
 ## Findings by Project
 
+### Hermes Agent: The Closed Learning Loop, Studied and Not Copied
+
+Repository: https://github.com/NousResearch/hermes-agent (MIT)
+
+Relevant areas reviewed: the published architecture, agent-loop, prompt-assembly,
+tools, skills, memory, cron, and gateway documentation on
+`hermes-agent.nousresearch.com/docs`, and the repository `README.md` and directory
+layout as presented on GitHub. Reviewed 2026-10-01. No third-party source is
+copied, and no dependency is taken; this section records design lessons only.
+
+This project is studied for one reason: it is the clearest public example of a
+**closed learning loop**, which is the capability JARVIS names as procedural
+memory and has not yet built. Its own documentation is unusually candid about the
+cost of shipping that loop before the guards, which is what makes it useful.
+
+Adopt:
+
+- **Progressive disclosure for skills**: a cheap index in every prompt, the full
+  procedure loaded on demand, and one named reference file loaded only when the
+  procedure needs it. This is a context-budget technique, and JARVIS's context
+  manifest is the natural place to record each level's inclusion and cost.
+- **Agent-authored procedural memory as first-class**: a small set of write
+  operations (author, patch, delete, add a supporting file) over a directory of
+  procedure documents, with a targeted patch preferred over a full rewrite.
+- **A post-turn review that extracts durable lessons**, and the routing of that
+  review to a cheaper auxiliary model on configurable hosts.
+- **A bounded review budget**: a cap on the *sum* of replayed input tokens across
+  the review's iterations, derived from the model's context window when unset.
+- **Trust tiers and supply-chain discipline for installed procedures**: content
+  hashing, a lockfile recording source and scan results, quarantine of a dangerous
+  verdict, and a re-scan as content drifts.
+- **Session lineage and a cheap lexical recall** over past conversations, kept
+  explicitly separate from canonical memory.
+- **Cost engineering for streaming and caching**: preserving a prompt-cache prefix
+  by keeping the system prompt stable within a session.
+
+Do not copy:
+
+- **Its memory store.** It is bounded by a character budget the agent must curate
+  by hand, and its own documentation states that two writers sharing one home will
+  compound each other's entries — it is explicitly a single-operator store. JARVIS
+  memory is a typed, workspace-scoped, provenance-bearing record.
+- **Its learning gate.** A boolean `write_approval` is weaker than JARVIS's
+  approval record: it cannot bind an exact action fingerprint, carry a scope,
+  expire, or be audited as a decision.
+- **Its review execution model.** The review runs as an in-memory fork whose queue
+  is lost when the process exits. JARVIS's review is a durable, resumable workflow
+  run with no such loss window.
+- **Its skill execution as policy.** Skill content is context; loading a skill must
+  never widen authority. JARVIS states this as an invariant and tests the expansion
+  case (`ACC-085`).
+- **Its plugin model.** In-process plugins are a weaker isolation boundary than
+  JARVIS's process-isolated plugins (`FR-PLG-001`), and convenience is not a reason
+  to trade it.
+- **Its breadth before a vertical slice.** The tool count, platform adapters, and
+  sandbox backends are evidence of what is *possible*, not a schedule.
+
+The decision this review produced is
+[ADR-0012](../adr/0012-governed-learning-loop.md): the learning loop is owned by
+JARVIS, runs through the canonical tool path and the durable workflow engine, and
+is deny-by-default. It is recorded as out-of-v1-scope but in-design, so the
+primitives are built to support it.
+
 ### OpenClaw: Product Operations and Extension Lifecycle
 
 Repository: https://github.com/openclaw/openclaw

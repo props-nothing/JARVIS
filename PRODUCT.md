@@ -61,6 +61,9 @@ internal agent loop or storage implementation.
 - Search and act across authorized services through one tool model.
 - Review and approve consequential actions before execution.
 - Teach JARVIS a preference, restart it, and retrieve that memory with source.
+- Let JARVIS learn a repeatable procedure from a finished task, reuse it later,
+  and revoke it, without the procedure ever gaining authority the user did not
+  grant.
 - Schedule or trigger work that survives process and machine restarts.
 - Use the same JARVIS from CLI, desktop, web, API, and phone.
 - Let another trusted agent consume a narrow subset of JARVIS capabilities.
@@ -140,6 +143,31 @@ internal agent loop or storage implementation.
   importance, and source-reliability signals.
 - `FR-CTX-001`: Context selection is budgeted, provenance-aware, and recorded.
 - `FR-CTX-002`: Policy filtering occurs before retrieval ranking and prompting.
+
+### Learning, Skills, and Self-Improvement
+
+- `FR-SKL-001`: JARVIS can author, patch, and delete its own procedural skills
+  after a complex task, improve them during use, and load a relevant skill on
+  demand, and every learning write is a canonical tool call that passes through
+  the one execution path with no fast path.
+- `FR-SKL-002`: A post-turn learning review is a durable, budgeted workflow run
+  that is resumable after a crash, cancellable, bounded by a cumulative
+  replayed-input-token budget, and routed to a configured auxiliary model when one
+  is set.
+- `FR-SKL-003`: A skill can narrow the tool catalog available to a call but can
+  never widen authority: it cannot add a tool, raise a risk ceiling, relax an
+  approval requirement, change an effect classification, or extend a bound the
+  tool did not declare.
+- `FR-SKL-004`: Every skill has a provenance and a trust tier; an installed skill
+  is scanned before it is usable, a dangerous verdict quarantines it rather than
+  deleting it, and a changed content hash or capability set requires a new grant
+  rather than carrying an old one forward.
+- `FR-SKL-005`: Learned skills and promoted memories are inspectable with their
+  provenance, correctable, revocable, and exportable, and a sensitive candidate is
+  not written without confirmation.
+- `NFR-SKL-001`: Loading a skill is authority-narrowing by construction; the
+  expansion case is a tested refusal, and learning writes are deny-by-default
+  until a workspace-scoped grant enables them.
 
 ### Events and Workflows
 
@@ -270,6 +298,11 @@ mode. It includes:
 
 V1 does **not** require a desktop UI, telephone calling, every provider, every
 connector, a distributed bus, Kubernetes, Redis, Temporal, or a marketplace.
+
+Autonomous self-improvement — agent-authored skills and the post-turn learning
+review — is designed in [ADR-0012](docs/adr/0012-governed-learning-loop.md) but
+scheduled after v1. V1 requires only the primitives the loop will use: canonical
+tools, durable workflows, provenance-bearing memory, and auxiliary model routes.
 
 ## V1 End-to-End Proof
 

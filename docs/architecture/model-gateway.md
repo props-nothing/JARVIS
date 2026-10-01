@@ -173,6 +173,49 @@ when the run states no ceiling, because an invented limit is a limit nobody set.
 place, `budget_for` applies `DEFAULT_MAX_OUTPUT_TOKENS` (4096) and the ceiling is enforced **twice**: the
 provider is told the bound, and a provider that ignores the hint is caught by the usage check.
 
+## Auxiliary Calls and Prefix-Cache Discipline
+
+Not every model call is a user turn. Vision, summarization, classification, and the
+post-turn learning review ([ADR-0012](../adr/0012-governed-learning-loop.md)) are
+**auxiliary** calls: they belong to a product feature rather than to the
+conversation, and they must not be paid for as if they were a second conversation.
+
+Three rules make auxiliary calls cheap and bounded, and all three are routing
+concerns rather than prompt-string concerns:
+
+- **An auxiliary route is named, not implied.** A feature declares the route it
+  wants — a specific provider/model, or "the parent model". When it names a
+  different model, that route is used; when it names none, the feature inherits the
+  parent run's route. This is the same provider/model/route distinction the
+  "Core Concepts" section requires, applied to a call that has no user waiting on
+  it.
+- **A same-route auxiliary call preserves the parent's prompt-cache prefix.** When
+  the auxiliary route resolves to the parent model, the call reuses the parent's
+  system prompt, tool definitions, and conversation prefix **byte-identically**, so
+  a provider that caches prefixes reads a warm cache instead of re-ingesting the
+  conversation. A feature that changes even the reasoning level of a same-route
+  call breaks that parity, which is why parity is a property to assert rather than
+  an intention to comment.
+- **A different-route auxiliary call replays a digest, not the transcript.** When
+  the auxiliary model differs from the parent, the cache cannot be shared, so
+  replaying the full conversation would write a cold cache once per iteration for
+  no benefit. The call receives recent turns verbatim plus a summary of older ones,
+  which is smaller in input tokens than the transcript while preserving the recent
+  context a review needs.
+
+**Every auxiliary call carries a cumulative input-token budget.** The budget caps
+the *sum* of replayed input tokens across the call's tool iterations, not the size
+of any one request, because replaying the conversation on each iteration is exactly
+how a "cheap" review multiplies its input cost. The loop stops before crossing the
+budget, and **a call that stops on budget reports that it stopped on budget** rather
+than appearing to have found nothing — a silent truncation would read as a clean
+result. When no budget is configured, a conservative default is derived from the
+resolved context window of the routed model, so the bound also bites on a small
+local model where a fixed cloud-scale default would never apply.
+
+Auxiliary calls are recorded as model calls under their own `task` label, so their
+usage is attributable and separable from conversation usage in the audit trail.
+
 ## Normalized Events
 
 ```text

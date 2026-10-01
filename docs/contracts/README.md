@@ -17,6 +17,7 @@ release is blocked until the owning source is corrected.
 - [Model stream](model-stream.md)
 - [Model data policy](model-data-policy.md)
 - [Canonical tools](tool-contract.md)
+- [Skills](skill-contract.md)
 - [Process plugin manifest](plugin-manifest.md)
 - [Approvals](approval-contract.md)
 - [Event envelope](event-envelope.md)

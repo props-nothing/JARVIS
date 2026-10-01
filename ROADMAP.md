@@ -116,6 +116,8 @@ Deliverables:
 - Context budgeter for identity, conversation, and active task
 - Measured incremental-delivery capability per model (time to first token and
   token spread), not a streaming boolean
+- Named auxiliary model routes for side tasks, with prompt-cache-prefix parity on
+  a same-route call and a cumulative replayed-input-token budget
 - Visible model data-use, retention, locality, and telemetry policy
 - HTTP/SSE and CLI chat surfaces
 - Cancellation, timeout, fallback, and restart semantics
@@ -143,6 +145,8 @@ Deliverables:
 - Plugin manifest, process supervision, and permission grant model
 - Plugin package verification, install-disabled lifecycle, update/rollback,
   quarantine, and removal
+- Skill contract: content-hash binding, trust tiers, scan-before-use, quarantine,
+  progressive index/body/reference loading, and the authority-narrowing invariant
 - Authenticated CLI/API approval list, preview, decide, expiry, and revocation
 
 Exit gate:
@@ -166,12 +170,16 @@ Deliverables:
 - Entity resolution with confidence and non-merge path
 - Context selection ledger, sensitivity filters, and token budgets
 - Inspect, correct, supersede, archive, forget, export, and disable flows
+- Procedural memory and learned skills: the candidate-to-commit promotion
+  pipeline, deny-by-default learning grants, and inspect/correct/revoke/export for
+  learned procedures
 
 Exit gate:
 
 - The restart memory proof in the product spec passes.
 - Cross-workspace retrieval is impossible in query-level tests.
 - Conflicting and expired memories behave deterministically.
+- A learned skill cannot widen authority, and the expansion attempt fails closed.
 
 ## Milestone 5: Connector Platform
 
@@ -206,12 +214,16 @@ Deliverables:
   and compensation steps
 - Quiet hours, notification policy, budgets, and proactive rules
 - Crash/restart and duplicate-delivery test harness
+- Durable post-turn learning review with a candidate pipeline and a replayed
+  input-token budget
 
 Exit gate:
 
 - A scheduled approval workflow resumes after process termination at each wait
   boundary and produces one external effect.
 - Replay and duplicate delivery do not duplicate side effects.
+- An interrupted learning review resumes or fails explicitly and performs no
+  write twice.
 
 ## Milestone 7: Runtime Ecosystem
 

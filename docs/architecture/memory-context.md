@@ -198,6 +198,44 @@ Typical order:
 Untrusted retrieved content is clearly delimited and never placed where a model
 could confuse it with system policy.
 
+## Procedural Memory and Learned Skills
+
+Procedural memory is the class this architecture names for "how a repeatable task
+should be performed", and it is the class with the least implementation. A
+procedure is not a sentence about the world the way a semantic memory is; it is an
+ordered method that composes tools. Its durable form is a **skill**
+([skill-contract.md](../contracts/skill-contract.md)), and its decision is
+[ADR-0012](../adr/0012-governed-learning-loop.md).
+
+Three rules connect procedural memory to the rest of this subsystem:
+
+- **A learned procedure is a memory *and* a set of tool references.** It carries the
+  same provenance every durable memory carries — source run, confidence, scope,
+  validity, sensitivity, and supersession lineage — and additionally names the
+  tools it uses. The tools are referenced by canonical identity and schema
+  fingerprint; the procedure never embeds a tool implementation or a grant.
+- **Promotion is a candidate→commit pipeline, not an in-place edit.** The extraction
+  stage that can use a model produces *candidates*; deterministic policy decides
+  whether a candidate may be written, exactly as the write pipeline above requires.
+  A sensitive procedure requires confirmation. Nothing is written by a model
+  deciding to write it.
+- **The review that proposes candidates is durable work, not a chat side effect.** It
+  is a persisted, budgeted, resumable workflow run
+  ([workflows-events.md](workflows-events.md)), so an interrupted review resumes
+  rather than being lost, and it is bounded by a cumulative replayed-input-token
+  budget so learning cannot become a silent, unbounded cost center.
+
+**Working memory is never promoted automatically**, and this rule extends to
+procedures: a procedure observed during a run becomes durable only through the
+pipeline, and the run's own working state is discarded with the run.
+
+The learned set is inspectable, correctable, revocable, and exportable under
+`FR-MEM-003`, and a revoked procedure is absent from the index for new runs
+without altering a run that already completed. Context assembly sees a learned
+skill as one more candidate whose inclusion is recorded in the manifest with its
+reason and token estimate — which is why progressive skill loading (index, body,
+reference) is a manifest concern rather than a prompt-editing concern.
+
 ## Summarization and Compaction
 
 - Keep raw source references and summary version.

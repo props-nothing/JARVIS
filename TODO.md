@@ -4010,6 +4010,14 @@ Foundation TODO remains incomplete.
   real endpoint, which is `BRN-003`'s adapter plus operator time rather than more code. Retention and
   training-use evidence is still absent from `route_candidates` (`None`), which is the data-policy
   half and is `BRN-010`'s, not this item's. **DO NOT COMMIT.**
+- [ ] `BRN-082` Implement auxiliary model routes: a named route for vision,
+  summarization, classification, and the post-turn learning review; byte-identical
+  prompt-cache parity when an auxiliary call resolves to the parent model; a digest
+  replay when it does not; and a cumulative replayed-input-token budget that stops
+  the call and reports the stop. Record auxiliary usage under its own task label so
+  it is separable from conversation usage. See
+  [model-gateway.md](docs/architecture/model-gateway.md) and
+  [ADR-0012](docs/adr/0012-governed-learning-loop.md).
 
 ## Milestone 3: Tool Fabric
 
@@ -6339,6 +6347,16 @@ Dependencies: Milestone 2 exit gate.
   data-retention choice, and removal.
 - [ ] `TLS-015` Implement plugin grants, scoped launch environment, process
   supervision, resource limits, health, crash-loop quarantine, and audit.
+- [ ] `TLS-016` Define and implement the skill contract
+  ([skill-contract.md](docs/contracts/skill-contract.md)): a persisted skill record
+  with a content hash over every loadable file, trust tiers whose install policy
+  differs by source, progressive index/body/reference loading recorded in the
+  context manifest, scan-before-use, quarantine of a dangerous verdict, and a
+  provenance lockfile. The authority-narrowing invariant — a skill may remove tools
+  from a call's catalog and may never add a tool, raise a risk ceiling, relax an
+  approval requirement, or change an effect classification — is implemented as a
+  tested refusal against a skill that declares the expansion, not only against a
+  conforming one. See [ADR-0012](docs/adr/0012-governed-learning-loop.md).
 
 ## Milestone 4: Memory
 
@@ -6347,6 +6365,25 @@ Dependencies: Milestone 3 exit gate.
 - [ ] `MEM-001` Define typed memory and provenance schema.
 - [ ] `MEM-002` Implement user-confirmed preference memory lifecycle.
 - [ ] `MEM-003` Implement lexical retrieval and deterministic ranking baseline.
+- [ ] `MEM-011` Implement the procedural memory lifecycle and the learned-skill
+  record: a learned procedure is a durable memory carrying the provenance every
+  memory class carries plus the canonical identities and schema fingerprints of the
+  tools it references. Learning is deny-by-default and disabled until a
+  workspace-scoped grant enables it, and a learned procedure is bound to the grant
+  for its exact content hash. See
+  [memory-context.md](docs/architecture/memory-context.md) and
+  [ADR-0012](docs/adr/0012-governed-learning-loop.md).
+- [ ] `MEM-012` Implement the skill authoring tools (`skill.author`, `skill.patch`,
+  `skill.delete`) and `memory.promote` as canonical tool calls, each with declared
+  effects, risk, timeout, and an idempotency key derived from the candidate so a
+  retried write cannot duplicate it; and implement inspect-with-provenance,
+  correct, revoke, export, and delete for learned skills and promoted memories.
+  Assert the absence of any write path that skips the tool fabric.
+- [ ] `MEM-013` Implement the candidate→commit promotion pipeline for learned
+  procedures: extraction may use a model, deterministic policy decides whether a
+  candidate may be written, a sensitive candidate requires confirmation, review may
+  be staged with a diff that survives restart, and hidden chain-of-thought is never
+  stored or derived from.
 - [ ] `MEM-004` Research and implement embedding adapter with version metadata.
 - [ ] `MEM-005` Implement hybrid retrieval and query-time workspace filtering.
 - [ ] `MEM-006` Implement entity candidates, confidence, merge, and split history.
@@ -6360,6 +6397,13 @@ Dependencies: Milestone 3 exit gate.
 
 ## Milestone 5: Connectors
 
+- [ ] `AUT-007` Implement the post-turn learning review as a durable workflow run:
+  persisted before it produces any effect so it resumes after a crash, cancellable,
+  bounded by a cumulative replayed-input-token budget that reports a budget stop,
+  and producing typed candidates that reach the canonical learning tools only
+  through the policy path. A review interrupted at any wait state recovers to an
+  explicit resumable or failed state. See
+  [ADR-0012](docs/adr/0012-governed-learning-loop.md).
 Dependencies: Milestone 4 exit gate.
 
 - [ ] `CON-001` Define connector manifest, lifecycle, auth, health, diagnostics,
@@ -6525,6 +6569,10 @@ the production profile. Public release additionally requires `OWN-001` through
   backup hooks, update, and lifecycle tests.
 - [ ] `PRD-009` Run one crash-consistency, migration, compatibility, and rollback
   contract matrix across every durable aggregate and supported storage backend.
+- [ ] `PRD-010` Enforce learning isolation and quota in the production profile:
+  per-workspace learning grants, per-tenant review budgets, cross-workspace
+  separation of learned skills and promoted memories under the server backend, and
+  an audit export of learning decisions.
 
 ## Explicitly Deferred Until Evidence Justifies Them
 

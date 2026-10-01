@@ -231,6 +231,73 @@ or workflow templates that compose tools. A skill contains:
 Loading a skill can narrow the relevant tool catalog. It cannot widen the user's
 grants or bypass approval.
 
+**That rule is now a requirement rather than a convention, and it is the invariant
+the whole skill ecosystem rests on.** Letting a skill *narrow* the catalog is a
+useful optimization — a procedure names the tools it needs, so the rest can be
+dropped from the call. Letting it *widen* the catalog is a privilege escalation
+dressed as convenience, and it is the single most dangerous thing a skill or
+plugin ecosystem can carry. The narrowing rule is therefore asserted against a
+skill that declares the expansion, not only against a well-behaved one
+(`ACC-085`), because a rule that is only checked on conforming inputs is not
+checked at all.
+
+### Authoring, Trust, and Supply Chain
+
+A skill that JARVIS writes for itself and a skill it installs from a registry are
+the same *shape* and different *trust*. A skill carries a `source` and a trust
+tier, and the tier — not a field the skill declares — decides the install policy:
+
+| Tier | Origin | Install policy |
+| --- | --- | --- |
+| `builtin` | Ships with JARVIS | Always trusted; scanned for completeness |
+| `official` | Published by the JARVIS project | Built-in trust; no third-party warning |
+| `trusted` | Reviewed registries the project pins | More permissive; dangerous findings still block |
+| `community` | Any other user-installed source | Full scan; a caution finding is overridable only by a recorded user override |
+| `learned` | Authored by an agent run | Deny-by-default; requires the learning grant and, by policy, review |
+
+A **dangerous** scan verdict is never overridable at any tier. The override exists
+for caution-level findings a user has read, not for a verdict naming exfiltration,
+injection, or destructive commands. An installed skill records its resolved source,
+content hash, scanner version, findings, and timestamp in a lockfile; a skill that
+cannot be scanned is not installed, and a dangerous verdict **quarantines** the
+skill — inert, on disk, inspectable, absent from the index — rather than deleting
+it silently.
+
+### Binding to an Implementation, Not a Name
+
+A skill's `content_hash` covers every file it can load, not only its entry body,
+because a reference file a procedure loads on demand is part of the procedure. A
+grant or approval recorded against a skill names that hash and the **schema
+fingerprints** of the tools the skill declares. A changed hash or capability set
+requires a new grant; the old one does not carry forward. This is the same rule
+`ACC-024` applies to a tool — an approval binds to the implementation, not to a
+name that can be re-pointed — lifted one level, where the "implementation" is a
+procedure and its tools together.
+
+### Progressive Disclosure and the Context Manifest
+
+A skill loads in three levels, and each is a separate context-manifest entry so
+the budget explains itself:
+
+```text
+Level 0  index      { name, description, tier, declared capabilities }   one line each
+Level 1  body       the full procedure, loaded when a task needs it
+Level 2  reference  one named file under the skill's references/, on demand
+```
+
+The index is the only level present in every prompt. Loading level 1 or 2 appends a
+manifest entry naming the skill and its token estimate. **A system-prompt mutation
+that the manifest does not record is a defect**, because the manifest is how a
+reader answers "why was this in the context". A skill whose body exceeds a bounded
+size is split or refused rather than loaded whole, since a body loaded once stays
+in context for the remainder of the run.
+
+The full wire and persistence shape — including the learning write pipeline, the
+review job's budget, and revocation — is
+[the skill contract](../contracts/skill-contract.md), decided by
+[ADR-0012](../adr/0012-governed-learning-loop.md).
+
+
 ## Tool Catalog Selection
 
 Do not send hundreds of tool definitions to every model call. Selection is:
