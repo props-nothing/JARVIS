@@ -519,6 +519,12 @@ not one a version-1 binary can read: that binary's unknown-field rejection would
 no provider table loads unchanged under both, so an existing profile is not rewritten
 merely because the binary was upgraded.
 
+**The schema has since moved to version 3** for the `[tools]` table that ships reviewed tool
+refusals — a different subsystem's table, moved by the same rule for the same reason. See
+[tool-fabric.md](tool-fabric.md)'s *Refusals Can Also Be Reviewed Configuration* for what the table
+means; the version arithmetic is recorded here because this section owns the configuration schema's
+history, and a bump made in one place while documented in another is how the two come to disagree.
+
 The configuration layer deliberately does **not** validate the host. Whether an endpoint is
 admissible is the adapter's decision — the loopback rule above — and a second predicate in
 the configuration layer could disagree with the first. So an invalid endpoint fails with the

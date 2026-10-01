@@ -156,6 +156,41 @@ always used. The reviewed grants remain as the unconfigured posture so a fresh p
 refuses its own read-only tools; see `StoredGrants` for why an empty store falls back and why a *failure* does
 not.
 
+### Refusals Can Also Be Reviewed Configuration
+
+**A refusal has two homes, and the asymmetry is the design.** A *grant* is authority, so it lives only in the
+durable store: authority in a configuration file would be authority no surface can list, revoke, or audit,
+which is the defect the grant store exists to remove. A *refusal* is a restriction, and losing one is the
+fail-open direction — so refusals may be shipped either as rows through `/api/v1/tool-grants/deny-rules` or as
+`[[tools.deny]]` entries in the profile's `config.toml`, and a deployment that wants its policy reviewable in
+a diff, present before any database exists, and surviving a profile reset declares them in the file.
+
+Both reach the evaluator, and they are **merged rather than one replacing the other**: a refusal can only
+narrow, so the union is the safe direction. They are also expanded by **one function**
+(`expand_deny_rule`), because a stored rule and a reviewed one arrive in different shapes — one carries a
+database identity, the other the operator's reason — but the step from a *capability* to the identities that
+currently offer it is identical, and it is the step where a mistake is silent: a rule expanded to the wrong
+identities still matches nothing and still looks applied.
+
+Four properties of the reviewed form:
+
+- **The rule names a capability, never an identity.** `ToolIdentity` includes the schema fingerprint, so an
+  identity-named refusal would stop applying after a tool was recompiled — a restriction that quietly
+  disappears. The capability is stored beside the rule and expanded into the identities offering it.
+- **The reason is required and bounded.** It is what a refused principal is shown, and a refusal nobody can
+  act on is not a usable refusal. The bound is the store's own, imported rather than restated.
+- **A refusal that names nothing is refused at startup.** The domain's `DenyRule` deliberately reports an
+  empty rule as matching nothing — the fail-closed choice for a *defaulted* record. An empty rule an operator
+  *wrote* is a mistake, and accepting it would ship a refusal that appears in the configuration file and does
+  nothing.
+- **It names no principal and no workspace.** Those come from the authenticated scope, resolved server-side.
+  A configuration file that could name a principal would make one profile's refusal another's.
+
+Adding the table moved the configuration schema version 2 → 3, for the reason the version-2 bump recorded: a
+version-2 binary's `deny_unknown_fields` would report an unknown `[tools]` table as a *parse* failure, when
+the accurate diagnostic is "written by a newer JARVIS". A file with no `[tools]` table loads unchanged under
+versions 1, 2, and 3.
+
 ## Approval Binding
 
 An approval request contains a safe preview and an action fingerprint over:

@@ -17,6 +17,14 @@ use super::ConfigError;
 use super::atomic::{read_bounded, write_atomic};
 use super::secret::SecretReference;
 
+/// The largest deny reason a reviewed refusal may carry.
+///
+/// **Imported from the port rather than restated**, because the bound an operator may *write* and the bound
+/// the store will *accept* must be the same number: two literals would drift, and the drift would show up as
+/// a configuration file that loads and then fails at the pipeline. Re-exported so a caller reading the config
+/// module does not have to know which layer owns it.
+pub use jarvis_application::repository::tool_grant::MAX_GRANT_NOTE_BYTES;
+
 /// The configuration schema version this binary writes.
 ///
 /// Version 2 added the optional `[model.provider]` table. The version moved because a
@@ -25,14 +33,21 @@ use super::secret::SecretReference;
 /// failure, when the accurate diagnostic is "written by a newer JARVIS". A file with no
 /// `[model.provider]` table loads unchanged under both versions, so an existing profile
 /// is not rewritten merely because the binary was upgraded.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 added the optional `[tools]` table, whose `[[tools.deny]]` entries are the
+/// operator's **reviewable refusals**. The version moved for exactly the version-2 reason:
+/// a version-2 binary's `deny_unknown_fields` would report an unknown `[tools]` table as a
+/// parse failure rather than as "written by a newer JARVIS". A file with no `[tools]` table
+/// loads unchanged under 1, 2, and 3 — so this bump rewrites nothing that did not use the
+/// new capability.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The schema versions this binary can read.
 ///
-/// Both are accepted. Version 1 remains readable because the only difference is an
+/// All three are accepted. Version 1 remains readable because the only difference is an
 /// optional table, so refusing it would lock an operator out of their own profile for no
-/// security benefit.
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2];
+/// security benefit — and the same is true of version 2.
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3];
 
 /// Log verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +184,143 @@ impl Default for ModelSection {
         }
     }
 }
+/// A reviewed refusal, as an operator declares it.
+///
+/// **This is the configuration form of a `tool_deny_rules` row**, and both exist deliberately rather than one
+/// being redundant. A stored rule is written at runtime through `/api/v1/tool-grants/deny-rules` and is
+/// scoped to one profile; a reviewed rule is part of the profile's *shipped configuration*, so it is present
+/// at startup, survives a database reset, and can be reviewed in a diff. The pipeline merges them — see
+/// `StoredGrants` — because a refusal can only narrow, so losing one is the direction that re-authorizes
+/// something an operator had forbidden.
+///
+/// `reason` is required and validated at composition rather than defaulted: the reason is what a refused
+/// principal is shown, and a refusal with no explanation is one a user cannot act on. The bound is the same
+/// one the store enforces, imported rather than restated, so the two cannot disagree about what is storable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenyRuleSection {
+    /// The capability to refuse, e.g. `clock.now@1`. Absent means the rule names no capability and is
+    /// constrained by its other dimensions alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// The effects to refuse, as contract spellings. Empty means "not constrained by effects".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
+    /// The reason shown to a refused principal.
+    pub reason: String,
+}
+
+impl DenyRuleSection {
+    /// Returns the rule as the domain's `DenyRule` plus the capability it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] when the reason is empty, over its bound, or carries a NUL, when an
+    /// effect spelling is not one the contract defines, when the capability is not a canonical one, or when
+    /// the rule names nothing at all.
+    ///
+    /// **The empty rule is refused here rather than at the pipeline**, and that is a deliberate departure
+    /// from the domain's own rule that an empty `DenyRule` matches nothing. A defaulted record must not
+    /// over-match, because that would refuse everything; a rule *written by an operator* that names nothing
+    /// is a configuration mistake, and accepting it would ship a refusal that silently does nothing while
+    /// appearing in the config file — the same reasoning `NewDenyRule::validated` records for the stored form.
+    pub fn to_rule(&self) -> Result<ReviewedDenyRule, ConfigError> {
+        let fail = |field: &'static str| ConfigError::InvalidToolDenyRule { field };
+        if self.reason.is_empty()
+            || self.reason.len() > MAX_GRANT_NOTE_BYTES
+            || self.reason.contains('\0')
+        {
+            return Err(fail("reason"));
+        }
+        let capability = match self.capability.as_deref() {
+            Some(value) => {
+                // Validated by parsing, so a typo is a startup failure rather than a rule that matches no
+                // identity and therefore refuses nothing — which would look like a working refusal in the
+                // config file and do nothing at the pipeline.
+                let parsed = jarvis_domain::tool::identity::ToolCapability::parse(value)
+                    .map_err(|_| fail("capability"))?;
+                Some(parsed.to_string())
+            }
+            None => None,
+        };
+        let effects: BTreeSet<jarvis_domain::tool::classification::Effect> = self
+            .effects
+            .iter()
+            .map(|value| {
+                jarvis_domain::tool::classification::Effect::parse(value)
+                    .map_err(|_| fail("effects"))
+            })
+            .collect::<Result<_, _>>()?;
+        if capability.is_none() && effects.is_empty() {
+            return Err(fail("rule"));
+        }
+        Ok(ReviewedDenyRule {
+            capability,
+            rule: jarvis_domain::tool::policy::DenyRule {
+                // **Always `None`.** A reviewed rule names a capability, which the adapter expands into the
+                // identities that currently offer it. Naming an identity here would make the refusal stop
+                // applying after a tool was recompiled — the direction that loses a restriction.
+                identity: None,
+                // The principal and workspace are the *deployment's*, not the file's: a configuration file
+                // that could name a principal would make one profile's refusal another's, and the
+                // authenticated scope is resolved server-side by the same rule every other surface follows.
+                principal: None,
+                workspace: None,
+                effects,
+            },
+            reason: self.reason.clone(),
+        })
+    }
+}
+
+/// A validated reviewed refusal: the domain rule plus the capability it names.
+///
+/// A pair rather than a bare `DenyRule`, because the domain type has no capability field and the
+/// expansion from a capability to the identities offering it cannot be done from the rule alone — the same
+/// reason `StoredDenyRule` exists beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedDenyRule {
+    /// The capability the rule refuses, when it names one.
+    pub capability: Option<String>,
+    /// The rule as the evaluator consumes it.
+    pub rule: jarvis_domain::tool::policy::DenyRule,
+    /// The reason shown to a refused principal.
+    pub reason: String,
+}
+
+/// Tool authorization as reviewed configuration.
+///
+/// **The reviewed counterpart of the durable grant store.** A deployment that wants its policy reviewable
+/// in a diff — and present before any database exists — declares it here, and the daemon merges these
+/// refusals with the stored ones at composition. The table is optional, so every existing profile loads
+/// unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsSection {
+    /// The refusals this deployment ships.
+    ///
+    /// **Only refusals, and no reviewed grants, and that asymmetry is the design rather than an
+    /// omission.** A grant is *authority*, and authority belongs in a durable row an operator can list,
+    /// revoke, and audit — a reviewed grant would be authority that no surface can withdraw, which is the
+    /// defect the grant store was built to remove. A refusal is a *restriction*, and losing one is the
+    /// fail-open direction, so shipping refusals in configuration is the safe half to make declarative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<DenyRuleSection>,
+}
+
+impl ToolsSection {
+    /// Validates every reviewed refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidToolDenyRule`] naming the field of the first unusable entry. Validated
+    /// at composition rather than when the pipeline reads it, so a profile with a broken refusal **fails
+    /// startup** instead of running with a refusal that silently does nothing.
+    pub fn reviewed_rules(&self) -> Result<Vec<ReviewedDenyRule>, ConfigError> {
+        self.deny.iter().map(DenyRuleSection::to_rule).collect()
+    }
+}
+
 /// Privacy and telemetry defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +350,12 @@ pub struct Config {
     /// Model routing selection.
     #[serde(default)]
     pub model: ModelSection,
+    /// Tool authorization, as reviewed configuration.
+    ///
+    /// **Last in the document, and it is the only table that ships *refusals* rather than *authority*.**
+    /// See [`ToolsSection::deny`] for why grants are deliberately absent here.
+    #[serde(default)]
+    pub tools: ToolsSection,
     /// Privacy defaults.
     #[serde(default)]
     pub privacy: PrivacySection,
@@ -210,6 +368,7 @@ impl Default for Config {
             runtime: RuntimeSection::default(),
             storage: StorageSection::default(),
             model: ModelSection::default(),
+            tools: ToolsSection::default(),
             privacy: PrivacySection::default(),
         }
     }
@@ -470,8 +629,12 @@ mod tests {
     use crate::config::secret::SecretReference;
 
     /// A complete document at the version this binary writes.
+    ///
+    /// Carries a `[[tools.deny]]` entry as well as every other table, so the round-trip test exercises the
+    /// reviewed-refusal shape rather than a document that happens not to use it — the same reason `VALID`
+    /// already names a provider-adjacent model policy rather than a minimal one.
     const VALID: &str = r#"
-schema_version = 2
+schema_version = 3
 
 [runtime]
 log_level = "debug"
@@ -482,6 +645,14 @@ kind = "sqlite"
 [model]
 policy_id = "local-default"
 api_key_ref = "env:JARVIS_MODEL_KEY"
+
+[[tools.deny]]
+capability = "email.send@1"
+reason = "outbound mail is never sent unattended"
+
+[[tools.deny]]
+effects = ["external_communication", "write"]
+reason = "destructive tools are refused profile-wide"
 
 [privacy]
 telemetry = false
@@ -525,13 +696,14 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
 
     #[test]
     fn a_minimal_document_uses_documented_defaults() {
-        let config = Config::from_toml("schema_version = 2").expect("minimal document must parse");
+        let config = Config::from_toml("schema_version = 3").expect("minimal document must parse");
         assert_eq!(config, Config::default());
         assert_eq!(config.runtime.log_level, LogLevel::Info);
         assert_eq!(config.storage.kind, StorageKind::Sqlite);
         assert_eq!(config.privacy, PrivacySection::default());
         assert!(config.model.api_key_ref.is_none());
         assert!(config.model.provider.is_none());
+        assert!(config.tools.deny.is_empty());
     }
 
     #[test]
@@ -593,10 +765,140 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
             "schema_version = 1\n[storage]\nkind = \"sqlite\"\npath = \"/tmp/db\"\n",
             "schema_version = 1\n[model]\npolicy_id = \"a\"\nkey = \"sk-live\"\n",
             "schema_version = 2\n[model]\npolicy_id = \"a\"\nsecret = \"sk-live\"\n",
+            // The reviewed-refusal table rejects unknown keys at its own level too, so a typo in a refusal
+            // is a parse failure rather than a silently ignored field on the one input that narrows.
+            "schema_version = 3\n[[tools.deny]]\ncapability = \"clock.now@1\"\nreason = \"x\"\nprincipal_id = \"a\"\n",
+            "schema_version = 3\n[tools]\nunknown = []\n",
         ] {
             let error = Config::from_toml(document).expect_err("must be rejected");
             assert_eq!(error.code(), "jarvis.config_parse", "{document}");
         }
+    }
+
+    /// The reviewed refusals a document declares, as rules the evaluator can consume.
+    ///
+    /// A `[[tools.deny]]` entry is **the configuration form of a `tool_deny_rules` row**, and it exists so a
+    /// deployment's policy can be reviewed in a diff and present before any database exists. These tests
+    /// assert the *validation* — what an operator may write and what is refused — because that is the part
+    /// that decides whether a refusal silently does nothing.
+    #[test]
+    fn a_reviewed_refusal_becomes_a_capability_keyed_rule() {
+        let config = Config::from_toml(VALID).expect("valid document must parse");
+        let rules = config
+            .tools
+            .reviewed_rules()
+            .expect("both entries are usable");
+        assert_eq!(rules.len(), 2, "both declared entries must produce a rule");
+
+        // The first names a capability and must keep it: the *adapter* expands a capability into the
+        // identities offering it, and it cannot do that if the capability is dropped here.
+        assert_eq!(rules[0].capability.as_deref(), Some("email.send@1"));
+        assert!(
+            rules[0].rule.identity.is_none(),
+            "a reviewed rule names a capability, never an identity — an identity-named refusal would stop \
+             applying after a tool was recompiled, which loses a restriction",
+        );
+        assert_eq!(rules[0].reason, "outbound mail is never sent unattended");
+
+        // The second names effects and no capability, which is the "refuse every destructive tool" form.
+        // It must survive with **no** capability, because a capability-less rule that acquired one would
+        // refuse one tool instead of the class the operator named.
+        assert_eq!(rules[1].capability, None);
+        assert_eq!(
+            rules[1].rule.effects.len(),
+            2,
+            "both named effects must be parsed: {:?}",
+            rules[1].rule.effects,
+        );
+        assert!(rules[1].rule.principal.is_none() && rules[1].rule.workspace.is_none());
+    }
+
+    #[test]
+    fn a_refusal_that_names_nothing_is_refused_rather_than_stored() {
+        // **The fail-open case this validation exists for.** A rule with no capability and no effects would
+        // be accepted by the domain's own `DenyRule`, whose `matches` reports it as naming nothing — so it
+        // would appear in the configuration file, be listed as a refusal, and refuse nothing at all. An
+        // operator would believe they had forbidden something. Refusing it at load time is the only place
+        // the mistake is still visible.
+        for (field, document) in [
+            (
+                "rule",
+                "schema_version = 3\n[[tools.deny]]\nreason = \"names nothing\"\n",
+            ),
+            // An empty reason is refused because the reason is what a refused principal is *shown*, and a
+            // refusal with no explanation is one they cannot act on.
+            (
+                "reason",
+                "schema_version = 3\n[[tools.deny]]\ncapability = \"clock.now@1\"\nreason = \"\"\n",
+            ),
+            // An unknown effect spelling is refused rather than dropped, because a dropped effect would
+            // broaden the refusal to the whole tool — the opposite of what the operator wrote.
+            (
+                "effects",
+                "schema_version = 3\n[[tools.deny]]\neffects = [\"teleport\"]\nreason = \"x\"\n",
+            ),
+            // A capability that is not canonical would match no identity, so the refusal would do nothing.
+            (
+                "capability",
+                "schema_version = 3\n[[tools.deny]]\ncapability = \"not a capability\"\nreason = \"x\"\n",
+            ),
+        ] {
+            let config = Config::from_toml(document).expect("the document itself is well formed");
+            let error = config
+                .tools
+                .reviewed_rules()
+                .expect_err("an unusable refusal must be refused");
+            assert_eq!(
+                error.code(),
+                "jarvis.config_tool_deny_invalid",
+                "{document}"
+            );
+            match error {
+                ConfigError::InvalidToolDenyRule { field: named } => {
+                    assert_eq!(named, field, "{document}");
+                }
+                other => {
+                    // The variant check rather than a `panic!`, which this workspace denies outside tests
+                    // and `clippy` refuses as an unconditional escape. `assert!` with a rendered value is
+                    // both the diagnostic and the idiom the workspace uses.
+                    assert!(
+                        matches!(other, ConfigError::InvalidToolDenyRule { .. }),
+                        "the refusal must name its field, got {other:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_profile_with_no_tools_table_declares_no_reviewed_refusal() {
+        // The ordinary state, and it must be **empty rather than an error**: a profile with no `[tools]`
+        // table ships no reviewed refusal, which is a complete configuration rather than an incomplete one.
+        // A default of "refused because absent" would make every existing profile fail to start.
+        let config = Config::from_toml("schema_version = 3").expect("minimal document must parse");
+        assert!(config.tools.deny.is_empty());
+        assert!(
+            config
+                .tools
+                .reviewed_rules()
+                .expect("no rules is not an error")
+                .is_empty(),
+        );
+    }
+
+    #[test]
+    fn a_version_two_document_remains_readable_and_declares_no_refusal() {
+        // The upgrade path, and the reason the version moved for a third time: a version-2 binary's
+        // `deny_unknown_fields` would report an unknown `[tools]` table as a *parse* failure, when the
+        // accurate diagnostic is "written by a newer JARVIS". A version-2 document must still load, and
+        // must not acquire a refusal that was never declared in it.
+        let version_two = "schema_version = 2\n[model]\npolicy_id = \"local-default\"\n";
+        let config = Config::from_toml(version_two).expect("a version-2 document must still parse");
+        assert_eq!(config.schema_version, 2);
+        assert!(
+            config.tools.deny.is_empty(),
+            "a document with no tools table must not gain a reviewed refusal",
+        );
     }
 
     #[test]
@@ -613,7 +915,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
         assert_eq!(missing_field.code(), "jarvis.config_missing_version");
 
         for future in [
-            "schema_version = 3",
+            "schema_version = 4",
             "schema_version = 0",
             "schema_version = 999",
         ] {
@@ -625,8 +927,8 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
             );
         }
 
-        // Both supported versions are accepted, so the version-1 upgrade path is real rather
-        // than only documented. `2` must not appear in the rejecting list above.
+        // All supported versions are accepted, so each upgrade path is real rather than only documented.
+        // `3` must not appear in the rejecting list above.
 
         // A negative or non-integer version is not silently accepted.
         assert!(Config::from_toml("schema_version = -1").is_err());
@@ -637,7 +939,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
     fn an_unsupported_version_is_not_rewritten() {
         let dir = temp_dir("no-rewrite");
         let path = config_file_path(&dir);
-        let original = "schema_version = 3\n[runtime]\nlog_level = \"info\"\n";
+        let original = "schema_version = 4\n[runtime]\nlog_level = \"info\"\n";
         std::fs::write(&path, original).expect("write fixture");
 
         // Loading fails, so there is nothing to save and the file is untouched.

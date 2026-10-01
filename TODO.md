@@ -6548,14 +6548,46 @@ Dependencies: Milestone 2 exit gate.
     for them, so a narrowing grant cannot be seen as a new permission without first removing
     the default. `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it`
     in `tool_adapters::tests` covers that direction at the source.
-- [ ] `TLS-019` Wire the reviewed deny rules in `tool_fabric_over` to configuration.
-  **Named rather than implied**: `tool_fabric_over` now takes the reviewed rules and passes them
-  to `NativeReadOnlyGrants::with_deny_rules`, so the plumbing is composed and asserted — but its
-  only caller (`daemon::start`) passes `Vec::new()`, because there is no `[tools]` configuration
-  section for it to read. That is a **value with no producer**, the same shape this project has
-  now recorded three times, and it is left as an explicit TODO rather than counted as done. Until
-  this lands, a deployment's reviewable refusals are only reachable through
-  `/api/v1/tool-grants/deny-rules`, which is the *stored* half and is fully working.
+- [x] `TLS-019` Wire the reviewed deny rules in `tool_fabric_over` to configuration.
+  **Done.** A `[[tools.deny]]` entry in the profile's `config.toml` is validated at startup and
+  reaches the evaluator, beside the stored rules.
+  Evidence: `ToolsSection` / `DenyRuleSection` / `ReviewedDenyRule`
+  (`config::loader`), the `jarvis.config_tool_deny_invalid` code, `DaemonConfig::with_reviewed_deny_rules`,
+  and `a_reviewed_refusal_from_the_profile_configuration_refuses_a_dispatch` in
+  `http::tool_grant_journey_tests` — which parses a real document, then asserts through `POST /api/v1/runs`
+  that the proposed call is refused and **did not execute**.
+  - **The value-with-no-producer is closed, and the finding was recorded before this existed.** The
+    previous round found `NativeReadOnlyGrants::with_deny_rules` had **no caller** — so a deployment's
+    refusals were a struct field nothing populated. `tool_fabric_over` took the rules but its only caller
+    passed `Vec::new()`, which is why this was named as its own TODO rather than counted as done.
+  - **The asymmetry between grants and refusals is the design.** A *grant* is authority, so it lives only
+    in the durable store: authority in a configuration file would be authority no surface can list, revoke,
+    or audit. A *refusal* is a restriction, and losing one is the fail-open direction — so refusals may be
+    shipped either as rows through the API or as reviewed entries, and the two are **merged rather than one
+    replacing the other**. Asserted by `a_reviewed_rule_and_a_stored_rule_are_both_applied`.
+  - **One expansion function, because a mistake there is silent.** A stored rule and a reviewed one arrive
+    in different shapes but need the same step — capability → the identities that currently offer it — and a
+    rule expanded to the wrong identities still matches nothing and still **looks applied**. `expand_deny_rule`
+    is a free function with both callers; the four-leg journey's leg 2 was re-read against it.
+  - **A refusal that names nothing is refused at startup, not at the pipeline.** The domain's `DenyRule`
+    deliberately reports an empty rule as matching nothing — the fail-closed choice for a *defaulted*
+    record. An empty rule an operator *wrote* is a mistake, and accepting it would ship a refusal that
+    appears in the config file and does nothing.
+  - **Merged, not replaced; and falsified.** Making `StoredGrants::read` drop the reviewed rules fails
+    `a_reviewed_refusal_from_the_profile_configuration_refuses_a_dispatch` (`(1, 0)` where `(1, 1)` is
+    required). A first attempt mutated `NativeReadOnlyGrants::read` instead — which the mutant **survived**,
+    because the composed adapter is `StoredGrants`; the mutation was moved to the path the composition
+    actually takes.
+  - **The config schema moved 2 → 3**, for the reason the version-2 bump recorded: a version-2 binary would
+    report an unknown `[tools]` table as a *parse* failure when the accurate diagnostic is "written by a
+    newer JARVIS". Files with no `[tools]` table load unchanged under 1, 2, and 3, so nothing is rewritten.
+    Documented in `docs/architecture/tool-fabric.md` and cross-referenced from `model-gateway.md`, which
+    owns the schema's history.
+  - 5 config tests + 1 journey test. 1684 workspace tests. All gates green. **DO NOT COMMIT.**
+  - **Not done, and named.** No `JARVIS_TOOLS_*` environment override, because the reviewed refusals are a
+    *set* rather than a scalar and the allowlist's override model is one value per key. No CLI command to
+    read or edit them (the file is the editor). A reviewed **grant** is deliberately absent, which is the
+    design rather than a gap.
 - [ ] `TLS-016` Define and implement the skill contract
   ([skill-contract.md](docs/contracts/skill-contract.md)): a persisted skill record
   with a content hash over every loadable file, trust tiers whose install policy

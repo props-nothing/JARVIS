@@ -355,7 +355,13 @@ async fn a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal() {
         workspace: None,
         effects: std::collections::BTreeSet::new(),
     };
-    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![rule.clone()]);
+    // A reviewed rule as configuration supplies it: a **capability** plus the rule to apply to it.
+    let reviewed = crate::config::ReviewedDenyRule {
+        capability: Some("clock.now@1".to_owned()),
+        rule: rule.clone(),
+        reason: "the operator refused this".to_owned(),
+    };
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![reviewed.clone()]);
     let source = StoredGrants::new(Arc::new(FailingStore), defaults, &tools);
 
     // A store that fails every read, so the rules that arrive are provably the **reviewed** ones rather than
@@ -371,7 +377,7 @@ async fn a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal() {
     // that authorizes — the refusal and the grant both reach policy for one tool, and the evaluator consults
     // the refusal first, which is the ordering that makes a reviewed refusal meaningful.
     let (_database, _unused, store) = fixture().await;
-    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![rule]);
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![reviewed.clone()]);
     let source = StoredGrants::new(Arc::clone(&store), defaults, &tools);
     let read = source.read(principal(), workspace()).await.expect("reads");
     assert_eq!(
@@ -402,7 +408,12 @@ async fn a_reviewed_rule_and_a_stored_rule_are_both_applied() {
         workspace: None,
         effects: std::collections::BTreeSet::new(),
     };
-    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![reviewed]);
+    let rule = crate::config::ReviewedDenyRule {
+        capability: Some("clock.now@1".to_owned()),
+        rule: reviewed,
+        reason: "the operator refused this".to_owned(),
+    };
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![rule]);
     let _ = &source;
     let source = StoredGrants::new(Arc::clone(&store), defaults, &tools);
     store

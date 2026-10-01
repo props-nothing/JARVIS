@@ -274,6 +274,19 @@ mod tests {
     /// would leave this file green, which is precisely the layer that needs proving. It is the reason
     /// `tool_fabric_over` is crate-visible.
     async fn journey(tag: &str, provider: Arc<ProposeThenAnswer>) -> (axum::Router, String) {
+        journey_with(tag, provider, Vec::new()).await
+    }
+
+    /// The same composition, with the reviewed refusals a profile declares.
+    ///
+    /// A separate entry point rather than widening [`journey`], so the four-leg test keeps composing an
+    /// empty reviewed list — its subject is the *store*, and a reviewed refusal present would make leg 2's
+    /// "another principal is not refused" indistinguishable from "a reviewed refusal happened not to match".
+    async fn journey_with(
+        tag: &str,
+        provider: Arc<ProposeThenAnswer>,
+        reviewed: Vec<crate::config::ReviewedDenyRule>,
+    ) -> (axum::Router, String) {
         use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
         use crate::http::{ApiState, Readiness, router, tests::temp_dir};
         use crate::storage::{Database, migrate};
@@ -287,7 +300,7 @@ mod tests {
 
         let database = Database::open_in_memory().await.expect("in-memory opens");
         migrate::run(database.pool()).await.expect("migrates");
-        let (tools, grants) = crate::daemon::tool_fabric_over(database.pool().clone(), Vec::new())
+        let (tools, grants) = crate::daemon::tool_fabric_over(database.pool().clone(), reviewed)
             .expect("the reviewed definitions are consistent");
         let repositories = Arc::new(crate::storage::repositories::SqliteRepositories::new(
             database.pool().clone(),
@@ -535,6 +548,42 @@ mod tests {
             2,
             "the removal must address a rule the listing names, so the listing is read first: {}",
             list.1,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviewed_refusal_from_the_profile_configuration_refuses_a_dispatch() {
+        // **`TLS-019`, and the last mile of the value-with-no-producer finding.** `tool_fabric_over` accepted
+        // the reviewed refusals but its only caller passed an empty list, so a deployment's reviewable
+        // refusals had no way to reach the evaluator. The value now comes from the `[[tools.deny]]`
+        // configuration table, and this test closes the same loop the four-leg test closes for the *store*:
+        // a refusal an operator **wrote in the configuration file** refuses a real dispatch.
+        //
+        // The document is parsed rather than a `ReviewedDenyRule` built by hand, because the parse is where a
+        // typo becomes a startup failure — a hand-built rule would skip the validation that makes the
+        // reviewed form safe to ship.
+        let document = format!(
+            "schema_version = 3\n[[tools.deny]]\ncapability = \"{CAPABILITY}\"\nreason = \"the profile refuses this\"\n",
+        );
+        let config = crate::config::Config::from_toml(&document).expect("the document parses");
+        let reviewed = config
+            .tools
+            .reviewed_rules()
+            .expect("the reviewed refusal is usable");
+        assert_eq!(reviewed.len(), 1, "the document declares one refusal");
+
+        let provider = provider("journey-reviewed", CAPABILITY);
+        let (app, token) =
+            journey_with("tool-grant-reviewed", Arc::clone(&provider), reviewed).await;
+        ran_to_completion(&app, &token).await;
+
+        // The model received the call it proposed as an **error** result: the tool ran zero times. Both facts
+        // are the same counter pair the store's journey asserts, so a reviewed refusal that reported itself
+        // while the tool still executed would fail here exactly as it would there.
+        assert_eq!(
+            observed(&provider),
+            (1, 1),
+            "a refusal declared in the profile configuration must reach the evaluator and stop the execution",
         );
     }
 

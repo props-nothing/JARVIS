@@ -182,7 +182,19 @@ fn compose_provider(
     let provider =
         jarvis_infrastructure::model_providers::resolve(&layered, &EnvSecretResolver::new())
             .map_err(jarvis_infrastructure::model_providers::ProviderResolutionError::code)?;
-    Ok(config.with_provider(provider))
+    // **The reviewed refusals are validated here, before the daemon starts.** A refusal whose reason is
+    // empty, whose effect spelling is unknown, or whose capability is not canonical is a configuration
+    // fault rather than a runtime one: a daemon that started with a broken refusal would run believing it
+    // had forbidden something it had not, which is the fail-open direction on the one input that has no
+    // override. A refusal that names no tool **and** no effect is refused for the same reason — it would
+    // appear in the configuration file and match nothing.
+    let reviewed = layered
+        .tools
+        .reviewed_rules()
+        .map_err(|error| error.code())?;
+    Ok(config
+        .with_provider(provider)
+        .with_reviewed_deny_rules(reviewed))
 }
 
 /// Serves the local surface until a shutdown signal arrives, then drains.

@@ -64,6 +64,14 @@ pub struct DaemonConfig {
     pub drain_grace: Duration,
     /// The composed model provider, when one was configured.
     provider: Option<Arc<dyn jarvis_application::model::ModelProvider>>,
+    /// The reviewed refusals the profile's `[[tools.deny]]` entries declare.
+    ///
+    /// **Validated before the daemon starts, and carried as a resolved value rather than as the section it
+    /// came from.** A refusal whose reason is empty or whose capability is not canonical is a *configuration*
+    /// fault, and the whole point of the reviewed form is that it is checked before anything serves: a daemon
+    /// that started with a broken refusal would run believing it had forbidden something it had not. Empty is
+    /// the ordinary state — a profile with no `[tools]` table declares no reviewed refusal.
+    reviewed_deny_rules: Vec<crate::config::ReviewedDenyRule>,
 }
 
 /// `Debug` is hand-written because the provider is a trait object: a derived implementation would
@@ -83,6 +91,9 @@ impl std::fmt::Debug for DaemonConfig {
             .field("database_path", &self.database_path)
             .field("drain_grace", &self.drain_grace)
             .field("provider_models", &models)
+            // The count rather than the rules: a reason is operator text, and a diagnostic line needs to
+            // say whether any reviewed refusal was configured, not reproduce the configuration file.
+            .field("reviewed_refusals", &self.reviewed_deny_rules.len())
             .finish_non_exhaustive()
     }
 }
@@ -101,6 +112,9 @@ impl DaemonConfig {
             database_path: paths.database_dir().join("jarvis.sqlite"),
             drain_grace: DEFAULT_DRAIN_GRACE,
             provider: None,
+            // An empty list is the **ordinary** state, not a placeholder: a profile that declares no
+            // `[[tools.deny]]` entry ships no reviewed refusal, and that is a complete configuration.
+            reviewed_deny_rules: Vec::new(),
         }
     }
 
@@ -117,6 +131,25 @@ impl DaemonConfig {
     ) -> Self {
         self.provider = Some(provider);
         self
+    }
+
+    /// Supplies the reviewed refusals the profile declares.
+    ///
+    /// A builder rather than a `from_profile` argument, for the reason [`Self::with_provider`] records: the
+    /// profile layout stays a pure function of the filesystem, and reading and validating the configuration
+    /// file stays an explicit composition step the caller performs. A caller that forgets it gets **no**
+    /// reviewed refusal, which is fail-*closed* in the sense that matters — nothing is silently forbidden,
+    /// and nothing is silently permitted either, because a refusal can only ever narrow.
+    #[must_use]
+    pub fn with_reviewed_deny_rules(mut self, rules: Vec<crate::config::ReviewedDenyRule>) -> Self {
+        self.reviewed_deny_rules = rules;
+        self
+    }
+
+    /// Returns the reviewed refusals this profile declares.
+    #[must_use]
+    pub fn reviewed_deny_rules(&self) -> &[crate::config::ReviewedDenyRule] {
+        &self.reviewed_deny_rules
     }
 
     /// Returns the discovery file path.
@@ -547,7 +580,10 @@ pub async fn start(
     // `tool_adapters::tests`) so adding the config field is a field and a read, not a new wire. The stored
     // deny rules — which an operator *can* write today, through `/api/v1/tool-grants/deny-rules` — reach the
     // evaluator independently, from the same store handle.
-    let (tools, tool_grants) = tool_fabric_over(database.pool().clone(), Vec::new())?;
+    let (tools, tool_grants) = tool_fabric_over(
+        database.pool().clone(),
+        config.reviewed_deny_rules().to_vec(),
+    )?;
     let ports = run_ports(
         Arc::clone(&repositories),
         delivery_campaigns.clone(),
@@ -792,7 +828,7 @@ fn run_ports(
 /// helpers record: the composition root is the layer a handler test is structurally blind to.
 pub(crate) fn tool_fabric_over(
     pool: sqlx::SqlitePool,
-    deny_rules: Vec<jarvis_domain::tool::policy::DenyRule>,
+    deny_rules: Vec<crate::config::ReviewedDenyRule>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -830,11 +866,11 @@ pub(crate) fn tool_fabric_over(
     // A reviewed grant is emitted **only** for a native, low-risk, read-only definition, and its own
     // ceilings restate those bounds so the evaluator re-checks them per call.
     //
-    // **The reviewed deny rules are attached here, and their absence was a real gap.**
+    // **The reviewed refusals are attached here, and their absence was a real gap.**
     // `NativeReadOnlyGrants::with_deny_rules` existed with no production caller, so an operator had no way
     // to refuse one of the daemon's own tools: the refusals a deployment ships were compiled into a struct
-    // field that nothing populated. Passing them through is what makes the reviewable refusal and the stored
-    // one two ways of saying the same thing rather than one way and one gap.
+    // field that nothing populated. They now come from the `[[tools.deny]]` configuration table, validated
+    // before this point, and they reach the evaluator beside the stored ones.
     let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(deny_rules);
     // **One store handle, shared by the source and the surface.** The source reads it on every dispatch
     // and the surface writes it from a client, so a second handle would let the two disagree about what

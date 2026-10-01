@@ -37,6 +37,7 @@ use jarvis_domain::tool::definition::ToolDefinition;
 use jarvis_domain::tool::identity::ToolIdentity;
 use jarvis_domain::tool::policy::{DenyRule, Grant};
 
+use crate::config::ReviewedDenyRule;
 use crate::tool_fingerprint::action_fingerprint;
 use crate::tool_schema::ToolSchema;
 
@@ -221,7 +222,13 @@ impl ToolGrantSource for ConfiguredGrants {
 #[derive(Debug)]
 pub struct NativeReadOnlyGrants {
     tools: Vec<ResolvedTool>,
-    deny_rules: Vec<DenyRule>,
+    /// The operator's reviewed refusals, paired with the capability each names.
+    ///
+    /// **A pair rather than a bare `DenyRule`**, because the domain's rule type has no capability field — a
+    /// rule stored by *identity* would stop refusing after a tool was recompiled, which is the direction that
+    /// loses a restriction. The capability is kept beside the rule and expanded into the identities that
+    /// currently offer it when the source is read.
+    deny_rules: Vec<ReviewedDenyRule>,
 }
 
 impl NativeReadOnlyGrants {
@@ -239,8 +246,13 @@ impl NativeReadOnlyGrants {
     }
 
     /// Returns this source with the operator's deny rules attached.
+    ///
+    /// Takes [`ReviewedDenyRule`]s — the validated configuration form — rather than bare `DenyRule`s, so a
+    /// capability-keyed refusal is expanded into the identities that currently offer it. A bare rule could
+    /// only name an identity, and a reviewed refusal that named one would stop applying after a tool was
+    /// recompiled, so accepting the pair is what makes the reviewed form able to express a refusal at all.
     #[must_use]
-    pub fn with_deny_rules(mut self, deny_rules: Vec<DenyRule>) -> Self {
+    pub fn with_deny_rules(mut self, deny_rules: Vec<ReviewedDenyRule>) -> Self {
         self.deny_rules = deny_rules;
         self
     }
@@ -300,11 +312,43 @@ impl ToolGrantSource for NativeReadOnlyGrants {
                 expires_at: None,
             })
             .collect();
-        let deny_rules = self.deny_rules.clone();
+        let deny_rules = self.reviewed_deny_rules();
         // Answered without an await, because the reviewed grants are compiled configuration — an
         // in-process list. The async signature is the port's, so this adapter pays one boxing per call
         // and no I/O, which is the right trade for a source that will be replaced by the store.
         Box::pin(async move { Ok(GrantRead { grants, deny_rules }) })
+    }
+}
+
+impl NativeReadOnlyGrants {
+    /// Expands every reviewed refusal into the identity-keyed rules the evaluator applies.
+    ///
+    /// A method rather than an inline expression in `read`, because the expansion needs the catalog's
+    /// identities grouped by capability and building that map per call would repeat work on a path taken on
+    /// every dispatch. It is rebuilt here from `tools` rather than stored, because the reviewed refusals are
+    /// fixed configuration while the tool list is the source's whole reason to exist — a stored map would be
+    /// a second representation of the same list.
+    fn reviewed_deny_rules(&self) -> Vec<DenyRule> {
+        if self.deny_rules.is_empty() {
+            return Vec::new();
+        }
+        let mut identities_by_capability: BTreeMap<String, Vec<ToolIdentity>> = BTreeMap::new();
+        for tool in &self.tools {
+            identities_by_capability
+                .entry(tool.definition.identity.capability.to_string())
+                .or_default()
+                .push(tool.definition.identity.clone());
+        }
+        self.deny_rules
+            .iter()
+            .flat_map(|reviewed| {
+                expand_deny_rule(
+                    reviewed.capability.as_deref(),
+                    reviewed.rule.clone(),
+                    &identities_by_capability,
+                )
+            })
+            .collect()
     }
 }
 
@@ -384,38 +428,63 @@ impl StoredGrants {
 
     /// Expands one stored rule into the rules the evaluator can apply.
     ///
-    /// Three shapes, and each is a different statement:
-    ///
-    /// - **a capability and effects** — one rule per identity offering that capability, each carrying the
-    ///   effects, so the refusal is scoped to the tool the operator named *and* the effects they named;
-    /// - **a capability alone** — one rule per identity offering it, with no effect constraint, which
-    ///   refuses that tool entirely;
-    /// - **no capability** — the rule already names only principal, workspace, and effects, which are the
-    ///   dimensions the domain's `DenyRule` carries, so it is passed through unchanged. This is the "refuse
-    ///   every destructive tool" form and it must not be expanded, or it would become a rule per tool.
+    /// Delegates to the shared [`expand_deny_rule`], so a stored refusal and a reviewed one cannot be
+    /// expanded differently — see that function for the four shapes and why each matters.
     fn expand_rule(&self, stored: StoredDenyRule) -> Vec<DenyRule> {
-        let Some(capability) = stored.capability.as_deref() else {
-            return vec![stored.rule];
-        };
-        let Some(identities) = self.identities_by_capability.get(capability) else {
-            // **A capability no installed tool offers refuses nothing, and dropping it is the honest
-            // reading.** The alternative — keeping a rule with no identity — would be a rule the
-            // evaluator's own `matches` reports as naming nothing, which is the same outcome reached by a
-            // path a reader cannot check, and it would also be *invisible* in the listing as an active
-            // refusal. An operator sees the rule they wrote; a rule for an uninstalled tool simply has no
-            // effect until the tool is installed.
-            return Vec::new();
-        };
-        identities
-            .iter()
-            .map(|identity| DenyRule {
-                identity: Some(identity.clone()),
-                principal: stored.rule.principal,
-                workspace: stored.rule.workspace,
-                effects: stored.rule.effects.clone(),
-            })
-            .collect()
+        expand_deny_rule(
+            stored.capability.as_deref(),
+            stored.rule,
+            &self.identities_by_capability,
+        )
     }
+}
+
+/// Expands one capability-keyed refusal into the identity-keyed rules the evaluator applies.
+///
+/// **A free function rather than a method, because there are two callers and the rule must have one home.**
+/// A *stored* rule arrives as a `StoredDenyRule` and a *reviewed* rule as a `ReviewedDenyRule` — two types
+/// because one carries a database identity and the other the operator's reason — but the expansion they need
+/// is identical, and it is the part where a mistake is silent: a rule expanded to the wrong identities still
+/// matches nothing and still looks applied. Two copies would be two chances to get that wrong, and the
+/// second copy would be the one written later.
+///
+/// Four shapes, and each is a different statement:
+///
+/// - **a capability and effects** — one rule per identity offering that capability, each carrying the
+///   effects, so the refusal is scoped to the tool the operator named *and* the effects they named;
+/// - **a capability alone** — one rule per identity offering it, with no effect constraint, which refuses
+///   that tool entirely;
+/// - **no capability** — the rule already names only the dimensions the domain's `DenyRule` carries, so it
+///   is passed through unchanged. This is the "refuse every destructive tool" form and it must **not** be
+///   expanded, or it would become a rule per tool;
+/// - **a capability nothing offers** — zero rules, which is the honest reading rather than an oversight. The
+///   alternative, keeping a rule with no identity, would be one the evaluator's `matches` reports as naming
+///   nothing: the same outcome reached by a path a reader cannot check, and invisible in a listing as an
+///   active refusal.
+fn expand_deny_rule(
+    capability: Option<&str>,
+    mut rule: DenyRule,
+    identities_by_capability: &BTreeMap<String, Vec<ToolIdentity>>,
+) -> Vec<DenyRule> {
+    let Some(capability) = capability else {
+        return vec![rule];
+    };
+    let Some(identities) = identities_by_capability.get(capability) else {
+        return Vec::new();
+    };
+    identities
+        .iter()
+        .map(|identity| DenyRule {
+            identity: Some(identity.clone()),
+            // The rule's own scope is **taken** rather than rebuilt, so the principal and workspace the
+            // caller supplied survive the expansion. A reviewed rule carries `None` for both — a
+            // configuration file that could name a principal would make one profile's refusal another's —
+            // while a stored rule may name one, and neither may be lost here.
+            principal: rule.principal.take(),
+            workspace: rule.workspace.take(),
+            effects: rule.effects.clone(),
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for StoredGrants {
@@ -442,8 +511,9 @@ impl ToolGrantSource for StoredGrants {
             let grants = self.store.grants_for(workspace, principal).await?;
             // The stored rules are capability-keyed, and the evaluator compares identities — so a rule
             // naming a capability must be narrowed to the identities that currently offer it. The
-            // defaults' own rules are already identity-shaped.
-            let mut deny_rules = self.defaults.deny_rules.clone();
+            // reviewed rules are expanded the **same way**, through the same function, so the two sources
+            // cannot be converted differently: see `expand_deny_rule`.
+            let mut deny_rules = self.defaults.reviewed_deny_rules();
             for stored in self.store.deny_rules(workspace).await? {
                 deny_rules.extend(self.expand_rule(stored));
             }

@@ -11,9 +11,10 @@ pub mod secret;
 
 pub use atomic::{MAX_CONFIG_BYTES, read_bounded, read_tail_window, write_atomic};
 pub use loader::{
-    Config, ConfigOverrides, ENV_ALLOWLIST, EnvApplication, LogLevel, ModelSection, PrivacySection,
-    ProviderSection, RuntimeSection, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, StorageKind,
-    StorageSection, config_file_path,
+    Config, ConfigOverrides, DenyRuleSection, ENV_ALLOWLIST, EnvApplication, LogLevel,
+    ModelSection, PrivacySection, ProviderSection, ReviewedDenyRule, RuntimeSection,
+    SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, StorageKind, StorageSection, ToolsSection,
+    config_file_path,
 };
 pub use secret::{EnvSecretResolver, MapSecretResolver, SecretReference, SecretResolver};
 
@@ -66,6 +67,18 @@ pub enum ConfigError {
         /// The file that failed.
         path: PathBuf,
     },
+    /// A reviewed tool refusal is unusable.
+    ///
+    /// **Its own variant rather than `Parse`**, because the two need different operator actions: `Parse`
+    /// means the document is malformed, while this names a *semantic* fault in a well-formed document — an
+    /// empty reason, an unknown effect spelling, a capability that is not canonical, or a rule that names
+    /// nothing at all. A refusal that silently did nothing is the failure this exists to prevent, so it is
+    /// reported at startup with the field named.
+    #[error("a reviewed tool refusal names an unusable field")]
+    InvalidToolDenyRule {
+        /// The field that was rejected. The value is never included, because a reason is operator text.
+        field: &'static str,
+    },
 }
 
 impl ConfigError {
@@ -82,6 +95,7 @@ impl ConfigError {
             Self::SecretReferenceInvalid => "jarvis.secret_reference_invalid",
             Self::SecretUnavailable => "jarvis.secret_unavailable",
             Self::Write { .. } => "jarvis.config_write",
+            Self::InvalidToolDenyRule { .. } => "jarvis.config_tool_deny_invalid",
         }
     }
 
@@ -96,7 +110,8 @@ impl ConfigError {
             | Self::UnsupportedVersion
             | Self::EnvOverrideInvalid { .. }
             | Self::SecretReferenceInvalid
-            | Self::SecretUnavailable => false,
+            | Self::SecretUnavailable
+            | Self::InvalidToolDenyRule { .. } => false,
         }
     }
 }
@@ -119,6 +134,7 @@ mod tests {
             ConfigError::SecretReferenceInvalid,
             ConfigError::SecretUnavailable,
             ConfigError::Write { path: "b".into() },
+            ConfigError::InvalidToolDenyRule { field: "reason" },
         ];
 
         let mut codes: Vec<&str> = errors.iter().map(ConfigError::code).collect();

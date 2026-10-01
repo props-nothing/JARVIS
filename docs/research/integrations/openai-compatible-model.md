@@ -447,7 +447,8 @@ the composition has four properties the tests hold:
 The configuration schema version moved 1 → 2 for the added `[model.provider]` table, and
 version 1 remains readable. The version moved because a document naming an endpoint is not
 one a version-1 binary can read — that binary would report a *parse* failure when the
-accurate diagnostic is "written by a newer JARVIS".
+accurate diagnostic is "written by a newer JARVIS". The schema later moved to 3 for the unrelated
+`[tools]` refusals table, by the same rule; see [tool-fabric.md](../../architecture/tool-fabric.md).
 
 The end-to-end proof is `tests/daemon_provider_composition.rs`: a **real daemon** over a
 **real socket**, pointed at a **local fake OpenAI-compatible server**, with a run created
