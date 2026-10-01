@@ -5694,6 +5694,48 @@ Dependencies: Milestone 2 exit gate.
     likewise covered by cases written for them rather than by a scan.
   - 1584 workspace tests (unchanged). 197 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
     docs gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-076` Make the run-field vocabulary check see the **third** way a code reaches it — passed
+  *through* a mapper from a domain type — and document the two codes that had no entry anywhere.
+  Evidence: two rows in the run error-code table in `docs/contracts/local-control-api.md`, the
+  `passed_through_codes` helper with its staleness assertion, and the widened `run_error_code_set`.
+  - **The finding: `context_assembly.rs` maps a `DomainError` code into `AssemblyError::Refused { code }`,
+    and that value reaches the run's `error_code` — with its only literal one crate away.**
+    `ContextBudget::new` and `ContextBudget::assemble` return `ContextBudgetInvalid` and
+    `ContextCandidatesUnbounded`; `context_assembly.rs` forwards `error.code()`; `ControllerError::
+    ContextUnassembled { code }` carries it to the field. So `jarvis.context_budget_invalid` was in **no
+    document at all**, and `jarvis.context_candidates_unbounded` was documented only as an **envelope**
+    code (`400`/`403`) — a client reading it off a `200` run resource had no table for it.
+  - **A whole-file scan of `jarvis-domain/src/error.rs` is the wrong fix, and the failure said so.** That
+    file defines every domain `code()`, most of which never reach this field; reading it whole made the
+    check reject **forty-one correctly-absent rows**. The right instrument for a passed-through value is an
+    explicit list whose entries are verified against the defining type — the shape `NOT_THE_FIELDS` and
+    `EXCLUDED` already use — because the question "which domain codes reach this field" is a fact about the
+    call graph, not a property of any file.
+  - **Two sets, used for different questions, and the pass-through codes join only one.** They enter
+    `every_value` ("can a producer write this value" — a forwarded domain type does) and stay out of
+    `field_codes` ("is this a code this vocabulary authors"), so the forward direction cannot be satisfied
+    by a value no file here spells. That separation is `BRN-074`'s two-set design doing more work than it
+    was written for.
+  - **Falsified:** with the two codes removed from `passed_through_codes`, the reverse direction fails
+    naming both as *causes that cannot occur* while the table documents them — which is what led to the
+    helper rather than to a wider file list. Restoring returns the gate to `0`.
+  - **A negative result this round, recorded because it is the majority of the work.** `BRN-075`'s
+    residual — "codes passed into mappers are covered only where a case was written by hand" — sent me to
+    enumerate every pass-through site. Three of the four are **unreachable today**, each for a different
+    reason: `PolicyServiceError::Invalid { code }` from `PolicyException::grant` has no HTTP caller
+    (`grant_exception` is invoked only from tests, and the policy routes call `active` and `evaluate`), the
+    `ContextBudgetInvalid`-via-`ContextUnassembled` path carries const-literal reasons that always satisfy
+    `TransitionReason`, and `ControllerError::ContextUnassembled`'s assembly-refusal source cannot fail in
+    a way a client can trigger. Only the domain-code forwarding above was live. Saying so is the result:
+    the class is narrowed, not closed, and the three unreachable sites would each become live with one
+    route.
+  - **Two of my own readings were wrong and were caught before they became entries.** I reported
+    `ContextUnassembled` as unconstructed (it is constructed at three sites) and `model.exception_expired`
+    as reaching a client through `grant_exception` before checking whether that method had a caller. Both
+    came from acting on a grep result without confirming the reachability premise — the same failure the
+    scanner notes describe, in a hand search.
+  - 1584 workspace tests (unchanged). 198 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
+    docs gates), all four journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

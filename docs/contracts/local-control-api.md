@@ -353,6 +353,8 @@ branches on the field, and a value a client branches on needs a list.
 | `run.budget_output_tokens_exceeded` | The run exceeded its output-token ceiling. |
 | `run.budget_cost_exceeded` | The run exceeded its cost ceiling. |
 | `run.context_budget_unusable` | The run's context ceiling could not be turned into a budget. |
+| `jarvis.context_budget_invalid` | The stored context budget was zero or above the domain ceiling. |
+| `jarvis.context_candidates_unbounded` | More context candidates were offered than the domain bound allows. |
 | `run.context_message_unlabelled` | A stored message carried a sensitivity label JARVIS does not write. |
 | `run.context_item_too_large` | A context item was too large to be a candidate. |
 | `run.context_objective_dropped` | The run's own objective had to be dropped to fit the budget. |

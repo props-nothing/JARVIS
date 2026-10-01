@@ -5075,6 +5075,37 @@ pub(crate) mod tests {
         every_value: std::collections::BTreeSet<String>,
     }
 
+    /// The codes that reach the run resource's `error_code` by being **passed through** a mapper.
+    ///
+    /// `context_assembly.rs` maps `ContextBudget::assemble`'s error with
+    /// `AssemblyError::Refused { code: error.code() }`, so a domain-defined value reaches
+    /// `ControllerError::ContextUnassembled { code }` and then the field — and its only literal is the
+    /// arm in `DomainError::code()`, one crate away from every file the vocabulary scan reads.
+    ///
+    /// Reading that file whole is **not** the fix: it defines every domain code, most of which never
+    /// reach this field, and a whole-file read rejected forty-one rows that are correctly absent. So the
+    /// list is explicit, and each entry is checked below against `DomainError::code()`'s own arms so a
+    /// renamed or deleted code cannot leave a stale permission behind.
+    #[cfg(test)]
+    fn passed_through_codes(root: &std::path::Path) -> Vec<String> {
+        const PASSED_THROUGH: [&str; 2] = [
+            "jarvis.context_budget_invalid",
+            "jarvis.context_candidates_unbounded",
+        ];
+        let domain_errors = std::fs::read_to_string(root.join("crates/jarvis-domain/src/error.rs"))
+            .expect("the domain error source reads");
+        for code in PASSED_THROUGH {
+            assert!(
+                domain_errors.contains(&format!("\"{code}\"")),
+                "a passed-through code must still be defined by DomainError::code(): {code}",
+            );
+        }
+        PASSED_THROUGH
+            .iter()
+            .map(|code| (*code).to_owned())
+            .collect()
+    }
+
     /// Reads the run-resource code producers, applying the three distinctions documented above.
     #[cfg(test)]
     fn run_error_code_set() -> RunCodeProducers {
@@ -5104,6 +5135,12 @@ pub(crate) mod tests {
             ),
         ];
 
+        // **Codes that reach the field by being PASSED THROUGH a mapper, which no scan of these files
+        // can see.** See `passed_through_codes`, which owns the list and checks each entry against the
+        // domain type that defines it. Reading `jarvis-domain/src/error.rs` whole is **not** a fix: it
+        // defines every domain code, most of which never reach this field, and a whole-file read rejected
+        // forty-one rows that are correctly absent.
+
         let root = repository_root();
         let producers: [&str; 5] = [
             "crates/jarvis-application/src/run_controller.rs",
@@ -5112,7 +5149,6 @@ pub(crate) mod tests {
             "crates/jarvis-application/src/context_assembly.rs",
             "crates/jarvis-domain/src/run/recovery.rs",
         ];
-
         // The `run.*` values that are event types, read from the protocol's own constants rather than
         // listed here.
         let mut event_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -5142,6 +5178,13 @@ pub(crate) mod tests {
         let mut produced_but_excluded: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         let mut unreadable: Vec<String> = Vec::new();
+        // The passed-through codes join `every_value` only, because that set answers "can a producer
+        // write this value" — and a domain type a mapper forwards does write it. They must **not** join
+        // `field_codes`, which answers "is this a code this vocabulary authors": widening that would let
+        // the forward direction accept a value no file here spells.
+        for code in passed_through_codes(&root) {
+            every_value.insert(code);
+        }
         for path in producers {
             let Ok(text) = std::fs::read_to_string(root.join(path)) else {
                 unreadable.push(format!("{path} (unreadable)"));
