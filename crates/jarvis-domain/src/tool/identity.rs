@@ -330,9 +330,12 @@ impl<'de> Deserialize<'de> for ToolVersion {
 /// Where a tool implementation came from.
 ///
 /// The kinds are the ones the tool fabric lists as `source`: native, connector, MCP server,
-/// runtime, plugin. A typed enum rather than a string because policy branches on it — a
-/// remote MCP server and a native tool reach the same pipeline through different trust
-/// assumptions, and a string would let a typo select the wrong branch.
+/// runtime, plugin. A typed enum rather than a string because the classification is a policy
+/// input — a remote MCP server and a native tool reach the same pipeline through different trust
+/// assumptions, and a string would let a typo select the wrong branch. **The policy branch that
+/// consumes it does not exist yet** (`BRN-063` corrected this doc, which said "policy branches on
+/// it" as though one did); what exists is the exhaustive [`SourceKind::ALL`] table and the test that
+/// requires every kind to be classified, so the input is ready and cannot silently default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
@@ -349,6 +352,23 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    /// Every source kind, in a fixed order.
+    ///
+    /// **Added by `BRN-063`, because the externality classification was not enumerable and therefore
+    /// not enforced.** `is_external` is a `matches!` over three named variants, so a variant added to
+    /// the enum compiles with no answer here and is treated as **not external** — the fail-open
+    /// direction, where a new remote source would be read as trusted. With this list,
+    /// `source_kind_classifies_externality_deliberately` compares it against a table written out by
+    /// hand, so adding a variant fails the length check and the author must state which side it is on.
+    /// The same technique `ToolCallState::ALL` and `LedgerOperation::ALL` use.
+    pub const ALL: &'static [Self] = &[
+        Self::Native,
+        Self::Connector,
+        Self::McpServer,
+        Self::Runtime,
+        Self::Plugin,
+    ];
+
     /// Returns the spelling the tool contract uses.
     #[must_use]
     pub const fn as_contract_str(self) -> &'static str {
@@ -363,9 +383,17 @@ impl SourceKind {
 
     /// Returns whether the source is external to the daemon.
     ///
-    /// Used by policy rather than by this module, but defined here so the classification has
-    /// one home: a source kind that is added later must be classified deliberately rather
-    /// than defaulting to trusted.
+    /// **No production caller yet, and `BRN-063` corrected this doc.** It read "used by policy rather
+    /// than by this module", but nothing in `jarvis_domain::tool::policy` calls it: policy branches on
+    /// effects and risk, not on the source kind, and the tool fabric has no HTTP surface, so this
+    /// predicate is reachable from its own tests alone. It is kept and defined here — rather than in a
+    /// future policy module — so the classification has **one home**.
+    ///
+    /// **The "must be classified deliberately" hope is now enforced.** `ALL` is the enumeration, and
+    /// `source_kind_classifies_externality_deliberately` compares it against a table written out by
+    /// hand, so a source kind added to the enum fails the length check rather than silently defaulting
+    /// to **not external** — which is the fail-open direction that matters, where a new remote source
+    /// would be read as trusted.
     #[must_use]
     pub const fn is_external(self) -> bool {
         matches!(self, Self::McpServer | Self::Runtime | Self::Plugin)

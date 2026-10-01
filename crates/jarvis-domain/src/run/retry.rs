@@ -305,7 +305,12 @@ impl RetryDecision {
         // module's: deciding it needs the provider's error vocabulary, which lives at the
         // adapter boundary. One layer owns each retry, and this module owns the *policy*
         // while the caller owns the classification.
-        if class == FailureClass::Permanent {
+        //
+        // **The question is asked through [`FailureClass::is_transient`] rather than by comparing to
+        // `Permanent`**, because the equality is the same rule written a second way and the named
+        // predicate is the definition. `BRN-062` found the predicate had no production caller while the
+        // comparison sat here — the `permits_step_at`/`is_permitted` shape one module over.
+        if !class.is_transient() {
             return Self::GiveUp {
                 reason: RetryRefusal::NotRetryable,
             };

@@ -496,10 +496,12 @@ impl ToolRegistry {
 
     /// Returns every registered tool, ordered by identity.
     ///
-    /// **Unfiltered, and named so.** This is what a discovery answer for one scope is computed
-    /// *from*; it is not what a client is shown. Returning it under the name `catalog` would
-    /// invite exactly the mistake this module exists to prevent — answering a scoped question with
-    /// the unscoped set — so the name says which set it is.
+    /// **Unfiltered, and named so.** Returning it under the name `catalog` would invite exactly the
+    /// mistake this module exists to prevent — answering a scoped question with the unscoped set — so
+    /// the name says which set it is. The scoped answer is computed by `discovery::catalog_for`, which
+    /// takes the tools it may offer as an argument rather than reading them from the registry; **the
+    /// production caller that would pass this accessor's result to it does not exist yet** (`BRN-063`
+    /// corrected this doc, which had read as though one did). It is reachable from tests only.
     #[must_use]
     pub fn all_unfiltered(&self) -> Vec<&RegisteredTool> {
         self.by_identity.values().collect()
@@ -507,8 +509,10 @@ impl ToolRegistry {
 
     /// Returns every source kind currently registered.
     ///
-    /// Used by an operator view and by a test that must prove an external source cannot displace a
-    /// native one; a set rather than a list because the question is membership.
+    /// **No production caller yet** — `BRN-063` corrected this doc, which claimed an operator view used
+    /// it. There is no operator view for the registry: no HTTP route, no CLI command. A test uses it to
+    /// prove an external source cannot displace a native one, and a set rather than a list because the
+    /// question is membership.
     #[must_use]
     pub fn registered_source_kinds(&self) -> BTreeSet<SourceKind> {
         self.by_identity

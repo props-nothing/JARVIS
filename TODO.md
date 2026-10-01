@@ -5004,6 +5004,110 @@ Dependencies: Milestone 2 exit gate.
     both are forms no constructor-based finder can see. There is no registry-level consumer yet, so the
     `ToolDefinition` half is proven by a round trip and by the falsifications rather than by a stored
     catalog.
+- [x] `BRN-062` Sweep for the complementary shape `BRN-060`'s note named but did not build — a rule that
+  exists and is enforced by nobody — and for **doc claims that name a guard which does not exist**. Found
+  one missing test, two false doc claims, and two duplicated predicates. **A doc that names a test is a
+  checkable claim, and nothing in this repository was checking it.**
+  Evidence: `every_operation_has_a_spelling_and_parses` (new, in `jarvis-domain`'s ledger tests), the
+  corrected `LedgerOperation::ALL` doc, the corrected `assurance_of` doc, and the two delegations in
+  `RunBudget::permits_step_at` / `RetryDecision::decide`.
+  - **The finder was wrong twice, in the under-reporting direction, and both bugs were found by
+    calibrating rather than by reading.** Stage 1 (every public bool-returning fn in a non-test file)
+    reported 105 for a name-prefix pattern and 176 once widened to any `-> bool`. The **zero
+    production-caller** test was first written as `refs <= 1`, which counts *test* references as
+    references — so `is_granted`, with five test callers and no production caller, was invisible. Fixing
+    it to `production reference count == 0` took the list from 4 to 21. Same lesson as rounds 124/125
+    (`debugging.md`): **under-reporting reads as a clean result**, so the finder has to be calibrated.
+  - **⚠ `LedgerOperation`'s doc named `every_operation_has_a_spelling_and_parses`, and no such test
+    existed.** That matters more than a stale comment because the operation column **is** stored —
+    `SqliteToolCallRepository` writes `operation.as_contract_str()` and reads it through
+    `LedgerOperation::parse` — so a variant added to the enum without being added to `ALL`, or one whose
+    `as_contract_str` disagreed with its serde form, would produce a value JARVIS writes and cannot read.
+    That is precisely the defect `ToolCallState` had (two spellings, found only by asserting the
+    serialized bytes). The test now asserts the set size, the round trip for each variant, and that the
+    serde form and the spelled form agree for **every** variant.
+  - **Falsified both halves, and each failure names the right thing.** Dropping `Read` from `ALL` fails
+    with `the contract lists three operations: left: 2, right: 3`; changing `Execute`'s spelling to
+    `EXECUTE` fails with `Execute must serialize to the spelling it parses from: left: "\"execute\"",
+    right: "\"EXECUTE\""`. The second is the `ToolCallState` defect reintroduced deliberately, and the
+    test names it rather than reporting a set-size mismatch.
+  - **A second false doc claim:** `assurance_of` cited `a_guest_is_refused_before_the_store_is_read`;
+    the test is `a_guest_cannot_decide_and_is_refused_before_the_record_is_read`. Corrected rather than
+    left, because a reader following the citation would not find the test and would conclude the
+    guarantee is unproven — the opposite of what the sentence intends.
+  - **Two predicates had no production caller because a caller restated them.** `BudgetStatus::is_permitted`
+    was defined as `!matches!(self, Expired)` while `RunBudget::permits_step_at` wrote the *same*
+    expression inline, and `FailureClass::is_transient` had **zero** references anywhere while
+    `RetryDecision::decide` compared `class == FailureClass::Permanent` — the complement. Both are the
+    "two spellings of one rule" defect: editing one leaves the other silently disagreeing. Each call site
+    now delegates to the named predicate, so the rule has one definition; `is_transient` gains the
+    production caller that makes it more than documentation.
+  - **Reviewed and deliberately left alone, each with a reason rather than a shrug:** the tool-fabric
+    predicates (`permits_dispatch`, `is_granted`, `is_settled_duplicate`, `needs_approval`, `is_denied`,
+    `has_effect`, `is_same_tool_as`, `is_external`, `is_replacement_of`, `requires_caller_key`,
+    `is_consumed_on_use`, `can_advance`, `has_artifacts`, `is_shape`) have no consumer because the
+    fabric's HTTP surface does not exist and their own notes say so — a *known* gap, not a
+    documented-as-enforced claim. `RetryDecision::is_retry` is a public accessor on a public type used
+    only by tests. `ControllerError::is_unimplemented` is public-API surface. `is_client_visible` **says
+    in its own doc** that it has no caller and why, with a test that keeps it true.
+  - 1578 workspace tests (+1). All gates green (fmt, clippy, test, doc). **DO NOT COMMIT.**
+  - **Not done, and named:** the sweep covers public `-> bool` predicates in non-test files. It does not
+    cover a private predicate with no caller, a `-> Option<T>` or `-> Result` accessor with no reader, or
+    a doc claim naming a *module*, *field*, or *constant* that does not exist (only `fn` names were
+    checked). The doc-claim check found two of nineteen; the other seventeen were verified by hand as
+    existing, so the check is not yet a gate.
+- [x] `BRN-063` Sweep for the **accessor** form of the same class — a public method with a producer and
+  no consumer — which `BRN-062`'s note named as uncovered. Found **four false doc claims** about callers
+  that do not exist, one of them a security-shaped claim, and one fail-open default that no test caught.
+  Evidence: the corrected docs in `jarvis_infrastructure::tool_schema::confirms`,
+  `jarvis_domain::tool::registry` (`all_unfiltered`, `registered_source_kinds`),
+  `jarvis_domain::tool::identity` (`SourceKind` and `is_external`), and `jarvis_domain::tool::ledger`
+  (`possibly_effecting_without_outcome`); plus `SourceKind::ALL` and the strengthened
+  `source_kind_classifies_externality_deliberately`.
+  - **The finder was wrong a third time, again under-reporting.** It counted production references as
+    `name(` — a CALL — so it missed `map(RetainedItem::to_input_item)`, where the method is passed as a
+    function **value** with no parentheses. That is a production caller, and the first run reported a live
+    function as dead. Adding the `::name` path form took the list from 44 to 38 and removed the false
+    positive. **Every sweep this session has needed its finder corrected before its output meant
+    anything** (`debugging.md`): calibrate on a case you know has hits, and print stage counts.
+  - **⚠ The claim with teeth was `ToolSchema::confirms`.** Its doc read "**this is what stops the
+    validator from being a component nothing consults**" — and nothing consults it. `ToolSchema::parse`
+    and `ToolSchema::validate` have no production caller either; the whole validator is reachable from
+    tests and the module's own example. `TLS-003`'s note had already recorded that gap ("no adapter stores
+    a schema and no request reaches the validator"), so the doc was claiming the opposite of the recorded
+    state. Corrected to say what the check is *for* and that it has no caller **yet**, keeping the
+    `ACC-024` rationale intact because the check is right and only uninvoked.
+  - **Three more "used by" claims, all false:** `registry.all_unfiltered` ("this is what a discovery
+    answer for one scope is computed *from*" — `catalog_for` takes its tools as an argument, and the
+    production call that would pass them does not exist), `registered_source_kinds` ("used by an operator
+    view" — there is no registry operator view at all), `SourceKind::is_external` ("used by policy" — no
+    policy module calls it), and `possibly_effecting_without_outcome` ("what makes the recovery able to
+    find the calls `ACC-025` is about" — recovery reads the **SQL** scans in
+    `jarvis_infrastructure::storage::tool_call_repository`, not this in-memory method).
+  - **The finding behind the security-shaped one: `is_external` was not enumerable, so an added source
+    kind silently defaulted to TRUSTED.** The predicate is a `matches!` over three named variants, so a
+    sixth `SourceKind` compiles with no answer and reads as *not external* — the fail-open direction,
+    where a new remote source is treated as native. `source_kind_classifies_externality_deliberately`
+    named the five kinds individually, so it kept passing when a sixth was added. Fix: `SourceKind::ALL`,
+    the same enumeration `ToolCallState::ALL` and `LedgerOperation::ALL` use, and the test now builds its
+    list from `ALL` and compares it to a hand-written table. **Falsified** by adding a variant: the test
+    fails printing `(WasmRuntime, false)` — naming the fail-open default rather than reporting a
+    mismatch. Its own doc's promise ("a source kind added later must be classified deliberately") is now
+    enforced rather than hoped for.
+  - **Reviewed and left alone, each with a reason:** builder/consumer methods on `ScriptedProvider`
+    (`also_serving`, `emit_raw`, `interrupt`, `fail_first_opens`), `WaitingWrite::waiting_on`,
+    `RunBudget::routed_model` (`route` is also read through the budget's own accessors), the
+    diagnostics/install/release accessor sets (operator-rendered, and `render()` is called),
+    `Observed::redactor`/`log_directory` (used by the `Debug` impl and the CLI), and the tool-fabric
+    accessors whose notes already say the fabric has no surface.
+  - 1578 workspace tests (unchanged — one test strengthened, none added). All gates green (fmt, clippy,
+    test, doc). **DO NOT COMMIT.**
+  - **Not done, and named:** the sweep covers `pub fn (&self…) -> T` accessors in non-test files. It does
+    not cover private accessors, trait-impl methods (excluded deliberately: they satisfy a trait), or
+    `pub const fn` on non-`self` values. The doc-claim checker now covers `fn` names; it still does not
+    check claims naming a module, field, or constant, and it is not yet a gate — 4 of the 5 claims this
+    round corrected were about *callers* rather than names, so a name-existence check would not have
+    found them either.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

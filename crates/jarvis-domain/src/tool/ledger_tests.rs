@@ -234,6 +234,43 @@ fn every_state_serializes_to_its_own_spelling() {
 }
 
 #[test]
+fn every_operation_has_a_spelling_and_parses() {
+    // **This test was named by `LedgerOperation`'s own doc for a round while it did not exist**, which
+    // is why it is written here rather than described. `ALL` is what makes a stored value total —
+    // `parse` searches it — so an operation added to the enum without being added to the list, or with
+    // a spelling that disagreed with its serde form, would have compiled and shipped while the reader
+    // refused a value the writer produced. `ToolCallState` had exactly that class of defect, where
+    // `as_contract_str` and the derive disagreed. The operation column **is** stored, so this is a
+    // durable round trip rather than a display concern.
+    for operation in LedgerOperation::ALL {
+        // The writer stores `as_contract_str`, so a `Serialize` derive that disagreed would make a value
+        // this code writes unreadable by this code.
+        let serialized = serde_json::to_string(operation).expect("an operation serializes");
+        assert_eq!(
+            serialized,
+            format!("\"{}\"", operation.as_contract_str()),
+            "{operation:?} must serialize to the spelling it parses from",
+        );
+        assert_eq!(
+            LedgerOperation::parse(operation.as_contract_str()).ok(),
+            Some(*operation),
+        );
+    }
+    assert_eq!(
+        LedgerOperation::ALL.len(),
+        3,
+        "the contract lists three operations",
+    );
+    // An unrecognised stored operation must not be read as `Execute`, which is the fail-open direction:
+    // a row opened for a read would look like one that dispatches.
+    assert_eq!(
+        field_of(&LedgerOperation::parse("no_such")),
+        Some("operation")
+    );
+    assert_eq!(field_of(&LedgerOperation::parse("")), Some("operation"));
+}
+
+#[test]
 fn the_transition_table_permits_exactly_the_contracts_edges() {
     // **Written out by hand rather than derived**, for the reason `TLS-005` established: a test that
     // derives its expectation from the implementation cannot catch a widened table. Thirteen edges

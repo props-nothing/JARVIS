@@ -570,15 +570,20 @@ impl ToolSchema {
 
     /// Refuses a definition review whose stated fingerprint is not this schema's.
     ///
-    /// **This is what stops the validator from being a component nothing consults.** A tool's
-    /// identity is bound to a [`SchemaFingerprint`] and an approval is recorded against that
-    /// identity, so the fingerprint a definition carries must describe the schema that calls are
-    /// actually validated against. Without this check a definition could carry one schema's
-    /// fingerprint while another schema — a looser one — was the document in force:
-    /// `ToolIdentity::authorizes` would then authorize every call, because the identity never
-    /// changed, while the rules that decide acceptance had. That is `ACC-024`'s failure mode
-    /// (replacing a tool behind the identity an approval was recorded against) reached through a
-    /// pair of values that disagree instead of through a display name.
+    /// **⚠ This is the check a composing caller must use, and `BRN-063` found no caller uses it yet.**
+    /// The doc here previously read "this is what stops the validator from being a component nothing
+    /// consults" — and nothing in the workspace consults it. `ToolSchema::parse` and `ToolSchema::validate`
+    /// have no production caller either (only tests and the module's own example), so the whole validator
+    /// is reachable from tests alone; that gap is named in `TLS-003` and this sentence was claiming the
+    /// opposite. A tool's identity is bound to a [`SchemaFingerprint`] and an approval is recorded against
+    /// that identity, so the fingerprint a definition carries must describe the schema that calls are
+    /// actually validated against. Without this check a definition could carry one schema's fingerprint
+    /// while another schema — a looser one — was the document in force: `ToolIdentity::authorizes` would
+    /// then authorize every call, because the identity never changed, while the rules that decide
+    /// acceptance had. That is `ACC-024`'s failure mode (replacing a tool behind the identity an approval
+    /// was recorded against) reached through a pair of values that disagree instead of through a display
+    /// name. The check is written and tested; what is missing is the adapter that stores a schema and the
+    /// call path that would invoke it.
     ///
     /// Comparing here rather than at each call site is deliberate: there is one place that decides
     /// whether a fingerprint and a schema belong together, so a caller cannot check it by a weaker

@@ -874,7 +874,7 @@ fn map_domain_refusal(error: &jarvis_domain::error::DomainError) -> ApprovalServ
 /// terminal-state guard in `ApprovalState::can_transition_to`. Collapsing to `map_err` states the
 /// function's actual contract — *any* failure to resolve an assurance here means the caller proved no
 /// identity — which is true precisely because the shared resolver has one failure mode, and the test
-/// that pins it is `a_guest_is_refused_before_the_store_is_read`.
+/// that pins it is `a_guest_cannot_decide_and_is_refused_before_the_record_is_read`.
 ///
 /// The rule itself is **delegated rather than restated**, so this surface and the policy surface
 /// cannot disagree about what a guest is.

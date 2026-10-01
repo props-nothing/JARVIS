@@ -437,6 +437,13 @@ impl LedgerOperation {
     /// stored value total: a variant added to the enum and not to this list fails
     /// `every_operation_has_a_spelling_and_parses`, which is the same technique
     /// `ToolCallState::ALL` uses.
+    ///
+    /// **⚠ The test this doc named did not exist for a round, and writing it is `BRN-062`.** The
+    /// sentence above was a claim about coverage rather than coverage — the same shape as a doc saying a
+    /// bound "is checked where a request is built" while nothing checks it — and the operation column
+    /// **is** stored, so an operation missing from this list would have been a value the writer produced
+    /// and the reader refused. The test now asserts the set's size, that each variant round-trips through
+    /// its spelling, and that the serde form and `as_contract_str` agree for every variant.
     pub const ALL: &'static [Self] = &[Self::Execute, Self::Reconcile, Self::Read];
 
     /// Returns the spelling JARVIS stores.
@@ -1006,8 +1013,15 @@ impl ToolCallLedger {
     ///
     /// Narrower than [`Self::unsettled`]: a call in `EXECUTING` when the daemon stopped had already
     /// been dispatched and its outcome is unknown, even though its *state* does not yet say
-    /// `RECONCILING`. That gap is exactly what a crash leaves, so a scan for it is what makes the
-    /// recovery able to find the calls `ACC-025` is about.
+    /// `RECONCILING`. That gap is exactly what a crash leaves.
+    ///
+    /// **⚠ The live recovery reads the store, not this type, and `BRN-063` corrected this doc.** It
+    /// read "a scan for it is what makes the recovery able to find the calls `ACC-025` is about", which
+    /// is false of the production path: `jarvis_infrastructure`'s ledger adapter has its own SQL scans
+    /// (`possibly_effecting`, `awaiting_conversion`) and `jarvis_application::tool_recovery` pages
+    /// through those, so the database is what recovery consults. This in-memory scan is the equivalent
+    /// for a caller holding a `ToolCallLedger`, and nothing constructs one outside tests — it is a
+    /// worked example of the classification, not the mechanism the daemon runs.
     #[must_use]
     pub fn possibly_effecting_without_outcome(&self) -> Vec<&LedgerEntry> {
         self.by_key

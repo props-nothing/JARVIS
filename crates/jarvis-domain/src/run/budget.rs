@@ -447,9 +447,16 @@ impl RunBudget {
     }
 
     /// Returns whether the budget permits work to begin at `now`.
+    ///
+    /// **Delegates to [`BudgetStatus::is_permitted`] rather than repeating the comparison**, because
+    /// the two are the same question — "may work start now" — asked of a budget and of a status. The
+    /// bodies were identical `!matches!(… Expired)` expressions until `BRN-062` noticed that
+    /// `is_permitted` had no production caller *and* that this method restated it: two spellings of one
+    /// rule, which is how the two come to disagree when only one is edited. The named predicate is the
+    /// single definition; this is the convenience form that reads the status for the caller.
     #[must_use]
     pub fn permits_step_at(&self, now: UtcTimestamp) -> bool {
-        !matches!(self.status_at(now), BudgetStatus::Expired { .. })
+        self.status_at(now).is_permitted()
     }
 
     /// Returns the per-call limits this budget imposes on one model call.

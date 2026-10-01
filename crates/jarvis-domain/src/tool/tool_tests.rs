@@ -671,11 +671,27 @@ fn source_kind_classifies_externality_deliberately() {
     // The classifier exists so a source added later must be classified rather than defaulting to
     // trusted. The assertion names both sides, because a check that only asserted the external
     // ones would pass if a native source were reclassified as external.
-    assert!(!SourceKind::Native.is_external());
-    assert!(!SourceKind::Connector.is_external());
-    assert!(SourceKind::McpServer.is_external());
-    assert!(SourceKind::Runtime.is_external());
-    assert!(SourceKind::Plugin.is_external());
+    //
+    // **`BRN-063` made this exhaustive.** The version before it named the five kinds individually, so
+    // it kept passing when a sixth was added — and `is_external` answers `false` for anything not named
+    // in its `matches!`, so the new kind would be read as **trusted**, which is the fail-open direction.
+    // Building the list from `SourceKind::ALL` and comparing it to a hand-written table means a new
+    // variant fails the length check here instead of silently defaulting.
+    let expected: &[(SourceKind, bool)] = &[
+        (SourceKind::Native, false),
+        (SourceKind::Connector, false),
+        (SourceKind::McpServer, true),
+        (SourceKind::Runtime, true),
+        (SourceKind::Plugin, true),
+    ];
+    let observed: Vec<(SourceKind, bool)> = SourceKind::ALL
+        .iter()
+        .map(|kind| (*kind, kind.is_external()))
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "every source kind must be classified deliberately; a new one defaults to trusted otherwise",
+    );
 }
 
 // ---------------------------------------------------------------------------------------
