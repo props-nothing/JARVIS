@@ -3627,6 +3627,14 @@ Foundation TODO remains incomplete.
   an oversight — and it is the distinction that decides whether a newtype needs a custom deserializer at
   all: **a bound, a non-emptiness rule, or a canonical-form rule needs one; a fixed-width value with no
   rule does not.**
+  **⚠ That "complete" was about transparent newtypes only, and `BRN-060` found the same defect by two
+  other routes** — a struct with public fields (`PreviewItem`) and a bare `String` field whose rule lived
+  in a free function (`summary`). A sweep scoped to the *mechanism* it first observed cannot see an
+  instance reached differently, so "the defect was confined to `jarvis-domain`" was true of the attribute
+  and false of the class. `BRN-061` then widened the sweep to **every type with a `Result<Self>`
+  constructor** and found nine more, three of which are correctly left derived because their only read
+  path validates — so the rule is "a validating constructor **and** an unvalidated path to it", not
+  "a validating constructor".
 - [x] `BRN-048` Make code-page round-trip damage in a text file fail a gate, because it is
   invisible to every one of them while it sits in a committed file. Found by **scanning the bytes**
   of every tracked text file for the `C3 A2` sequence the earlier rounds had recorded as a hazard,
@@ -4898,6 +4906,104 @@ Dependencies: Milestone 2 exit gate.
     contract specifies no such field, and this is recorded rather than guessed at.
 - [ ] `TLS-010` Add MCP negotiation, auth, cancellation, malformed payload, and
   conformance/Inspector tests.
+- [x] `BRN-060` Close the second way a validated value is bypassed on the way in, which round 90's
+  `#[serde(transparent)]` sweep could not see: `PreviewItem` (a struct with **public fields** and a
+  derived impl) and the approval summary (which was a bare `String` whose bound, `MAX_SUMMARY_BYTES`,
+  was **checked nowhere in production**). Both are rendered inside the consent prompt a user reads to
+  decide, and the preview is read back from `preview_json` on every approval load — so the reader was a
+  path an unvalidated value could take into that prompt.
+  Evidence: `crates/jarvis-domain/src/tool/wire_validation_tests.rs` (two new tests),
+  `crates/jarvis-infrastructure/src/storage/approval_repository_tests.rs` (two corruption tests), and
+  `ApprovalSummary` in `jarvis_domain::tool::approval`.
+  - **The rule was never about the attribute.** Round 90 swept for `#[serde(transparent)]` because that
+    was the mechanism it found, so it recorded nine instances and concluded the defect was confined to
+    `jarvis-domain`'s transparent newtypes. But the *defect* is "a type with a validating constructor or a
+    documented bound has no path from the wire through that check", and a derived `Deserialize` on a
+    plain struct, or a `String` field with a free-function rule beside it, are two more ways to have it.
+    Both are now closed for the approval module.
+  - **`PreviewItem`'s fields are private now.** They were `pub`, so a caller could pass a good pair to
+    `new` and then **assign** an empty or control-bearing half — the same bypass as the derived
+    `Deserialize`, reached through a field rather than through the wire. `key()`/`value()` are the
+    accessors, and `Deserialize` goes through `new`. There was exactly one production reader
+    (`http::approval::preview_rows`), so the change is contained.
+  - **The summary is now a type** (`ApprovalSummary`) rather than a `String`. `is_usable_summary` existed
+    and was **referenced only by its own tests** — its doc said "the summary's bound is checked where a
+    request is built" and no request-building path checked it — and the adapter read the column with
+    `text(row, "summary")?` and no check at all. A newtype makes the value constructible only through its
+    bound, so the two places that carry a summary (the request parts and the durable record) cannot skip
+    it, and the **reader validates a stored row** rather than trusting the column.
+  - **`ApprovalPreview`'s count bound now holds on the way in.** The transparent derive wrapped the vector
+    directly, so a document with more than `MAX_PREVIEW_ITEMS` rows was accepted; the storage read went
+    through `new` (which hides why this was invisible), but the `Deserialize` was still a bypass and had
+    no test.
+  - **3 mutations, all killed.** Restoring a direct-wrap `Deserialize` for `PreviewItem` fails
+    `an_approval_preview_cannot_arrive_over_the_wire_unvalidated` (`assertion failed:
+    !accepts::<PreviewItem>(r#"{"key":"","value":"x"}"#)`). A second run mutating `ApprovalPreview` and
+    `ApprovalSummary` the same way fails both of their tests, naming the empty summary — and the two
+    failures are distinct test names, so neither was masked by the other. A first attempt at the
+    `PreviewItem` mutation left the derive in place and hit `E0119` (conflicting impls), which proves
+    nothing; it was discarded and redone as a compiling direct wrap.
+  - **Also corrected in passing:** a stale doc block on `assurance_of` in
+    `jarvis_application::approval_service` that still said "the required level is always `Standard`" and
+    carried two `# Errors` sections — both made false by the step-up rule the previous round added.
+  - 1567 workspace tests (+4). All gates green (fmt, clippy, test, doc), both docs gates green, all five
+    journeys green. **DO NOT COMMIT.**
+  - **Not done, and named:** this closes the approval module. The same question — "does this type have a
+    validating constructor and a derived or absent deserializer?" — has not been swept across the *rest*
+    of the crate for non-transparent structs, and a bare field with a free-function rule beside it (the
+    summary's shape) is the pattern least likely to be found by an attribute search.
+- [x] `BRN-061` Widen the `BRN-060` sweep from transparent newtypes to **every type whose constructor
+  returns `Result<Self>`**, which is how the same class is reached when the type is an ordinary struct
+  with named fields. Nine instances in `jarvis-domain` were deriving `Deserialize` while their
+  constructors enforced rules the derived impl never called — including `ToolDefinition`, whose own doc
+  claimed "constructed only through `new`, so every instance satisfies the cross-field rules".
+  Evidence: `crates/jarvis-domain/src/tool/wire_validation_tests.rs` (10 new tests, one per instance plus
+  the positive control), and a validating `Deserialize` on each type.
+  - **The sweep was calibrated before it was trusted, and the calibration is why it found anything.**
+    The first version of the finder reported **zero** candidates — which is exactly the false-negative
+    direction this project has recorded (`debugging.md`: under-reporting reads as a clean result). It had
+    two bugs: a window too short to see a multi-line signature, and `Result<` anywhere in the signature
+    rather than in the **return type**, which is the actual validation point. With stage counts printed,
+    the tuned version reads `268 pub structs → 43 with a fallible constructor → 12 deriving Deserialize`.
+    A finder that cannot be shown to have found anything is not evidence; the stage counts are.
+  - **Nine are real and now go through their constructors.** `ToolSource` (inside `ToolIdentity`, read
+    from `tool_identity_json` on every approval and ledger load), `DataClasses` (the cross-field
+    "output never below input" rule), `ExecutionDefaults` (zero timeout / zero attempts), `PathGrant`
+    (a grant conferring nothing, or listing a mode twice), `ReservationKey` (**an empty idempotency key
+    makes every unkeyed call collide with every other** — the exact duplicate a reservation exists to
+    prevent), `RetryPolicy` (**the one that is actually stored**, inside `agent_runs.budget_json`),
+    `ToolResultBody` (the total byte bound), `ToolCallIntent` (capability and reason-summary bounds), and
+    `ToolDefinition` (five cross-field rules, reached through `DiscoveredCatalog`).
+  - **⚠ Three were deliberately LEFT derived, and the reason is a property of the read path rather than
+    laziness.** `ReleaseManifest`, `DiscoveryFile`, and `SignatureEnvelope` all have a fallible
+    constructor, which is what put them on the list — but each is read **only** through a `parse` that
+    deserializes and then calls a validator returning a **typed** error (`ReleaseError`,
+    `DiscoveryReject`). A validating `Deserialize` can only report through `serde`'s single opaque error,
+    so it would collapse those variants: `UnsupportedSchemaVersion { found: 2 }` became
+    `ManifestMalformed`, turning "this release is for a newer schema" into "the file is not valid JSON".
+    **A test caught it** — `a_manifest_with_an_unsupported_schema_version_is_refused` failed the moment
+    the change was made — which is the round's most useful measurement. The class needs **both** halves:
+    a validating constructor *and* an unvalidated path to it. Where the only path is `parse`, the derived
+    impl is not reachable with an invalid value, and "fixing" it is a regression.
+  - **`SignatureEnvelope` is the `CredentialVerifier` case again**: its `parse` only checks a byte size,
+    which a `Deserializer` cannot enforce, and its real checks (the algorithm comparison, the base64url
+    decode) happen at the point of use in `verify_manifest`. No field-level invariant, so no custom impl
+    — the same distinction round 90 recorded, now asserted rather than assumed.
+  - **10 mutations, all killed, each in isolation with the other fixes in place so none was masked by a
+    sibling.** Two batches of direct wraps, each failing **distinct** test names
+    (`a_tool_source_…`, `data_classes_…`, `execution_defaults_…`, `a_path_grant_…`,
+    `a_retry_policy_…`, `a_reservation_key_…`, `a_tool_result_body_…`, `a_tool_call_intent_…`,
+    `a_tool_definition_…`).
+  - **Also corrected: a doc claim that was false.** `ToolDefinition`'s "constructed only through `new`"
+    is now true, and the doc says when it was not; the `ToolSource` fix additionally documents that its
+    owner is what makes `ACC-024` hold for a same-named tool.
+  - 1577 workspace tests (+10). All gates green (fmt, clippy, test, doc). **DO NOT COMMIT.**
+  - **Not done, and named:** the sweep covers `jarvis-domain` and the two `crates` outside it that had a
+    candidate. It does **not** cover a bare field with a free-function rule beside it (`BRN-060`'s
+    `summary` shape) in other modules, nor a `Deserialize` derived on a type with no constructor at all —
+    both are forms no constructor-based finder can see. There is no registry-level consumer yet, so the
+    `ToolDefinition` half is proven by a round trip and by the falsifications rather than by a stored
+    catalog.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

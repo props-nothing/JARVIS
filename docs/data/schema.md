@@ -616,7 +616,11 @@ right index **for the query it was designed around**; what is missing is the que
   two values that must agree. A per-record override still has no producer and is named in the contract.
 - **`summary` and `preview_json` are stored verbatim**, because they are the *record* of what the user
   was shown and agreed to. Rebuilding them from the tool would show a preview the user never saw, whose
-  definition may since have changed.
+  definition may since have changed. **Both are read back through their constructors**, so a stored row
+  whose summary or preview item the domain would refuse is `storage.row_corrupted` rather than a value
+  carried forward — these two are rendered inside the consent prompt, so the reader is a path an
+  unvalidated value could take into that prompt. (Before `BRN-060`, `summary` was a bare `String` read with
+  no check at all, and `preview_json` was decoded with a derived item deserializer.)
 - **The decision's note is in `approval_transitions.actor_json`, not in a column of `approvals`.** A
   decision's `comment` and a cancellation's `reason` explain *that* transition — the only two a human
   authors — so they belong to the step rather than to the record, and a column would have to answer what

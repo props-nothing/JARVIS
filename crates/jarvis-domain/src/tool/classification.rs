@@ -342,7 +342,7 @@ impl fmt::Display for Idempotency {
 /// sent to a model governed by the other would compare `Confidential` against `Confidential`
 /// spelled by a different type and get *nothing*, or compare two integers that happen to be
 /// equal and get *permission*. One ladder means the comparison is meaningful by construction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DataClasses {
     /// The classification of the arguments a caller supplies.
     pub input: Sensitivity,
@@ -370,13 +370,28 @@ impl DataClasses {
     }
 }
 
+impl<'de> Deserialize<'de> for DataClasses {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            input: Sensitivity,
+            output: Sensitivity,
+        }
+        let classes = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** The cross-field rule — output never below
+        // input — is what stops a tool laundering a classification, and a derived impl rebuilt the
+        // forbidden pair for any `ToolDefinition` read from a document.
+        Self::new(classes.input, classes.output).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The bounded defaults a definition declares for time and retry.
 ///
 /// Bounded here for the same reason `RunBudget` bounds its own: an unbounded timeout is an
 /// unbounded wait. These are the definition's *defaults*; a run's budget can narrow them and
 /// never widen them, which is why the upper bounds are checked at construction rather than
 /// at use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExecutionDefaults {
     /// The default call timeout in milliseconds.
     pub timeout_ms: u64,
@@ -418,6 +433,22 @@ impl ExecutionDefaults {
             timeout_ms,
             max_attempts,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionDefaults {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            timeout_ms: u64,
+            max_attempts: u32,
+        }
+        let defaults = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** A zero timeout or a zero attempt count is not
+        // an execution — the call would be refused before it started, or never made — and the bounds
+        // are what keep a definition from claiming a longer default than a run step may take. A
+        // derived impl rebuilt both forbidden values for any definition read from a document.
+        Self::new(defaults.timeout_ms, defaults.max_attempts).map_err(serde::de::Error::custom)
     }
 }
 

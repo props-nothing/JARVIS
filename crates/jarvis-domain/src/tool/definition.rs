@@ -38,7 +38,15 @@ use super::identity::{ToolCapability, ToolIdentity, ToolSource, ToolVersion};
 /// cross-field rules above. Field visibility is public for reading — the fabric's policy layer
 /// reads these — while construction is private to the module, which is what makes "a
 /// `ToolDefinition` is always valid" true rather than aspirational.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **⚠ That "constructed only through `new`" was false for several rounds, and `BRN-061` is where it
+/// became true.** The derived `Deserialize` built one field by field, so the five cross-field rules
+/// `new` enforces — a usable display name, a non-empty purpose, a non-empty duplicate-free effect
+/// list, `ReadOnly` never combined with another effect, and a capability major matching the source
+/// release major — were all bypassed for a definition read from a document. `Deserialize` is now
+/// hand-written to go through [`Self::new`], so the sentence above is a statement about the type
+/// rather than a hope, and a persisted catalog cannot carry a definition the constructor would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolDefinition {
     /// The canonical identity: capability, source, and schema fingerprint.
     pub identity: ToolIdentity,
@@ -162,7 +170,6 @@ impl ToolDefinition {
     pub fn capability(&self) -> &ToolCapability {
         &self.identity.capability
     }
-
     /// Returns the source the implementation came from.
     #[must_use]
     pub fn source(&self) -> &ToolSource {
@@ -192,6 +199,49 @@ impl ToolDefinition {
     #[must_use]
     pub fn is_same_tool_as(&self, candidate: &Self) -> bool {
         self.identity.authorizes(&candidate.identity)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDefinition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The wire form, so a missing field is still an error and `deny_unknown_fields` still applies.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            identity: ToolIdentity,
+            display_name: String,
+            purpose: String,
+            source_version: ToolVersion,
+            effects: Vec<Effect>,
+            risk: Risk,
+            required_scopes: Vec<Scope>,
+            default_approval: ApprovalHint,
+            idempotency: Idempotency,
+            data_classes: DataClasses,
+            execution: ExecutionDefaults,
+        }
+        let definition = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived**, which is what makes the type's own doc — "a
+        // `ToolDefinition` is always valid" — true rather than aspirational. The five cross-field rules
+        // `new` enforces were all bypassed by the derived impl for a definition that arrived in a
+        // document, and this type is a field of `DiscoveredCatalog`, so a persisted or MCP-provided
+        // catalog is exactly such a document. `source_version` is deliberately **not** passed: `new`
+        // derives it from `identity.source.version`, so accepting the wire's copy would let a document
+        // state a source version that disagrees with the identity it carries.
+        let _ = definition.source_version;
+        Self::new(
+            definition.identity,
+            &definition.display_name,
+            &definition.purpose,
+            definition.effects,
+            definition.risk,
+            definition.required_scopes,
+            definition.default_approval,
+            definition.idempotency,
+            definition.data_classes,
+            definition.execution,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

@@ -39,7 +39,7 @@ use crate::time::UtcTimestamp;
 /// How many attempts one logical model call may make, and how long to wait between them.
 ///
 /// Bounded by construction: an unbounded retry count is an unbounded run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     /// The total number of attempts allowed, including the first.
@@ -180,6 +180,32 @@ impl RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self::none()
+    }
+}
+
+impl<'de> Deserialize<'de> for RetryPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// Mirrors the struct's own `deny_unknown_fields`, so a misspelled key is still refused rather
+        /// than silently defaulted.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            max_attempts: u32,
+            base_backoff_ms: u64,
+            max_backoff_ms: u64,
+        }
+        let policy = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived, and this one is stored.** A `RetryPolicy` is a
+        // field of `RunBudget`, which is read back from `agent_runs.budget_json` on every run load — so a
+        // derived impl let a corrupt or hand-edited row carry a zero attempt count (a run that can never
+        // make a call) or a backoff above the ceiling into the controller's retry decision. The
+        // constructor is the only place those bounds are enforced, so the reader has to go through it.
+        Self::new(
+            policy.max_attempts,
+            policy.base_backoff_ms,
+            policy.max_backoff_ms,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

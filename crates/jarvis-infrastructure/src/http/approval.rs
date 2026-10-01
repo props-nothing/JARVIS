@@ -586,7 +586,7 @@ fn view_of(approval: &DurableApproval, now: UtcTimestamp) -> ApprovalView {
             .iter()
             .map(|effect| effect.as_contract_str().to_owned())
             .collect(),
-        summary: approval.summary.clone(),
+        summary: approval.summary.to_string(),
         preview: preview_rows(approval),
         allowed_channels: approval
             .allowed_channels
@@ -643,8 +643,8 @@ fn preview_rows(approval: &DurableApproval) -> Vec<PreviewRowView> {
         .items()
         .iter()
         .map(|item| PreviewRowView {
-            key: item.key.clone(),
-            value: item.value.clone(),
+            key: item.key().to_owned(),
+            value: item.value().to_owned(),
         })
         .collect()
 }

@@ -30,7 +30,7 @@ use jarvis_domain::ids::{ApprovalId, RunId, ToolCallId, WorkspaceId};
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalChannel, ApprovalPreview, ApprovalRequestParts, ApprovalScopeKind,
-    DurableApproval, MAX_DECISION_NOTE_BYTES, PreviewItem,
+    ApprovalSummary, DurableApproval, MAX_DECISION_NOTE_BYTES, PreviewItem,
 };
 use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_domain::tool::classification::{Effect, Risk};
@@ -82,7 +82,7 @@ fn pending() -> DurableApproval {
         action_digest: ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::Write],
-        summary: "Send one email".to_owned(),
+        summary: ApprovalSummary::new("Send one email").expect("a usable summary"),
         preview: ApprovalPreview::new(vec![
             PreviewItem::new("to", "peter@example.com").expect("a usable preview item"),
         ])

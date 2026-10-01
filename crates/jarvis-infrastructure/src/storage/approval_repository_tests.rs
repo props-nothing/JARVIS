@@ -28,8 +28,8 @@ use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
-    ApprovalScopeKind, ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DecisionNote,
-    DurableApproval, PreviewItem,
+    ApprovalScopeKind, ApprovalState, ApprovalSummary, ApprovalTransitionRecord, ApprovalVersion,
+    DecisionNote, DurableApproval, PreviewItem,
 };
 use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_domain::tool::classification::{Effect, Risk};
@@ -103,7 +103,7 @@ fn parts() -> ApprovalRequestParts {
         action_digest: ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::ExternalCommunication, Effect::Write],
-        summary: "Send one email to peter@example.com".to_owned(),
+        summary: ApprovalSummary::new("Send one email to peter@example.com").expect("shaped"),
         preview: ApprovalPreview::new(vec![
             PreviewItem::new("To", "peter@example.com").expect("shaped"),
             PreviewItem::new("Subject", "Following up").expect("shaped"),
@@ -724,6 +724,51 @@ async fn a_stored_channel_set_that_is_empty_is_corruption() {
     let requested = approval();
     approvals.request(&requested).await.expect("inserted");
     sqlx::query("UPDATE approvals SET allowed_channels_json = '[]' WHERE id = ?")
+        .bind(requested.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("the corruption is written");
+
+    assert_eq!(
+        code_of(&approvals.load(workspace(), requested.id).await),
+        Some("storage.row_corrupted"),
+    );
+}
+
+#[tokio::test]
+async fn a_stored_preview_item_the_constructor_refuses_is_corruption() {
+    // The preview is **read back on every load and rendered into the consent prompt**, so a stored row is
+    // a path an unvalidated preview item could take into the prompt — an empty half, an over-long one, or
+    // one carrying a control character. Each is refused by `PreviewItem::new`; the reader now goes
+    // through it, so the row is corruption rather than a value carried forward.
+    let (database, approvals) = repository().await;
+    let requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    sqlx::query(
+        "UPDATE approvals SET preview_json = '[{\"key\":\"To\",\"value\":\"\"}]' WHERE id = ?",
+    )
+    .bind(requested.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("the corruption is written");
+
+    assert_eq!(
+        code_of(&approvals.load(workspace(), requested.id).await),
+        Some("storage.row_corrupted"),
+    );
+}
+
+#[tokio::test]
+async fn a_stored_summary_the_constructor_refuses_is_corruption() {
+    // **The bound that was checked nowhere in production.** `summary` was a bare `String`, so the adapter
+    // read the column with no check and `MAX_SUMMARY_BYTES` was enforced only by a function no production
+    // caller used. A stored over-long summary is now refused on the way in, because the prompt renders it.
+    let (database, approvals) = repository().await;
+    let requested = approval();
+    approvals.request(&requested).await.expect("inserted");
+    let over_long = "a".repeat(jarvis_domain::tool::approval::MAX_SUMMARY_BYTES + 1);
+    sqlx::query("UPDATE approvals SET summary = ? WHERE id = ?")
+        .bind(&over_long)
         .bind(requested.id.to_string())
         .execute(database.pool())
         .await

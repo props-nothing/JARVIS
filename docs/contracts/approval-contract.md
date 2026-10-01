@@ -265,6 +265,16 @@ rather than a defaulted level.
 Not yet stored: the policy version in force at the decision, and a preview hash rather than the preview
 itself (the record stores the bounded preview verbatim, because it is the record of what the user was shown).
 
+**The summary and the preview are validated on the way in, not only where the request is built.** Both are
+rendered inside the consent prompt, and the preview is additionally read back on every load, so the reader
+is a path an unvalidated value could take into that prompt. `ApprovalSummary` and `PreviewItem` are types
+with validating constructors and hand-written `Deserialize` impls, and the SQLite reader builds both through
+those constructors — so a stored row whose summary or preview item the constructor would refuse is
+`storage.row_corrupted` rather than a value carried forward. The summary was previously a bare `String`
+whose `MAX_SUMMARY_BYTES` bound was checked **nowhere in production** (`is_usable_summary` was referenced
+only by its own tests), and `PreviewItem`'s fields were `pub`, so an unvalidated half could also be assigned
+after a valid one had been constructed. Recorded in `BRN-060`.
+
 ## Tests
 
 - concurrent approve/reject;

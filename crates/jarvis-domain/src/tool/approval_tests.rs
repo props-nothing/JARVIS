@@ -8,9 +8,9 @@
 
 use super::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
-    ApprovalScopeKind, ApprovalState, ApprovalVersion, DecisionNote, DurableApproval,
-    MAX_APPROVAL_CHANNELS, MAX_DECISION_NOTE_BYTES, MAX_PREVIEW_ITEMS, MAX_PREVIEW_TEXT_BYTES,
-    MAX_SUMMARY_BYTES, PreviewItem, is_usable_summary,
+    ApprovalScopeKind, ApprovalState, ApprovalSummary, ApprovalVersion, DecisionNote,
+    DurableApproval, MAX_APPROVAL_CHANNELS, MAX_DECISION_NOTE_BYTES, MAX_PREVIEW_ITEMS,
+    MAX_PREVIEW_TEXT_BYTES, MAX_SUMMARY_BYTES, PreviewItem, is_usable_summary,
 };
 use super::classification::{Effect, Risk};
 use super::identity::{
@@ -61,7 +61,7 @@ fn parts() -> ApprovalRequestParts {
         action_digest: super::canonical::ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::ExternalCommunication, Effect::Write],
-        summary: "Send one email to peter@example.com".to_owned(),
+        summary: ApprovalSummary::new("Send one email to peter@example.com").expect("shaped"),
         preview: ApprovalPreview::new(vec![
             PreviewItem::new("To", "peter@example.com").expect("shaped"),
             PreviewItem::new("Subject", "Following up").expect("shaped"),
@@ -792,6 +792,16 @@ fn a_summary_is_bounded_and_control_free() {
     assert!(!is_usable_summary("send\u{7}bell"));
     assert!(!is_usable_summary(&"a".repeat(MAX_SUMMARY_BYTES + 1)));
     assert!(is_usable_summary(&"a".repeat(MAX_SUMMARY_BYTES)));
+
+    // The type is now the enforcement point, so the same rules hold through it and the text round-trips.
+    let summary = ApprovalSummary::new("Send one email").expect("shaped");
+    assert_eq!(summary.as_str(), "Send one email");
+    assert_eq!(summary.to_string(), "Send one email");
+    assert_eq!(
+        field_of(&ApprovalSummary::new("")),
+        Some("summary"),
+        "an empty summary is refused by the type a record now carries",
+    );
 }
 
 #[test]

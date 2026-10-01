@@ -415,7 +415,7 @@ impl<'de> Deserialize<'de> for WorkspaceRelativePath {
 ///
 /// The root is a [`WorkspaceRelativePath`], so a grant cannot be rooted outside the workspace; the
 /// workspace itself is the outermost boundary and is enforced by resolution, not by a path string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PathGrant {
     /// The directory the grant is rooted at, inclusive.
     pub root: WorkspaceRelativePath,
@@ -457,6 +457,23 @@ impl PathGrant {
     #[must_use]
     pub fn writes(&self) -> bool {
         self.modes.iter().any(|mode| mode.writes())
+    }
+}
+
+impl<'de> Deserialize<'de> for PathGrant {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            root: WorkspaceRelativePath,
+            modes: Vec<PathMode>,
+        }
+        let grant = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** A grant that confers nothing, or that lists a
+        // mode twice, is a stored authorization the user never gave: an empty list is recorded as access
+        // and authorizes nothing, and a duplicate is a list that has been narrowed from what a reviewer
+        // read. A derived impl rebuilt both for any grant read from a document, and a grant store is the
+        // next consumer.
+        Self::new(grant.root, grant.modes).map_err(serde::de::Error::custom)
     }
 }
 

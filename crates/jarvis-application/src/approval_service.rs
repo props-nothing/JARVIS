@@ -850,22 +850,20 @@ fn map_domain_refusal(error: &jarvis_domain::error::DomainError) -> ApprovalServ
     }
 }
 
-/// Maps the assurance a caller proved onto the level a decision requires.
+/// Resolves the assurance level a verified caller holds, refusing an anonymous one.
 ///
 /// **The ladder itself lives in [`crate::policy_service`]**, because a grant and a decision are the
 /// same kind of authorization — a person permitting an action — and two copies of the ladder is how
-/// they come to disagree about what `Standard` permits. This function exists only to translate the
+/// they come to disagree about what `Standard` permits. This function exists only to translate a
 /// refusal into this surface's error type, so the *rule* has one home even though the *code* differs.
 ///
-/// In this build the required level is always `Standard`: the record has no field naming a higher one,
-/// so an approval that needs a step-up is unrepresentable rather than merely unenforced. The branch is
-/// stated so that adding the field is a change here rather than a new rule in a new place.
-///
-/// # Errors
-///
-/// Returns [`ApprovalServiceError::Unauthenticated`] for a guest, because an anonymous caller cannot
-/// be the principal a decision is attributed to.
-/// Returns the assurance a verified caller proved, refusing an anonymous one.
+/// **This resolves the level; it does not decide what is required.** The requirement is derived from
+/// the record's own risk by [`RequiredAssurance::required_for`] and compared against this value in
+/// [`require_deciding_assurance`], which is the real producer of
+/// [`ApprovalServiceError::InsufficientAssurance`]. An earlier version of this comment said the
+/// required level was always `Standard` because the record named no higher one; that stopped being
+/// true the moment the risk-derived threshold was added, so it is corrected here rather than left to
+/// mislead a reader into thinking a step-up is unrepresentable.
 ///
 /// **`map_err` to a single variant rather than a `match` with a `_` arm, and the difference is the
 /// point.** The previous form matched the shared resolver's nine-variant error and mapped everything
@@ -879,9 +877,7 @@ fn map_domain_refusal(error: &jarvis_domain::error::DomainError) -> ApprovalServ
 /// that pins it is `a_guest_is_refused_before_the_store_is_read`.
 ///
 /// The rule itself is **delegated rather than restated**, so this surface and the policy surface
-/// cannot disagree about what a guest is. The real producer of
-/// [`ApprovalServiceError::InsufficientAssurance`] is [`require_deciding_assurance`], which compares
-/// a requirement against what the caller holds.
+/// cannot disagree about what a guest is.
 ///
 /// # Errors
 ///

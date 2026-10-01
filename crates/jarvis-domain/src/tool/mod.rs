@@ -39,7 +39,7 @@ pub mod registry;
 
 pub use approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalScopeKind,
-    ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
+    ApprovalState, ApprovalSummary, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
     MAX_APPROVAL_CHANNELS, MAX_CHANNEL_BYTES, MAX_PREVIEW_ITEMS, MAX_PREVIEW_TEXT_BYTES,
     MAX_SUMMARY_BYTES, PreviewItem,
 };

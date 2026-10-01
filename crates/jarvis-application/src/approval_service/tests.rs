@@ -129,7 +129,8 @@ fn pending() -> DurableApproval {
         action_digest: jarvis_domain::tool::canonical::ActionDigest::from_bytes([11; 32]),
         risk: Risk::High,
         effects: vec![Effect::Write],
-        summary: "Send one email".to_owned(),
+        summary: jarvis_domain::tool::approval::ApprovalSummary::new("Send one email")
+            .expect("a usable summary"),
         preview: jarvis_domain::tool::approval::ApprovalPreview::new(vec![
             jarvis_domain::tool::approval::PreviewItem::new("to", "peter@example.com")
                 .expect("a usable preview item"),

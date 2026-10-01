@@ -35,7 +35,8 @@ use jarvis_domain::model::exception::RequiredAssurance;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalScopeKind,
-    ApprovalState, ApprovalTransitionRecord, ApprovalVersion, DurableApproval, PreviewItem,
+    ApprovalState, ApprovalSummary, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
+    PreviewItem,
 };
 use jarvis_domain::tool::canonical::ActionDigest;
 use jarvis_domain::tool::classification::{Effect, Risk};
@@ -206,7 +207,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
             .bind(approval.action_digest.to_string())
             .bind(approval.risk.as_contract_str())
             .bind(serialize_effects(&approval.effects)?)
-            .bind(&approval.summary)
+            .bind(approval.summary.as_str())
             .bind(serialize_preview(&approval.preview)?)
             .bind(serialize_channels(&approval.allowed_channels)?)
             .bind(approval.expires_at.to_string())
@@ -528,12 +529,7 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
         ToolCallId::parse(&text(row, "tool_call_id")?).map_err(|_| RepositoryError::Corrupted {
             column: "tool_call_id",
         })?;
-    let identity: ToolIdentity =
-        serde_json::from_str(&text(row, "tool_identity_json")?).map_err(|_| {
-            RepositoryError::Corrupted {
-                column: "tool_identity_json",
-            }
-        })?;
+    let identity = stored_tool_identity(row)?;
     let effects: Vec<Effect> = parse_json(&text(row, "effects_json")?, "effects_json")?;
     let preview_items: Vec<PreviewItem> = parse_json(&text(row, "preview_json")?, "preview_json")?;
     let channels: AllowedChannels = parse_json(
@@ -544,9 +540,15 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
         .map_err(|_| RepositoryError::Corrupted { column: "risk" })?;
     let scope = parse_scope(&text(row, "scope")?)?;
     let state = parse_approval_state(&text(row, "state")?)?;
+    // **The two text-shaped fields are built through their constructors, not read as raw columns.**
+    // Both are rendered in the consent prompt, so the reader is a path each value takes — the same
+    // "the reader is a path the value takes" rule the other validated newtypes follow. A row either
+    // does not construct is corruption rather than a value carried forward.
     let preview = ApprovalPreview::new(preview_items).map_err(|_| RepositoryError::Corrupted {
         column: "preview_json",
     })?;
+    let summary = ApprovalSummary::new(&text(row, "summary")?)
+        .map_err(|_| RepositoryError::Corrupted { column: "summary" })?;
     let version = stored_version(row)?;
     let expires_at = parse_time(&text(row, "expires_at")?, "expires_at")?;
     let decided_by = match opt_text(row, "decided_by")? {
@@ -589,7 +591,7 @@ fn stored_approval(row: &sqlx::sqlite::SqliteRow) -> Result<DurableApproval, Rep
             )?,
             risk,
             effects,
-            summary: text(row, "summary")?,
+            summary,
             preview,
             allowed_channels: channels,
             expires_at,
@@ -918,6 +920,18 @@ fn serialize_actor(actor: &ApprovalActor) -> Result<(&'static str, String), Repo
 /// Parses a stored approval state.
 fn parse_approval_state(value: &str) -> Result<ApprovalState, RepositoryError> {
     ApprovalState::parse(value).map_err(|_| RepositoryError::Corrupted { column: "state" })
+}
+
+/// Reads the tool identity from its JSON column.
+///
+/// Extracted so `stored_approval` stays within clippy's line bound after the summary and preview gained
+/// their constructors, and so the column name is bound to the type here rather than spelled inline.
+fn stored_tool_identity(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIdentity, RepositoryError> {
+    serde_json::from_str(&text(row, "tool_identity_json")?).map_err(|_| {
+        RepositoryError::Corrupted {
+            column: "tool_identity_json",
+        }
+    })
 }
 
 /// Parses a stored scope kind.

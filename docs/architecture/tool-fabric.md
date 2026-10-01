@@ -52,6 +52,18 @@ availability          health and workspace/account prerequisites
 Descriptions and MCP annotations are untrusted hints. JARVIS derives effect and
 risk classifications from trusted manifests, built-in policy, and owner review.
 
+**Every field of a definition is validated on the way in as well as where it is constructed.** A
+definition may arrive as a document — a persisted catalog, an MCP server's list result — so a type that
+enforces its rules only in a constructor has them enforced only for values this process built, and the
+derived `Deserialize` is the door that skips the constructor. `ToolDefinition` and each of the field
+types it composes (`ToolSource`, `DataClasses`, `ExecutionDefaults`, `ToolIdentity`, `ToolResultBody`,
+`ToolCallIntent`, `PathGrant`, `ReservationKey`, `RetryPolicy`) hand-write `Deserialize` to go through
+their own constructor, so "a definition is always valid" is a property of the type rather than a claim
+about the callers. The counterpart rule matters as much: a type read **only** through a `parse` that
+validates and returns a typed error keeps its derived impl, because a custom one would collapse the
+specific error into `serde`'s generic form — a validating path is required, and a *second*, unvalidated
+one is the defect.
+
 ### Argument Validation
 
 `input_schema` is validated by `jarvis_infrastructure::tool_schema`, which

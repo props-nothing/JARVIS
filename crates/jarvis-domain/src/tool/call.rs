@@ -273,7 +273,7 @@ impl ContentBlock {
 }
 
 /// A tool's result, validated and bounded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolResultBody {
     /// The content blocks, in the order the provider returned them.
     pub content: Vec<ContentBlock>,
@@ -360,6 +360,30 @@ impl ToolResultBody {
     }
 }
 
+impl<'de> Deserialize<'de> for ToolResultBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            content: Vec<ContentBlock>,
+            #[serde(default)]
+            provider_reference: Option<String>,
+            sensitivity: Sensitivity,
+        }
+        let body = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** The total byte bound and the non-empty block
+        // list are enforced in the constructor — the round's own note calls the total "the bound with
+        // teeth" — and a derived impl rebuilt an empty or over-total result for any document that
+        // carried one. A tool result is an unbounded write to a durable record and to a model's context,
+        // which is the bound the constructor exists to keep.
+        Self::new(
+            body.content,
+            body.provider_reference.as_deref(),
+            body.sensitivity,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
 /// What a caller asked for, before it was validated or authorized.
 ///
 /// **Holds no principal, workspace, or grant.** The contract is explicit: "Principal/workspace/
@@ -367,7 +391,7 @@ impl ToolResultBody {
 /// would invite a caller to take them from here, and the trust boundary would move to whatever
 /// produced the intent — which is commonly a model. The identity a call is authorized under is
 /// resolved server-side and passed *alongside* an intent rather than inside it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolCallIntent {
     /// The call's own identity.
     pub call_id: ToolCallId,
@@ -421,6 +445,31 @@ impl ToolCallIntent {
             arguments,
             reason_summary: reason_summary.map(str::to_owned),
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCallIntent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            call_id: ToolCallId,
+            capability: String,
+            arguments: ToolArguments,
+            #[serde(default)]
+            reason_summary: Option<String>,
+        }
+        let intent = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** The capability bound and the reason-summary
+        // bound are enforced only in the constructor — an unbounded capability is an unbounded lookup
+        // key and an unbounded log field, and `reason_summary` reaches a log line and an audit record.
+        // The derived impl accepted both unchecked.
+        Self::new(
+            intent.call_id,
+            &intent.capability,
+            intent.arguments,
+            intent.reason_summary.as_deref(),
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

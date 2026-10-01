@@ -26,6 +26,17 @@ pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_DISCOVERY_BYTES: usize = 4 * 1024;
 
 /// The published discovery record for one running daemon.
+///
+/// **Deliberately a derived `Deserialize`, and `BRN-061` records why.** The audit flags this type
+/// because its fallible `parse` validates the fields a client depends on — including the loopback rule
+/// — and a derived impl does not. But the read path is *only* [`DiscoveryFile::parse`], and that calls
+/// [`DiscoveryFile::validate`], which returns a **typed** [`DiscoveryReject`] naming the exact fault
+/// (`UnsafeAuthority`, `UnsupportedVersion`, `EmptyField`). A validating `Deserialize` reports through
+/// `serde`'s single opaque error, so every one of those variants would collapse into `Malformed` —
+/// turning "the daemon published itself on a non-loopback host" into "the file is not valid JSON",
+/// which is exactly the collapse [`DiscoveryReject`]'s own doc says must never happen. The class this
+/// round closes needs a validating constructor **and** an unvalidated deserialization path; here the
+/// one path is `parse`, so the derived impl is not reachable with an invalid value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryFile {

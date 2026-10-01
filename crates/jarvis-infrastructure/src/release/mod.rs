@@ -145,6 +145,17 @@ pub struct ArtifactEntry {
 }
 
 /// The publication record: what was released, from what build, and its bytes.
+///
+/// **Deliberately a derived `Deserialize`, and `BRN-061` records why.** The audit for that class flags
+/// any type with a fallible constructor that derives `Deserialize`, and this type has one — but a
+/// hand-written validating impl would be a **regression** here: [`Self::parse`] deserializes and then
+/// calls [`Self::validate`], which returns a *typed* [`ReleaseError`] naming the exact fault
+/// (`UnsupportedSchemaVersion`, `EmptyField`, `UnsafeArtifactName`, `InvalidDigest`). A validating
+/// `Deserialize` can only report through `serde`'s single opaque error, so every one of those variants
+/// would collapse into `ManifestMalformed` — which an installer cannot act on, and which a test caught
+/// the moment the change was attempted. The class this round closes needs *both* halves: a validating
+/// constructor **and** a deserialization path that does not reach it. Here the only path is `parse`,
+/// and `parse` does reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
@@ -171,6 +182,15 @@ pub struct ReleaseManifest {
 }
 
 /// The detached signature over a manifest document.
+///
+/// **A derived `Deserialize` is correct here, and `BRN-061` checked rather than assumed it.** The type
+/// has a fallible `parse`, which is what put it on the audit list — but that fallibility is only the
+/// byte-size bound, which a `Deserializer` cannot enforce and which the call site's
+/// [`SignatureEnvelope::parse`] does. There is **no field-level invariant**: the algorithm is compared
+/// against [`SIGNATURE_ALGORITHM`] and the signature is base64url-decoded in
+/// [`TrustStore::verify_manifest`], at the point of use, so there is nothing for a hand-written
+/// deserializer to go through. That is the same distinction round 90 recorded for `CredentialVerifier`
+/// — a value with no rule needs no custom impl, and adding one would be ceremony, not safety.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignatureEnvelope {

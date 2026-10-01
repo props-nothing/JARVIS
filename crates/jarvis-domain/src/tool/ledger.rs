@@ -344,7 +344,7 @@ impl fmt::Display for ToolCallState {
 /// is worse — a retry that finds another principal's row would either be refused as a duplicate
 /// (confusing but safe) or, if the lookup were looser, be answered with that row's outcome and skip
 /// the call the caller actually asked for.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ReservationKey {
     /// The exact tool identity, including source and schema fingerprint.
     pub identity: ToolIdentity,
@@ -385,6 +385,30 @@ impl ReservationKey {
             principal,
             idempotency_key: idempotency_key.to_owned(),
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for ReservationKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            identity: ToolIdentity,
+            workspace: WorkspaceId,
+            principal: PrincipalId,
+            idempotency_key: String,
+        }
+        let key = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** An empty idempotency key would make every
+        // unkeyed call collide with every other, which is precisely the duplicate the reservation exists
+        // to prevent — so a key read from a durable row must satisfy the same rule a constructed one
+        // does. This is the type the five-part uniqueness guarantee is stated over.
+        Self::new(
+            key.identity,
+            key.workspace,
+            key.principal,
+            &key.idempotency_key,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

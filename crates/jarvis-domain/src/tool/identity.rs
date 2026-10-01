@@ -385,7 +385,7 @@ impl fmt::Display for SourceKind {
 /// approval to a different implementation": if identity were the kind and the id alone, a
 /// second MCP server configured with the same id would silently inherit the first server's
 /// approvals.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ToolSource {
     /// The source kind.
     pub kind: SourceKind,
@@ -413,6 +413,27 @@ impl ToolSource {
             owner: owner.to_owned(),
             version,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The wire form, so a missing field is still an error and the field set is not restated in a
+        /// tuple.
+        #[derive(Deserialize)]
+        struct Wire {
+            kind: SourceKind,
+            owner: String,
+            version: ToolVersion,
+        }
+        let source = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** `ToolSource` is a field of
+        // [`ToolIdentity`], which is read back from `tool_identity_json` on every approval and
+        // ledger load — so an invalid owner (an empty string, uppercase, a NUL) would otherwise
+        // reach the identity that a grant, an approval, and a deduplication key all bind to. The
+        // owner is also what makes a same-named tool from a different publisher a *different* tool
+        // (`ACC-024`), so a malformed one is an identity defect rather than a cosmetic one.
+        Self::new(source.kind, &source.owner, source.version).map_err(serde::de::Error::custom)
     }
 }
 

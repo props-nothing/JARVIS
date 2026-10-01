@@ -406,12 +406,18 @@ impl ApprovalChannel {
 /// "schema-defined, bounded, redacted, and sufficient for informed consent" — this is the *shape*
 /// half; redaction is the producer's job, because only the producer knows which of its own values is
 /// sensitive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreviewItem {
     /// The field being shown.
-    pub key: String,
+    ///
+    /// **Private so [`Self::new`] is the only way to make one.** The fields were public, which let a
+    /// caller assign an empty, over-long, or control-bearing half *after* the constructor had validated
+    /// a good one — the same bypass the derived `Deserialize` below is, reached through a field instead
+    /// of through the wire. A preview is rendered inside a prompt a user reads to decide, so an
+    /// unvalidated half is where a crafted string could make the prompt misrepresent the action.
+    key: String,
     /// The value to show. Already redacted by the producer.
-    pub value: String,
+    value: String,
 }
 
 impl PreviewItem {
@@ -432,6 +438,35 @@ impl PreviewItem {
             value: value.to_owned(),
         })
     }
+
+    /// Returns the field being shown.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the value to show.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl<'de> Deserialize<'de> for PreviewItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The wire form, so the derived field order is preserved and a missing field is still an error.
+        #[derive(Deserialize)]
+        struct Wire {
+            key: String,
+            value: String,
+        }
+        let item = Wire::deserialize(deserializer)?;
+        // **Through [`Self::new`] rather than derived.** A preview is read back from `preview_json` on
+        // every approval load and rendered into the consent prompt, so the reader is a path this value
+        // takes — and a derived impl wraps both halves directly, admitting exactly the empty, over-long,
+        // and control-bearing strings the constructor exists to refuse.
+        Self::new(&item.key, &item.value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Returns whether a preview or summary string is usable.
@@ -441,8 +476,63 @@ fn usable(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+/// The one-line summary of the action being approved.
+///
+/// **A type rather than a `String`, because the bound this value has was checked nowhere.** A summary is
+/// the line a user reads in the consent prompt, so `MAX_SUMMARY_BYTES` and the control-character rule
+/// bound it where it is *accepted* — but the field was a bare `String` on both [`ApprovalRequestParts`]
+/// and [`DurableApproval`], so nothing enforced either rule: a caller could build a request with a
+/// summary of any length, and the adapter read the stored column back with `text(row, "summary")?` and
+/// no check at all. A type makes the value constructible only through its own bound, so the two places
+/// that carry a summary cannot skip it, and a stored row is validated on the way in as well.
+///
+/// The rule is the same as a preview item's, for the same reason: a summary is rendered inside the prompt
+/// a user reads to decide, and a control character there would let a crafted summary escape the line it
+/// was supposed to occupy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ApprovalSummary(String);
+
+impl ApprovalSummary {
+    /// Validates and wraps a summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::ToolDefinitionInvalid`] naming `summary` when the value is empty, over
+    /// [`MAX_SUMMARY_BYTES`], or carries a control character.
+    pub fn new(value: &str) -> Result<Self, DomainError> {
+        if is_usable_summary(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(DomainError::ToolDefinitionInvalid { field: "summary" })
+        }
+    }
+
+    /// Returns the summary text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ApprovalSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovalSummary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        // **Through [`Self::new`]**, because the adapter reads the column back as a plain string and
+        // would otherwise carry whatever a writer — or a hand-edited database — left there into the
+        // prompt. The same `wire_validation_tests` rule the crate's other validated newtypes follow.
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A bounded, structured preview of the exact action being approved.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[serde(transparent)]
 pub struct ApprovalPreview(Vec<PreviewItem>);
 
@@ -473,6 +563,18 @@ impl ApprovalPreview {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovalPreview {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let items = Vec::<PreviewItem>::deserialize(deserializer)?;
+        // **Through [`Self::new`]**, so the item-count bound holds on the way in. The transparent
+        // derive wrapped the vector directly, so a document carrying more than [`MAX_PREVIEW_ITEMS`]
+        // rows was accepted — and an unbounded preview is an unbounded entry in the prompt a user reads
+        // to decide, which is the entry this bound exists to bound. `PreviewItem`'s own deserializer
+        // already validates each row's text; this validates the count.
+        Self::new(items).map_err(serde::de::Error::custom)
     }
 }
 
@@ -557,7 +659,10 @@ pub struct ApprovalRequestParts {
     /// The tool's effects, for the prompt.
     pub effects: Vec<super::classification::Effect>,
     /// A one-line summary of the action.
-    pub summary: String,
+    ///
+    /// Typed, so the bound is enforced by the constructor rather than promised in a comment — the field
+    /// was a bare `String` and `MAX_SUMMARY_BYTES` was checked nowhere in production.
+    pub summary: ApprovalSummary,
     /// The structured preview.
     pub preview: ApprovalPreview,
     /// Which channels may decide it.
@@ -595,7 +700,7 @@ pub struct DurableApproval {
     /// The tool's effects at the time of asking.
     pub effects: Vec<super::classification::Effect>,
     /// A one-line summary of the action.
-    pub summary: String,
+    pub summary: ApprovalSummary,
     /// The structured preview.
     pub preview: ApprovalPreview,
     /// Which channels may decide it.
@@ -957,6 +1062,11 @@ impl fmt::Display for ApprovalTransitionRecord {
 ///
 /// Exposed because the summary's bound is checked where a request is built, and the *reason* a
 /// summary is refused must be available to that caller without duplicating these rules.
+///
+/// **No longer called from production.** [`ApprovalSummary::new`] is now the enforcement point, and a
+/// production caller reaches the rule only through it — so this function is public for a caller that
+/// wants to *ask* whether a summary would be accepted (for example to render a validation hint) without
+/// building one. It is not dead: `ApprovalSummary::new` calls it, and its own tests assert it directly.
 #[must_use]
 pub fn is_usable_summary(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_SUMMARY_BYTES && !value.chars().any(char::is_control)
