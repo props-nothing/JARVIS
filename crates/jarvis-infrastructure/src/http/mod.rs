@@ -4462,6 +4462,103 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn every_code_this_surface_produces_survives_the_emission_boundary() {
+        // **The guard the "normative" namespace list never had.** `common-conventions.md` states
+        // that a code outside JARVIS's namespaces is replaced by `jarvis.internal` at the emission
+        // boundary. Three things were true at once and none of them was checked: the rule had no
+        // production caller (`ErrorCode` is referenced from nothing outside its own module), the
+        // boundary that real responses pass through validated nothing (`ErrorEnvelope::new` stored
+        // any `String`), and the list itself omitted seven namespaces this surface emits
+        // (`request`, `api`, `auth`, `resource`, `idempotency`, `service`, `internal`).
+        //
+        // Either half being wrong is invisible from inside its own crate. `jarvis-domain` cannot
+        // see the wire and `jarvis-protocol` cannot see the domain, so **this crate is the only
+        // place both ends are in scope** — which is why the check lives here rather than beside
+        // either the rule or the set.
+        //
+        // A code that fails this is silently delivered to a client as `jarvis.internal`, and the
+        // client loses the one value it branches on. That is the same collapse the `jarvis.`-only
+        // rule would have caused for every `tool.*` code, reached from the other side.
+        let (produced, modules) = production_codes();
+        assert!(
+            modules >= 3,
+            "the surface must have been scanned: {modules}"
+        );
+        assert!(
+            produced.len() >= 10,
+            "the scan must have found the surface's codes: {produced:?}",
+        );
+        for carried in super::CODES_CARRIED_BY_ERROR_TYPES {
+            // Carried on error types rather than written here, so the scan cannot see them; they
+            // reach the same constructor and must survive it for the same reason.
+            let envelope = jarvis_protocol::ErrorEnvelope::new(carried, "m", false);
+            assert_eq!(
+                envelope.code(),
+                carried,
+                "{carried} reaches a client as a different code",
+            );
+        }
+        for code in &produced {
+            let envelope = jarvis_protocol::ErrorEnvelope::new(code.as_str(), "m", false);
+            assert_eq!(
+                envelope.code(),
+                code.as_str(),
+                "{code} is produced by this surface but the emission boundary rewrote it, so a \
+                 client can no longer branch on it",
+            );
+        }
+
+        // The enforcement is only worth anything if nothing goes around it. `ErrorResponse`'s
+        // fields are public — the shape is the wire contract and a client parses it — so a struct
+        // literal is reachable and would skip the namespace check. Assert the crate has exactly one
+        // construction site, the constructor itself, so adding a second one fails here. Scanned in
+        // this crate because it is the one place that can see both the boundary and a consumer of
+        // it; `ErrorResponse`'s own doc names this check so the two cannot drift.
+        let protocol_error = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the crate lives two levels under the repository root")
+            .join("crates/jarvis-protocol/src/error.rs");
+        let source = std::fs::read_to_string(&protocol_error).expect("the protocol source reads");
+        let sites = source
+            .lines()
+            .filter(|line| line.contains("ErrorResponse {") && !line.contains("pub struct"))
+            .count();
+        assert_eq!(
+            sites, 1,
+            "the emission boundary must have exactly one construction site, so the namespace rule \
+             cannot be bypassed by a struct literal: found {sites}",
+        );
+    }
+
+    #[test]
+    fn the_domain_and_protocol_namespace_sets_are_the_same_rule() {
+        // Two spellings of one rule is how the contract's list came to disagree with the codes it
+        // governed. `BRN-065` exists because a documented set lived apart from the set the wire
+        // enforced, so the fix is only complete if the two sets are held equal by an executable
+        // check rather than by a comment in each place saying they agree.
+        let mut domain: Vec<&str> = jarvis_domain::error::ErrorCode::NAMESPACES.to_vec();
+        let mut protocol: Vec<&str> = jarvis_protocol::CODE_NAMESPACES.to_vec();
+        domain.sort_unstable();
+        protocol.sort_unstable();
+        assert_eq!(
+            domain, protocol,
+            "the domain and protocol namespace sets must be identical",
+        );
+        // Naming the boundary's own code explicitly, because it must be a member of the set it
+        // enforces: a replacement no namespace owns would itself be rewritten, and the fail-closed
+        // direction would become an infinite one.
+        assert!(
+            protocol.contains(&"internal"),
+            "the boundary's replacement code must be in the set it enforces",
+        );
+        assert_eq!(
+            jarvis_protocol::ErrorEnvelope::new(jarvis_protocol::INTERNAL_CODE, "m", false).code(),
+            jarvis_protocol::INTERNAL_CODE,
+        );
+    }
+
     /// Collects every namespaced code literal in this surface's production half.
     ///
     /// Extracted so the table test reads as an assertion rather than as a scanner.

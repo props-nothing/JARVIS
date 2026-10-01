@@ -323,8 +323,17 @@ impl fmt::Display for ErrorCode {
 
 /// A borrowed, namespaced error code.
 ///
-/// This is a presentation type for boundaries (the error envelope emits
-/// `code`). It borrows a constant, so constructing it never allocates.
+/// This borrows a constant, so constructing it never allocates.
+///
+/// **It is the domain-side mirror of the namespace rule, not the enforcement point.** The
+/// rule is enforced where errors are actually emitted —
+/// `jarvis_protocol::ErrorEnvelope::new`, whose `CODE_NAMESPACES` is the normative set —
+/// because `jarvis-protocol` depends on no JARVIS crate and no response surface goes
+/// around it. `jarvis-domain` cannot enforce anything on the wire: it depends on nothing
+/// internal, and the emission type is `String`-based. So a domain `code()` is a value a
+/// caller may build this from, and this type states the same rule for callers that want it
+/// before reaching the boundary; the two sets are asserted equal by a cross-crate test in
+/// `jarvis-infrastructure`.
 ///
 /// **A code is accepted when its first segment is a namespace JARVIS owns**, not only
 /// when it begins with `jarvis.`. The earlier rule tested the `jarvis.` prefix alone,
@@ -347,9 +356,27 @@ pub struct ErrorCode(&'static str);
 impl ErrorCode {
     /// The namespaces the contracts define codes under.
     ///
-    /// Order is irrelevant; this is a membership set, not a precedence order.
+    /// Order is irrelevant; this is a membership set, not a precedence order. The value
+    /// must equal `jarvis_protocol::CODE_NAMESPACES`; the cross-crate test in
+    /// `jarvis-infrastructure` fails if they diverge, so the two spellings of one rule
+    /// cannot drift apart the way the contract's list drifted from the emitted codes.
     pub const NAMESPACES: &'static [&'static str] = &[
-        "jarvis", "tool", "approval", "model", "run", "stream", "storage", "event", "session",
+        "jarvis",
+        "tool",
+        "approval",
+        "model",
+        "run",
+        "stream",
+        "storage",
+        "event",
+        "session",
+        "request",
+        "api",
+        "auth",
+        "resource",
+        "idempotency",
+        "service",
+        "internal",
     ];
 
     /// Creates an error code from a namespaced string.
@@ -503,10 +530,15 @@ mod tests {
             // **Asserted through `ErrorCode::new` rather than against a hand-written prefix
             // list**, because the prefix list is what was wrong: it admitted `jarvis.` and
             // `model.` only, so a `tool.` or `approval.` code passed this loop and was then
-            // rewritten to `jarvis.internal` at the boundary. Asking the type that actually
-            // gates the boundary is the difference between testing the list and testing the
-            // rule. `jarvis.*` and `model.*` are covered as a consequence rather than by a
-            // special case.
+            // rewritten to `jarvis.internal` at the boundary. Asking the type that states the
+            // rule is the difference between testing the list and testing the rule.
+            // `jarvis.*` and `model.*` are covered as a consequence rather than by a special
+            // case.
+            //
+            // This checks the domain half. The enforcement half is
+            // `jarvis_protocol::ErrorEnvelope::new`, and the two sets are held equal by a
+            // cross-crate test in `jarvis-infrastructure`; this test alone would keep passing
+            // while the emitted set drifted, which is exactly how the defect survived.
             assert_eq!(
                 ErrorCode::new(code).as_str(),
                 code,
@@ -554,7 +586,7 @@ mod tests {
         // added to `NAMESPACES` without a sample — the one change that could otherwise slip
         // through, and the one that matters, since the sample is what proves the namespace is
         // actually reached. Set equality makes either omission a failure.
-        let samples: [(&'static str, &'static str); 9] = [
+        let samples: [(&'static str, &'static str); 16] = [
             ("jarvis", "jarvis.invalid_timestamp"),
             ("tool", "tool.permission_denied"),
             ("approval", "approval.required"),
@@ -564,6 +596,13 @@ mod tests {
             ("storage", "storage.transition_refused"),
             ("event", "event.envelope_invalid"),
             ("session", "session.expired"),
+            ("request", "request.invalid"),
+            ("api", "api.version_unsupported"),
+            ("auth", "auth.credential_rejected"),
+            ("resource", "resource.not_found"),
+            ("idempotency", "idempotency.conflict"),
+            ("service", "service.not_ready"),
+            ("internal", "internal.failure"),
         ];
         let mut claimed: Vec<&str> = samples.iter().map(|(namespace, _)| *namespace).collect();
         claimed.sort_unstable();
@@ -593,7 +632,14 @@ mod tests {
                 "stream" => "stream.",
                 "storage" => "storage.",
                 "event" => "event.",
-                _ => "session.",
+                "session" => "session.",
+                "request" => "request.",
+                "api" => "api.",
+                "auth" => "auth.",
+                "resource" => "resource.",
+                "idempotency" => "idempotency.",
+                "service" => "service.",
+                _ => "internal.",
             };
             assert_eq!(
                 ErrorCode::new(bare),

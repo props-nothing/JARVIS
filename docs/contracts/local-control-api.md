@@ -575,6 +575,14 @@ surface, and the connector platform (`CON-004`) owns rate limiting for provider 
 It stays listed so the `429` shape is fixed before a limiter is added, but a client must not
 treat "handled" as "will occur".
 
+The `request`, `api`, `auth`, `resource`, `idempotency`, `service`, and `internal` namespaces used
+above are JARVIS's own and are named in
+[the error-envelope conventions](common-conventions.md#error-envelope), which also states the rule
+this surface relies on: a code outside JARVIS's namespaces is replaced by `jarvis.internal` at the
+emission boundary rather than forwarded. That replacement happens in `jarvis_protocol::ErrorEnvelope::new`,
+so a code in this table cannot be altered between being written here and reaching a client, and a
+code this table does not list cannot reach a client at all — it arrives as `jarvis.internal`.
+
 **`409 resource.version_conflict` covers a stale durable precondition, on every route that has one.**
 The run routes supply the version they read on every transition, so a concurrent advance is refused as
 a conflict — and it is the *same* conflict the policy route meets its own `expected_version` with.

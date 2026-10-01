@@ -19,7 +19,7 @@ pub use approval::{
     DecideApprovalRequest, MAX_APPROVAL_PAGE, PreviewRowView,
 };
 pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
-pub use error::{ErrorEnvelope, ErrorResponse};
+pub use error::{CODE_NAMESPACES, ErrorEnvelope, ErrorResponse, INTERNAL_CODE, is_owned_code};
 pub use policy::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
     PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView, SourceLayerView,

@@ -5158,6 +5158,139 @@ Dependencies: Milestone 2 exit gate.
     the caller did not exist for, which this check cannot see at all.
   - 23 validator tests (+3). 1578 workspace tests (unchanged). All gates green (fmt, clippy, test, doc,
     both docs gates). **DO NOT COMMIT.**
+- [x] `BRN-065` Enforce the **error-code namespace rule** at the emission boundary and reconcile the
+  contract's own list with the codes the surface emits. The rule was documented as normative and
+  enforced nowhere: three things were true at once and no check covered any of them.
+  Evidence: `jarvis_protocol::CODE_NAMESPACES` (16) + `INTERNAL_CODE` + `is_owned_code`, the namespace
+  check inside `ErrorEnvelope::new`, the widened `ErrorCode::NAMESPACES` in `jarvis-domain`, two new
+  `jarvis-infrastructure` guards (a cross-crate survival check and a set-equality check), two new
+  `jarvis-protocol` unit tests, the corrected normative list in `docs/contracts/common-conventions.md`.
+  - **The three facts.** `docs/contracts/common-conventions.md` said only nine namespaces are JARVIS's
+    and that a code outside them "is replaced by `jarvis.internal` at the emission boundary". (1) That
+    rule had **no production caller**: `ErrorCode` (`jarvis-domain/src/error.rs`) is referenced from
+    nothing outside its own module and tests. (2) The boundary real responses pass through —
+    `ErrorEnvelope::new` — **validated nothing**: it took `impl Into<String>` and stored it, so it could
+    not consult `ErrorCode` even by accident. (3) The surface emits **seven namespaces the list omits**:
+    `request`, `api`, `auth`, `resource`, `idempotency`, `service`, `internal`. The contract's own
+    Minimum-codes table, twenty lines below the list, **names five of those seven** — so the "normative"
+    list was not a superset of the table beside it. The two documents contradicted each other in a file
+    the docs validator reads but cannot judge.
+  - **The direction that was almost lost.** The tempting reading is "the list is too long, trim it".
+    It is the opposite: the list was missing namespaces, and `ErrorCode` had already been corrected once
+    for exactly this. `BRN-062`'s round found that a `jarvis.`-only rule would have rewritten the tool
+    contract's sixteen `tool.*` codes and the approval contract's twelve `approval.*` codes to
+    `jarvis.internal`, collapsing every code a client branches on. Wiring that same `ErrorCode` into the
+    boundary **without** widening it would have done exactly that to `request.`, `api.`, and the rest —
+    so the fix is not "enforce the rule as written", it is "make the rule and the codes agree, then
+    enforce it". A test that had asserted the enforcement without the widening would have passed while
+    the daemon shipped `jarvis.internal` for every `409` and `429`.
+  - **Why the enforcement is in `jarvis-protocol` and not in `jarvis-domain`.** The list is wire
+    vocabulary, and `jarvis-protocol` depends on no other JARVIS crate — so it is the one place a
+    boundary can consult without depending inward, which `jarvis-domain` cannot do (it has no internal
+    dependency, and the emission type is `String`). `jarvis-domain`'s set is the **mirror**, not the
+    enforcement point, and its doc now says so; the two are held equal by an executable check.
+  - **The set-equality check is not decoration.** `BRN-065` is the failure of "two spellings of one
+    rule": a documented set living apart from the enforced one. `the_domain_and_protocol_namespace_sets_are_the_same_rule`
+    makes the second spelling impossible, and it also asserts the replacement code is **in the set it
+    enforces** — a replacement no namespace owned would itself be rewritten, turning the fail-closed
+    direction into a rewrite to something else.
+  - **The cross-crate guard exists because neither crate can see both ends.** `jarvis-domain` cannot see
+    the wire and `jarvis-protocol` cannot see the domain, so a divergence is invisible from inside
+    either. `jarvis-infrastructure` depends on both, which is why
+    `every_code_this_surface_produces_survives_the_emission_boundary` lives there: it runs the surface's
+    own code scan (`production_codes`, reused rather than re-invented) against the real constructor and
+    fails naming a code the boundary would rewrite. Both halves of the round are needed: enforcement
+    without the survival check passes while a namespace is missing from the set; the survival check
+    without enforcement passes while nothing is replaced.
+  - **A struct literal would bypass the constructor, so the check is on the construction sites.** The
+    wire shape is public (a client parses it), so `ErrorResponse { .. }` is reachable and skips the
+    namespace check. Rather than claim otherwise in a doc comment — the defect this round is about — the
+    survival test asserts the crate has **exactly one** construction site, the constructor, so adding a
+    second fails. Its own doc comment names the check, so the claim and the guard cannot drift.
+  - **Falsified in both directions.** Removing `"api"` from the protocol set makes the survival check
+    fail `api.forwarded_header_not_allowed is produced by this surface but the emission boundary rewrote
+    it` (the code is named, not the namespace) and the set-equality check fail
+    `the domain and protocol namespace sets must be identical`; disabling the check inside
+    `ErrorEnvelope::new` makes `a_code_outside_the_owned_namespaces_is_replaced` fail
+    `acme.thing must not be forwarded as a JARVIS code`. Restoring each returns the gate to `0`. The
+    protocol test's namespace table is compared against `CODE_NAMESPACES` **as a set in both
+    directions**, so a namespace added to the const without a sample — the one change that could slip
+    through — is a failure.
+  - **One claim of mine was wrong and the check is what disproved it.** I read
+    `error_code_rejects_a_non_namespaced_value` as asserting the wrong answer for `toolbox.x`, on the
+    reading that `starts_with` is a prefix test. It is a prefix test, and `starts_with(ns) && bytes[len]
+    == b'.'` requires the `.` at exactly that position, so `toolbox.x` is correctly rejected — which the
+    test, run, confirms. Recorded because the finding was in my reading, not in the code, and running
+    the one test settles it in seconds.
+  - **Not done, and named.** `ErrorCode` still has no *production* caller: the boundary is
+    `String`-based, so it cannot be routed through the type. It is now the domain-side mirror with an
+    executable tie to the enforced set, which is the honest description rather than the "presentation
+    type for boundaries" the doc claimed while nothing used it. The domain test asserts the domain half
+    only; `jarvis-infrastructure` asserts the pair. And the surface scan sees only string **literals**
+    written in `src/http/` — codes carried on error types (`run.*`, `storage.*`, `idempotency.conflict`)
+    are invisible to it and are covered by `CODES_CARRIED_BY_ERROR_TYPES`, which remains a
+    hand-maintained list.
+  - 1582 workspace tests (+4). 23 validator tests (unchanged). 188 TODO IDs (+1). All gates green (fmt,
+    clippy, test, doc, both docs gates). **DO NOT COMMIT.**
+- [x] `BRN-066` Complete the `BRN-065` inverse sweep: **a rule written as a function that nothing
+  calls**. `BRN-065` found the shape on a `pub` method (`ErrorCode::new`); this round looked for it in
+  free functions, then in the `pub` methods `BRN-065`'s scope had deliberately skipped, and calibrated
+  the finder against a fixture before trusting it.
+  Evidence: `join_under`, `verify_within_profile`, and `is_safe_component` removed from
+  `crates/jarvis-infrastructure/src/paths.rs`; the two error variants they constructed
+  (`UnsafePathComponent`, `PathOutsideProfile`) removed from `error.rs`; the duplicated `normalize`
+  deleted from `install/mod.rs`, which now uses the `pub(crate)` one in `paths.rs`.
+  - **The finding: a complete, tested, documented path-safety chain with no caller in any crate.**
+    `verify_within_profile`'s doc said it "prevents a crafted name from redirecting durable state
+    elsewhere"; `join_under`'s refused "empty, `.`, `..`, absolute, rooted, or ... a separator or drive
+    prefix". Both were `pub`, both had thorough unit tests, and both were called by nothing outside
+    those tests. This is worse than ordinary dead code: a reader (or an audit) that finds a tested
+    containment function reasonably concludes traversal is handled, and it is not handled *there*.
+  - **The finder was wrong three times and the fixture is what caught it.** (1) `tests.rs` modules carry
+    `#[cfg(test)]` on the `mod tests;` line in the *parent*, so the file body has no marker and the
+    whole file read as production — 383 hits, nearly all test names. (2) `text.indexOf("#[cfg(test)]")`
+    and truncating there is wrong when the test module sits **mid-file**, as `service/mod.rs` has: it
+    hid every definition and call site after it, so `xml_escape` (called three times) read as uncalled.
+    (3) counting a name's occurrences including **comments** meant a function merely *named in a doc
+    comment* counted as referenced — which is the dangerous direction, because an uncalled rule usually
+    has a doc comment explaining it, so the better documented it is, the more invisible it becomes. A
+    crafted fixture with known-uncalled and known-called functions is what exposed (3); the positive
+    control (a function with one caller) did not, because nothing in the real tree was named in a
+    comment in a way that masked a *real* defect — only the fixture's own header comment did.
+  - **The honest result is a negative one, said plainly.** After calibration the free-function sweep
+    over 121 modules and 423 definitions found **zero** uncalled rules. That is a result, not a failure:
+    it retires the class for free functions in this tree. The 102 uncalled *methods* it then reported are
+    almost all legitimate test seams, and the ones that are not — the in-memory `ToolCallLedger`
+    (constructed nowhere outside tests), `ToolRegistry`'s query methods, `ToolDiscoveryCache`'s
+    invalidation, `ApprovalRecord`'s transition predicates — already carry docs corrected by `BRN-062`
+    and `BRN-063` that say exactly that. So the class was swept, not merely sampled.
+  - **Why the dead chain was deleted rather than wired up.** `BRN-065`'s lesson was "do not enforce a
+    rule that is wrong". Here the rule is fine but the *need* is absent: no HTTP route takes a
+    filesystem path (`Path<String>` carries ids), diagnostics derives its paths from `ProfilePaths`, and
+    the one place untrusted names do become filesystem access — the release manifest's artifact names —
+    is already guarded by `is_plain_file_name` at the join site. Containment is enforced where it is
+    needed by `InstallLayout::contains`, `InstallLayout::is_inside_profile`, and the domain's
+    `PathGrant`. Keeping a fourth implementation nobody consulted was the defect; deleting it is the fix.
+  - **Every "is it live?" claim was checked by finding the call site, and three of my own were wrong
+    before I did.** I wrote that `ProfilePaths::contains` was live (its only caller is
+    `profile/mod.rs`'s test), that `InstallLayout::contains`'s lexical-prefix case was untested (it is
+    asserted in `a_portable_layout_keeps_every_path_under_its_root`), and that `is_plain_file_name` had
+    only a positive test (its negative matrix runs through `manifest.validate()` in `release/tests.rs`).
+    Each correction came from grepping for the caller rather than reading the name — the same
+    distinction `BRN-065` recorded, and it was needed three more times in one round.
+  - **No coverage was lost, and that is demonstrated rather than asserted.** `root-escape rejection`
+    is a checked box in `docs/research/integrations/rust-foundation.md`, which is why the deletion had
+    to be justified: `crates/jarvis-domain/src/tool/path_grant_tests.rs` covers lexical containment
+    ("a sibling that shares a string prefix is not") for the *production* path-authorization rule, and
+    `install/tests.rs`, `diagnostics/tests.rs`, and `diagnostics/archive.rs` cover it for their own
+    surfaces. The deleted tests were the only coverage of a function nothing called.
+  - **Not done, and named.** The dead-method finder stops at "docs that claim a production role" and
+    still produces 15 loose matches (ordinary words like `every`, `always`, `never` in ordinary
+    rationale), so it is a reading aid rather than a gate, and it is not checked in. It also cannot see
+    a dead rule expressed as a *macro*, a *trait default method*, or a `const fn` in an `impl` reached
+    only through a generic bound.
+  - 1579 workspace tests (−3: the deleted dead tests). 23 validator tests (unchanged). All gates green
+    (fmt, clippy, test, doc, both docs gates), all four journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

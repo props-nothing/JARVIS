@@ -48,11 +48,11 @@
 //! which binary a service starts.
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::paths::ProfilePaths;
+use crate::paths::{ProfilePaths, normalize};
 
 /// The directory name of the per-version program directories.
 pub const VERSIONS_DIRECTORY: &str = "versions";
@@ -666,26 +666,6 @@ impl fmt::Display for InstallAction {
 }
 
 use std::fmt::Write as _;
-
-/// Normalizes a path lexically for containment comparison.
-///
-/// No filesystem access occurs, so a symlink cannot influence the answer. A
-/// caller that must resist links resolves the real path first.
-fn normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // `pop` past the root is a no-op, which keeps normalization
-                // anchored rather than letting a `..` escape.
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
-}
 
 mod apply;
 mod plan;

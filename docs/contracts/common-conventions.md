@@ -112,15 +112,24 @@ aim an operator's search, or to collide with another request's.
 Requirements:
 
 - `code` is stable and namespaced. The namespaces JARVIS owns are `jarvis`, `tool`,
-  `approval`, `model`, `run`, `stream`, `storage`, `event`, and `session`; the first
-  segment must be one of them and must be followed by a non-empty name, because a
-  family name alone names no error. A code outside that set is replaced by
-  `jarvis.internal` at the emission boundary rather than forwarded, so a provider or
-  runtime cannot name a code a client would read as JARVIS's own. **This list is
-  normative**: the tool contract defines sixteen `tool.*` codes and the approval
-  contract twelve `approval.*` codes, and a boundary that recognized only the `jarvis.`
-  prefix would have rewritten every one of them to `jarvis.internal`, collapsing codes a
-  client is told to branch on into a single value.
+  `approval`, `model`, `run`, `stream`, `storage`, `event`, `session`, `request`, `api`,
+  `auth`, `resource`, `idempotency`, `service`, and `internal`; the first segment must be
+  one of them and must be followed by a non-empty name, because a family name alone names
+  no error. A code outside that set is replaced by `jarvis.internal` at the emission
+  boundary rather than forwarded, so a provider or runtime cannot name a code a client
+  would read as JARVIS's own. **This list is normative** and is enforced, not merely
+  documented: `jarvis_protocol::ErrorEnvelope::new` — the single constructor every
+  response surface uses to build an error — replaces an unrecognized code with
+  `jarvis.internal` before the envelope can exist, and a test asserts the crate has no
+  second construction site for the error body, so the rule cannot be bypassed by a struct
+  literal. `jarvis_domain::ErrorCode::NAMESPACES` holds the same
+  set for domain-side code, and a cross-crate test in `jarvis-infrastructure` asserts
+  that every code the local control surface produces survives that constructor unchanged.
+  Two earlier boundaries were wrong in opposite directions: one recognized only the
+  `jarvis.` prefix and would have rewritten the tool contract's sixteen `tool.*` codes and
+  the approval contract's twelve `approval.*` codes to `jarvis.internal`, collapsing codes
+  a client is told to branch on; and the boundary before this one validated nothing at all,
+  while the namespaces above it omitted the seven the HTTP surface actually emits.
 - `message` is safe for the requesting principal.
 - `request_id` is populated on every refusal a handler can produce, not only on
   internal failures, and matches the `jarvis-request-id` response header. The

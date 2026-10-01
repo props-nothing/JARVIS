@@ -268,7 +268,11 @@ impl ProfilePaths {
 }
 
 /// Removes `.` and resolves `..` lexically without touching the filesystem.
-fn normalize(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` because `install` uses the same normalization for its own containment checks. Two
+/// copies of this existed until `BRN-066`; they were logically identical, so the copy was deleted
+/// rather than kept in step by hand — a rule spelled twice is how the two spellings come to disagree.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -285,57 +289,33 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-/// Returns whether a path component may be joined under a root.
-fn is_safe_component(component: &str) -> bool {
-    if component.is_empty() || component == "." || component == ".." {
-        return false;
-    }
-    // Reject separators and anything the platform would treat as a root.
-    if component.contains('/') || component.contains('\\') {
-        return false;
-    }
-    if component.contains(':') {
-        // Windows drive-relative and drive-absolute forms, and NTFS alternate
-        // data streams, all use a colon.
-        return false;
-    }
-    !Path::new(component).is_absolute()
-}
-
-/// Joins `names` under `root`, rejecting any unsafe component.
-///
-/// # Errors
-///
-/// Returns [`InfrastructureError::UnsafePathComponent`] if any name is empty,
-/// `.`, `..`, absolute, rooted, or contains a separator or drive prefix.
-pub fn join_under(root: &Path, names: &[&str]) -> Result<PathBuf, InfrastructureError> {
-    let mut result = root.to_path_buf();
-    for name in names {
-        if !is_safe_component(name) {
-            return Err(InfrastructureError::UnsafePathComponent {
-                component: (*name).to_owned(),
-            });
-        }
-        result.push(name);
-    }
-    Ok(result)
-}
-
-/// Verifies that `path` is contained by a user profile directory.
-///
-/// # Errors
-///
-/// Returns [`InfrastructureError::PathOutsideProfile`] when the path escapes
-/// `profile`, which is what prevents a crafted name from redirecting durable
-/// state elsewhere.
-pub fn verify_within_profile(profile: &Path, path: &Path) -> Result<(), InfrastructureError> {
-    let root = normalize(profile);
-    if normalize(path).starts_with(&root) {
-        Ok(())
-    } else {
-        Err(InfrastructureError::PathOutsideProfile)
-    }
-}
+// `join_under` and `verify_within_profile` were removed here rather than kept, and the reason is the
+// opposite of "unused code is untidy". Both were `pub`, thoroughly tested, and documented as
+// controls — `verify_within_profile`'s doc said it "prevents a crafted name from redirecting durable
+// state elsewhere" and `join_under`'s that it refuses "empty, `.`, `..`, absolute, rooted, or ... a
+// separator or drive prefix". Neither had a caller in any crate, so both described a guarantee
+// nothing relied on.
+//
+// **The containment rule had four spellings and this was the only dead one**, which is worth stating
+// exactly because it is easy to get backwards. `InstallLayout::contains` is called from the install
+// applier, the planner, and the uninstall path; `InstallLayout::is_inside_profile` is called from the
+// uninstall path and is what makes "uninstall retains data" structural; `ProfilePaths::contains` is
+// `pub` on the resolved-profile type that production constructs and is exercised by the profile
+// resolution test. Only `verify_within_profile` was called by nothing, so deleting it removed a
+// duplicate rather than a control. Each of those three was checked by finding its call sites, not
+// inferred from its name.
+//
+// `join_under` was the more misleading of the two, because it looked like a control and was not one.
+// Traversal is actually refused by the `release` module, which validates every manifest-supplied name
+// with `is_plain_file_name` at the point the untrusted name becomes a filesystem access — that is
+// where the artifact names are joined (`release.directory().join(&artifact.file)`,
+// `bin_dir.join(&artifact.name)`). Keeping a second, unused validator of the same rule split the
+// rule's coverage across two implementations that could disagree silently.
+//
+// No coverage was lost, and that was verified rather than assumed: `is_plain_file_name` is driven
+// with a traversal and path-shape matrix through `manifest.validate()` in `release/tests.rs`, and the
+// lexical-prefix case (`/install` must not contain `/installer`) is asserted for the live
+// `InstallLayout::contains` in `install/tests.rs`.
 
 /// Creates `path` as an owner-only directory, then re-queries `path`'s mode.
 fn ensure_private_dir(path: &Path) -> Result<(), InfrastructureError> {
@@ -443,7 +423,7 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), InfrastructureEr
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{ProfilePaths, join_under, normalize, verify_within_profile};
+    use super::{ProfilePaths, normalize};
 
     #[test]
     fn portable_profile_uses_explicit_subdirectories_only() {
@@ -574,56 +554,6 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str()),
             Some("run"),
-        );
-    }
-
-    #[test]
-    fn rooted_absolute_and_parent_components_are_rejected() {
-        let root = Path::new("/srv/jarvis");
-        for unsafe_name in [
-            "",
-            ".",
-            "..",
-            "../escape",
-            "nested/../../escape",
-            "/absolute",
-            "\\absolute",
-            "c:\\windows",
-            "..\\escape",
-            "stream:name",
-        ] {
-            let result = join_under(root, &[unsafe_name]);
-            assert!(
-                result.is_err(),
-                "{unsafe_name:?} must not be joined under the root",
-            );
-        }
-    }
-
-    #[test]
-    fn safe_components_are_joined_under_the_root() {
-        let root = Path::new("/srv/jarvis");
-        let joined = join_under(root, &["profiles", "default", "db.sqlite"])
-            .expect("safe components must join");
-        assert_eq!(joined, Path::new("/srv/jarvis/profiles/default/db.sqlite"));
-        assert!(joined.starts_with(root));
-    }
-
-    #[test]
-    fn traversal_that_escapes_the_profile_is_detected() {
-        let profile = Path::new("/home/user/.local/share/JARVIS");
-        assert!(verify_within_profile(profile, &profile.join("data/db.sqlite")).is_ok());
-        assert!(
-            verify_within_profile(profile, Path::new("/home/user/.ssh/id_ed25519")).is_err(),
-            "a path outside the profile must be rejected",
-        );
-        // A lexical prefix must not be mistaken for containment.
-        assert!(
-            verify_within_profile(
-                profile,
-                Path::new("/home/user/.local/share/JARVIS-backup/x")
-            )
-            .is_err()
         );
     }
 

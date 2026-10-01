@@ -36,17 +36,6 @@ pub enum InfrastructureError {
         /// The observed mode, in octal, for operator diagnostics.
         mode: String,
     },
-    /// A path component would escape its intended root.
-    #[error("a path component is absolute, rooted, or contains a parent reference")]
-    UnsafePathComponent {
-        /// The rejected component. It is echoed back because it is operator
-        /// input the user must correct; callers must not log it alongside
-        /// secrets.
-        component: String,
-    },
-    /// A resolved path is not contained by the profile root it must live under.
-    #[error("the resolved path is outside the profile root")]
-    PathOutsideProfile,
 }
 
 impl InfrastructureError {
@@ -58,8 +47,6 @@ impl InfrastructureError {
             Self::DirectoryCreate { .. } => "jarvis.directory_create",
             Self::FileWrite { .. } => "jarvis.file_write",
             Self::UnsafePermissions { .. } => "jarvis.unsafe_permissions",
-            Self::UnsafePathComponent { .. } => "jarvis.unsafe_path_component",
-            Self::PathOutsideProfile => "jarvis.path_outside_profile",
         }
     }
 
@@ -73,10 +60,7 @@ impl InfrastructureError {
     pub const fn retryable(&self) -> bool {
         match self {
             Self::DirectoryCreate { .. } | Self::FileWrite { .. } => true,
-            Self::HomeDirectoryUnavailable
-            | Self::UnsafePermissions { .. }
-            | Self::UnsafePathComponent { .. }
-            | Self::PathOutsideProfile => false,
+            Self::HomeDirectoryUnavailable | Self::UnsafePermissions { .. } => false,
         }
     }
 }
@@ -95,10 +79,6 @@ mod tests {
                 path: "c".into(),
                 mode: "755".to_owned(),
             },
-            InfrastructureError::UnsafePathComponent {
-                component: "..".to_owned(),
-            },
-            InfrastructureError::PathOutsideProfile,
         ];
 
         let mut codes: Vec<&str> = errors.iter().map(InfrastructureError::code).collect();
@@ -119,7 +99,6 @@ mod tests {
             }
             .retryable()
         );
-        assert!(!InfrastructureError::PathOutsideProfile.retryable());
         assert!(InfrastructureError::FileWrite { path: "d".into() }.retryable());
     }
 }
