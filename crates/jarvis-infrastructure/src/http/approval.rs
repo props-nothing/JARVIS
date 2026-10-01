@@ -137,16 +137,19 @@ fn parse_list_query(
 /// URL-safe without percent-encoding, so a client cannot mangle it by re-encoding the query.
 ///
 /// **It is not a security boundary.** Everything a cursor carries is data the client already received
-/// (the last row's expiry and identifier) plus the channel it fetched on, and the store re-applies its
-/// own workspace and channel predicates regardless of what the value claims. Opaqueness here is about
-/// honesty of use, not about hiding anything: a hand-forged cursor can only ask for a legitimate page
-/// of the caller's own view.
+/// (the last row's expiry and identifier) plus the channel and risk it fetched on, and the store
+/// re-applies its own workspace and narrowing predicates regardless of what the value claims.
+/// Opaqueness here is about honesty of use, not about hiding anything: a hand-forged cursor can only
+/// ask for a legitimate page of the caller's own view.
 fn encode_cursor(cursor: &ApprovalCursor) -> String {
     let raw = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         cursor.expires_at,
         cursor.id,
-        cursor.channel.as_contract_str()
+        cursor.channel.as_contract_str(),
+        // An un-narrowed page encodes an empty segment rather than a sentinel, so the field is present
+        // and its absence is distinguishable from a risk level.
+        cursor.risk.map_or("", Risk::as_contract_str),
     );
     format!("v1.{}", base64url(raw.as_bytes()))
 }
@@ -156,6 +159,12 @@ fn encode_cursor(cursor: &ApprovalCursor) -> String {
 /// Returns `None` for anything that is not a well-formed cursor this build wrote, so a malformed or
 /// truncated value is a `400 request.invalid_cursor` rather than a silent restart from page one — the
 /// failure a client would never detect, because page one looks like a plausible answer.
+///
+/// **Three and four segments are both accepted, and that is deliberate.** The risk segment is new, so a
+/// cursor this build issued before it has three; decoding it as "no risk narrow" is correct, because
+/// such a page *was* un-narrowed, and refusing it would break a client mid-page over a format change
+/// it had no way to observe. A fifth segment is still refused — reading a prefix is how a parser
+/// accepts a value the writer never produced.
 fn decode_cursor(value: &str) -> Option<ApprovalCursor> {
     let encoded = value.strip_prefix("v1.")?;
     let raw = String::from_utf8(base64url_decode(encoded)?).ok()?;
@@ -163,9 +172,12 @@ fn decode_cursor(value: &str) -> Option<ApprovalCursor> {
     let expires_at = UtcTimestamp::parse(parts.next()?).ok()?;
     let id = ApprovalId::parse(parts.next()?).ok()?;
     let channel = ApprovalChannel::parse(parts.next()?).ok()?;
-    // A trailing segment means a field was injected into the payload, so the value is refused rather
-    // than read with the extra part ignored — reading a prefix of something is how a parser accepts
-    // a value the writer never produced.
+    // An empty segment (or a missing one) is "no risk narrow"; a non-empty one must parse, so a cursor
+    // naming a level this build does not know is refused rather than read as un-narrowed.
+    let risk = match parts.next() {
+        None | Some("") => None,
+        Some(text) => Some(Risk::parse(text).ok()?),
+    };
     if parts.next().is_some() {
         return None;
     }
@@ -173,6 +185,7 @@ fn decode_cursor(value: &str) -> Option<ApprovalCursor> {
         expires_at,
         id,
         channel,
+        risk,
     })
 }
 

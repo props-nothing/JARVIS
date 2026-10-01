@@ -1773,6 +1773,12 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                 // matters: a rule the adapter keeps could be asserted against a store that never held
                 // it, and here the mirror was of a rule the adapter applies to a different input.
                 let filter_channel = after.map_or(channel, |cursor| cursor.channel);
+                // **The risk narrow comes from the cursor when resuming, matching the adapter.** Both
+                // narrowings are facts a position is bound to, so the double takes each from the same
+                // place the adapter does — otherwise a rule the adapter keeps could be asserted against
+                // a double that enforces a different one. A cursor carrying no risk is an un-narrowed
+                // position, so the caller's narrow is applied over it.
+                let narrow_risk = after.map_or(filter.risk, |cursor| cursor.risk.or(filter.risk));
                 let mut found: Vec<DurableApproval> = store
                     .approvals
                     .values()
@@ -1789,7 +1795,7 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                             // the bound — or not at all — would let the short-page defect this filter
                             // exists to prevent pass every test, which is a double enforcing less than
                             // its adapter, the direction that hides a bug.
-                            && filter.risk.is_none_or(|risk| stored.risk == risk)
+                            && narrow_risk.is_none_or(|risk| stored.risk == risk)
                     })
                     .cloned()
                     .collect();
@@ -1819,7 +1825,8 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                     .map(|last| ApprovalCursor {
                         expires_at: last.expires_at,
                         id: last.id,
-                        channel,
+                        channel: filter_channel,
+                        risk: narrow_risk,
                     });
                 Ok(ApprovalsPage {
                     approvals: found,

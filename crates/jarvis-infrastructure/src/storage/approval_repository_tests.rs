@@ -1323,6 +1323,9 @@ async fn the_double_and_the_adapter_agree_on_a_cursor_for_another_channel() {
         expires_at: UtcTimestamp::parse("2000-01-01T00:00:00Z").expect("a valid instant"),
         id: ApprovalId::from_uuid(uuid::Uuid::from_u128(1)),
         channel: ApprovalChannel::Api,
+        // No risk narrow, so the risk half of the binding excludes nothing here — this test is about the
+        // channel, and the two are asserted separately.
+        risk: None,
     };
 
     // The adapter honours the **cursor's** channel, so the row is visible.
@@ -1362,6 +1365,67 @@ async fn the_double_and_the_adapter_agree_on_a_cursor_for_another_channel() {
     );
 }
 
+#[tokio::test]
+async fn a_cursor_carries_the_risk_narrow_and_resuming_inside_it_skips_nothing() {
+    // **The binding the cursor lacked, and the harm is a skipped row.** The cursor recorded the channel
+    // but not the risk, so a page fetched under `?risk=high` produced a position that, replayed under a
+    // different narrow (or none), skipped every row before it. The adapter must record the narrow on the
+    // cursor it mints **and** apply it when resuming, or a client paging a narrowed listing loses rows
+    // silently — the "a skipped approval is a prompt nobody decides" failure in the one place the keyset
+    // bound cannot prevent it, because the position is correct and the *filter* moved under it.
+    let (_database, approvals) = repository().await;
+    // Three highs interleaved with lows, so an unfiltered resume would return a low row and a narrowed
+    // one would return the next high — the two answers are distinguishable, which a same-risk fixture
+    // could not achieve.
+    for (index, risk) in [
+        (0_u128, Risk::High),
+        (1, Risk::Low),
+        (2, Risk::High),
+        (3, Risk::High),
+    ] {
+        let mut parts = parts();
+        parts.risk = risk;
+        parts.expires_at = UtcTimestamp::parse(&format!("2026-11-{:02}T00:00:00Z", index + 1))
+            .expect("a valid instant");
+        let mut approval = DurableApproval::request(parts);
+        approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(120 + index));
+        approvals.request(&approval).await.expect("inserted");
+    }
+
+    let high = ApprovalListFilter {
+        risk: Some(Risk::High),
+    };
+    let first = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, high, 1, None)
+        .await
+        .expect("lists");
+    let cursor = first.next.expect("a bounded high page carries a cursor");
+    assert_eq!(
+        cursor.risk,
+        Some(Risk::High),
+        "**the minted cursor must record the narrow it was fetched under**, or the next page cannot \
+         know which view its position belongs to",
+    );
+
+    // Resuming **inside the narrow** returns the next high row, skipping the interleaved low one.
+    let resumed = approvals
+        .pending_in(workspace(), ApprovalChannel::Cli, high, 5, Some(cursor))
+        .await
+        .expect("lists");
+    assert!(
+        resumed.approvals.iter().all(|row| row.risk == Risk::High),
+        "a resumed page must stay inside the narrow: {resumed:?}",
+    );
+    assert_eq!(
+        resumed.approvals.len(),
+        2,
+        "the two remaining high rows, with the low row between them excluded rather than counted: \
+         {resumed:?}",
+    );
+}
+
+/// The cursor's own encode/decode lives in the HTTP layer; this asserts the **value** it round-trips,
+/// including the new risk segment, so a page fetched under a narrow resumes under the same one.
 #[tokio::test]
 async fn paging_through_the_listing_yields_every_row_exactly_once() {
     // **The property the cursor exists for.** A client told "there are more" must be able to read them

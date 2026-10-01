@@ -485,6 +485,99 @@ async fn a_cursor_bound_to_another_channel_is_refused() {
 }
 
 #[tokio::test]
+async fn a_cursor_bound_to_another_risk_narrow_is_refused() {
+    // **The harm here is a SKIPPED row, not a disclosure.** A cursor minted under `?risk=critical`
+    // records a `(expires_at, id)` that is the last critical row — so replaying it under `?risk=low`
+    // makes the `>` comparison skip every low row that expires before that instant. Those are rows the
+    // caller asked for and would never see, which is the "a skipped approval is a prompt nobody decides"
+    // failure the keyset bound exists to prevent, arriving through the filter rather than an offset.
+    //
+    // The fixture is built so the skip is **observable**: a high row expires first, a critical row
+    // second, a second high row third. Page one under the critical narrow is the critical row and its
+    // cursor lands at the second position; replaying that cursor under the high narrow must be refused,
+    // because a correct high page (both high rows) would otherwise be read from position two and the
+    // first high row skipped.
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut first_high = pending();
+    first_high.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0xa1));
+    first_high.risk = Risk::High;
+    first_high.expires_at = UtcTimestamp::parse("2030-01-01T00:00:00Z").expect("a valid instant");
+    repositories.request(&first_high).await.expect("inserted");
+    let mut critical = pending();
+    critical.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0xa2));
+    critical.risk = Risk::Critical;
+    critical.expires_at = UtcTimestamp::parse("2030-01-02T00:00:00Z").expect("a valid instant");
+    repositories.request(&critical).await.expect("inserted");
+    let mut second_high = pending();
+    second_high.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0xa3));
+    second_high.risk = Risk::High;
+    second_high.expires_at = UtcTimestamp::parse("2030-01-03T00:00:00Z").expect("a valid instant");
+    repositories.request(&second_high).await.expect("inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+
+    // One critical row under a bound of one is a full page with nothing behind it, so no cursor. A
+    // bound of one over a *larger* narrow is needed — so page the high narrow instead, whose first page
+    // is `first_high`, giving a cursor at the first position.
+    let high_page = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter {
+                risk: Some(Risk::High),
+            },
+            1,
+            None,
+            now(),
+        )
+        .await
+        .expect("the listing runs");
+    let cursor = high_page
+        .next
+        .expect("a bounded high page carries a cursor");
+    assert_eq!(
+        cursor.risk,
+        Some(Risk::High),
+        "**the cursor must record the narrow it was minted under**, or the store cannot tell which \
+         view its position belongs to",
+    );
+
+    // The same position under the critical narrow must be refused: a critical cursor could sit past a
+    // low/high row the caller wanted, so crossing narrows is how a row gets skipped.
+    let error = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter {
+                risk: Some(Risk::Critical),
+            },
+            1,
+            Some(cursor),
+            now(),
+        )
+        .await
+        .expect_err("a cursor minted under another risk narrow must be refused");
+    assert_eq!(error.code(), "request.invalid_cursor", "{error:?}");
+
+    // And the same cursor under the narrow that minted it is accepted and reads the next high row, so
+    // the refusal is the **binding** rather than a cursor that never round-trips.
+    let next = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter {
+                risk: Some(Risk::High),
+            },
+            1,
+            Some(cursor),
+            now(),
+        )
+        .await
+        .expect("the minting narrow's own cursor is accepted");
+    assert_eq!(
+        next.approvals.first().map(|row| row.id),
+        Some(second_high.id),
+        "resuming inside the narrow must return the next high row rather than skip it: {next:?}",
+    );
+}
+
+#[tokio::test]
 async fn a_decision_records_the_principal_and_channel_from_the_context_not_the_request() {
     // The contract says a client "cannot assert" the deciding principal, channel, assurance, or time.
     // The proof is that the recorded actor **follows the context**: there is no field to set, so a

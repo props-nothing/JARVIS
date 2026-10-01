@@ -115,6 +115,17 @@ than the authenticated identity, and replaying a cursor minted for one channel a
 excludes. When a principal-scoped listing exists, its cursor must carry the principal for the same reason
 the channel is carried here.
 
+**Every narrowing the query applies is carried in the cursor, and `risk` was the one that was not.**
+A cursor minted under `?risk=critical` records the last *critical* row's `(expires_at, id)`; replayed
+against `?risk=high` the `>` comparison would skip every high row expiring before that instant — rows the
+caller asked for and would never see, which is the "a skipped approval is a prompt nobody decides" harm
+the keyset bound exists to prevent, arriving through the *filter* rather than through an offset. So the
+cursor carries the narrow it was minted under and a mismatch is `request.invalid_cursor`, exactly as for
+the channel. A cursor with **no** recorded narrow is tolerated: it names an un-narrowed superset position,
+so no row a narrower view wanted can fall behind it. The value stays opaque and versioned; the risk
+segment is additive, and a cursor this build issued before it decodes as un-narrowed rather than as
+invalid, because such a page genuinely was.
+
 Detail returns the immutable action fingerprint inputs needed for informed
 review as a bounded, schema-defined, redacted preview plus request/version/state,
 requesting identity, tool source/schema identity, effects/risk, allowed channels,

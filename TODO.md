@@ -5786,13 +5786,15 @@ Dependencies: Milestone 2 exit gate.
     both docs gates), 23 validator tests, all four journeys pass. **DO NOT COMMIT.**
 - [x] `BRN-078` Serve the approval listing's **`risk` filter** — the residual `TLS-013` named and the
   one filter whose meaning changed when the step-up rule became real.
-  Evidence: `ApprovalListFilter` (the port's filter value), the four `PENDING_RISK_*`/`PENDING_AFTER_*`
-  SQL constants and the `approval_select!` macro that shares their column list, the pass-through and
-  sweep re-read in `ApprovalService::list`/`expire_lapsed`, the `?risk=` parse in the listing handler,
-  and four tests — `a_risk_narrow_is_applied_before_the_page_bound_and_yields_the_served_position`
-  (adapter), `a_risk_narrow_reaches_the_store_rather_than_being_dropped_on_the_way` and
+  Evidence: `ApprovalListFilter` (the port's filter value), the `?risk=` parse in the listing handler, the
+  pass-through and sweep re-read in `ApprovalService::list`/`expire_lapsed`, and four tests —
+  `a_risk_narrow_is_applied_before_the_page_bound_and_yields_the_served_position` (adapter),
+  `a_risk_narrow_reaches_the_store_rather_than_being_dropped_on_the_way` and
   `a_lapsed_row_is_swept_without_widening_the_callers_risk_narrow` (service), and
   `the_listing_narrows_to_a_risk_level_and_refuses_an_unknown_one` (wire).
+  *(The four `PENDING_RISK_*`/`PENDING_AFTER_*` SQL constants and the `approval_select!` macro this entry
+  originally named were replaced by a `QueryBuilder`-built statement in `BRN-081`; the filter behaviour
+  and the tests are unchanged, and only the adapter's assembly shape differs.)*
   - **The filter must run inside the `WHERE` the `LIMIT` bounds, and that is the whole design.** Applying
     it over an already-bounded page returns fewer rows than the caller asked for on a query that has
     more — a short page, which a client reads as "nothing more to decide". That is the exact defect the
@@ -5809,7 +5811,9 @@ Dependencies: Milestone 2 exit gate.
     reviewer reads one list, and a new statement cannot silently disagree about a column. The four
     listing shapes (narrowed? resuming?) exist as four constants because SQLite cannot index a nullable
     parameter, so a `(? IS NULL OR risk = ?)` predicate would degrade every first-page fetch to a scan —
-    the same reason the cursor was already two statements rather than one.
+    the same reason the cursor was already two statements rather than one. *(The four constants became one
+    `QueryBuilder`-built statement in `BRN-081`; the nullable-parameter reason is why each predicate is
+    pushed only when it applies rather than bound as a nullable value.)*
   - **The filter is a value, not a fifth positional argument.** `pending_in` already takes four values
     of three types with two adjacent integers; adding the narrow positionally invites a transposition
     the next scalar filter would make a compile error only by luck, and a second filter would then
@@ -5873,6 +5877,84 @@ Dependencies: Milestone 2 exit gate.
   - 1595 workspace tests (+6: cli 42, protocol 49, domain 501, infra 695; plus 3 composed-surface CLI
     steps in the journey). 201 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs gates),
     all four hermetic journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-080` Bind the **risk narrow into the approval cursor**, which I left unbound in `BRN-078` and
+  made reachable from the CLI in `BRN-079` — a page boundary that silently **skipped** rows.
+  Evidence: `ApprovalCursor.risk` with its doc, the `encode_cursor`/`decode_cursor` risk segment, the
+  service's mismatch refusal, the adapter's and double's risk-from-cursor mirror, and three tests —
+  `a_cursor_bound_to_another_risk_narrow_is_refused` (service),
+  `a_cursor_carries_the_risk_narrow_and_resuming_inside_it_skips_nothing` (adapter), and
+  `the_cursor_round_trips_the_risk_narrow_and_accepts_a_legacy_cursor` (wire).
+  - **The finding, and it is a defect I introduced two rounds ago.** The cursor bound the **channel** but
+    not the **risk**, so a position minted under `?risk=critical` (the last *critical* row's
+    `(expires_at, id)`) replayed under `?risk=high` made the `>` comparison skip every high row expiring
+    before it. Those are rows the caller asked for and would never see — the "a skipped approval is a
+    prompt nobody decides" harm the keyset bound exists to prevent, arriving through the **filter**
+    instead of through an offset. The risk filter (`BRN-078`) created the hole and the CLI wiring
+    (`BRN-079`) made it reachable by a real operator; neither round's tests used a cursor *and* a narrow
+    together, which is why every gate stayed green.
+  - **The rule: every narrowing the query applies must be carried in the cursor, not just the first one.**
+    The channel was bound because it was the only narrowing when the cursor was written; adding a second
+    narrowing without binding it is the defect, and it is invisible because both the fresh-page path and
+    the resume path work in isolation. A cursor is a position *inside a specific query*, so a query with
+    two predicates needs both bound.
+  - **A mismatch is refused (`request.invalid_cursor`), and an un-narrowed cursor is tolerated.** Refusing
+    risk-vs-risk crossings matches the channel rule and keeps the binding honest. A cursor with **no**
+    recorded narrow names an un-narrowed *superset* position, so no row a narrower view wanted can fall
+    behind it — and there the caller's narrow is applied *over* the position rather than dropped, or a
+    narrowed page would return rows above its own filter.
+  - **The encoding is additive and the decoder accepts the legacy shape.** The risk is a fourth pipe
+    segment; a three-segment cursor (what this build issued before) decodes as un-narrowed rather than as
+    invalid, because such a page genuinely was — refusing it would break a client mid-page over a format
+    change it cannot observe. A fifth segment is still refused (reading a prefix is how a parser accepts a
+    value the writer never produced), and an unknown level is refused rather than silently widened.
+  - **The adapter and the in-memory double take the risk from the cursor on a resume, matching how they
+    already took the channel** — the same agreement `the_double_and_the_adapter_agree_on_a_cursor_for_another_channel`
+    enforces, extended to the second narrowing. The service refuses a crossing, so the two values agree on
+    every real request; taking the cursor's is what keeps the adapter correct if called directly.
+  - **Falsified**: disabling the service's risk-mismatch guard lets the mismatched cursor return a
+    **high** row under a **critical** request (`must be refused` fails with the row in the body), which is
+    both the skip and the widening at once. Restored to `0`.
+  - 1598 workspace tests (+3: application 268, infra 697). 202 TODO IDs (+1). All gates green (fmt,
+    clippy, test, doc, both docs gates), all four hermetic journeys pass. **DO NOT COMMIT.**
+  - **Not done, and named.** The cursor's bindings are still hand-assembled pipe segments rather than a
+    versioned struct, so a *third* narrowing would repeat this exercise unless it is extracted first.
+- [x] `BRN-081` Replace the approval listing's **four hand-written `SELECT` statements** with one statement
+  built from the predicates the request has — the follow-up `BRN-080` named — so a new filter is one
+  guarded `push` rather than a doubling of the statement count.
+  Evidence: the `QueryBuilder`-built statement and the `approval_columns!` macro in
+  `jarvis-infrastructure`'s approval adapter; `DECIDED_SQL`/`LOAD_SQL` share the one column list through
+  it and the four `PENDING_*` constants are gone.
+  - **The finding: the statement count multiplied with the optional filters.** `BRN-078` added the `risk`
+    narrow and the cursor, making four constants for (narrowed? × resuming?) × the column list; the
+    contract names five more optional filters (`state`, `effect`, requesting run/tool, time), so the next
+    one would have made **eight** statements, each a place a predicate could be wired into the wrong shape
+    and each with its own bind order to get right. Selecting among constants is a hand-written state space;
+    the multiplication is the defect, not the four copies.
+  - **`sqlx::QueryBuilder` builds the `WHERE` from the predicates that apply**, so a new filter is one
+    `if let Some(x) { builder.push(" AND x = ").push_bind(..) }` — the parameters after it stay in the
+    order they were pushed, and there is no combination to enumerate. `sqlx` is a direct dependency
+    (`sqlx-core` is on the workspace graph already, so this is not a new dependency).
+  - **Every user value is still BOUND, never interpolated.** `push_bind` emits a `?` and a parameter; the
+    only text the statement interpolates is the column list and the predicate fragments, none of which
+    come from the request. The guarantee the four constants gave is kept while the assembly became
+    conditional, which is the point — a `QueryBuilder` used to splice a value would be worse than the
+    constants, not better.
+  - **The column list is still ONE definition.** It moved into an `approval_columns!` macro that `concat!`
+    accepts as an argument, so `LOAD_SQL`, `DECIDED_SQL`, and the built statement share it — the "one list,
+    not four copies" property `BRN-078` established, preserved across the rewrite. (`push` takes
+    `impl Display`, so a `concat!(approval_columns!())` fragment could be pushed too; the initial fragment
+    is a `concat!` literal so the whole statement is still as literal as it can be.)
+  - **Behaviour is unchanged, and that is what the existing suite demonstrates.** Every adapter test —
+    the four narrow/cursor combinations, the keyset resume, the short-page guard, the risk binding — passes
+    with the same 1598-test count, and the composed-surface journey (real daemon, SQLite, cursor + risk +
+    channel) is green. A rewrite of a hot query that changed no test *would* be suspicious; here the tests
+    are the evidence that the state space collapsed without changing an answer.
+  - 1598 workspace tests (unchanged — a refactor with no new behaviour). 203 TODO IDs (+1). All gates green
+    (fmt, clippy, test, doc, both docs gates), all four hermetic journeys pass. **DO NOT COMMIT.**
+  - **Not done, and named.** The `QueryBuilder` is confined to `pending_in`; `LOAD_SQL` and `DECIDED_SQL`
+    are still plain constants because their parameter lists are fixed (the builder exists for the listing,
+    whose predicates vary). The cursor's bindings remain hand-assembled pipe segments — extracting them
+    into a versioned struct is the other half of the `BRN-080` residual and is untouched here.
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

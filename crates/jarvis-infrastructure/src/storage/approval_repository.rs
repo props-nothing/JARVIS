@@ -24,7 +24,7 @@
 //! identity that no longer parses is `Corrupted`, because it means the *shape* changed under a row
 //! JARVIS wrote — which is a migration fault, not a missing record.
 
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use jarvis_application::repository::approval::{
     ApprovalCursor, ApprovalListFilter, ApprovalRepository, ApprovalsPage, DecideOutcome,
@@ -47,110 +47,41 @@ use super::repositories::{
     assurance_from_stored, assurance_stored, begin_write, int, opt_text, parse_time, text,
 };
 
-/// The column list every approval `SELECT` shares, expanded into each statement.
+/// The approval column list every `SELECT` shares, as a macro so it is written once.
 ///
-/// **Written once and interpolated, where four hand-repeated copies stood before.** The copies were not
-/// only verbose: the comment over them said "the three statements below therefore repeat the list" while
-/// **four** statements did, and a column list that must stay synchronised is exactly the fact a wrong
-/// count hides — the same drift `LOAD_SQL`'s predecessor warned about. `sqlx::query` cannot take a string
-/// assembled at run time (it cannot audit one for injection, correctly), so the interpolation is textual:
-/// this macro expands to a single `concat!` literal that `sqlx` accepts and a reviewer reads as the one
-/// list it is.
-macro_rules! approval_select {
-    ($tail:literal) => {
-        concat!(
-            "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
-             tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-             allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
-             decided_assurance, decided_at, created_at, updated_at FROM approvals ",
-            $tail,
-        )
+/// **One definition, interpolated into each statement by [`concat!`].** Four hand-repeated copies stood
+/// here before, and the comment over them said "the three statements below therefore repeat the list"
+/// while **four** did — so a wrong count was hiding exactly the drift the comment warned about.
+/// `sqlx::query` refuses a string built at run time (it cannot audit one for injection, correctly), so
+/// the interpolation is textual: this expands to a `&'static str` literal that `sqlx::query` accepts, and
+/// [`concat!`] accepts a macro call as one of its arguments, so the column list stays one definition while
+/// every statement remains a compile-time literal.
+macro_rules! approval_columns {
+    () => {
+        "id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+         tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
+         allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+         decided_assurance, decided_at, created_at, updated_at"
     };
 }
 
 /// The `SELECT` for [`ApprovalRepository::load`].
-const LOAD_SQL: &str = approval_select!("WHERE workspace_id = ? AND id = ?");
-
-/// The `SELECT` for [`ApprovalRepository::pending_in`] with neither a risk narrow nor a cursor.
-///
-/// **Three things in this statement are deliberate, and each fixes a way the listing silently
-/// short-changes an operator.**
-///
-/// 1. **The channel is a `WHERE` predicate, not a post-filter.** `allowed_channels_json` is a JSON
-///    array, and `json_each` tests membership. Filtering after the `LIMIT` would spend the page on
-///    rows the caller cannot decide and return a short list — and a client that receives a short list
-///    concludes there is nothing more to act on.
-/// 2. **The `LIMIT` is the caller's bound plus one, and the extra row is a probe.** Reading exactly
-///    `limit` rows cannot distinguish "there are more" from "that was all", and for this query the
-///    difference is an operator believing the queue is empty. The probe row is discarded; it exists
-///    only so the caller is told the truth about whether it saw everything. The same technique
-///    `RunRepository::incomplete_runs` and the ledger scans use.
-/// 3. **The order is `(expires_at, id)`, and the identifier is not decoration.** Soonest deadline first
-///    is the order an operator has to work in, but `expires_at` alone is not total — two requests can
-///    share a deadline, and a page boundary inside such a group would let one row appear on two pages
-///    while another is skipped.
-///
-/// `json_each` requires the JSON1 extension. The workspace's bundled SQLite has it (probed against the
-/// exact crate version: 3.51.3), and a build without it would fail the query loudly rather than
-/// silently return every row — the right direction, since the alternative is a channel check that
-/// quietly stops applying.
-const PENDING_SQL: &str = approval_select!(
-    "WHERE workspace_id = ? AND state = 'pending' \
-     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
-     ORDER BY expires_at ASC, id ASC LIMIT ?"
-);
-
-/// The `risk`-narrowed sibling of [`PENDING_SQL`].
-///
-/// **The risk filter is applied inside the same `WHERE` the `LIMIT` bounds, never over a bounded page.**
-/// Filtering a page after the fact returns fewer rows than the caller asked for on a query that has more,
-/// which is the short-page defect the channel predicate was introduced to prevent arriving by a second
-/// route — so the contract's `risk` filter reaches the statement rather than the handler.
-const PENDING_RISK_SQL: &str = approval_select!(
-    "WHERE workspace_id = ? AND state = 'pending' \
-     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
-     AND risk = ? \
-     ORDER BY expires_at ASC, id ASC LIMIT ?"
-);
-
-/// The `SELECT` for [`ApprovalRepository::pending_in`] when resuming from a cursor.
-///
-/// **A separate statement rather than a branch inside [`PENDING_SQL`], and the reason is the same one
-/// that makes the cursor a keyset.** A single statement would need either a nullable resume parameter
-/// in the `WHERE` — `(? IS NULL OR (expires_at, id) > (?, ?))`, which SQLite cannot index and which
-/// silently degrades every first-page fetch to a scan — or a string built by concatenation, which is
-/// how a user-supplied value reaches a statement. The constants keep both statements indexable and
-/// keep the values bound.
-///
-/// The comparison is a **row-value** comparison over `(expires_at, id)`, matching the `ORDER BY`
-/// exactly. Comparing only `expires_at` with `>` would drop every row sharing the boundary instant,
-/// which is precisely the tie the identifier exists to break.
-const PENDING_AFTER_SQL: &str = approval_select!(
-    "WHERE workspace_id = ? AND state = 'pending' \
-     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
-     AND (expires_at, id) > (?, ?) \
-     ORDER BY expires_at ASC, id ASC LIMIT ?"
-);
-
-/// The `risk`-narrowed sibling of [`PENDING_AFTER_SQL`], completing the four shapes a listing can take.
-///
-/// The four combinations exist because SQLite cannot index a nullable parameter — see [`PENDING_RISK_SQL`]
-/// — so each (narrowed?, resuming?) pair is its own statement, sharing its column list through
-/// [`approval_select`] and differing only in the `WHERE` tail.
-const PENDING_RISK_AFTER_SQL: &str = approval_select!(
-    "WHERE workspace_id = ? AND state = 'pending' \
-     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
-     AND risk = ? \
-     AND (expires_at, id) > (?, ?) \
-     ORDER BY expires_at ASC, id ASC LIMIT ?"
+const LOAD_SQL: &str = concat!(
+    "SELECT ",
+    approval_columns!(),
+    " FROM approvals WHERE workspace_id = ? AND id = ?"
 );
 
 /// The `SELECT` for [`ApprovalRepository::decided_by`], most recent first.
 ///
 /// The tie-break on `id` is the same requirement the pending listing records: `decided_at` alone is not
-/// total, and an order that is not total can show one decision twice and hide another.
-const DECIDED_SQL: &str = approval_select!(
-    "WHERE workspace_id = ? AND decided_by = ? ORDER BY decided_at DESC, id ASC LIMIT ?"
+/// total, and an order that is not total can show one decision twice and hide another. It is a plain
+/// constant rather than a [`QueryBuilder`] statement because its parameter list is fixed — the builder
+/// exists for the listing, whose predicates vary.
+const DECIDED_SQL: &str = concat!(
+    "SELECT ",
+    approval_columns!(),
+    " FROM approvals WHERE workspace_id = ? AND decided_by = ? ORDER BY decided_at DESC, id ASC LIMIT ?"
 );
 
 /// The `SELECT` for [`ApprovalRepository::transitions`], oldest first.
@@ -431,59 +362,71 @@ impl ApprovalRepository for SqliteApprovalRepository {
             // `limit` rows makes "there are more" and "that was all" the same observation — and here
             // that ambiguity makes an operator believe the queue is empty.
             let probe = i64::from(limit.saturating_add(1));
-            // **Four statements, chosen by the two independent narrowings.** SQLite cannot index a
-            // nullable parameter, so a `risk` predicate cannot be `(? IS NULL OR risk = ?)` — that
-            // silently turns every first-page fetch into a scan — and the statement is selected rather
-            // than built, so no user value ever reaches the SQL text. Every branch binds the same
-            // parameters in the same order, so a mismatch is a compile-time arity error rather than a
-            // silently wrong value.
-            let risk = filter.risk.map(Risk::as_contract_str);
-            let rows = match (risk, after) {
-                // The channel is taken from the **cursor** rather than from the parameter, because a
-                // cursor is bound to the query that produced it: honouring a caller's channel here
-                // would let a cursor from one view be replayed against another and report whether
-                // rows exist outside it. The two are the same value on every real request — the
-                // handler builds one from the other — and this is the one that cannot be forged.
-                (Some(risk), Some(cursor)) => {
-                    sqlx::query(PENDING_RISK_AFTER_SQL)
-                        .bind(workspace.to_string())
-                        .bind(cursor.channel.as_contract_str())
-                        .bind(risk)
-                        .bind(cursor.expires_at.to_string())
-                        .bind(cursor.id.to_string())
-                        .bind(probe)
-                        .fetch_all(&self.pool)
-                        .await
-                }
-                (Some(risk), None) => {
-                    sqlx::query(PENDING_RISK_SQL)
-                        .bind(workspace.to_string())
-                        .bind(channel.as_contract_str())
-                        .bind(risk)
-                        .bind(probe)
-                        .fetch_all(&self.pool)
-                        .await
-                }
-                (None, Some(cursor)) => {
-                    sqlx::query(PENDING_AFTER_SQL)
-                        .bind(workspace.to_string())
-                        .bind(cursor.channel.as_contract_str())
-                        .bind(cursor.expires_at.to_string())
-                        .bind(cursor.id.to_string())
-                        .bind(probe)
-                        .fetch_all(&self.pool)
-                        .await
-                }
-                (None, None) => {
-                    sqlx::query(PENDING_SQL)
-                        .bind(workspace.to_string())
-                        .bind(channel.as_contract_str())
-                        .bind(probe)
-                        .fetch_all(&self.pool)
-                        .await
-                }
+            // **The statement is built from the predicates the request actually has, rather than selected
+            // from one per predicate combination.** Four constants stood here — (risk narrowed? × cursor
+            // resuming?) × the column list — and the multiplication is the defect: a third *optional*
+            // predicate (the `effect`, `state`, or time filters the contract names) would have needed
+            // eight statements, each a place a predicate could be wired into the wrong shape. The builder
+            // appends each predicate **only when it applies**, so a new filter is one `push` guarded by one
+            // condition, and the parameters that follow it stay in the order they were pushed.
+            //
+            // **Every user value is BOUND, never interpolated.** `push_bind` emits `?` and a bound
+            // parameter; the only text this statement interpolates is the column list and the predicates
+            // themselves, none of which come from the request. That is the same guarantee the four
+            // constants gave, kept while the assembly became conditional.
+            //
+            // **Why each predicate is in the `WHERE` rather than applied afterwards:** the channel and the
+            // risk must bound the rows the `LIMIT` applies to, not filter an already-bounded page — a
+            // post-filter returns fewer rows than the caller asked for on a query that has more, and a
+            // short page is how a client concludes there is nothing left to decide. The keyset bound is a
+            // **row-value** comparison over `(expires_at, id)` matching the `ORDER BY`, because comparing
+            // `expires_at` alone drops every row sharing the boundary instant — the tie the identifier
+            // exists to break.
+            //
+            // **The narrowing comes from the cursor on a resume and from the parameters on a fresh page,
+            // and that is one rule rather than two.** The channel already behaved this way and the risk now
+            // does too, because both are facts a position is bound to. Taking the cursor's values keeps
+            // the adapter correct even when called directly rather than through the service — the service
+            // refuses a cursor whose channel or risk differs, so on every real request the two agree, and
+            // the value that cannot be forged is the one used. A cursor carrying no risk is an *un-narrowed*
+            // position, so the caller's narrow is applied over it: the page must still be narrowed, or the
+            // caller receives rows its own filter would have excluded.
+            let (channel, risk) = match after {
+                Some(cursor) => (cursor.channel, cursor.risk.or(filter.risk)),
+                None => (channel, filter.risk),
+            };
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(concat!(
+                "SELECT ",
+                approval_columns!(),
+                " FROM approvals WHERE workspace_id = "
+            ));
+            builder
+                .push_bind(workspace.to_string())
+                .push(
+                    " AND state = 'pending' AND EXISTS (SELECT 1 FROM \
+                       json_each(approvals.allowed_channels_json) WHERE value = ",
+                )
+                .push_bind(channel.as_contract_str().to_owned())
+                .push(")");
+            if let Some(risk) = risk.map(Risk::as_contract_str) {
+                builder.push(" AND risk = ").push_bind(risk.to_owned());
             }
-            .map_err(|_| RepositoryError::Query)?;
+            if let Some(cursor) = after {
+                builder
+                    .push(" AND (expires_at, id) > (")
+                    .push_bind(cursor.expires_at.to_string())
+                    .push(", ")
+                    .push_bind(cursor.id.to_string())
+                    .push(")");
+            }
+            builder
+                .push(" ORDER BY expires_at ASC, id ASC LIMIT ")
+                .push_bind(probe);
+            let rows = builder
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| RepositoryError::Query)?;
             let bounded = rows.len() > limit as usize;
             let approvals = rows
                 .iter()
@@ -491,7 +434,9 @@ impl ApprovalRepository for SqliteApprovalRepository {
                 .map(stored_approval)
                 .collect::<Result<Vec<_>, _>>()?;
             // The cursor is the **last row actually returned**, not the probe row: resuming after the
-            // probe would skip it, and resuming before the last returned row would repeat it.
+            // probe would skip it, and resuming before the last returned row would repeat it. It carries
+            // the narrowing the page was fetched under, so the next page cannot be asked with a different
+            // one and skip the rows in between.
             let next = bounded
                 .then(|| approvals.last())
                 .flatten()
@@ -499,6 +444,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
                     expires_at: last.expires_at,
                     id: last.id,
                     channel,
+                    risk: filter.risk.or(after.and_then(|cursor| cursor.risk)),
                 });
             Ok(ApprovalsPage {
                 approvals,

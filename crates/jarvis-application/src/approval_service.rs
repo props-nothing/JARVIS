@@ -282,6 +282,19 @@ impl ApprovalService {
         {
             return Err(ApprovalServiceError::InvalidCursor);
         }
+        // **A cursor minted under a different risk narrow is refused, and the harm is a SKIPPED row.**
+        // The position is the *last row of a narrowed page*, so replaying it under another narrow makes
+        // the `>` comparison skip every row that expires before it — rows the caller asked for and would
+        // never see, which is the "a skipped approval is a prompt nobody decides" failure the keyset
+        // bound exists to prevent, arriving through the filter rather than through an offset. A cursor
+        // with **no** recorded narrow is tolerated: it names a superset position, so no row a narrower
+        // view wanted can fall behind it.
+        if let Some(cursor) = after
+            && cursor.risk.is_some()
+            && cursor.risk != filter.risk
+        {
+            return Err(ApprovalServiceError::InvalidCursor);
+        }
         let page = self
             .approvals
             .pending_in(context.workspace_id, channel, filter, limit, after)

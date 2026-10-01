@@ -115,10 +115,11 @@ pub struct ApprovalsPage {
 /// cannot skip: it names the last row seen, and the next page begins after it whatever has happened to
 /// the rows in between.
 ///
-/// **Carries the channel it was bound to.** A position derived from one caller's filtered view is
-/// meaningless against another's, so the channel travels with it and the store applies its own filter
-/// from that value — a cursor cannot be replayed across a different channel to probe what the filter
-/// excludes.
+/// **Carries the channel and risk it was bound to.** A position derived from one caller's filtered
+/// view is meaningless against another's, so the narrowing travels with it and the store applies its
+/// own filter from those values — a cursor cannot be replayed across a different channel to probe what
+/// the filter excludes, and a cursor minted under a risk narrow cannot be replayed against a different
+/// narrow and skip the rows between. See [`ApprovalCursor::risk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApprovalCursor {
     /// The `expires_at` of the last row on the previous page.
@@ -127,6 +128,21 @@ pub struct ApprovalCursor {
     pub id: ApprovalId,
     /// The channel the page was fetched for.
     pub channel: ApprovalChannel,
+    /// The risk level the page was fetched for, when the listing was narrowed to one.
+    ///
+    /// **Bound into the cursor for the same reason the channel is: a position is only meaningful
+    /// inside the query that produced it.** A cursor minted under `?risk=critical` records a
+    /// `(expires_at, id)` that is the *last critical row* — and against `?risk=low` the `>` comparison
+    /// would skip every low row that expires before that instant. Those are rows the caller asked for
+    /// and never sees, which is the "a skipped approval is a prompt nobody decides" harm the keyset
+    /// bound exists to prevent, arriving through the filter instead of through an offset.
+    ///
+    /// `None` means the page was un-narrowed, and the store omits the risk predicate for it. An
+    /// un-narrowed cursor reused with a narrow is **tolerated** rather than refused — it describes a
+    /// superset position, so the extra rows a narrow excludes are not rows the caller wanted, and the
+    /// only effect is that the first narrowed page may skip nothing. Binding the *narrow's* value is
+    /// what closes the actual skip.
+    pub risk: Option<Risk>,
 }
 
 /// What `decide` did, so a caller can distinguish a first decision from a repeat.

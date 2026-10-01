@@ -452,6 +452,66 @@ async fn a_cursor_that_was_not_produced_by_this_listing_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn the_cursor_round_trips_the_risk_narrow_and_accepts_a_legacy_cursor() {
+    // **The cursor now carries the narrow it was minted under, and the encoding is where a value goes
+    // missing.** `encode_cursor`/`decode_cursor` are pure, so the round trip is asserted directly rather
+    // than only through a page: a level that encoded but did not decode would make the next page resume
+    // under the wrong narrow (or none), which is the skip the service's guard exists to refuse.
+    use super::{base64url, decode_cursor, encode_cursor};
+    use jarvis_application::repository::approval::ApprovalCursor;
+    use jarvis_domain::ids::ApprovalId;
+    use jarvis_domain::time::UtcTimestamp;
+    use jarvis_domain::tool::approval::ApprovalChannel;
+    use jarvis_domain::tool::classification::Risk;
+
+    let at = UtcTimestamp::parse("2026-09-27T12:00:00Z").expect("a valid instant");
+    let id = ApprovalId::from_uuid(uuid::Uuid::from_u128(7));
+    let cursor = |risk| ApprovalCursor {
+        expires_at: at,
+        id,
+        channel: ApprovalChannel::Cli,
+        risk,
+    };
+
+    // Every level round-trips its own value, so a page narrowed to one resumes narrowed to the same.
+    for level in [Risk::Low, Risk::Moderate, Risk::High, Risk::Critical] {
+        let value = cursor(Some(level));
+        assert_eq!(
+            decode_cursor(&encode_cursor(&value)),
+            Some(value),
+            "{level:?} must survive the cursor round trip",
+        );
+    }
+    // An un-narrowed cursor round-trips as un-narrowed, which is a different fact from any single level.
+    let bare = cursor(None);
+    assert_eq!(decode_cursor(&encode_cursor(&bare)), Some(bare));
+
+    // **A three-segment cursor decodes as un-narrowed, not as invalid.** This build issued such cursors
+    // before the risk segment existed, and such a page *was* un-narrowed — refusing one would break a
+    // client mid-page over a format change it has no way to observe.
+    let legacy = format!(
+        "v1.{}",
+        base64url(format!("{}|{}|{}", at, id, ApprovalChannel::Cli.as_contract_str()).as_bytes()),
+    );
+    assert_eq!(decode_cursor(&legacy), Some(bare));
+
+    // A fifth segment is still refused: reading a prefix is how a parser accepts a value the writer
+    // never produced.
+    let injected = format!(
+        "v1.{}",
+        base64url(format!("{at}|{id}|cli|high|extra").as_bytes()),
+    );
+    assert_eq!(decode_cursor(&injected), None);
+    // And a level this build does not know is refused rather than read as un-narrowed, which would
+    // silently widen a page the client believed it had narrowed.
+    let unknown = format!(
+        "v1.{}",
+        base64url(format!("{at}|{id}|cli|severe").as_bytes())
+    );
+    assert_eq!(decode_cursor(&unknown), None);
+}
+
 #[tokio::test]
 async fn a_listing_page_spends_its_bound_on_rows_the_caller_may_decide() {
     // The end-to-end half of the short-page defect: a page of one, with a row the caller cannot decide
