@@ -334,6 +334,98 @@ async fn a_rule_naming_only_effects_is_passed_through_unchanged() {
     );
 }
 
+#[tokio::test]
+async fn a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal() {
+    // **The gap this test closes was a value with no producer.** `NativeReadOnlyGrants::with_deny_rules`
+    // existed with no production caller — `tool_fabric_over` never passed any — so an operator had no way to
+    // refuse one of the daemon's own tools, and the reviewed refusals were a struct field nothing populated.
+    //
+    // Two assertions, because the failure has two directions. The rule must **arrive** (a refusal that does
+    // not reach the source is enforcement that is not happening), and it must arrive as a **refusal** — a
+    // reviewed rule that somehow became a grant would be the fail-open direction on the one input that can
+    // refuse an action a grant would otherwise allow.
+    let (_database, _source, _store) = fixture().await;
+    let tools: Vec<ResolvedTool> = vec![ResolvedTool {
+        definition: read_definition("clock.now@1"),
+        input_schema: None,
+    }];
+    let rule = jarvis_domain::tool::policy::DenyRule {
+        identity: Some(read_definition("clock.now@1").identity),
+        principal: None,
+        workspace: None,
+        effects: std::collections::BTreeSet::new(),
+    };
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![rule.clone()]);
+    let source = StoredGrants::new(Arc::new(FailingStore), defaults, &tools);
+
+    // A store that fails every read, so the rules that arrive are provably the **reviewed** ones rather than
+    // anything the store supplied — which is the property under test.
+    let read = source.read(principal(), workspace()).await;
+    assert!(
+        read.is_err(),
+        "an unreachable store is still a fault, so the reviewed rules are reachable through the \
+         success path only",
+    );
+
+    // And on a working store, the reviewed rule is present and the reviewed grant is **not** the only thing
+    // that authorizes — the refusal and the grant both reach policy for one tool, and the evaluator consults
+    // the refusal first, which is the ordering that makes a reviewed refusal meaningful.
+    let (_database, _unused, store) = fixture().await;
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![rule]);
+    let source = StoredGrants::new(Arc::clone(&store), defaults, &tools);
+    let read = source.read(principal(), workspace()).await.expect("reads");
+    assert_eq!(
+        read.deny_rules.len(),
+        1,
+        "the reviewed refusal must reach the evaluator",
+    );
+    assert!(
+        read.deny_rules[0].identity.is_some(),
+        "a reviewed rule names an exact identity, unlike a stored capability-keyed one",
+    );
+}
+
+#[tokio::test]
+async fn a_reviewed_rule_and_a_stored_rule_are_both_applied() {
+    // **The union, asserted because a refusal can only narrow.** A stored rule must not *replace* the
+    // reviewed ones the way a stored grant replaces the reviewed grants: a grant is authority and authority
+    // is replaceable, while a refusal is a restriction and losing one is the direction that re-authorizes
+    // something an operator had forbidden. So one of each is stored and both are asserted present.
+    let (_database, source, store) = fixture().await;
+    let tools: Vec<ResolvedTool> = vec![ResolvedTool {
+        definition: read_definition("clock.now@1"),
+        input_schema: None,
+    }];
+    let reviewed = jarvis_domain::tool::policy::DenyRule {
+        identity: Some(read_definition("clock.now@1").identity),
+        principal: None,
+        workspace: None,
+        effects: std::collections::BTreeSet::new(),
+    };
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(vec![reviewed]);
+    let _ = &source;
+    let source = StoredGrants::new(Arc::clone(&store), defaults, &tools);
+    store
+        .add_deny_rule(&jarvis_application::repository::tool_grant::NewDenyRule {
+            workspace_id: Some(workspace()),
+            capability: Some("clock.now@1".to_owned()),
+            principal: None,
+            effects: std::collections::BTreeSet::new(),
+            reason: "the stored half".to_owned(),
+            created_at: now(),
+        })
+        .await
+        .expect("the stored rule is written");
+
+    let read = source.read(principal(), workspace()).await.expect("reads");
+    assert_eq!(
+        read.deny_rules.len(),
+        2,
+        "both the reviewed and the stored refusal must reach the evaluator, got {:?}",
+        read.deny_rules,
+    );
+}
+
 /// A store that fails every read, so the fallback direction is observable.
 struct FailingStore;
 

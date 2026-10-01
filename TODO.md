@@ -6487,7 +6487,15 @@ Dependencies: Milestone 2 exit gate.
     grouping is a correctness property rather than tidiness: two independent reads could observe the
     store at two instants, so a grant written between them would be seen while its matching deny rule
     was not.
-  - 13 store tests + 8 adapter tests. 1672 workspace tests. All gates green
+  - **⚠ A value with no producer, found while closing the store.** `NativeReadOnlyGrants::with_deny_rules`
+    had **no caller**: `tool_fabric_over` took no rules, so the reviewed refusals a deployment ships were a
+    struct field nothing populated and an operator could not refuse one of the daemon's own tools.
+    `tool_fabric_over` now takes them and passes them through, so the path from a reviewed refusal to the
+    evaluator is composed and asserted (`a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal`,
+    `a_reviewed_rule_and_a_stored_rule_are_both_applied` in `tool_adapters::tests`). Its caller still
+    passes `Vec::new()` because no `[tools]` config section exists — which is `TLS-019` rather than a gap
+    in this slice, and is named there rather than left implicit.
+  - 13 store tests + 10 adapter tests + 3 journey tests. 1679 workspace tests. All gates green
     (`fmt`, `clippy -D warnings`, `doc`, `test`, both docs gates). **DO NOT COMMIT.**
   - **Not done, and named.** No plugin process supervision, scoped launch environment, resource
     limits, health probe, crash-loop quarantine, or plugin audit — those need a plugin to supervise
@@ -6496,12 +6504,58 @@ Dependencies: Milestone 2 exit gate.
     does not yet carry a *standing* scope (`ApprovalScopeKind` is written one-shot everywhere), and
     the grant surface has no route-level test — its coverage is the service's and the store's, which
     is why `TLS-018` names the surface test rather than claiming one.
-- [ ] `TLS-018` Test the tool-authorization surface end to end: a grant written through
-  the HTTP routes authorizes a real dispatch, a revocation withdraws it, and a widening
-  is refused with the field named. **Named rather than implied**: `TLS-015`'s store and
-  adapter are covered, and the *routes* are covered only by the compile-time guarantees
-  that they exist and that every code they can emit is in the contract table. A
-  surface-level journey is what would catch a handler that resolved the wrong scope.
+- [x] `TLS-018` Test the tool-authorization surface end to end: a refusal written through
+  the HTTP routes reaches a real dispatch, removing it restores the allowance, and a body
+  that tries to name its own workspace or operator is refused. **Done, and the journey
+  crosses the composition root — the layer every handler test is structurally blind to.**
+  Evidence: `crates/jarvis-infrastructure/src/http/tool_grant_journey_tests.rs`, three tests
+  over a router composed by `daemon::tool_fabric_over` — the *same* function the daemon calls
+  at startup — so the pipeline the journey drives is the production composition rather than a
+  fixture's copy.
+  - **The journey is asserted through `POST /api/v1/runs`, not through the source.**
+    `a_deny_rule_written_through_the_surface_refuses_a_dispatch_and_removing_it_restores_it`
+    runs four legs over one profile with the store as the **only** difference between them:
+    the reviewed default runs the clock tool; a denial stored for **another principal** does
+    not disturb this one; the same denial for this principal refuses it; removing the denial
+    restores the allowance. The second and third legs are what make the others meaningful —
+    leg 2 distinguishes a store that *scopes* from one that applies its rows to whoever asks,
+    and leg 3 changes exactly one input to observe the opposite outcome, which is what
+    attributes the refusal to the write.
+  - **The evidence that the tool executed is the observation the model received, not the run's
+    event stream.** The observation is in-flight context the controller passes to the next model
+    call, so the provider double counts `InputItem::ToolResult`s — and counts `is_error`
+    separately. Both halves are asserted (`(3, 1)` after leg 3): a refusal reported while the
+    tool still ran would satisfy an assertion on the error flag alone, and a controller that
+    returned an **empty success** would satisfy "no error". `an_unknown_capability_is_refused_with_the_not_found_class_rather_than_a_run_failure`
+    holds the other end: an unresolvable capability is an observation the run continues from.
+  - **⚠ Two fixture bugs the journey found, both of which would have made later legs assert
+    nothing.** (1) A provider keyed on `open == 0` only proposes a tool on the *first* run, so
+    legs 2–4 would have observed no tool work at all; the double now proposes on every even open.
+    (2) The controller uses the provider's call id as the **idempotency key**, and the reservation
+    is scoped to `(identity, workspace, principal, idempotency_key)` with no run — so two runs
+    receiving a call named `call-1` collide, and the second is refused `Conflict` *before policy is
+    consulted*. The double now generates a fresh id per call, as a real provider does. Neither was
+    visible from the first leg's passing assertion.
+  - **Falsified.** Making the adapter's `expand_rule` drop the principal fails leg 2
+    (`(2, 1)` where `(2, 0)` is required), which proves the scoping claim is observed rather than
+    argued. `the_surface_refuses_a_body_that_names_its_own_workspace_or_operator` asserts the
+    structural guarantee through the route: `deny_unknown_fields` makes a body carrying
+    `workspace_id` or `granted_by` a **400** rather than a silently ignored key.
+  - **Not done, and named.** No CLI commands for the surface (its driver is the HTTP routes,
+    which a control plane and a UI both speak). The journey asserts refusals, not a *grant*
+    becoming newly effective: the reviewed default already grants every native read-only tool,
+    and `StoredGrants` replaces the defaults for a principal only when the store holds a grant
+    for them, so a narrowing grant cannot be seen as a new permission without first removing
+    the default. `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it`
+    in `tool_adapters::tests` covers that direction at the source.
+- [ ] `TLS-019` Wire the reviewed deny rules in `tool_fabric_over` to configuration.
+  **Named rather than implied**: `tool_fabric_over` now takes the reviewed rules and passes them
+  to `NativeReadOnlyGrants::with_deny_rules`, so the plumbing is composed and asserted — but its
+  only caller (`daemon::start`) passes `Vec::new()`, because there is no `[tools]` configuration
+  section for it to read. That is a **value with no producer**, the same shape this project has
+  now recorded three times, and it is left as an explicit TODO rather than counted as done. Until
+  this lands, a deployment's reviewable refusals are only reachable through
+  `/api/v1/tool-grants/deny-rules`, which is the *stored* half and is fully working.
 - [ ] `TLS-016` Define and implement the skill contract
   ([skill-contract.md](docs/contracts/skill-contract.md)): a persisted skill record
   with a content hash over every loadable file, trust tiers whose install policy

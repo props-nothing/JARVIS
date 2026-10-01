@@ -538,7 +538,16 @@ pub async fn start(
     // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_over` for why
     // composing it twice would let a grant written through one surface be invisible to the pipeline the
     // other resolves against.
-    let (tools, tool_grants) = tool_fabric_over(database.pool().clone())?;
+    //
+    // **The reviewed deny rules are empty, and that is the honest current state rather than a placeholder.**
+    // There is no `[tools]` configuration section, so no shipped profile declares a reviewable refusal yet —
+    // and the alternative, omitting the parameter, would make the plumbing between a reviewed refusal and
+    // the evaluator something nothing at all exercises. Passing the empty vector keeps that path composed
+    // and asserted (the journey in `http::tool_grant_journey_tests`, and the adapter tests in
+    // `tool_adapters::tests`) so adding the config field is a field and a read, not a new wire. The stored
+    // deny rules — which an operator *can* write today, through `/api/v1/tool-grants/deny-rules` — reach the
+    // evaluator independently, from the same store handle.
+    let (tools, tool_grants) = tool_fabric_over(database.pool().clone(), Vec::new())?;
     let ports = run_ports(
         Arc::clone(&repositories),
         delivery_campaigns.clone(),
@@ -776,8 +785,14 @@ fn run_ports(
 /// Returns [`StartupError`] when a reviewed native definition is inconsistent. That is a
 /// packaging fault rather than a runtime one, and refusing startup is right: a daemon whose catalog
 /// cannot be built would answer every tool call `tool.not_found` while appearing healthy.
-fn tool_fabric_over(
+///
+/// **`pub(crate)` rather than private, so a journey can compose the real thing.** The alternative — a test
+/// assembling its own pipeline — would be a second composition, and a journey that exercised a copy would
+/// pass while the daemon's own wiring was broken. That is the same defect the daemon's other composition
+/// helpers record: the composition root is the layer a handler test is structurally blind to.
+pub(crate) fn tool_fabric_over(
     pool: sqlx::SqlitePool,
+    deny_rules: Vec<jarvis_domain::tool::policy::DenyRule>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -814,7 +829,13 @@ fn tool_fabric_over(
         })));
     // A reviewed grant is emitted **only** for a native, low-risk, read-only definition, and its own
     // ceilings restate those bounds so the evaluator re-checks them per call.
-    let defaults = NativeReadOnlyGrants::new(tools.clone());
+    //
+    // **The reviewed deny rules are attached here, and their absence was a real gap.**
+    // `NativeReadOnlyGrants::with_deny_rules` existed with no production caller, so an operator had no way
+    // to refuse one of the daemon's own tools: the refusals a deployment ships were compiled into a struct
+    // field that nothing populated. Passing them through is what makes the reviewable refusal and the stored
+    // one two ways of saying the same thing rather than one way and one gap.
+    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(deny_rules);
     // **One store handle, shared by the source and the surface.** The source reads it on every dispatch
     // and the surface writes it from a client, so a second handle would let the two disagree about what
     // is configured — the same argument the catalog's single list records.

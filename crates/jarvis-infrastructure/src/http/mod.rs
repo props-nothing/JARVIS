@@ -1292,6 +1292,17 @@ fn strip_test_items(text: &str) -> String {
     out
 }
 
+/// The tool-authorization journey: a refusal written through the HTTP surface changes what a run does.
+///
+/// A separate file rather than more arms in [`tests`], because it is a different kind of test. `tests` is
+/// a suite of **surface** assertions — this handler's status, that rejection's code — built on a fixture
+/// that composes the minimum a route needs. This one asserts a **composition**, from a route through the
+/// services to an executor, and it needs the daemon's real tool fabric rather than a fixture's stand-in.
+/// Merging it would have meant widening the surface fixture for one test and hiding which tests depend on
+/// the pipeline, and the two would then share a provider double neither of them wants.
+#[cfg(test)]
+mod tool_grant_journey_tests;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
