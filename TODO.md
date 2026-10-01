@@ -6039,6 +6039,73 @@ Dependencies: Milestone 2 exit gate.
     health probe, no crash-loop counter, and no audit emission (`TLS-015`). Nothing moves a plugin between
     these states yet — the same "a complete domain capability with no producer" that `TLS-002`'s registry
     recorded, and `TLS-015` is its first consumer.
+  - **The installed source identity is now typed, and an update is a classification.** The contract's
+    "Stable Identity and Provenance" section names the tuple that an approval binds to and an update is
+    measured against, and it had no value. `jarvis_domain::plugin::PluginSourceIdentity` is the seven
+    facts as a tuple — `id`, publisher, package digest, signature identity, source, version, protocol —
+    with the display name deliberately absent (the contract's own "display name … never identifies a
+    plugin"), and `PluginVersion` is ordered **numerically** so `1.10.0 > 1.9.0` (a text comparison would
+    get that backwards), with a pre-release sorting below its release per `SemVer`.
+    `SourceContinuity::classify` is the update question as a **pure function**: same publisher **and** same
+    id **and** a strictly newer version, else no continuity. Continuity is the *input* to the contract's
+    grant-carry-forward rule, not the rule — `TLS-015` still decides whether to carry a grant forward, and
+    can refuse even when continuity holds (an expanded capability set).
+  - **⚠ A second copy of a rule, found by writing the domain value.** The manifest validation had its own
+    `is_plugin_id` and `is_canonical_sha256`; the identity needs the same two rules, and a domain value
+    cannot depend on an infrastructure helper — so the rules moved to the domain
+    (`is_plugin_identifier`, `is_canonical_package_digest`) and the manifest now **consults** them. The
+    duplicate helpers are **deleted**, not left beside the new ones: two spellings of one rule is the
+    defect class this project keeps finding, and `is_canonical_package_digest` is now the domain's third
+    carrier of the `sha256:` rule (`ActionDigest`, `SchemaFingerprint`), which must agree with the other
+    two or a value written by one would be refused by another while looking identical.
+  - **Falsified both halves of the classification.** Relaxing `<` to `<=` fails
+    `continuity_requires_the_same_source_and_a_strictly_newer_version` ("the same version must not be
+    continuity" — a re-install claiming continuity it does not have); dropping the publisher comparison
+    fails `an_identity_is_a_tuple_so_a_different_publisher_is_a_different_plugin` ("a different publisher
+    is never continuity" — the impersonation case). Each restored to `0`.
+  - 1626 workspace tests (+6: domain 513). 205 TODO IDs (unchanged). All gates green (fmt, clippy, test,
+    doc, both docs gates). **DO NOT COMMIT.**
+  - **Not done, and named.** No grant store, so `SourceContinuity` has no consumer yet — the carry-forward
+    *policy* (proving no capability/schema/effect expansion) is `TLS-014`/`TLS-015`'s. The signature
+    identity is carried opaque and bounded; validating it against a signature *kind* is `TLS-014`'s, since
+    kinds (sigstore, and any other) are that slice's external vocabulary.
+  - **The durable grant is now typed, and the carry-forward rule has one definition whose direction is the
+    crux.** The contract's "Permissions and Grants" section names what a grant binds and states the
+    carry-forward rule ("only under an explicit policy that proves publisher continuity and no
+    capability/schema/effect expansion"), and neither had a value.
+    `jarvis_domain::plugin::PluginGrant` binds the **whole** `PluginSourceIdentity` (not `id`) plus the
+    workspace and granting principal; `applies_at` requires all four conditions together and
+    `names_identity_but_expired` keeps "your grant expired" distinct from "you have no grant", because
+    both refuse. `PluginCapabilitySelector` is a validated selector whose `Deserialize` **routes through
+    the constructor**, since a selector reaches a persisted grant and the `Scope`/`WorkspaceRelativePath`
+    precedence applies.
+  - **⚠ The carry-forward rule was first written backwards, and two tests caught it at once.** The first
+    `is_superset_of` asked whether the *new* grant conferred at least everything the old one did — which
+    carries a grant across exactly the update the rule exists to stop (the update that grants **more**).
+    "No expansion" is a **subset** on every dimension: every capability the new grant confers must already
+    be conferred, and each ceiling (`risk`, `sensitivity`) must not have risen. `grants_no_more_than` is
+    the corrected single definition, and `carry_forward_to` composes it with workspace, principal, and
+    `SourceContinuity`. The schema dimension of "no expansion" is carried by the whole-identity comparison
+    already in `carry_forward_to`, so it is deliberately not re-derived in the expansion check — two
+    derivations of one condition is how a caller comes to apply one and forget the other.
+  - **Falsified four mutations, each in its intended test, each restored to `0`.**
+    (A) dropping `grants_no_more_than` from `carry_forward_to` fails
+    `carry_forward_requires_continuity_and_no_expansion` with "a grant must not carry forward across a
+    capability expansion"; (B) dropping the identity equality from `applies_at` fails
+    `a_grant_applies_only_to_the_exact_source_identity_workspace_and_principal` with "the same id from a
+    different publisher" — the impersonation case; (C) making `grants_no_more_than` always refuse fails
+    the **complement** test (`a_narrowing_update_carries_forward…`), which is the control that stops the
+    expansion test from being satisfied by an implementation that refuses every carry-forward; and
+    (D) making `SourceContinuity::classify` always continuity fails three tests including the
+    carry-forward one ("a different publisher is not continuity"). The complement and the mutation-C
+    pairing is the point: an assertion and its control, falsified separately.
+  - 1631 workspace tests (+5: domain 518). 204 TODO IDs (unchanged — the item is `[~]`). All gates green
+    (fmt, clippy, test, doc, both docs gates). **DO NOT COMMIT.**
+  - **Not done, and named.** No grant store, so `PluginGrant` and `carry_forward_to` are the contract's
+    vocabulary with **no producer and no consumer** — scaffolding, labelled as such in the contract's
+    Implementation Status rather than implied to be wired. `TLS-015` still owns the decision to carry a
+    grant forward (it may refuse even when all four conditions hold) and every producer that would write
+    one.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
   revoke, and resume use cases for API and CLI with channel assurance checks. Owns

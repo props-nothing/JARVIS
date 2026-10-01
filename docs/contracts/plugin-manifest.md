@@ -241,6 +241,45 @@ rules are encoded as **absent** edges rather than as checks a caller could forge
   one. A running plugin (`Enabled` or `Unhealthy`) also cannot be removed directly — it must be disabled
   or quarantined first, so a child process is stopped before the package it runs against is taken away.
 
+**The stable identity is a typed tuple** (`jarvis_domain::plugin::PluginSourceIdentity`). The contract's
+"Stable Identity and Provenance" section says `id`, `publisher`, package digest, signature identity,
+source, version, and protocol "form the installed source identity" — and it is a **tuple** rather than an
+`id` string for the reason `ToolIdentity` records: a name can be re-pointed, so a grant bound to `id`
+alone would let a different package (new publisher, new bytes, new signature) inherit every grant the
+original had. The display name is deliberately absent, per the contract's own rule that it never
+identifies a plugin. The identifier/publisher slug rule (`is_plugin_identifier`) and the
+`sha256:<hex>` package-digest rule (`is_canonical_package_digest`) live in this module and the manifest
+validation **consults** them rather than holding a second copy.
+
+**An update is a classification, not a comparison a policy re-derives.**
+`SourceContinuity::classify` answers whether two source identities stand in the update relationship —
+same publisher **and** same identifier **and** a strictly newer version. A different publisher is
+`NoContinuity` even for the same identifier and a newer version, which is the impersonation case the
+tuple exists to prevent; the same version is a replay and an older one is a downgrade, and neither is the
+update the contract describes. Continuity is the *input* to the contract's grant-carry-forward policy,
+not the policy itself: `TLS-015` still decides whether to carry grants, and can refuse even when
+continuity holds (an expanded capability set, a changed schema). `PluginVersion` is ordered **numerically**
+so `1.10.0 > 1.9.0`, and a pre-release sorts below its release (`1.0.0-rc.1 < 1.0.0`).
+
+**The durable grant is a typed value** (`jarvis_domain::plugin::PluginGrant`), bound to the whole
+`PluginSourceIdentity` rather than to `id`, plus the workspace and the granting principal — so a
+replacement behind the same `id`, or a grant applied "by plugin" across workspaces, does not inherit it.
+`PluginGrant::applies_at` answers all four conditions together (identity, workspace, principal, not
+expired), and `names_identity_but_expired` tells the operator's "your grant expired" apart from "you have
+no grant". Capability selectors are a validated type (`PluginCapabilitySelector`) whose `Deserialize`
+**goes through the constructor**, so a selector that arrived over the wire is held to the same rule as one
+this code built — required because a selector reaches a persisted grant.
+
+**The carry-forward rule is answered in one method, and its direction is the crux.**
+`PluginGrant::carry_forward_to` is the single place the contract's "existing grants carry forward only
+under an explicit policy that proves publisher continuity and no capability/schema/effect expansion" is
+decided: same workspace and principal, `SourceContinuity` is continuity, and
+`grants_no_more_than` — a **subset** on every dimension. The first version of this code asked the
+question backwards (a superset check), which carried a grant across exactly the update the rule exists to
+stop; two tests falsified it. The schema dimension is carried by the whole identity, which
+`carry_forward_to` compares separately, so it is not re-derived in the expansion check. Continuity remains
+an *input*: `TLS-015` may still refuse a carry-forward even when all four conditions hold.
+
 **Not implemented, and each is a named slice:**
 
 - **package provenance and signature verification** (`TLS-014`). The `package` block carries the digest,
@@ -254,5 +293,8 @@ rules are encoded as **absent** edges rather than as checks a caller could forge
 - **installation, grants, and lifecycle** (`TLS-014`/`TLS-015`). The contract's lifecycle states and its
   "installation creates no grant" rule are prose here; no installer, no grant store, and no health
   transition writer exists. **`PluginManifest::parse` grants nothing** — it produces a validated
-  document, which is exactly what the contract says a parsed manifest is.
+  document, which is exactly what the contract says a parsed manifest is. `PluginGrant` is the *shape* a
+  grant store would persist and `carry_forward_to` the rule it would apply; **no store reads or writes it
+  yet**, so the grant model is the contract's vocabulary with no producer and no consumer — scaffolding in
+  AGENTS.md's sense, stated as such rather than implied to be wired.
 

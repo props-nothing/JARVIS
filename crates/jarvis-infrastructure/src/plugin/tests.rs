@@ -7,9 +7,12 @@
 
 use super::{
     MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_STARTUP_TIMEOUT_MS, PluginManifest, PluginManifestError,
-    is_canonical_sha256, is_capability_token, is_environment_name, is_package_relative_path,
-    is_plugin_id, is_reserved_device_name,
+    is_capability_token, is_environment_name, is_package_relative_path, is_reserved_device_name,
 };
+// The two rules that moved to the domain: the manifest consults them rather than holding its own copy,
+// so these tests exercise the **domain** helpers the manifest delegates to. That the manifest uses them
+// is asserted by the `PluginManifest::parse` tests below, not by the helper tests here.
+use jarvis_domain::plugin::{is_canonical_package_digest, is_plugin_identifier};
 
 /// The repository root, from this crate's manifest directory.
 fn repository_root() -> std::path::PathBuf {
@@ -191,7 +194,10 @@ fn a_legitimate_package_relative_path_is_accepted() {
 fn a_digest_without_the_algorithm_prefix_is_refused() {
     // A bare digest could be any algorithm; the prefix is what makes two digests comparable, the same
     // rule `SchemaFingerprint` records.
-    assert!(is_canonical_sha256(&format!("sha256:{}", "ab".repeat(32))));
+    assert!(is_canonical_package_digest(&format!(
+        "sha256:{}",
+        "ab".repeat(32)
+    )));
     for (digest, why) in [
         ("ab".repeat(32), "no algorithm prefix"),
         (format!("sha512:{}", "ab".repeat(32)), "the wrong algorithm"),
@@ -203,7 +209,10 @@ fn a_digest_without_the_algorithm_prefix_is_refused() {
             "non-hex characters",
         ),
     ] {
-        assert!(!is_canonical_sha256(&digest), "must be refused: {why}");
+        assert!(
+            !is_canonical_package_digest(&digest),
+            "must be refused: {why}"
+        );
         // Built from the **raw** example, because this test is about the digest itself and the raw
         // document carries the documented placeholder for exactly this substitution.
         let example = contract_example().replace(
@@ -295,7 +304,7 @@ fn a_configuration_schema_that_is_not_an_object_is_refused() {
 fn an_identity_field_that_is_not_a_slug_is_refused() {
     // The id and publisher are the source identity — the display name never identifies a plugin — so they
     // are held to a slug rule rather than accepting free text.
-    assert!(is_plugin_id("example.research-runtime"));
+    assert!(is_plugin_identifier("example.research-runtime"));
     for (value, why) in [
         ("Example.Runtime", "uppercase"),
         ("example", "no namespace dot"),
@@ -305,7 +314,7 @@ fn an_identity_field_that_is_not_a_slug_is_refused() {
         ("example runtime", "a space"),
         ("example\truntime", "a control character"),
     ] {
-        assert!(!is_plugin_id(value), "must be refused: {why}");
+        assert!(!is_plugin_identifier(value), "must be refused: {why}");
     }
     // And the publisher is held to the same rule, so a manifest cannot smuggle free text through it.
     let example = valid_example().replace(

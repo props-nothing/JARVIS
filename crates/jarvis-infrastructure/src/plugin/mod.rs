@@ -287,10 +287,10 @@ impl PluginManifest {
                 found: self.schema_version.clone(),
             });
         }
-        if !is_plugin_id(&self.id) {
+        if !jarvis_domain::plugin::is_plugin_identifier(&self.id) {
             return Err(PluginManifestError::InvalidIdentity { field: "id" });
         }
-        if !is_plugin_id(&self.publisher) {
+        if !jarvis_domain::plugin::is_plugin_identifier(&self.publisher) {
             return Err(PluginManifestError::InvalidIdentity { field: "publisher" });
         }
         // The display name is text an operator reads, so it is bounded and free of control characters
@@ -331,7 +331,7 @@ impl PackageIdentity {
     ///
     /// Returns the [`PluginManifestError`] for the first field that fails.
     pub fn validate(&self) -> Result<(), PluginManifestError> {
-        if !is_canonical_sha256(&self.digest) {
+        if !jarvis_domain::plugin::is_canonical_package_digest(&self.digest) {
             return Err(PluginManifestError::InvalidDigest);
         }
         // The signature reference is a package-relative path a verifier reads, so it is validated as
@@ -625,26 +625,6 @@ impl PluginManifestError {
     }
 }
 
-/// Returns `true` when `value` is a valid plugin source-identity slug.
-///
-/// A slug is lowercase alphanumeric with `.` and `-` separators, must contain at least one `.` (the
-/// contract's own example is `example.research-runtime`), and is bounded. **Not free text:** the
-/// display name never identifies a plugin, so this is the field that does, and a value that could carry
-/// control characters or an unbounded length is refused rather than stored beside a grant that will be
-/// compared against it.
-#[must_use]
-pub fn is_plugin_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_PLUGIN_TOKEN_BYTES
-        && value.contains('.')
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && !value.contains("..")
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-        })
-}
-
 /// Returns `true` when `value` is display text an operator may be shown.
 ///
 /// Bounded and free of control characters, but otherwise unrestricted: this is a name, not an identity,
@@ -667,22 +647,6 @@ pub fn is_version_text(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
-}
-
-/// Returns `true` when `value` is a `sha256:<64 lowercase hex>` digest.
-///
-/// The `sha256:` prefix is required, so a bare digest — which could be any algorithm — is refused rather
-/// than compared against a `SHA-256` by a reader that assumed the algorithm. This is the same rule
-/// `SchemaFingerprint` records: an algorithm prefix is what makes two different digests incomparable.
-#[must_use]
-pub fn is_canonical_sha256(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Returns `true` when `path` is a package-relative path that cannot escape its root.
