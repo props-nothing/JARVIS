@@ -288,6 +288,12 @@ fn the_event_type_names_the_stream_contract_requires_are_all_defined() {
             super::event_type::OUTPUT_TEXT_DELTA,
         ),
         ("run.usage", super::event_type::USAGE),
+        ("run.tool_executing", super::event_type::TOOL_EXECUTING),
+        ("run.observing", super::event_type::OBSERVING),
+        (
+            "run.approval_requested",
+            super::event_type::APPROVAL_REQUESTED,
+        ),
         ("run.responding", super::event_type::RESPONDING),
         ("run.completed", super::event_type::COMPLETED),
         ("run.failed", super::event_type::FAILED),
@@ -339,6 +345,12 @@ fn the_three_terminal_event_types_are_exactly_the_ones_the_contract_lists() {
         super::event_type::OUTPUT_TEXT_DELTA,
         super::event_type::USAGE,
         super::event_type::RESPONDING,
+        // The tool lifecycle events and the approval prompt are all non-terminal: a run that
+        // dispatched a tool, observed its result, or is waiting on a decision is still working, and
+        // reading any of them as an outcome would report live work as finished.
+        super::event_type::TOOL_EXECUTING,
+        super::event_type::OBSERVING,
+        super::event_type::APPROVAL_REQUESTED,
         // The overrun signal most needs this check of anything here: it is the one event that ends a
         // *stream* while the run continues, so a client that read it as a terminal outcome would
         // report a working run as finished — the exact failure the signal exists to prevent.

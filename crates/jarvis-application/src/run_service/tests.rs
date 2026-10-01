@@ -158,6 +158,7 @@ fn fixture_policied() -> Fixture {
             // campaign keeps every descriptor without a delivery profile. The attestation path has
             // its own tests, which drive `route_candidates` directly rather than through a run.
             delivery_campaigns: Vec::new(),
+            tools: None,
         },
         Arc::clone(&cancellations),
     );
@@ -225,6 +226,7 @@ fn fixture_with(provider: Arc<ScriptedProvider>) -> Fixture {
             // Nothing measured. Every descriptor keeps `incremental_delivery: None`, which is the
             // fresh-profile state a route requiring that capability must refuse.
             delivery_campaigns: Vec::new(),
+            tools: None,
         },
         Arc::clone(&cancellations),
     );
@@ -256,6 +258,7 @@ fn fixture_with_provider(provider: Arc<dyn crate::model::ModelProvider>) -> Fixt
             clock: Arc::new(ManualClock::new(now())),
             policies: None,
             delivery_campaigns: Vec::new(),
+            tools: None,
         },
         Arc::clone(&cancellations),
     );
@@ -1599,6 +1602,7 @@ async fn fixture_local_only_with_locality_grant(
             policies: Some(Arc::clone(&repositories)
                 as Arc<dyn crate::repository::policy::ModelDataPolicyRepository>),
             delivery_campaigns: Vec::new(),
+            tools: None,
         },
         Arc::clone(&cancellations),
     );

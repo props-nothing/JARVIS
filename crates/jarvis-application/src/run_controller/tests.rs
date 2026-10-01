@@ -8,7 +8,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use jarvis_domain::clock::ManualClock;
 use jarvis_domain::ids::{
@@ -1286,7 +1287,7 @@ async fn the_run_deadline_reaches_the_provider_in_the_request() {
     }
 
     struct Capturing {
-        seen: std::sync::Mutex<Observed>,
+        seen: Mutex<Observed>,
         models: Vec<ModelRef>,
     }
 
@@ -1317,7 +1318,7 @@ async fn the_run_deadline_reaches_the_provider_in_the_request() {
     }
 
     let provider = Arc::new(Capturing {
-        seen: std::sync::Mutex::new(Observed::NeverCalled),
+        seen: Mutex::new(Observed::NeverCalled),
         models: vec![model()],
     });
     let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
@@ -2065,7 +2066,7 @@ async fn a_failure_after_acceptance_is_not_retried_even_when_the_error_is_retrya
     // that `BRN-007` recorded, and it was invisible until the assertion below existed.
     let provider = Arc::new(FailingAfterAcceptance {
         models: vec![model()],
-        opens: std::sync::atomic::AtomicU32::new(0),
+        opens: AtomicU32::new(0),
     });
     let fixture = fixture(Arc::clone(&provider) as Arc<dyn ModelProvider>);
     seed_with_budget(&fixture, retrying(5)).await;
@@ -2172,7 +2173,7 @@ async fn a_retry_is_not_attempted_when_the_run_has_no_time_left() {
 /// steps are normalized frames, so it has no way to express "the stream itself errors".
 struct FailingAfterAcceptance {
     models: Vec<ModelRef>,
-    opens: std::sync::atomic::AtomicU32,
+    opens: AtomicU32,
 }
 
 impl ModelProvider for FailingAfterAcceptance {
@@ -2190,7 +2191,7 @@ impl ModelProvider for FailingAfterAcceptance {
         _request: &'a ModelCallRequest,
         _cancel: &'a CancellationScope,
     ) -> OpenResult<'a> {
-        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.opens.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             /// A stream that fails its first frame, after the call was accepted.
             struct FailsOnFirstFrame;
@@ -2222,7 +2223,7 @@ impl ModelProvider for FailingAfterAcceptance {
 
 impl FailingAfterAcceptance {
     fn opens_seen(&self) -> u32 {
-        self.opens.load(std::sync::atomic::Ordering::SeqCst)
+        self.opens.load(Ordering::SeqCst)
     }
 }
 
@@ -2251,14 +2252,14 @@ fn context_capped(tokens: u64) -> RunBudget {
 /// only difference from `answering(..)` is the recording.
 struct RecordingProvider {
     inner: ScriptedProvider,
-    requests: std::sync::Mutex<Vec<ModelCallRequest>>,
+    requests: Mutex<Vec<ModelCallRequest>>,
 }
 
 impl RecordingProvider {
     fn new(inner: ScriptedProvider) -> Self {
         Self {
             inner,
-            requests: std::sync::Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -3824,4 +3825,473 @@ async fn a_failed_call_records_no_finish_reason() {
         recorded[0].finish_reason.is_none(),
         "a call that never reached a terminal has no finish reason to record",
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The tool loop: one model turn that proposes a tool, one that answers.
+// ---------------------------------------------------------------------------------------
+
+/// A provider whose **first** script proposes a tool call and whose stream then ends with
+/// `ToolCalls`, answering on the second open.
+///
+/// Built as a purpose-made provider rather than a scripted one because the interesting behaviour is
+/// **per-call**: the scripted provider replays one script for every `open`, so it cannot express "the
+/// model asks for a tool and then answers". That difference is the whole point of the loop.
+struct ToolThenAnswer {
+    model: ModelRef,
+    /// How many opens have been served, so the second one answers.
+    opens: AtomicU32,
+    /// Whether the second call's request carried a tool result, captured for the assertion.
+    second_request: Arc<Mutex<Option<bool>>>,
+}
+
+impl ToolThenAnswer {
+    fn new(model: ModelRef, second_request: Arc<Mutex<Option<bool>>>) -> Self {
+        Self {
+            model,
+            opens: AtomicU32::new(0),
+            second_request,
+        }
+    }
+}
+
+impl ModelProvider for ToolThenAnswer {
+    fn models(&self) -> &[ModelRef] {
+        std::slice::from_ref(&self.model)
+    }
+
+    fn endpoint_class(&self) -> EndpointClass {
+        EndpointClass::Local
+    }
+
+    fn open<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        request: &'a ModelCallRequest,
+        _cancel: &'a CancellationScope,
+    ) -> OpenResult<'a> {
+        Box::pin(async move {
+            let open = self.opens.fetch_add(1, Ordering::SeqCst);
+            let frames: Vec<ModelStreamEventKind> = if open == 0 {
+                vec![
+                    ModelStreamEventKind::ToolCallAdded {
+                        call_id: "call-1".to_owned(),
+                        tool_name: TOOL_CAPABILITY.to_owned(),
+                    },
+                    ModelStreamEventKind::ToolCallArgumentsDelta {
+                        call_id: "call-1".to_owned(),
+                        delta: r#"{"path":"/tmp"}"#.to_owned(),
+                    },
+                    ModelStreamEventKind::ToolCallCompleted {
+                        call_id: "call-1".to_owned(),
+                        arguments: r#"{"path":"/tmp"}"#.to_owned(),
+                    },
+                    ModelStreamEventKind::CallCompleted {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: None,
+                        refused: false,
+                    },
+                ]
+            } else {
+                // Whether the second request carried a tool result is the fact that proves the loop
+                // fed the observation back rather than re-asking the same question.
+                let carried = request
+                    .input
+                    .as_slice()
+                    .iter()
+                    .any(|item| matches!(item, InputItem::ToolResult { .. }));
+                *self
+                    .second_request
+                    .lock()
+                    .expect("the lock is not poisoned") = Some(carried);
+                vec![
+                    ModelStreamEventKind::OutputItemAdded {
+                        item_id: "out-1".to_owned(),
+                    },
+                    ModelStreamEventKind::OutputTextDelta {
+                        item_id: "out-1".to_owned(),
+                        delta: "the tool answered".to_owned(),
+                    },
+                    ModelStreamEventKind::CallCompleted {
+                        finish_reason: FinishReason::Stop,
+                        usage: None,
+                        refused: false,
+                    },
+                ]
+            };
+            let ids = crate::model::CountingIds::new();
+            let mut stamper = crate::model::FrameStamper::start(request.call_id, &ids);
+            let mut scripted = Vec::new();
+            for kind in frames {
+                let frame = stamper
+                    .stamp(kind, None)
+                    .map_err(|_| ProviderError::Malformed)?;
+                scripted.push(frame);
+            }
+            Ok(Box::new(ScriptedStream::new(scripted)) as Box<dyn ModelStream + Send>)
+        })
+    }
+}
+
+/// The capability the fixture's catalog serves.
+const TOOL_CAPABILITY: &str = "files.read@1";
+
+/// A stream over pre-stamped frames.
+struct ScriptedStream {
+    frames: std::collections::VecDeque<jarvis_domain::model::stream::ModelStreamEvent>,
+}
+
+impl ScriptedStream {
+    fn new(frames: Vec<jarvis_domain::model::stream::ModelStreamEvent>) -> Self {
+        Self {
+            frames: frames.into(),
+        }
+    }
+}
+
+impl ModelStream for ScriptedStream {
+    fn next_event(&mut self) -> crate::model::NextEventFuture<'_> {
+        Box::pin(async move { Ok(self.frames.pop_front()) })
+    }
+}
+
+/// A catalog serving one read-only tool, so the loop has something to dispatch.
+struct OneToolCatalog;
+
+impl crate::tool_call::ToolCatalog for OneToolCatalog {
+    fn resolve(
+        &self,
+        _workspace: WorkspaceId,
+        capability: &str,
+    ) -> Option<crate::tool_call::ResolvedTool> {
+        if capability != TOOL_CAPABILITY {
+            return None;
+        }
+        Some(crate::tool_call::ResolvedTool {
+            definition: read_definition(),
+            input_schema: Some(READ_SCHEMA.to_owned()),
+        })
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec![TOOL_CAPABILITY.to_owned()]
+    }
+}
+
+/// The schema the fixture's tool declares.
+const READ_SCHEMA: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{"path":{"type":"string"}},"required":["path"]}"#;
+
+/// Builds the read-only definition the fixture's catalog serves.
+fn read_definition() -> jarvis_domain::tool::definition::ToolDefinition {
+    use jarvis_domain::model::policy::Sensitivity;
+    use jarvis_domain::tool::classification::{
+        ApprovalHint, DataClasses, Effect, ExecutionDefaults, Idempotency, Risk,
+    };
+    use jarvis_domain::tool::identity::{
+        SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
+    };
+    let capability = ToolCapability::parse(TOOL_CAPABILITY).expect("valid");
+    let source = ToolSource::new(
+        SourceKind::Native,
+        "test.publisher",
+        ToolVersion::parse("1.0.0").expect("valid"),
+    )
+    .expect("valid");
+    jarvis_domain::tool::definition::ToolDefinition::new(
+        ToolIdentity {
+            capability,
+            source,
+            schema_fingerprint: SchemaFingerprint::from_bytes([0x11; 32]),
+        },
+        "Read a file",
+        "Reads a path the caller names.",
+        vec![Effect::ReadOnly],
+        Risk::Low,
+        Vec::new(),
+        // `Allow` is what policy's read-only fast path requires, so the tool runs without a prompt.
+        ApprovalHint::Allow,
+        Idempotency::NaturallyIdempotent,
+        DataClasses::new(Sensitivity::Public, Sensitivity::Internal).expect("valid"),
+        ExecutionDefaults::new(5_000, 1).expect("valid"),
+    )
+    .expect("consistent")
+}
+
+/// A validator that accepts everything.
+struct AcceptAll;
+
+impl crate::tool_call::ToolArgumentValidator for AcceptAll {
+    fn validate(
+        &self,
+        _tool: &crate::tool_call::ResolvedTool,
+        _arguments: &jarvis_domain::tool::call::ToolArguments,
+    ) -> Result<(), crate::tool_call::ToolArgumentRefusal> {
+        Ok(())
+    }
+}
+
+/// A fingerprint port returning a fixed digest.
+struct FixedFingerprint;
+
+impl crate::tool_call::ActionFingerprint for FixedFingerprint {
+    fn fingerprint(
+        &self,
+        _input: &jarvis_domain::tool::canonical::FingerprintInput,
+    ) -> jarvis_domain::tool::canonical::ActionDigest {
+        jarvis_domain::tool::canonical::ActionDigest::from_bytes([0x22; 32])
+    }
+}
+
+/// An executor that records it ran and returns a text result.
+struct RecordingNative {
+    calls: Arc<AtomicU32>,
+}
+
+impl crate::tool_call::ToolExecutor for RecordingNative {
+    fn execute<'a>(
+        &'a self,
+        _request: crate::tool_call::ToolExecutionRequest<'a>,
+        _cancel: &'a CancellationScope,
+    ) -> crate::tool_call::ToolExecutionFuture<'a> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let block = jarvis_domain::tool::call::ContentBlock::text("a synthetic result")
+                .map_err(|_| {
+                    crate::tool_call::ToolExecutionError::Failed(
+                        jarvis_domain::tool::error_class::ToolErrorClass::OutputInvalid,
+                    )
+                })?;
+            jarvis_domain::tool::call::ToolResultBody::new(
+                vec![block],
+                None,
+                jarvis_domain::model::policy::Sensitivity::Internal,
+            )
+            .map_err(|_| {
+                crate::tool_call::ToolExecutionError::Failed(
+                    jarvis_domain::tool::error_class::ToolErrorClass::OutputInvalid,
+                )
+            })
+        })
+    }
+}
+
+/// A grants source that grants the fixture's read-only tool.
+struct FixtureGrants;
+
+impl crate::tool_call::ToolGrantSource for FixtureGrants {
+    fn grants_for(
+        &self,
+        principal: PrincipalId,
+        workspace: WorkspaceId,
+    ) -> Vec<jarvis_domain::tool::policy::Grant> {
+        use jarvis_domain::tool::classification::{Effect, Risk};
+        vec![jarvis_domain::tool::policy::Grant {
+            identity: read_definition().identity,
+            workspace,
+            principal,
+            scopes: std::collections::BTreeSet::new(),
+            effects: [Effect::ReadOnly].into_iter().collect(),
+            risk_ceiling: Risk::Low,
+            sensitivity_ceiling: jarvis_domain::model::policy::Sensitivity::Public,
+            expires_at: None,
+        }]
+    }
+}
+
+/// The controller plus the counters a loop assertion reads.
+struct ToolFixture {
+    controller: RunController,
+    repositories: Arc<InMemoryRepositories>,
+    executions: Arc<AtomicU32>,
+    second_request: Arc<Mutex<Option<bool>>>,
+}
+
+/// Builds a controller whose run proposes one tool and then answers.
+fn tool_fixture() -> ToolFixture {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let executions = Arc::new(AtomicU32::new(0));
+    let second_request = Arc::new(Mutex::new(None));
+    let tools = Arc::new(crate::tool_call::ToolCallService::new(
+        Arc::new(OneToolCatalog),
+        Arc::new(FixtureGrants),
+        Arc::new(AcceptAll),
+        Arc::new(FixedFingerprint),
+        Arc::new(RecordingNative {
+            calls: Arc::clone(&executions),
+        }),
+        Arc::clone(&repositories) as Arc<dyn crate::repository::tool_call::ToolCallRepository>,
+        Arc::clone(&repositories) as Arc<dyn crate::repository::approval::ApprovalRepository>,
+        Arc::new(ManualClock::new(now())),
+    ));
+    let controller = RunController::new(
+        Arc::clone(&repositories) as Arc<dyn RunRepository>,
+        Arc::clone(&repositories) as Arc<dyn ConversationRepository>,
+        Arc::clone(&repositories) as Arc<dyn ModelCallRepository>,
+        Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+        Arc::new(ToolThenAnswer::new(model(), Arc::clone(&second_request)))
+            as Arc<dyn ModelProvider>,
+        Arc::new(ManualClock::new(now())),
+    )
+    .with_tools(tools);
+    ToolFixture {
+        controller,
+        repositories,
+        executions,
+        second_request,
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_is_executed_and_its_result_answers_the_run() {
+    // **The vertical slice this round exists for.** Before it, the controller refused every tool
+    // intent with `run.tools_not_implemented` and the whole fabric was unreachable. Now the run
+    // dispatches the tool, feeds the result back, and the model's second turn produces the answer.
+    let fixture = tool_fixture();
+    let store = fixture.repositories.clone();
+    store
+        .create_conversation(
+            NewConversation::new(
+                conversation(),
+                context().workspace_id,
+                PrincipalId::from_uuid(id(3)),
+                Some("first".to_owned()),
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the conversation is created");
+    store
+        .create(
+            NewRun::new(
+                run(),
+                context().workspace_id,
+                conversation(),
+                PrincipalId::from_uuid(id(3)),
+                Some("objective".to_owned()),
+                now(),
+            )
+            .expect("valid"),
+            crate::repository::run::run_received_event(run(), now()),
+        )
+        .await
+        .expect("the run is created");
+
+    let outcome = fixture
+        .controller
+        .execute(
+            &context(),
+            run(),
+            conversation(),
+            "read a file",
+            None,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the run completes after the tool answers");
+
+    assert_eq!(outcome.state, RunState::Completed);
+    assert_eq!(outcome.answer.as_deref(), Some("the tool answered"));
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        1,
+        "the tool must have run exactly once",
+    );
+    assert_eq!(
+        *fixture.second_request.lock().expect("not poisoned"),
+        Some(true),
+        "the second request must carry the tool result, or the model was re-asked the same question",
+    );
+
+    // And the run took the states the architecture's diagram names for tool work, published as
+    // durable events a client following the stream would see.
+    let events = store.recorded_events().expect("readable");
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    for expected in ["run.tool_executing", "run.observing"] {
+        assert!(
+            types.contains(&expected),
+            "the run must publish {expected}: {types:?}",
+        );
+    }
+    // The tool work happens **between** the two model calls, so the sequence is the architecture's
+    // own path: `... model_started, tool_executing, observing, planning, model_started ...`. Asserted
+    // as the whole order rather than a count, because a loop that re-asked the model without the tool
+    // work would also produce two `model_started` events — and the ordering is what distinguishes a
+    // tool round-trip from a retry.
+    assert_eq!(
+        types,
+        vec![
+            "run.received",
+            "run.context_building",
+            "run.planning",
+            "run.model_started",
+            "run.tool_executing",
+            "run.observing",
+            "run.planning",
+            "run.model_started",
+            "run.output_text.delta",
+            "run.responding",
+            "run.completed",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_with_no_pipeline_fails_with_the_unimplemented_code() {
+    // The fail-closed default survives: a controller composed without a pipeline refuses the tool
+    // **by name** rather than running it ungoverned. This is the code's remaining honest meaning.
+    let provider = ScriptedProvider::new(model())
+        .emit(ModelStreamEventKind::ToolCallAdded {
+            call_id: "call-1".to_owned(),
+            tool_name: "files.read@1".to_owned(),
+        })
+        .emit(ModelStreamEventKind::ToolCallArgumentsDelta {
+            call_id: "call-1".to_owned(),
+            delta: "{}".to_owned(),
+        })
+        .emit(ModelStreamEventKind::ToolCallCompleted {
+            call_id: "call-1".to_owned(),
+            arguments: "{}".to_owned(),
+        })
+        .emit(ModelStreamEventKind::CallCompleted {
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+            refused: false,
+        });
+    let fixture = fixture(Arc::new(provider));
+    seed(&fixture).await;
+
+    let error = execute(&fixture, &CancellationScope::new())
+        .await
+        .expect_err("a tool call cannot be dispatched without a pipeline");
+    assert_eq!(error.code(), "run.tools_not_implemented");
+    assert!(error.is_unimplemented());
+
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn the_tool_names_the_model_is_offered_are_the_catalogs_own() {
+    // What the model is offered and what the pipeline can resolve must be one list: a name the model
+    // was told about but the service could not dispatch would produce `tool.not_found` for a tool the
+    // model believes exists, which reads as a JARVIS bug rather than as a refusal.
+    let tool_only = tool_fixture();
+    assert_eq!(
+        tool_only.controller.tool_names(),
+        vec![TOOL_CAPABILITY.to_owned()]
+    );
+
+    // And a controller with no pipeline offers nothing, rather than offering the catalog it does not
+    // have.
+    let plain = fixture(answering("hi"));
+    assert!(plain.controller.tool_names().is_empty());
 }

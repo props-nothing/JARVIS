@@ -433,6 +433,27 @@ pub mod event_type {
     pub const PLANNING: &str = "run.planning";
     /// A model call started.
     pub const MODEL_STARTED: &str = "run.model_started";
+    /// The model's tool calls are being dispatched through the governed pipeline.
+    ///
+    /// Published for the move into `ExecutingTool`. It is a **run** event rather than a tool event
+    /// because it describes the run's own position: the tool calls have their own durable record in
+    /// the ledger, and a client following the stream needs to see that the run is working rather
+    /// than waiting on the model.
+    pub const TOOL_EXECUTING: &str = "run.tool_executing";
+    /// The dispatched tool calls settled and their observations are being assembled.
+    ///
+    /// Published for the move into `Observing`. A separate event from [`TOOL_EXECUTING`] because "the
+    /// tools are running" and "their results are in" are different facts, and a client that saw only
+    /// the first would not know whether the work had completed.
+    ///
+    /// [`TOOL_EXECUTING`]: crate::run::event_type::TOOL_EXECUTING
+    pub const OBSERVING: &str = "run.observing";
+    /// A tool call needs a human decision, so the run is waiting on one.
+    ///
+    /// **Not terminal.** The approval is durable and listed; the run resumes when it is decided,
+    /// which is the whole point of the prompt. A client that treated it as an ending would abandon
+    /// work a user is about to permit.
+    pub const APPROVAL_REQUESTED: &str = "run.approval_requested";
     /// A chunk of output text.
     pub const OUTPUT_TEXT_DELTA: &str = "run.output_text.delta";
     /// Provider-reported usage.

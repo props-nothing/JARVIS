@@ -2241,6 +2241,7 @@ pub(crate) mod tests {
                 // Nothing measured in this fixture: the handler tests are about the HTTP surface,
                 // and an empty campaign is the fresh-profile state they should exercise.
                 delivery_campaigns: Vec::new(),
+                tools: None,
             },
             Arc::new(RunCancellationRegistry::new()),
         ));
@@ -5437,7 +5438,7 @@ pub(crate) mod tests {
         // The exclusions, each with the fact that decides it. `run_controller.rs` and `model.rs` are
         // the two that carry a client-visible code onto a *field* rather than an envelope; the other
         // three have no HTTP production reference.
-        const EXCLUDED: [(&str, &str); 5] = [
+        const EXCLUDED: [(&str, &str); 6] = [
             (
                 "run_controller.rs",
                 "carries run.* onto the run resource's error_code field, read on a 200",
@@ -5445,6 +5446,12 @@ pub(crate) mod tests {
             (
                 "model.rs",
                 "carries model.provider_* through the controller onto the same error_code field",
+            ),
+            (
+                "tool_call.rs",
+                "carries tool.* and storage.* through the controller onto the same error_code field \
+                 (a dispatch fault), never into an error envelope — the tool service's own decisions \
+                 are observations, not responses",
             ),
             (
                 "context_assembly.rs",

@@ -53,7 +53,13 @@ use crate::repository::run::{
     NewRun, RecoveryPage, RunEventPage, RunRepository, RunResumeState, StoredActivityEvent,
     StoredRun, validate_idempotency_key,
 };
+use crate::repository::tool_call::{EffectingScan, ToolCallRepository};
 use crate::repository::{RepositoryError, RepositoryFuture};
+use jarvis_domain::ids::ToolCallRecordId;
+use jarvis_domain::tool::ledger::{
+    LedgerEntry, ReservationKey as ToolCallReservationKey, ReservationOutcome, ToolCallState,
+    ToolCallTransition, ToolCallVersion,
+};
 
 /// Synthesizes the stable identifier this double gives one event of one run.
 ///
@@ -202,6 +208,13 @@ struct Store {
     /// note would pass against the double and fail in production — the direction a double must never
     /// differ in.
     approval_transitions: BTreeMap<ApprovalId, Vec<ApprovalTransitionRecord>>,
+    /// Tool-call ledger rows, keyed by the five-dimension reservation key.
+    ///
+    /// **Keyed by the whole key, so the reservation is a membership test on all five dimensions** —
+    /// the same shape the domain's own `ToolCallLedger` uses and the adapter's unique index enforces.
+    /// A double keyed by the caller's string alone would make a retry from one principal collide with
+    /// another's fresh call, which is the duplicate the reservation exists to prevent.
+    ledger: BTreeMap<ToolCallReservationKey, LedgerEntry>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -251,6 +264,26 @@ impl InMemoryRepositories {
     /// Returns [`RepositoryError::Query`] if the lock is poisoned.
     pub fn run_count(&self) -> Result<usize, RepositoryError> {
         self.with(|store| Ok(store.runs.len()))
+    }
+
+    /// Returns the state of the single ledger row the store holds, if it holds exactly one.
+    ///
+    /// **For the `EXECUTING`-before-the-effect assertion, and nothing else.** That claim is about
+    /// *ordering*, so it can only be observed from inside the effect: a read after the call returns a
+    /// later state and would pass for an implementation that wrote `EXECUTING` afterwards.
+    ///
+    /// Returns `None` when the store does not hold exactly one row, rather than answering for an
+    /// arbitrary one — an ambiguous answer would make the ordering claim unprovable while looking
+    /// satisfied. Fallible rather than panicking because this is a **library** function: a poisoned
+    /// lock or a surprising row count is mapped to `None`, the same rule every other accessor here
+    /// follows.
+    #[must_use]
+    pub fn sole_ledger_state(&self) -> Option<ToolCallState> {
+        let guard = self.store.lock().ok()?;
+        if guard.ledger.len() != 1 {
+            return None;
+        }
+        guard.ledger.values().next().map(LedgerEntry::state)
     }
 
     /// Returns how many policy versions the store holds.
@@ -1899,6 +1932,149 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                 Ok(trail)
             })
         })
+    }
+}
+
+impl ToolCallRepository for InMemoryRepositories {
+    /// Takes a reservation, atomically within this double's lock.
+    ///
+    /// **The lookup and the insert happen under one lock**, which is what makes this double model the
+    /// contract the port states rather than a simplification of it: a caller that looked up, decided,
+    /// and then inserted would have a window in which a second caller in the same process could do the
+    /// same. Across processes the adapter's unique index is what closes that window, and the double
+    /// cannot model that — but within one process it must, or a controller test could pass against a
+    /// race the adapter would lose.
+    fn reserve(&self, entry: &LedgerEntry) -> RepositoryFuture<'_, ReservationOutcome> {
+        let key = entry.key.clone();
+        let row = entry.clone();
+        Box::pin(async move {
+            self.with(|store| {
+                if let Some(existing) = store.ledger.get(&key) {
+                    return Ok(duplicate_outcome(existing));
+                }
+                store.ledger.insert(key, row);
+                Ok(ReservationOutcome::Granted)
+            })
+        })
+    }
+
+    fn load(
+        &self,
+        workspace: WorkspaceId,
+        record: ToolCallRecordId,
+    ) -> RepositoryFuture<'_, LedgerEntry> {
+        Box::pin(async move {
+            self.with(|store| {
+                store
+                    .ledger
+                    .values()
+                    .find(|row| row.id == record && row.key.workspace == workspace)
+                    .cloned()
+                    .ok_or(RepositoryError::NotFound)
+            })
+        })
+    }
+
+    /// Stores a transition, refusing a stale version before an illegal edge.
+    ///
+    /// The ordering mirrors the domain's own `apply`: a caller working from a stale view must learn its
+    /// view is stale **before** it is told an edge is illegal, because an edge that is illegal from the
+    /// caller's state may be legal from the current one. The store is authoritative for the version,
+    /// which is what the optimistic check exists to enforce.
+    fn apply_transition(
+        &self,
+        workspace: WorkspaceId,
+        _transition: &ToolCallTransition,
+        expected: ToolCallVersion,
+        entry: &LedgerEntry,
+    ) -> RepositoryFuture<'_, ()> {
+        let row = entry.clone();
+        Box::pin(async move {
+            self.with(|store| {
+                let stored = store
+                    .ledger
+                    .get(&row.key)
+                    .ok_or(RepositoryError::NotFound)?;
+                if stored.key.workspace != workspace {
+                    return Err(RepositoryError::NotFound);
+                }
+                if stored.version() != expected {
+                    return Err(RepositoryError::VersionConflict {
+                        expected: expected.get(),
+                        actual: stored.version().get(),
+                    });
+                }
+                store.ledger.insert(row.key.clone(), row);
+                Ok(())
+            })
+        })
+    }
+
+    /// Returns the calls that may have effected and have no outcome.
+    ///
+    /// **The double's predicate must be the adapter's**, so it selects the same two states the port
+    /// describes — `executing` and `reconciling` — rather than "anything non-terminal". A wider
+    /// predicate would make a test pass against the double for a scan the adapter would not return,
+    /// which is the direction a double must never differ in.
+    fn possibly_effecting(&self, limit: u32) -> RepositoryFuture<'_, EffectingScan> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut records: Vec<LedgerEntry> = store
+                    .ledger
+                    .values()
+                    .filter(|row| row.state().was_dispatched() && row.outcome().is_none())
+                    .cloned()
+                    .collect();
+                records.sort_by_key(|row| row.created_at);
+                let bounded = records.len() > limit as usize;
+                records.truncate(limit as usize);
+                Ok(EffectingScan { records, bounded })
+            })
+        })
+    }
+
+    /// Returns the calls that need settling and have not been settled.
+    fn awaiting_conversion(&self, limit: u32) -> RepositoryFuture<'_, EffectingScan> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut records: Vec<LedgerEntry> = store
+                    .ledger
+                    .values()
+                    .filter(|row| {
+                        // Every non-terminal state **except `reconciling`**, the excluded set the
+                        // port's own doc calls a requirement rather than an optimisation.
+                        !row.state().is_terminal() && row.state() != ToolCallState::Reconciling
+                    })
+                    .cloned()
+                    .collect();
+                records.sort_by_key(LedgerEntry::updated_at);
+                let bounded = records.len() > limit as usize;
+                records.truncate(limit as usize);
+                Ok(EffectingScan { records, bounded })
+            })
+        })
+    }
+}
+
+/// Turns a stored row into the reservation outcome its state implies.
+///
+/// **One reader for the three duplicate shapes**, so the double cannot answer `AlreadyTerminal` for a
+/// row that is still running. The mapping is the port's own: a terminal row is a settled duplicate
+/// whose outcome is available, a dispatched-but-unsettled row must be reconciled, and anything else is
+/// in flight.
+fn duplicate_outcome(stored: &LedgerEntry) -> ReservationOutcome {
+    if stored.state().is_terminal() {
+        ReservationOutcome::AlreadyTerminal {
+            state: stored.state(),
+            outcome: stored.outcome(),
+            no_effect_confirmed: stored.no_effect_confirmed(),
+        }
+    } else if stored.state().is_unsettled() {
+        ReservationOutcome::Unsettled { row: stored.id }
+    } else {
+        ReservationOutcome::InFlight {
+            state: stored.state(),
+        }
     }
 }
 

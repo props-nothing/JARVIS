@@ -49,7 +49,9 @@ use std::time::Duration;
 
 use jarvis_domain::clock::Clock;
 use jarvis_domain::context::manifest::ContextManifest;
-use jarvis_domain::ids::{ConversationId, MessageId, ModelCallId, RunId, WorkspaceId};
+use jarvis_domain::ids::{
+    ApprovalId, ConversationId, MessageId, ModelCallId, RunId, ToolCallId, WorkspaceId,
+};
 use jarvis_domain::model::identity::ModelRef;
 use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::model::stream::{
@@ -62,6 +64,8 @@ use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::retry::{FailureClass, FailureSite, RetryDecision};
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
+use jarvis_domain::tool::call::{ContentBlock, ToolArguments, ToolCallIntent, ToolResultBody};
+use jarvis_domain::tool::error_class::ToolErrorClass;
 
 use crate::cancellation::CancellationScope;
 use crate::context_assembly::{self, RetainedItem};
@@ -93,6 +97,19 @@ pub const MAX_TRANSCRIPT_MESSAGES: u32 = 200;
 /// so a default run behaves identically to a capped one while a caller that needs a
 /// different bound can say so.
 pub const DEFAULT_CONTEXT_TOKENS: u64 = 8_192;
+
+/// The greatest number of model turns one run may take.
+///
+/// A turn is one model call plus the tool calls it proposed, so this bounds a run's **loop** rather
+/// than its size: without it a model that keeps proposing tool calls would run until the deadline,
+/// and a deadline failure reports "too slow" for a run that was in fact looping. Ten is generous
+/// against a real task and small enough that a runaway loop is caught in seconds, not minutes.
+///
+/// A constant rather than a stored budget field, deliberately: adding a persisted `max_turns` to
+/// `RunBudget` changes a serialized shape every stored run carries, and a migration for a bound that
+/// no operator has asked to configure would be ceremony. When a caller *does* need to set it, it
+/// becomes a budget field with a migration — and this constant is the default that field would take.
+pub const MAX_MODEL_TURNS: u32 = 10;
 
 /// Returns the context ceiling a run's budget implies.
 ///
@@ -184,6 +201,22 @@ pub enum ControllerError {
     },
     /// The caller cancelled the run.
     Cancelled,
+    /// The run took more model turns than it is allowed.
+    ///
+    /// Distinct from [`DeadlineExceeded`](Self::DeadlineExceeded) because the remedies differ: a
+    /// deadline breach means the run was too slow, while this means it was **looping** — a model
+    /// proposing tool call after tool call — and an operator reading `run.turn_budget_exhausted`
+    /// knows to look at the model's behaviour rather than at the budget's numbers.
+    TurnBudgetExceeded,
+    /// The tool pipeline could not be reached at all.
+    ///
+    /// Distinct from a tool that refused the call, which is an **observation** the model receives:
+    /// this is a fault in JARVIS's own composition — an unreachable store, an unavailable clock —
+    /// and it ends the run because no observation could be produced.
+    ToolRefused {
+        /// The stable, namespaced code from the tool service.
+        code: &'static str,
+    },
 }
 
 impl ControllerError {
@@ -211,6 +244,8 @@ impl ControllerError {
             },
             Self::ContextUnassembled { .. } => "The run's context could not be assembled.",
             Self::Cancelled => "The run was cancelled.",
+            Self::TurnBudgetExceeded => "The run took more turns than it is allowed.",
+            Self::ToolRefused { .. } => "A tool call could not be dispatched.",
         }
     }
 
@@ -234,7 +269,11 @@ impl ControllerError {
             | Self::DeadlineExceeded
             | Self::BudgetExceeded { .. }
             | Self::ContextUnassembled { .. }
-            | Self::Cancelled => false,
+            | Self::Cancelled
+            | Self::TurnBudgetExceeded
+            // A dispatch fault is not retryable: the same composition fails the same way, and a
+            // repeat would spend a budget on a certain failure.
+            | Self::ToolRefused { .. } => false,
         }
     }
 
@@ -253,8 +292,12 @@ impl ControllerError {
             Self::ClockUnavailable => "run.clock_unavailable",
             Self::DeadlineExceeded => "run.deadline_exceeded",
             Self::BudgetExceeded { limit } => limit.code(),
-            Self::ContextUnassembled { code } => code,
+            // Both carry a code from an inner value rather than naming a constant of their own, so
+            // they share an arm. Merging them is safe here for the reason it must be checked
+            // elsewhere: neither has a variant-specific meaning to preserve.
+            Self::ContextUnassembled { code } | Self::ToolRefused { code } => code,
             Self::Cancelled => "run.cancelled",
+            Self::TurnBudgetExceeded => "run.turn_budget_exhausted",
         }
     }
 
@@ -279,7 +322,12 @@ impl ControllerError {
             | Self::ClockUnavailable
             | Self::DeadlineExceeded
             | Self::BudgetExceeded { .. }
-            | Self::ContextUnassembled { .. } => RunState::Failed,
+            | Self::ContextUnassembled { .. }
+            | Self::TurnBudgetExceeded
+            // A dispatch fault leaves the run `Failed` for the same reason a store fault does: it is
+            // a fault rather than a decision, and a run whose tool pipeline is unreachable cannot
+            // produce an answer.
+            | Self::ToolRefused { .. } => RunState::Failed,
         }
     }
 
@@ -290,6 +338,10 @@ impl ControllerError {
     /// and an apparent bug.
     #[must_use]
     pub const fn is_unimplemented(&self) -> bool {
+        // The one value that survives is the tool-fabric gap **reached through a controller with no
+        // pipeline composed**. It is deliberately still classified here: a deployment without a
+        // tool pipeline is reporting an absent capability rather than a fault, and `TLS-012`'s
+        // pipeline is what removes the code from a fully composed daemon.
         matches!(self, Self::ToolsNotImplemented { .. })
     }
 }
@@ -314,6 +366,8 @@ impl fmt::Display for ControllerError {
             },
             Self::ContextUnassembled { .. } => "the run's context could not be assembled",
             Self::Cancelled => "the run was cancelled",
+            Self::TurnBudgetExceeded => "the run exceeded its turn budget",
+            Self::ToolRefused { .. } => "a tool call could not be dispatched",
         };
         formatter.write_str(text)
     }
@@ -564,11 +618,11 @@ fn escape_json_string(value: &str) -> String {
 /// Three outcomes rather than a `Result` with an error, because "this attempt failed and
 /// another is worth making" is not a failure of the *run*: the run is still live and
 /// non-terminal when this is returned, and a caller that treated it as an error would fail
-/// a run that is about to succeed.
+/// a run that is about to succeed. The third arm is a tool call, which is not a failure of anything.
 #[derive(Debug)]
 enum AttemptOutcome {
-    /// The attempt produced a completed run.
-    Completed(RunOutcome),
+    /// The attempt produced a final answer, or tool results for a further turn.
+    Completed(TurnOutcome),
     /// The provider refused before accepting the call, and a repeat may help.
     Retryable {
         /// How the caller classified the failure.
@@ -659,6 +713,14 @@ struct ModelTurn<'a> {
     /// the budget rather than from everything that was read, so the two cannot disagree
     /// about what the model was given.
     items: &'a [RetainedItem],
+    /// The tool observations produced by the **previous** turn, in call order.
+    ///
+    /// Empty on the first turn. Carried on the turn rather than appended to `items`, because the
+    /// budgeted items are a **durable** decision about the transcript and an observation is
+    /// in-flight context: folding one into the other would make the manifest describe content the
+    /// budget never selected, and the observation would then be re-sent on a resumed turn as though
+    /// it were part of the conversation.
+    observations: &'a [ToolObservation],
     model: &'a ModelRef,
     cancel: &'a CancellationScope,
     /// The run's own budget. Carried into the turn because the deadline is a property of
@@ -671,11 +733,222 @@ struct ModelTurn<'a> {
     budget: &'a RunBudget,
 }
 
+/// What one model turn produced once its stream reached a terminal.
+///
+/// Three arms rather than a `Result` with an error, because **a tool call is not a failure of the
+/// run**: the model proposed work, the fabric performed or refused it, and the run continues with
+/// the observation. An implementation that returned `Err` for a tool call would end a run the model
+/// was still working through — which is exactly what the previous version did with
+/// `run.tools_not_implemented`, deliberately and with a label saying so.
+#[derive(Debug)]
+enum TurnOutcome {
+    /// The turn produced the run's final answer.
+    Answer(RunOutcome),
+    /// The turn's tool calls were dispatched and produced observations for a further turn.
+    ToolResults {
+        /// The observations, in the order the calls completed.
+        observations: Vec<ToolObservation>,
+    },
+    /// A call is blocked on a human decision, so the run waits.
+    WaitingApproval {
+        /// The approval the caller must list and decide.
+        approval: ApprovalId,
+    },
+}
+
+/// What dispatching one turn's tool calls produced.
+///
+/// Two arms, and the difference is whether the run can continue: a set of observations lets the
+/// model take another turn, while a pending approval stops the batch because a later call's
+/// observation depends on a decision nobody has made yet.
+#[derive(Debug)]
+enum DispatchOutcome {
+    /// Every call settled and produced an observation.
+    Observations(Vec<ToolObservation>),
+    /// A call is waiting on a decision, so the run cannot continue this turn.
+    WaitingApproval {
+        /// The approval to list and decide.
+        approval: ApprovalId,
+    },
+}
+
+/// One tool call the model completed, with the canonical id its result must pair with.
+///
+/// **The pair is the point.** `InputItems::new` refuses a tool result whose call is absent, so an
+/// observation must carry the *same* call id the provider stamped — a fresh id would produce an
+/// orphaned pair the domain refuses, and the run would fail with a stream error for a tool that ran
+/// perfectly. The capability is the name the call was announced under, which is what the catalog
+/// resolves; the identity it resolves to is what policy authorizes and the ledger keys on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedToolCall {
+    /// The provider's canonical call id, shared by the call and its result.
+    call_id: String,
+    /// The capability name the model used.
+    capability: String,
+    /// The complete argument document, as the provider sent it.
+    arguments: String,
+}
+
+/// What one dispatched tool call produced, as the next model turn sees it.
+///
+/// Carries **both halves of the pair**: the assistant's call and the tool's result. A request built
+/// from the result alone is refused by the domain's `InputItems::new` as an orphaned tool result —
+/// the invariant the contract states for context compaction is that a result cannot survive its
+/// call — so the call has to travel with it rather than being re-derived, because re-deriving it
+/// would mean re-parsing the argument document the provider already sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolObservation {
+    /// The provider's canonical call id, shared by the call and its result.
+    call_id: String,
+    /// The capability name the model used, which is the call item's `tool_name`.
+    capability: String,
+    /// The complete argument document, as the provider sent it.
+    arguments: String,
+    /// Whether the tool reported an error, so the model can tell a result from a refusal.
+    is_error: bool,
+    /// The bounded text the model reads.
+    content: String,
+}
+
+/// Renders a call outcome as the observation the model receives.
+///
+/// A refusal is rendered as **an observation with `is_error` true rather than as a run failure**,
+/// and that is the whole design: the model is a participant that must be told "you are not allowed
+/// to do that" or "that tool does not exist", because a model that receives a run-level fault
+/// cannot reason about it and will propose the same call again. The contract's rule is that a
+/// refusal is information; only a fault ends the run.
+///
+/// The rendering names the **error class**, never the provider's own text and never the arguments:
+/// both are untrusted, and an observation is placed in the model's context as content the model
+/// reasons over. A class is a closed-set token the model can act on; a provider's raw message would
+/// be an injection channel with a helpful tone.
+fn observation_of(
+    call: &CapturedToolCall,
+    outcome: &crate::tool_call::ToolCallOutcome,
+) -> ToolObservation {
+    use crate::tool_call::ToolCallOutcome;
+    let (is_error, content) = match outcome {
+        ToolCallOutcome::Completed { result } => (false, render_result(result)),
+        ToolCallOutcome::Refused { class, .. } => (
+            true,
+            format!(
+                "{{\"refused\":\"{}\",\"detail\":\"{}\"}}",
+                // **Through the class's own spelling, never a literal.** A hand-written `tool.*`
+                // string here would be a second spelling of a value the domain already owns, and it
+                // would put a *tool* code inside the run controller's source where the run
+                // error-code scan reads dotted literals — the scan would then report a code this
+                // file does not use as a run outcome. The observation is content, not a code, and
+                // sourcing it from the type is what keeps that distinction visible.
+                class.as_contract_str(),
+                refusal_detail(*class),
+            ),
+        ),
+        // A waiting approval is **not** an observation to reason from: there is no result and
+        // nothing for the model to decide, because a human has to. The run is moved to a waiting
+        // state by the caller and resumes when the approval is decided, so this arm is never reached
+        // for a run that continues; the text names the state and contains no code, because the
+        // pending approval is already a durable record a client lists rather than a value to parse
+        // out of prose.
+        ToolCallOutcome::WaitingApproval { .. } => (
+            true,
+            "{\"pending\":\"a human decision is required before this call can run\"}".to_owned(),
+        ),
+        // A duplicate whose result this build cannot return is reported as a conflict rather than
+        // as a success with no content — returning an empty result would tell the model the tool
+        // ran and produced nothing, which is a claim JARVIS cannot make.
+        ToolCallOutcome::Duplicate { state, .. } => (
+            true,
+            format!(
+                "{{\"refused\":\"{}\",\"detail\":\"an equivalent call is already {}\"}}",
+                ToolErrorClass::Conflict.as_contract_str(),
+                state.as_contract_str(),
+            ),
+        ),
+    };
+    ToolObservation {
+        call_id: call.call_id.clone(),
+        capability: call.capability.clone(),
+        arguments: call.arguments.clone(),
+        is_error,
+        content,
+    }
+}
+
+/// Returns a short, fixed explanation for a refusal class.
+///
+/// **A closed set with fixed text**, so an observation cannot carry anything but a sentence JARVIS
+/// wrote. This is the same rule the run's own error messages follow: a message that interpolated a
+/// provider's value or a caller's argument would put untrusted text into a model's context through
+/// the one channel the model is guaranteed to trust.
+fn refusal_detail(class: ToolErrorClass) -> &'static str {
+    match class {
+        ToolErrorClass::NotFound => "no such tool is registered",
+        ToolErrorClass::Unavailable => "the tool is unavailable",
+        ToolErrorClass::SchemaInvalid => "the arguments did not match the tool's schema",
+        ToolErrorClass::PermissionDenied => "this action is not permitted",
+        ToolErrorClass::ApprovalRequired => "this action needs approval",
+        ToolErrorClass::ApprovalRejected => "approval was refused",
+        ToolErrorClass::ApprovalExpired => "approval expired",
+        ToolErrorClass::Conflict => "the call conflicts with an existing one",
+        ToolErrorClass::RateLimited => "the tool is rate limited",
+        ToolErrorClass::Timeout => "the call timed out",
+        ToolErrorClass::Cancelled => "the call was cancelled",
+        ToolErrorClass::ProviderAuth => "the tool's credentials were rejected",
+        ToolErrorClass::ProviderError => "the tool failed",
+        ToolErrorClass::OutputInvalid => "the result did not validate",
+        ToolErrorClass::OutcomeAmbiguous => "the outcome is unknown and must be reconciled",
+        ToolErrorClass::LimitExceeded => "a bound was exceeded",
+    }
+}
+
+/// Renders a result's content blocks as the text a model reads.
+///
+/// A tool result is bounded (the domain refuses an over-total one), so this cannot produce an
+/// unbounded string; the blocks are joined in the order the provider returned them.
+fn render_result(result: &ToolResultBody) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(result.content.len());
+    for block in &result.content {
+        match block {
+            ContentBlock::Json { value } => parts.push(value.as_str().to_owned()),
+            ContentBlock::Text { text } => parts.push(text.as_str().to_owned()),
+            // A reference the model cannot read is rendered as an explicit note. Placing the
+            // artifact *id* alone would look like content, and a model that treated an identifier
+            // as the answer would hallucinate around it.
+            ContentBlock::Artifact {
+                id,
+                media_type,
+                size,
+            } => parts.push(format!(
+                "{{\"artifact\":\"{id}\",\"media_type\":\"{media_type}\",\"size\":{size},\"note\":\"content is stored outside this result\"}}"
+            )),
+        }
+    }
+    parts.join("\n")
+}
+
 /// What draining a stream produced once it reached its terminal.
 #[derive(Debug, Default)]
 struct DrainedTurn {
     answer: String,
     tool_intent: Option<String>,
+    /// The tool calls the model **completed**, with their final arguments.
+    ///
+    /// **Separate from [`Self::tool_intent`], and the separation was a real gap.** `tool_intent`
+    /// records only the *name* of the first `tool.call.added` frame, which was all a controller that
+    /// refused every tool call needed. Executing one needs the **complete argument document**, which
+    /// arrives on a later `tool.call.completed` frame — so the name alone could not dispatch
+    /// anything, and a controller that had tried would have run a tool on half-received arguments.
+    /// The domain's `ToolArguments::executable_raw` is the single door that answers "are these
+    /// arguments complete?", and this list is built from frames that passed through it.
+    tool_calls: Vec<CapturedToolCall>,
+    /// The tool name each open call id was announced under.
+    ///
+    /// A map rather than a field on the vector, because `tool.call.added` and `tool.call.completed`
+    /// are **separate frames** and a provider may interleave several calls: pairing them by position
+    /// would attribute one call's arguments to another's name. The domain's stream state machine
+    /// already keys its own open-call table the same way, and this mirrors it rather than
+    /// re-deriving the pairing.
+    tool_names: std::collections::BTreeMap<String, String>,
     /// The usage the provider reported, from a `usage.updated` frame or the terminal.
     ///
     /// Captured so the run can be judged against its token and cost ceilings. Before
@@ -738,6 +1011,20 @@ struct DrainedTurn {
     output_delta_count: u32,
 }
 
+/// Everything a turn needs that does not change between turns.
+///
+/// Grouped so [`RunController::drive_turns`] takes one argument rather than seven, following
+/// `BRN-008`'s own rule that several same-shaped identifiers in a positional call invite a
+/// transposition — and here two of them are identifiers.
+struct TurnInputs<'a> {
+    context: &'a RequestContext,
+    conversation_id: ConversationId,
+    items: &'a [RetainedItem],
+    model: &'a ModelRef,
+    budget: &'a RunBudget,
+    cancel: &'a CancellationScope,
+}
+
 /// Drives one durable run to a terminal state.
 pub struct RunController {
     runs: Arc<dyn RunRepository>,
@@ -758,6 +1045,15 @@ pub struct RunController {
     /// and it could not see a delta published through [`StreamDeltaSink`], which is a separate
     /// port.
     live: crate::live_events::RunStreamNotifier,
+    /// Dispatches the model's tool calls through the governed pipeline.
+    ///
+    /// **Optional, and `None` is a real state rather than a permissive default.** A controller
+    /// composed without this port **refuses** every tool call with `run.tools_not_implemented` — the
+    /// behaviour the whole fabric had before this existed — rather than executing one ungoverned. A
+    /// default that ran tools directly would be the single most dangerous fail-open in the product,
+    /// and making the port optional is what lets every existing controller test keep asserting the
+    /// refusal without constructing a full tool stack.
+    tools: Option<Arc<crate::tool_call::ToolCallService>>,
 }
 
 impl fmt::Debug for RunController {
@@ -794,7 +1090,21 @@ impl RunController {
             // than a missing behaviour. That is what keeps a controller test and a daemon run on one
             // code path.
             live: crate::live_events::RunStreamNotifier::new(),
+            // No tool pipeline, so every tool call is refused by name. The safe default: a
+            // controller that ran tools without a policy stage would be the one bypass `TLS-012`
+            // exists to make impossible.
+            tools: None,
         }
+    }
+
+    /// Shares a tool-call service, so this run's tool intents are governed.
+    ///
+    /// Consuming rather than taking `&mut self`, so the composition cannot attach the pipeline
+    /// after a run has begun — the same reason [`Self::with_notifier`] consumes.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<crate::tool_call::ToolCallService>) -> Self {
+        self.tools = Some(tools);
+        self
     }
 
     /// Shares `live` so a follower and the controller that feeds it hold one notifier.
@@ -938,7 +1248,9 @@ impl RunController {
             }
         };
 
-        // Planning -> AwaitingModel.
+        // Planning -> AwaitingModel. This is the **first** turn's move into the model call; a later
+        // turn makes the same move from `Observing`, which is the state the tool work leaves the run
+        // in. `step_unless_cancelled` is used for both so the cancellation check is identical.
         self.step_unless_cancelled(
             run,
             Step::new(
@@ -952,19 +1264,146 @@ impl RunController {
         .await?;
 
         // From here every failure must leave the run terminal, so the remainder runs
-        // in a helper that owns the `AwaitingModel -> <terminal>` transition.
-        self.ask_model(
+        // in a helper that owns the `AwaitingModel -> <terminal>` transition. The turn loop is a
+        // second helper, so every argument it needs is named once rather than closed over.
+        self.drive_turns(
             run,
-            &ModelTurn {
+            &TurnInputs {
                 context,
                 conversation_id,
                 items: &assembled.items,
                 model: &model,
-                cancel,
                 budget: &budget,
+                cancel,
             },
         )
         .await
+    }
+
+    /// Runs model turns until one answers or the turn budget is exhausted.
+    ///
+    /// **The loop carries its observations forward**, which is why it is a loop over turns rather than
+    /// over model calls: turn *n+1*'s input is turn *n*'s tool results, and a helper that re-read the
+    /// stored transcript would re-send the objective as a fresh question and lose the pairing between
+    /// a call and its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] when a turn could not be driven, or
+    /// [`ControllerError::TurnBudgetExceeded`] when the model kept proposing tool calls past
+    /// [`MAX_MODEL_TURNS`].
+    async fn drive_turns(
+        &self,
+        run: RunRef,
+        turn: &TurnInputs<'_>,
+    ) -> Result<RunOutcome, ControllerError> {
+        let mut observations: Vec<ToolObservation> = Vec::new();
+        let mut turn_index: u32 = 1;
+        loop {
+            let outcome = self
+                .ask_model(
+                    run,
+                    &ModelTurn {
+                        context: turn.context,
+                        conversation_id: turn.conversation_id,
+                        items: turn.items,
+                        observations: &observations,
+                        model: turn.model,
+                        cancel: turn.cancel,
+                        budget: turn.budget,
+                    },
+                )
+                .await?;
+
+            match outcome {
+                TurnOutcome::Answer(outcome) => return Ok(outcome),
+                TurnOutcome::ToolResults {
+                    observations: produced,
+                } => {
+                    // A further model turn is permitted only while the run has turns left. The bound
+                    // is checked **before** the loop continues, so an exhausted budget fails the run
+                    // with a named reason rather than looping until the deadline does it — which
+                    // would report a slow run for one that asked for too many turns.
+                    turn_index = turn_index.saturating_add(1);
+                    if turn_index > MAX_MODEL_TURNS {
+                        self.finish(
+                            run,
+                            Step::failed(
+                                RunState::Observing,
+                                "run.failed",
+                                "turn_budget_exhausted",
+                                ControllerError::TurnBudgetExceeded.code(),
+                            ),
+                        )
+                        .await?;
+                        return Err(ControllerError::TurnBudgetExceeded);
+                    }
+                    // **The run returns to `Planning` and then to `AwaitingModel`.** The architecture's
+                    // diagram routes a settled tool observation through `Observing -> Planning`, so the
+                    // next turn is a fresh decision about what to do with the result rather than a
+                    // continuation of the same model call — and the two transitions are the domain's own
+                    // legal edges rather than a shortcut, which is what keeps the run's recorded state
+                    // path a path the table permits.
+                    self.step_unless_cancelled(
+                        run,
+                        Step::new(
+                            RunState::Observing,
+                            RunState::Planning,
+                            "run.planning",
+                            "observation_ready",
+                        ),
+                        turn.cancel,
+                    )
+                    .await?;
+                    self.step_unless_cancelled(
+                        run,
+                        Step::new(
+                            RunState::Planning,
+                            RunState::AwaitingModel,
+                            "run.model_started",
+                            "model_call_requested",
+                        ),
+                        turn.cancel,
+                    )
+                    .await?;
+                    observations = produced;
+                }
+                // A tool call is blocked on a human. The run is left **waiting** rather than
+                // terminal, which is the whole point of a durable approval: the prompt is recorded
+                // and the run resumes when it is decided. A terminal state here would make the
+                // approval useless.
+                TurnOutcome::WaitingApproval { approval } => {
+                    self.finish(
+                        run,
+                        Step::new(
+                            RunState::AwaitingModel,
+                            RunState::AwaitingApproval,
+                            "run.approval_requested",
+                            "tool_approval_pending",
+                        ),
+                    )
+                    .await?;
+                    // **No `error_code` is fabricated, and the approval is not encoded into one.**
+                    // A run waiting on a decision has not failed: putting a code on its row would
+                    // make a successful request read as a failure, and appending the approval id to
+                    // a fixed code would make `error_code` a dynamic value the client-visible
+                    // vocabulary cannot enumerate — the defect the vocabulary test caught. A caller
+                    // learns which approval to decide from the run's `run.approval_requested` event
+                    // and from `GET /api/v1/approvals`, which is the surface that lists it.
+                    //
+                    // The approval identity is deliberately **not** logged here either: this layer
+                    // has no tracing dependency, and the value is already durable in the approval
+                    // store and named by the transition's reason.
+                    let _ = approval;
+                    return Ok(RunOutcome {
+                        run_id: run.run_id,
+                        state: RunState::AwaitingApproval,
+                        answer: None,
+                        error_code: None,
+                    });
+                }
+            }
+        }
     }
 
     /// Reads the run's budget, the transcript, and the budgeted prompt.
@@ -1200,7 +1639,7 @@ impl RunController {
         &self,
         run: RunRef,
         turn: &ModelTurn<'_>,
-    ) -> Result<RunOutcome, ControllerError> {
+    ) -> Result<TurnOutcome, ControllerError> {
         // A run whose deadline had already passed when its turn began is refused before a
         // provider is contacted at all. Recording a model call for a request that was never
         // going to be made would leave an open attempt and spend nothing on purpose.
@@ -1356,7 +1795,15 @@ impl RunController {
             .await
             .map_err(ControllerError::Repository)?;
 
-        let request = build_request(run.run_id, call_id, turn.model, turn.items, turn.budget)?;
+        let request = build_request(
+            run.run_id,
+            call_id,
+            turn.model,
+            turn.items,
+            turn.observations,
+            &self.tool_names(),
+            turn.budget,
+        )?;
 
         // Bounded by the run's own budget. A provider that never answers must not hold
         // the run open: the deadline this run declares has to be an actual bound, and an
@@ -1512,41 +1959,23 @@ impl RunController {
         // Captured before anything is moved out of `drained`, because several paths below
         // need them and a later borrow would be a borrow of a partially moved value. The
         // delivery timing is captured here rather than at each use for exactly that reason:
-        // `drained.tool_intent` is moved out a few lines below, and reading the timing after
-        // that move does not compile.
+        // the tool calls are moved out below, and reading the timing after that move does not
+        // compile.
         let usage = usage_of(&drained);
         let delivery = DeliveryTiming::of(&drained);
 
-        // A tool intent needs the fabric that does not exist yet. Refused with a
-        // terminal, typed outcome rather than a fabricated observation.
-        if let Some(tool_name) = drained.tool_intent {
-            let _ = tool_name;
-            self.finish(
-                run,
-                Step::failed(
-                    RunState::AwaitingModel,
-                    "run.failed",
-                    "tool_fabric_unavailable",
-                    ControllerError::ToolsNotImplemented {
-                        tool_name: "unavailable".to_owned(),
-                    }
-                    .code(),
-                ),
-            )
-            .await?;
-            self.record_call_outcome_with(
-                run,
-                call_id,
-                ModelCallState::Failed,
-                RecordedOutcome {
-                    usage,
-                    delivery,
-                    provider_request_id: drained.provider_request_id,
-                    ..RecordedOutcome::default()
-                },
-            )
-            .await?;
-            return Err(ControllerError::ToolsNotImplemented { tool_name });
+        // **A completed tool call is dispatched through the governed pipeline**, and the run
+        // continues with the observation rather than ending. This replaces the refusal that carried
+        // `run.tools_not_implemented` for every tool intent.
+        //
+        // A call whose arguments the provider never completed (`tool.call.added` with no matching
+        // `tool.call.completed`) is **not** dispatched: the domain's stream state machine refuses to
+        // finish a stream with an open call, so reaching here with an uncompleted call means the
+        // `finish()` below would have refused the stream — which it does, before this point.
+        if !drained.tool_calls.is_empty() {
+            return self
+                .settle_tool_calls(run, turn, call_id, drained, usage, delivery)
+                .await;
         }
 
         // The run's ceilings are checked against what was actually used. This is what makes
@@ -1626,7 +2055,9 @@ impl RunController {
             self.publish_usage(run, call_id, reported).await?;
         }
 
-        // AwaitingModel -> Responding -> Completed, then the answer is stored.
+        // AwaitingModel -> Responding -> Completed, then the answer is stored. The turn's outcome is
+        // a `RunOutcome` rather than a further tool round-trip, because a stream that reached its
+        // terminal without tool calls is the model answering.
         self.complete_run(
             run,
             drained,
@@ -1635,7 +2066,202 @@ impl RunController {
             turn.cancel,
         )
         .await
-        .map(AttemptOutcome::Completed)
+        .map(|outcome| AttemptOutcome::Completed(TurnOutcome::Answer(outcome)))
+    }
+
+    /// Dispatches one turn's tool calls and closes the model call that proposed them.
+    ///
+    /// **Extracted from [`Self::finish_attempt`] so that method stays about judging a drained
+    /// stream.** The tool lifecycle has its own states (`ExecutingTool`, `Observing`), its own
+    /// events, and its own two outcomes — observations for a further turn, or a pending approval —
+    /// and folding it into the stream judgement is what pushed both past clippy's line budget.
+    ///
+    /// A call whose arguments the provider never completed (`tool.call.added` with no matching
+    /// `tool.call.completed`) is **not** dispatched: the domain's stream state machine refuses to
+    /// finish a stream with an open call, so by the time this runs every captured call is complete —
+    /// and `CapturedToolCall` is only built from a `ToolCallCompleted` frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] only for a fault, or [`ControllerError::TurnBudgetExceeded`] is
+    /// **not** raised here — the turn bound belongs to [`Self::drive_turns`]. A tool that refused a
+    /// call is an observation, not an error.
+    async fn settle_tool_calls(
+        &self,
+        run: RunRef,
+        turn: &ModelTurn<'_>,
+        call_id: ModelCallId,
+        drained: DrainedTurn,
+        usage: Option<Usage>,
+        delivery: DeliveryTiming,
+    ) -> Result<AttemptOutcome, ControllerError> {
+        // The run moves through the states the architecture's diagram names, so a client following
+        // the stream sees the tool work rather than only its result. `AwaitingModel -> ExecutingTool
+        // -> Observing` is the documented path, and each step is one durable transition with its
+        // event.
+        self.step(
+            run,
+            Step::new(
+                RunState::AwaitingModel,
+                RunState::ExecutingTool,
+                "run.tool_executing",
+                "tool_calls_proposed",
+            ),
+        )
+        .await?;
+
+        let dispatched = self.dispatch_tools(run, turn, &drained.tool_calls).await?;
+
+        // The model call is closed **before** the observation is acted on, so a call that proposed
+        // tools is not left open while the run moves on. The finish reason travels with it, so an
+        // operator reading the row sees `tool_calls` rather than a bare completion.
+        self.record_call_outcome_with(
+            run,
+            call_id,
+            ModelCallState::Completed,
+            RecordedOutcome {
+                usage: usage.clone(),
+                finish_reason: drained.finish_reason.clone(),
+                delivery,
+                provider_request_id: drained.provider_request_id.clone(),
+            },
+        )
+        .await?;
+
+        // The usage is published before the observation for the same reason it is published on the
+        // answer path: it is a durable statement about what a completed call consumed.
+        if let Some(reported) = usage.as_ref()
+            && reported.has_any_counter()
+        {
+            self.publish_usage(run, call_id, reported).await?;
+        }
+
+        self.step(
+            run,
+            Step::new(
+                RunState::ExecutingTool,
+                RunState::Observing,
+                "run.observing",
+                "tool_calls_settled",
+            ),
+        )
+        .await?;
+
+        Ok(match dispatched {
+            DispatchOutcome::Observations(observations) => {
+                // The observation is carried to the next turn rather than stored: it is in-flight
+                // context, and the durable record of what a tool did is the ledger row and the model
+                // call, not a transcript entry that a resumed run would re-send.
+                AttemptOutcome::Completed(TurnOutcome::ToolResults { observations })
+            }
+            DispatchOutcome::WaitingApproval { approval } => {
+                AttemptOutcome::Completed(TurnOutcome::WaitingApproval { approval })
+            }
+        })
+    }
+
+    /// Dispatches every captured tool call through the governed pipeline.
+    ///
+    /// **One call may wait for an approval, and that stops the batch.** A run whose second tool call
+    /// is blocked on a human cannot proceed with a third, because the model's next turn needs an
+    /// observation this call has not produced — so the batch returns `WaitingApproval` and the run
+    /// moves to `AwaitingApproval`. The alternative — dispatching the rest and returning a partial
+    /// set — would send the model a transcript with a call that has no result, which
+    /// `InputItems::new` refuses and which would be a lie about what happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError`] only for a **fault**: a store failure, a clock failure, or the
+    /// absence of the tool pipeline. A tool that refused the call is an **observation**, not an
+    /// error — the model must be told, and a run-level fault would deny it the chance to react.
+    async fn dispatch_tools(
+        &self,
+        run: RunRef,
+        turn: &ModelTurn<'_>,
+        calls: &[CapturedToolCall],
+    ) -> Result<DispatchOutcome, ControllerError> {
+        // **No pipeline means the capability is absent, and that is refused by name rather than
+        // approximated.** This is the state every controller test that composes no tool stack is in,
+        // and it keeps `run.tools_not_implemented` honest: it now means "this deployment has no tool
+        // pipeline", not "the fabric was never built".
+        let Some(service) = self.tools.as_ref() else {
+            let name = calls
+                .first()
+                .map(|call| call.capability.clone())
+                .unwrap_or_default();
+            self.finish(
+                run,
+                Step::failed(
+                    RunState::ExecutingTool,
+                    "run.failed",
+                    "tool_fabric_unavailable",
+                    ControllerError::ToolsNotImplemented {
+                        tool_name: name.clone(),
+                    }
+                    .code(),
+                ),
+            )
+            .await?;
+            return Err(ControllerError::ToolsNotImplemented { tool_name: name });
+        };
+
+        let mut observations: Vec<ToolObservation> = Vec::with_capacity(calls.len());
+        for call in calls {
+            // The intent is built from the captured pair: the name the model emitted becomes a
+            // capability the catalog resolves, and the argument document is carried as the
+            // **unvalidated** text the domain's `ToolArguments` wraps. The domain deliberately does
+            // not parse it — validating against a schema is the validator's job — so a malformed
+            // document is refused by `tool.schema_invalid` rather than at construction, which is the
+            // diagnosis a model can act on.
+            let Ok(arguments) = ToolArguments::new(&call.arguments) else {
+                // An argument document that cannot even be wrapped — empty, over the byte bound, or
+                // carrying a NUL — is refused as a schema failure. Building an intent would be
+                // impossible, so the model is told its arguments were unusable, and the remaining
+                // calls in the batch are still dispatched.
+                observations.push(ToolObservation {
+                    call_id: call.call_id.clone(),
+                    capability: call.capability.clone(),
+                    arguments: call.arguments.clone(),
+                    is_error: true,
+                    content: format!(
+                        "{{\"refused\":\"{}\",\"detail\":\"the arguments were empty or \
+                         exceeded the accepted size\"}}",
+                        ToolErrorClass::SchemaInvalid.as_contract_str(),
+                    ),
+                });
+                continue;
+            };
+            let intent = ToolCallIntent::new(
+                ToolCallId::from_uuid(uuid::Uuid::now_v7()),
+                &call.capability,
+                arguments,
+                None,
+            )
+            .map_err(|error| ControllerError::StreamRejected { code: error.code() })?;
+
+            // The idempotency key is the provider's own call id, scoped by the service's
+            // `ReservationKey` to identity, workspace, and principal. That is deliberately the
+            // **provider's** identifier rather than a fresh one: a provider that re-sends the same
+            // call id within one turn is making the same logical call, and the reservation's whole
+            // purpose is to recognise it. A fresh key per dispatch would make every repeat look like
+            // a new call and duplicate the effect.
+            let outcome = service
+                .invoke(
+                    turn.context,
+                    run.run_id,
+                    &intent,
+                    &call.call_id,
+                    turn.cancel,
+                )
+                .await
+                .map_err(|error| ControllerError::ToolRefused { code: error.code() })?;
+
+            if let crate::tool_call::ToolCallOutcome::WaitingApproval { approval } = outcome {
+                return Ok(DispatchOutcome::WaitingApproval { approval });
+            }
+            observations.push(observation_of(call, &outcome));
+        }
+        Ok(DispatchOutcome::Observations(observations))
     }
 
     /// Drives a successful run through `Responding` to `Completed`, storing the answer first.
@@ -2361,6 +2987,20 @@ impl RunController {
             .map_err(ControllerError::Repository)
     }
 
+    /// Returns the canonical tool names this run may propose.
+    ///
+    /// An empty vector when no pipeline is composed, which is the honest answer: the model is told it
+    /// has no tools rather than being offered tools nothing can run. Sourced from the service rather
+    /// than from a second list, so what the model is offered and what policy can authorize are the
+    /// same set — a catalog the model saw but the service could not resolve would produce
+    /// `tool.not_found` for a tool the model was told about, which reads as a JARVIS bug.
+    fn tool_names(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .map(|tools| tools.capabilities())
+            .unwrap_or_default()
+    }
+
     /// Returns the current instant from the injected clock.
     fn now(&self) -> Result<UtcTimestamp, ControllerError> {
         self.clock
@@ -2522,8 +3162,33 @@ fn capture(drained: &mut DrainedTurn, event: &ModelStreamEvent) {
         drained.provider_request_id = Some(request_id.clone());
     }
     match &event.kind {
-        ModelStreamEventKind::ToolCallAdded { tool_name, .. } => {
+        ModelStreamEventKind::ToolCallAdded {
+            call_id, tool_name, ..
+        } => {
+            // Both records: the first name is what the *refusal* path reports (a tool the fabric
+            // cannot resolve at all), and the map is what pairs a later completed frame's arguments
+            // with the name they belong to.
             drained.tool_intent.get_or_insert_with(|| tool_name.clone());
+            drained
+                .tool_names
+                .insert(call_id.clone(), tool_name.clone());
+        }
+        // **A completed tool call is captured with its canonical call id and its argument
+        // document.** The domain guarantees the document is whole: `ToolCallCompleted` is the frame
+        // a provider sends once, after the deltas, and the stream state machine refuses a completed
+        // frame whose arguments disagree with what the deltas assembled. So this is the only frame a
+        // dispatch may be built from, which is why the capture happens here rather than on
+        // `ToolCallAdded`.
+        //
+        // The pair is recorded even when the argument document is later refused by validation: the
+        // call id is what the observation must pair with, and a tool result that answered nothing
+        // would be an orphaned pair the domain's `InputItems::new` refuses.
+        ModelStreamEventKind::ToolCallCompleted { call_id, arguments } => {
+            drained.tool_calls.push(CapturedToolCall {
+                call_id: call_id.clone(),
+                capability: drained.tool_names.get(call_id).cloned().unwrap_or_default(),
+                arguments: arguments.clone(),
+            });
         }
         // Usage arrives on its own frame or with the terminal, and a provider may send both. The
         // last one wins rather than the first, because a later frame is a revision and the
@@ -2612,6 +3277,8 @@ fn build_request(
     call_id: ModelCallId,
     model: &ModelRef,
     items: &[RetainedItem],
+    observations: &[ToolObservation],
+    tools: &[String],
     budget: &RunBudget,
 ) -> Result<ModelCallRequest, ControllerError> {
     let mut input: Vec<InputItem> = vec![InputItem::SystemPolicyRef {
@@ -2623,6 +3290,29 @@ fn build_request(
         policy_ref: "system/default".to_owned(),
     }];
     input.extend(items.iter().map(RetainedItem::to_input_item));
+    // **The previous turn's tool calls and their results, as pairs.** Both halves are appended for
+    // every call, in the order the calls completed, because a `ToolResult` must follow the
+    // `ToolCall` it answers — the domain's `InputItems::new` is order-sensitive and refuses an
+    // orphaned result, so appending only results would make every tool-using run fail with an
+    // invariant error for a tool that ran perfectly.
+    input.extend(observations.iter().flat_map(|observation| {
+        let call = InputItem::ToolCall {
+            call_id: observation.call_id.clone(),
+            tool_name: observation.capability.clone(),
+            // **Through the domain's own type**, so the arguments are wrapped rather than
+            // reconstructed: `ToolArguments::Complete` is what the executor saw, and building a
+            // differently-typed value here would let the transcript and the executed call disagree.
+            arguments: jarvis_domain::model::stream::ToolArguments::Complete {
+                raw: observation.arguments.clone(),
+            },
+        };
+        let result = InputItem::ToolResult {
+            call_id: observation.call_id.clone(),
+            is_error: observation.is_error,
+            content: observation.content.clone(),
+        };
+        [call, result]
+    }));
     Ok(ModelCallRequest {
         call_id,
         run_id,
@@ -2634,7 +3324,11 @@ fn build_request(
         route_requirements: RouteRequirements::text(),
         input: InputItems::new(input)
             .map_err(|error| ControllerError::StreamRejected { code: error.code() })?,
-        tools: Vec::new(),
+        // **The tools the model may propose, from the run's own catalog.** An empty vector is a real
+        // state (no pipeline composed, or a catalog with nothing in it) and tells the model it has
+        // no tools — which is honest, where omitting the field entirely would look like a provider
+        // that does not support the feature.
+        tools: tools.to_vec(),
         output_schema: None,
         settings: PortableSettings::default(),
         // The run's budget, not an empty set of limits. Sending `None` here was the

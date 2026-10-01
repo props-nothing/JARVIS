@@ -1,11 +1,29 @@
 # JARVIS Roadmap
 
 Status: ACCEPTED
-Last updated: 2026-09-27
+Last updated: 2026-10-01
 Current milestone: Milestone 2 - Native Brain (started; `BRN-001`, `BRN-002`, `BRN-004`, `BRN-005`, and `BRN-006` done, `BRN-007`'s run resource surface, CLI chat path, **live SSE follow**, **CLI streaming renderer**, **conversation continuation**, and **per-principal idempotency scoping** done with the run list outstanding, `BRN-008`'s run controller, startup recovery, time/token/cost/context budgets, pre-acceptance retry, and cancellation/disconnect partially done with fallback and turn/byte/concurrency budgets outstanding, `BRN-010`'s policy rules, route selector, versioned policy store, policy service, the three policy endpoints, and the create-run policy reference with its context ceiling done with the exception lifecycle outstanding, `BRN-012` done, `BRN-011` done, `BRN-003`'s OpenAI-compatible adapter implemented, composed into the daemon, verified against a real Ollama model end to end, and translating tool calls with a cloud endpoint still needing its own reviewed TLS dependency, `BRN-009`'s gated provider smoke test done with the deterministic suites still to be gathered under that TODO. Milestone 2's exit gate — "a gated real-provider smoke test streams a response" — is now **met**; Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
 by `node scripts/validate-docs.mjs`.
+
+Milestone 3 progress: **started**, and its first half is reachable rather than
+declared. The tool fabric's layers (`TLS-001` through `TLS-006`) were each
+complete and none of them had a caller — the registry had no consumer, schema
+validation and action fingerprinting had no production call site, and the run
+controller refused every model-proposed tool with `run.tools_not_implemented`.
+`TLS-012` now carries the pipeline that joins them
+(`jarvis_application::tool_call`), the reviewed adapters that implement its four
+ports, the first real native tool (`clock.now@1`), and the controller's dispatch
+loop; the first deliverable — "canonical tool definition and registry", with
+"JSON Schema validation and stable tool identity", "effect/risk classification
+and policy engine", "durable approvals and exact action fingerprints", and the
+"idempotent tool-call ledger" — is therefore exercised end to end rather than
+verified in parts. Outstanding for the exit gate: the MCP client/host and server
+export (`TLS-008`/`TLS-009`/`TLS-010`) and the plugin/runtime route
+(`TLS-011`/`TLS-014`/`TLS-015`) do not exist, so "a denied model request cannot
+bypass policy through native, MCP, or runtime routes" is proven for the native
+route only, and `TLS-012` stays `[~]` for exactly that reason.
 
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or

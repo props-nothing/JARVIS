@@ -6114,7 +6114,91 @@ Dependencies: Milestone 2 exit gate.
     Implementation Status rather than implied to be wired. `TLS-015` still owns the decision to carry a
     grant forward (it may refuse even when all four conditions hold) and every producer that would write
     one.
-- [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
+- [~] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy. **The native route is now
+  proven and reachable; the MCP and runtime routes do not exist yet, so their proof is not
+  attempted.** The native proof is not a test over a hypothetical path — it is the only path a
+  native tool has, and the milestone's real defect was that the path did not exist at all.
+  Evidence: `jarvis_application::tool_call` owns the single governed pipeline
+  (`resolve -> validate -> fingerprint -> evaluate -> reserve -> execute -> record`), the
+  infrastructure adapters in `jarvis_infrastructure::tool_adapters` and the first real native tool
+  (`clock.now@1`, `native_tools::clock`) are its production callers, and the run controller now
+  dispatches model-proposed tool calls through it instead of refusing every intent with
+  `run.tools_not_implemented`. **By construction rather than by assertion**, which is the only
+  version of this claim that holds: `ToolCallService::invoke` is one method, every step is a call
+  inside it, and a second entry point would be a second pipeline — and the one a caller reached
+  first would be the one that governed. The tests below are what make the construction checkable.
+  - **`EXECUTING` is durable before the effect, and the assertion is made from *inside* the effect.**
+    The contract's rule is about ordering, so a read taken after `invoke` returns a *later* state and
+    would pass for an implementation that wrote `Executing` afterwards. The recording executor reads
+    the ledger while its own body is running and returns it to the test, and the three writes
+    (`Approved`, `Reserved`, `Executing`) are separate rather than one combined write for the same
+    reason: a single write carrying state-and-outcome would place `EXECUTING` on disk only after the
+    world changed, which is the window a crash duplicates an effect in. Falsified by moving the
+    `Executing` transition after the `execute` call, which fails
+    `executing_is_recorded_before_the_effect_runs` on the observed state alone.
+  - **A refusal is an outcome, never an error.** `ToolCallOutcome::Refused` carries a
+    `ToolErrorClass`, and a denied call, an unknown tool, and invalid arguments all arrive as it —
+    because a model that is not told "you are not allowed to do that" proposes it again, and
+    collapsing these into `Err` would make the controller report a *run fault* for a working
+    refusal. The refusal detail is rendered into the observation the next turn receives, so the loop
+    is closed rather than merely recorded.
+  - **A consequential tool cannot be dispatched by a grant alone.** The `email.send@1` fixture is
+    granted and *still* waits: policy's `Allow` requires a **positive** property (read-only **and**
+    low risk), so a tool that declares `allow` while doing something consequential is asked about
+    anyway. The load-bearing assertion is the executor's call count — zero — because a pipeline that
+    ran the effect and *then* asked would make every approval decorative, and a test that asserted
+    only the outcome would not distinguish the two.
+  - **The grant source that ships is the reviewed one, and it is narrow on purpose.**
+    `NativeReadOnlyGrants` confers a grant only for `SourceKind::Native` **and** `risk == Low`
+    **and** effects exactly `{ReadOnly}`. The conjunction is the point: each condition alone is
+    satisfied by a tool that should not have been granted (a native tool that writes, a low-risk
+    tool that sends, a read that also deletes), so the predicate is asserted from the refusing side
+    as well as the granting one.
+  - **A repeat is answered from the ledger, and the count proves it.** Two identical calls produce
+    one execution and a `Duplicate` outcome, which is the difference between "the ledger is read" and
+    "the ledger is written and then ignored". The ambiguous arm is the complement:
+    `OutcomeAmbiguous` is **never retried**, because repeating a call whose effect may or may not
+    have happened is how one effect becomes two.
+  - **⚠ One logical call used to have two identities, and only a cross-record assertion could see
+    it.** `raise_approval` minted a **fresh** `ToolCallId` for the approval's `tool_call_id` instead
+    of the ledger row's own, so the durable prompt a user decides named a call that appears in no
+    ledger row — and nothing could connect the decision to the row it releases, which is the read a
+    resume needs. Every assertion in the pipeline suite stayed green, because none of them compared
+    the two records: the test that catches it re-reads the **ledger row** through
+    `awaiting_conversion` and compares it with the stored prompt, so it cannot be satisfied by two
+    values built from the same expression in two places. Falsified by restoring
+    `ToolCallId::from_uuid(now_v7())` in the request, which fails
+    `a_prompt_names_the_very_row_the_ledger_opened` with "the prompt must name the ledger row's own
+    call identifier, not a second one". The identifier is now derived once
+    (`canonical_call_id`) and carried into both records. The approval's raised arguments also stopped
+    being re-derived from a second source: the call id travels **from the row**, so the pair cannot
+    drift.
+  - **The loop, end to end, against a real controller.** `run_controller_tests` drives a run whose
+    model proposes a tool call and asserts the **exact 11-event sequence** rather than an outcome,
+    which is what caught two real defects: a `ToolResult` published without its `ToolCall`
+    (`jarvis.orphaned_tool_result`) and a transition attempted straight from `Observing`
+    (`jarvis.run_transition_not_allowed` — the loop must go `Observing -> Planning ->
+    AwaitingModel`). Both are invisible to a test that only checks the final answer.
+  - **Not done, and named.** The MCP route (`TLS-008`/`TLS-009`) and the external-runtime route
+    (`TLS-011`/`TLS-015`) have no transport yet, so no test can yet show *their* calls arriving at
+    the same pipeline; when they exist, the proof they need is that they reach `invoke` rather than a
+    parallel path, and this item stays `[~]` until that is asserted. The result body is not durable
+    in the ledger — a `Duplicate` reports the recorded class and state, not the recorded output —
+    and `ClockUnavailable` is a service error rather than a tool outcome, so a clockless daemon
+    fails the call rather than refusing it. **And a waiting call cannot yet be resumed, for a reason
+    that is now structural rather than merely absent:** an approved call must reserve and dispatch
+    through this same pipeline, which needs the arguments it was proposed with, and the ledger
+    stores none (`tool_call_records` has no arguments column — the row is about whether an effect may
+    exist, not about how to perform one). Dispatching the call when the approval is decided would
+    therefore need the arguments re-derivable from a durable proposal record, and without one the
+    honest options are "nothing dispatches it" or "it is dispatched with a second copy of the
+    arguments that could differ from the fingerprinted ones — the exact defect the fingerprint
+    exists to prevent". So a granted prompt currently leaves a `waiting_approval` row whose key keeps
+    its reservation: a later duplicate is refused `Conflict` rather than answered, and startup
+    recovery ends the row `cancelled` as a safe-to-retry pre-dispatch call. That is fail-closed, and
+    it is written down here rather than implied to work.
+  - 1646 workspace tests (+1). 211 TODO IDs (unchanged — the item is `[~]`). All gates green
+    (`fmt`, `clippy -D warnings`, `doc`, `test`, both docs gates). **DO NOT COMMIT.**
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,
   revoke, and resume use cases for API and CLI with channel assurance checks. Owns
   `jarvis_application::approval_service`.

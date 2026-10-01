@@ -404,6 +404,14 @@ pub struct RunPorts {
     /// means nothing has been measured yet, so every descriptor keeps `None` and a route requiring
     /// incremental delivery refuses rather than passing on an absent measurement.
     pub delivery_campaigns: Vec<crate::repository::model_call::ModelDeliverySamples>,
+    /// The governed tool-call pipeline, when one is composed.
+    ///
+    /// `None` is a real state and is **fail-closed**: a controller without it refuses every tool
+    /// call with `run.tools_not_implemented` rather than running one ungoverned. Every existing
+    /// controller test composes without it, which is why the "no tools" path stays covered and why
+    /// the refusal code still means "this deployment has no pipeline" rather than "the fabric was
+    /// never built".
+    pub tools: Option<Arc<crate::tool_call::ToolCallService>>,
 }
 
 /// Orchestrates run creation, execution, and cancellation.
@@ -507,7 +515,7 @@ impl RunService {
     /// Builds a controller over this service's ports.
     #[must_use]
     pub fn controller(&self) -> RunController {
-        RunController::new(
+        let controller = RunController::new(
             Arc::clone(&self.ports.runs),
             Arc::clone(&self.ports.conversations),
             Arc::clone(&self.ports.model_calls),
@@ -515,7 +523,14 @@ impl RunService {
             Arc::clone(&self.ports.provider),
             Arc::clone(&self.ports.clock),
         )
-        .with_notifier(self.live.clone())
+        .with_notifier(self.live.clone());
+        // The tool pipeline is attached **here** rather than read inside the controller, so a
+        // controller built from ports without one cannot execute a tool at all — the composition is
+        // the enablement, and there is no runtime path that turns it on.
+        match self.ports.tools.as_ref() {
+            Some(tools) => controller.with_tools(Arc::clone(tools)),
+            None => controller,
+        }
     }
 
     /// Creates a run for `context` and returns it without waiting for it to finish.
