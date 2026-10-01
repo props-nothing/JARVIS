@@ -441,6 +441,100 @@ export function unownedAcceptanceScenarios(traceability, acceptanceHeadings) {
   return acceptanceHeadings.filter((value) => !owned.has(value));
 }
 
+/**
+ * A test-shaped identifier: a snake_case sentence long enough to be a test name.
+ *
+ * Deliberately narrow. A document cites a test to tell a reader where a rule is *proven*, so the
+ * checker's job is to notice when the citation no longer resolves — and the safe failure is to miss a
+ * shortened name, not to flag every snake_case phrase in the corpus. Requiring an article or quantifier
+ * prefix plus ten characters of body keeps `tool_call_repository.rs` and `MAX_PENDING_PAGE` out of the
+ * result, which is why it is a shape test rather than "any backticked identifier".
+ */
+const CITED_TEST_NAME =
+  /^(?:a|an|the|every|no|one|two|three|four|each|all|only|both|neither)_[a-z0-9_]{10,}$/;
+
+/**
+ * Returns the test names a document cites that no `fn` in the workspace defines.
+ *
+ * **A citation is a claim, and nothing checked it.** `BRN-062` found `LedgerOperation`'s doc naming a
+ * guard that did not exist; `BRN-064` found a **contract's** test table citing a name its test had been
+ * renamed away from — and a reader who follows a citation that resolves to nothing concludes the rule
+ * is unproven, which is the opposite of what the sentence intends. This belongs in the docs validator
+ * because it is the one gate every change already runs, and a checker nobody runs does not exist.
+ *
+ * **A line may opt out explicitly, and the opt-out is per line on purpose.** A sentence that says
+ * "renamed from `old_name`" is *correct prose* that names a symbol defined nowhere, so it is
+ * distinguished by the writer marking that one line `citation-history` rather than by the checker
+ * guessing from the surrounding words. A prose heuristic would have to decide which sentences are
+ * historical, and the direction it fails in is the dangerous one — a checker that stops flagging a
+ * renamed citation is silence that reads as a clean corpus. The marker is a deliberate, greppable
+ * statement that this name is history rather than a reference.
+ *
+ * The defined set is built from every `fn` in `crates/` and `apps/`, and the searched text is the corpus
+ * the caller passes, so both halves are explicit inputs and the function is a pure test subject.
+ */
+export function unresolvedTestCitations(definedNames, textsByPath) {
+  const unresolved = new Map();
+  for (const [relativePath, text] of textsByPath) {
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index].includes(CITATION_HISTORY_MARKER)) {
+        continue;
+      }
+      for (const match of lines[index].matchAll(/`([a-z][a-z0-9_]{11,})`/g)) {
+        const name = match[1];
+        if (!CITED_TEST_NAME.test(name) || definedNames.has(name)) {
+          continue;
+        }
+        if (!unresolved.has(name)) {
+          unresolved.set(name, []);
+        }
+        unresolved.get(name).push(`${relativePath}:${index + 1}`);
+      }
+    }
+  }
+  return unresolved;
+}
+
+/**
+ * Marks a line as naming a test *historically* rather than citing it as current.
+ *
+ * Written as an HTML comment so it is invisible in the rendered document, and checked for as a plain
+ * substring so it can sit on any line of any text file. The name is deliberately long and specific:
+ * `history` alone would appear in ordinary prose about this project's own rounds.
+ */
+export const CITATION_HISTORY_MARKER = "<!-- citation-history -->";
+
+/**
+ * Checks every test citation in the documentation corpus against the source tree.
+ *
+ * Reads both the documents and the Rust sources, so it compares the two rather than one against a
+ * hand-maintained list — which is exactly the defect `BRN-016` recorded for the capability example
+ * ("the document against itself").
+ */
+export function validateCitations(errors) {
+  const files = walk(ROOT);
+  const definedNames = new Set();
+  for (const filePath of files.filter((value) => value.endsWith(".rs"))) {
+    const text = readFileSync(filePath, "utf8");
+    for (const match of text.matchAll(/\bfn\s+([a-z][a-z0-9_]*)\s*[<(]/g)) {
+      definedNames.add(match[1]);
+    }
+  }
+  const documents = files.filter((value) => value.endsWith(".md"));
+  const texts = new Map();
+  for (const filePath of documents) {
+    texts.set(relative(filePath), readFileSync(filePath, "utf8"));
+  }
+  const unresolved = unresolvedTestCitations(definedNames, texts);
+  for (const [name, sites] of unresolved) {
+    errors.push(
+      `test citation resolves to nothing: ${name} (cited at ${sites.slice(0, 3).join(", ")})`,
+    );
+  }
+  return documents.length;
+}
+
 export function traceabilityRowErrors(line, knownTodos, knownAcceptance) {
   const rowErrors = [];
   const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
@@ -1013,6 +1107,7 @@ function main() {
   const textFileCount = validateTextEncoding(errors);
   const { acceptanceCount, requirementCount, todoCount } =
     validateIdsAndTraceability(errors);
+  validateCitations(errors);
   const integrationCount = validateEvidence(
     errors,
     argumentsValue.changedFiles,

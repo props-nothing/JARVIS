@@ -50,6 +50,35 @@ Markdown file, so the gate's headline count had never described the repository. 
 file in a disposable working area must not be able to fail the gate or change its count, and
 a fail-closed test writes both a `.scratch` probe and asserts the count is unchanged.
 
+## The Test Citation Check
+
+`unresolvedTestCitations` in `scripts/validate-docs.mjs` reads every Markdown file the walk
+reaches, collects the test-shaped identifiers it cites in backticks, and compares them against
+every `fn` **actually defined** in `crates/` and `apps/`. A name that is cited and defined
+nowhere is an error naming the citation's file and line.
+
+This check exists because a citation is a claim about where a rule is *proven*, and nothing was
+checking it. Two instances were found by hand before it existed. `LedgerOperation`'s doc comment
+named `every_operation_has_a_spelling_and_parses` as the guard that keeps its `ALL` list total,
+and no such test existed — on an enum whose column **is** stored, so a variant missing from the
+list would have been a value JARVIS writes and cannot read. And
+`docs/contracts/model-data-policy.md`'s test table cited `a_grant_needing_step_up_is_refused_at_standard_assurance`, <!-- citation-history -->
+which had been renamed to `..._for_a_standard_context`; a reader following the citation would
+conclude the step-up rule is unproven, which is the opposite of the table's intent. Both are the
+`BRN-016` shape — a claim checked against itself rather than against the thing it describes — so
+the check reads the documents **and** the sources rather than comparing a document to a list.
+
+**A line that names a test historically is marked, and the marker is explicit.** A sentence
+saying "renamed from `old_name`" is correct prose that names a symbol defined nowhere. It is
+excluded by writing `<!-- citation-history -->` on that line — an HTML comment, invisible in the
+rendered document, and a deliberate greppable statement that this is history rather than a
+reference. The alternative, inferring "historical" from the words around the name, is a heuristic
+over prose whose failure direction is the dangerous one: a citation that silently stops being
+flagged reads as a clean corpus. The fail-closed tests drive the function with a resolved
+citation (so it cannot be satisfied by always reporting), with an unresolved one, and with the
+same sentence both marked and unmarked (so the marker, not the wording, is what the check
+responds to).
+
 The `lint` lane's `cargo doc` step is what makes the crate-level
 `#![deny(rustdoc::broken_intra_doc_links)]` real. `clippy` compiles doc comments
 without resolving their links, so without a step that runs rustdoc, a doc link

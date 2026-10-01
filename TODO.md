@@ -2611,7 +2611,7 @@ Foundation TODO remains incomplete.
     `model.exception_required` would tell an operator to inspect a policy for a request that never
     authenticated.
   - **The existing test was asserting the wrong actor, and had to be rewritten rather than
-    adjusted.** `a_grant_needing_step_up_is_refused_at_standard_assurance` set the request's
+    adjusted.** `a_grant_needing_step_up_is_refused_at_standard_assurance` set the request's <!-- citation-history -->
     assurance field, so it proved the *domain* checked whatever it was handed while the value it
     checked was the caller's to pick — a green test over a hole. It now varies the one thing a real
     request cannot forge, and the same `GrantRequest` is refused from a standard context and
@@ -2807,7 +2807,7 @@ Foundation TODO remains incomplete.
     `runs.create/read/cancel/events` while the daemon advertised **only `system.status`** — so a
     client reading the example would call an operation the daemon never advertised, and a client
     reading the daemon would not learn the run routes exist. The protocol test was named
-    `the_status_example_names_the_capabilities_the_daemon_actually_serves` and its comment said "the
+    `the_status_example_names_the_capabilities_the_daemon_actually_serves` and its comment said "the <!-- citation-history -->
     daemon's own route table must agree", **but it only read the contract's example and compared it
     to a literal list** — the document against itself. It could never see the daemon, and
     `jarvis-protocol` cannot: it does not depend on `jarvis-infrastructure`.
@@ -2835,7 +2835,7 @@ Foundation TODO remains incomplete.
 - [x] `BRN-030` Make startup recovery reach **every** interrupted run, and make a bounded read say so.
   Found by applying the previous round's technique — a test whose name claims a cross-check its body
   cannot perform — and then following the claim it hid.
-  - **The test-shaped defect first:** `the_double_enforces_scope_like_the_real_adapter` claimed in its
+  - **The test-shaped defect first:** `the_double_enforces_scope_like_the_real_adapter` claimed in its <!-- citation-history -->
     name to compare the test double against the SQLite adapter. It cannot: `jarvis-application` does
     not depend on `jarvis-infrastructure`, so the test drove the double and asserted against the
     double. Renamed to what it does. The same sweep found **nine comment claims of parity** inside
@@ -5031,10 +5031,15 @@ Dependencies: Milestone 2 exit gate.
     `EXECUTE` fails with `Execute must serialize to the spelling it parses from: left: "\"execute\"",
     right: "\"EXECUTE\""`. The second is the `ToolCallState` defect reintroduced deliberately, and the
     test names it rather than reporting a set-size mismatch.
-  - **A second false doc claim:** `assurance_of` cited `a_guest_is_refused_before_the_store_is_read`;
+  - **A second false doc claim:** `assurance_of` cited `a_guest_is_refused_before_the_store_is_read`; <!-- citation-history -->
     the test is `a_guest_cannot_decide_and_is_refused_before_the_record_is_read`. Corrected rather than
     left, because a reader following the citation would not find the test and would conclude the
-    guarantee is unproven — the opposite of what the sentence intends.
+    guarantee is unproven — the opposite of what the sentence intends. **`BRN-064` later found this
+    same sentence cited a name defined nowhere in the workspace**, and only because the correction
+    wrote the stale name in a shape a checker could read: a citation in backticks is a claim whether a
+    sentence says it is current or superseded, so the checker reports it either way and a reader has to
+    judge. The four other stale names `BRN-064` reported are all like this one — inside sentences that
+    say "renamed from" or "was named" — so they are correct history rather than defects.
   - **Two predicates had no production caller because a caller restated them.** `BudgetStatus::is_permitted`
     was defined as `!matches!(self, Expired)` while `RunBudget::permits_step_at` wrote the *same*
     expression inline, and `FailureClass::is_transient` had **zero** references anywhere while
@@ -5108,6 +5113,51 @@ Dependencies: Milestone 2 exit gate.
     check claims naming a module, field, or constant, and it is not yet a gate — 4 of the 5 claims this
     round corrected were about *callers* rather than names, so a name-existence check would not have
     found them either.
+- [x] `BRN-064` Make the test-citation check a **permanent gate** rather than a hand sweep, and fix the
+  one stale citation it found in a contract document. `BRN-062` found this class by hand; nothing stopped
+  it recurring, and a contract's test table is exactly where a reader looks to decide whether a rule is
+  proven.
+  Evidence: `unresolvedTestCitations` + `validateCitations` in `scripts/validate-docs.mjs` (wired into
+  `main`), 3 fail-closed tests in `scripts/validate-docs.test.mjs`, the corrected citation in
+  `docs/contracts/model-data-policy.md`, four `<!-- citation-history -->` markers in `TODO.md`, and the
+  new **Test Citation Check** section in `docs/operations/ci-gates.md`.
+  - **⚠ The contract citation was the defect: `docs/contracts/model-data-policy.md` cited
+    `a_grant_needing_step_up_is_refused_at_standard_assurance`, which no longer exists.** The test is <!-- citation-history -->
+    `a_grant_needing_step_up_is_refused_for_a_standard_context` — renamed when it was rewritten to vary
+    the *server-derived* assurance rather than a body field, which is the stronger test. A reader
+    following the citation into the table's "Falsified by" column would find nothing and conclude the
+    step-up rule is unproven, the opposite of the table's intent. The corrected name resolves.
+  - **The checker validates against the sources, not against a list.** It collects every `fn` in
+    `crates/` and `apps/` and every test-shaped backticked identifier in the Markdown corpus, and
+    compares the two — the `BRN-016` lesson ("the document against itself") applied to citations. A
+    hand-maintained allowlist would be a second thing to drift.
+  - **Four stale citations are correct history rather than defects, and the marker is how the checker
+    tells.** `BRN-062`'s own record cites `a_guest_is_refused_before_the_store_is_read` (naming the stale <!-- citation-history -->
+    value in order to correct it), and three TODO entries cite names their tests were renamed *away from*,
+    in sentences that say so. A prose heuristic that tried to detect "this sentence is about the past"
+    would fail in the dangerous direction — a citation that silently stops being flagged reads as a clean
+    corpus — so the exclusion is an explicit per-line `<!-- citation-history -->` marker: an HTML comment,
+    invisible when rendered, greppable, and a deliberate statement that the name is history.
+  - **The finder was wrong once more, in the OVER-reporting direction, and calibrating caught it.** The
+    first version collected type names, function names, constants, and enum variants but **not struct
+    fields**, so twelve `Struct::field` paths (`RunBudget::max_output_tokens`,
+    `PolicyRequest::action_digest`) read as unresolved. Over-reporting is the direction that reads as a
+    work list, so it was fixed before the result meant anything. With fields collected, all **646**
+    backticked `Type::item` paths in doc comments resolve — a clean result that only now means something,
+    because the same-looking finding had a different cause the first time.
+  - **Falsified end to end three ways.** Removing a `<!-- citation-history -->` marker makes the
+    validator exit `1` naming `a_guest_is_refused_before_the_store_is_read (cited at TODO.md:5034)`;
+    replacing a real contract-table citation with `a_test_that_does_not_exist_anywhere_at_all` makes it <!-- citation-history -->
+    exit `1` naming `docs/contracts/model-data-policy.md:259`; restoring each returns it to `0`. The unit
+    tests additionally drive the pure function with a **resolved** citation, which is the positive control
+    that stops "report everything" from satisfying the check.
+  - **Not covered, and named:** it matches a test-shaped name (article prefix plus ten characters), so a
+    shortened name, a name in prose without backticks, a path, or a claim about a *module* or *constant*
+    is not caught — the same boundary `BRN-062` recorded. And a citation that **resolves** is not the same
+    as a citation that is **true**: `BRN-063` found four claims about callers that named a real function
+    the caller did not exist for, which this check cannot see at all.
+  - 23 validator tests (+3). 1578 workspace tests (unchanged). All gates green (fmt, clippy, test, doc,
+    both docs gates). **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

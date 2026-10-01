@@ -18,6 +18,7 @@ import {
   sectionForHeading,
   traceabilityRowErrors,
   unownedAcceptanceScenarios,
+  unresolvedTestCitations,
 } from "./validate-docs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -135,6 +136,66 @@ test("a scenario covered through a range is not reported as unowned", () => {
   const toForm =
     "| `NFR-X-001` | [Owner](o.md) | [Contract](c.md) | All | `FND-007` | `ACC-070` to `ACC-074` |";
   assert.deepEqual(unownedAcceptanceScenarios(toForm, headings), []);
+});
+
+test("a test citation that resolves to nothing is reported", () => {
+  // `BRN-062` found `LedgerOperation`'s doc naming a guard that did not exist, and `BRN-064` found a
+  // **contract's** test table citing a name its test had been renamed away from. A reader who follows
+  // a citation that resolves to nothing concludes the rule is unproven, which is the opposite of what
+  // the sentence intends.
+  const defined = new Set(["an_existing_test_name_here"]);
+  const cited = new Map([
+    [
+      "docs/contracts/x.md",
+      "| a rule | `Some::thing` | `a_renamed_away_test_name_here` |",
+    ],
+  ]);
+  const unresolved = unresolvedTestCitations(defined, cited);
+  assert.deepEqual([...unresolved.keys()], ["a_renamed_away_test_name_here"]);
+  assert.equal(unresolved.get("a_renamed_away_test_name_here")[0], "docs/contracts/x.md:1");
+
+  // And a citation that resolves is not reported, so the check cannot be satisfied by always
+  // reporting — the positive control every finder in this repository needs.
+  const present = new Map([["docs/contracts/x.md", "| a rule | `Some::thing` | `an_existing_test_name_here` |"]]);
+  assert.equal(unresolvedTestCitations(defined, present).size, 0);
+});
+
+test("a line marked as citation history is not reported", () => {
+  // A sentence that says "renamed from `old_name`" is correct prose that names a symbol defined
+  // nowhere. It is distinguished by an explicit per-line marker rather than by a guess about the
+  // surrounding words, because a prose heuristic that *stops* flagging a renamed citation fails in
+  // the direction this project treats as dangerous: silence that reads as a clean corpus.
+  const defined = new Set();
+  const marked = new Map([
+    [
+      "TODO.md",
+      "**Renamed from `the_old_test_name_that_moved`** <!-- citation-history -->",
+    ],
+  ]);
+  assert.equal(unresolvedTestCitations(defined, marked).size, 0);
+
+  // The same sentence WITHOUT the marker is reported, so the marker is what the check responds to
+  // rather than the wording around it.
+  const unmarked = new Map([["TODO.md", "**Renamed from `the_old_test_name_that_moved`**"]]);
+  assert.equal(unresolvedTestCitations(defined, unmarked).size, 1);
+});
+
+test("a non-test-shaped backticked identifier is not treated as a citation", () => {
+  // The shape test is what keeps the check usable: a document full of file names, constants, and
+  // identifiers would otherwise report dozens of entries, and a checker that over-reports is a work
+  // list a reader stops reading. `tool_call_repository.rs` has no article prefix and `MAX_PENDING_PAGE`
+  // is upper case, so neither is a candidate.
+  const defined = new Set();
+  const corpus = new Map([
+    [
+      "docs/contracts/x.md",
+      "`tool_call_repository.rs`, `MAX_PENDING_PAGE`, `every_state_serializes_to_its_own_spelling`",
+    ],
+  ]);
+  // The third IS test-shaped and undefined, so it is reported; the first two are not.
+  assert.deepEqual([...unresolvedTestCitations(defined, corpus).keys()], [
+    "every_state_serializes_to_its_own_spelling",
+  ]);
 });
 
 test("traceability rows reject unknown and missing IDs", () => {
