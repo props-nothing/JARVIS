@@ -339,6 +339,14 @@ decision about *something*, and a default for either would let a caller decide a
 reviewed. The CLI prints the daemon's own body in both directions — its state on success so the two
 cannot disagree, and its envelope on a refusal because the stable code is what an operator acts on.
 
+`approvals list` carries `--limit`, `--risk`, and `--cursor`. The last two are the client half of the
+listing's own features: `--risk` narrows to one contract level (a **closed set** parsed on the client,
+so `--risk severe` is a usage error rather than a `400` from a round trip), and `--cursor` sends back
+the `next_cursor` the daemon printed. Without `--cursor` the daemon's own cursor was a value a client
+could read and not use — the same read-but-unusable dead end the cursor was introduced on the daemon
+side to close, one layer out. Both are **omitted** when unset rather than sent as placeholders, so a
+bare `list` is the un-narrowed first page.
+
 **Not implemented, each named rather than implied:**
 
 - **`POST /api/v1/approval-grants/{grant_id}/revoke`.** A standing grant is a *separate* record from a

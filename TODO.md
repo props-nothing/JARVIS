@@ -5829,6 +5829,50 @@ Dependencies: Milestone 2 exit gate.
     `>=` is available) that this increment did not take.
   - 1589 workspace tests (+4: infra 693, application 267). 200 TODO IDs (+1). All gates green (fmt,
     clippy, test, doc, both docs gates), all four hermetic journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-079` Wire the approval listing's **`--risk` and `--cursor` into the reference CLI**, so the
+  cursor the daemon prints is a value an operator can spend rather than only read.
+  Evidence: `ApprovalsAction::List`'s two new options and the `RiskArg`/`list_path` pair in
+  `jarvis-cli`, the `jarvis_protocol::approval::risk` vocabulary, `Risk::ALL` in `jarvis-domain`, and
+  four tests — `the_listing_accepts_a_risk_narrow_and_a_cursor`,
+  `an_unknown_risk_level_is_refused_before_a_request_is_built`, and
+  `the_listing_path_carries_exactly_the_filters_the_client_was_given` (CLI),
+  `the_wire_risk_vocabulary_is_the_domain_ladder_in_ladder_order` (infra), plus the composed-surface
+  steps in `tests/e2e/approval-journey.mjs`.
+  - **The finding: the daemon served `?risk=` and handed back a `next_cursor`, and the reference client
+    could send neither.** `approvals list` was wired for `--limit` only, so a cursor the CLI printed was
+    a value an operator **could read and not use** — the exact dead end the cursor was introduced to
+    close on the daemon side (`BRN-077`/`BRN-078`), one layer out. `TLS-013` names the CLI as a served
+    surface, so a feature the API has and the CLI cannot reach is the CLI half of the feature missing,
+    not a separate one.
+  - **The wire vocabulary moved to `jarvis_protocol::approval::risk` so the CLI does not hold a second
+    spelling.** The CLI depends on `jarvis-protocol`, not `jarvis-domain`, and the contract's rule is
+    that the wire value is the contract's own spelling — so the four level names live beside the
+    `ApprovalView.risk` field they must agree with, and `RiskArg` (a **closed set** parsed on the client)
+    iterates `LEVELS` rather than a local list. `--risk severe` is a usage error before any request is
+    built, rather than a `400` from a round trip: a client that forwarded an unrecognised level would be
+    trusting the server to validate its own command line.
+  - **⚠ `Risk` had no `ALL`, so "every level" had no definition.** `Effect` gained one precisely for the
+    exhaustive-parse guard, and `Risk` — the value an ordering comparison and now a wire filter both turn
+    on — had only the four variants and a `parse` match. Adding `Risk::ALL` gives `every_risk_level_…` a
+    list to iterate, and `the_wire_risk_vocabulary_is_the_domain_ladder_in_ladder_order` (in
+    `jarvis-infrastructure`, the one crate that sees both) holds the wire list to the domain ladder
+    **including its order**, because a future "this level or higher" filter would iterate it.
+  - **`list_path` is a pure function so the query string is checkable without a daemon**, asserted byte
+    for byte (`limit`, `risk`, `cursor` in a fixed order) — the same technique `ask_body` uses. The
+    cursor is inserted **verbatim**: it is base64url-without-padding behind a `v1.` prefix, so it is
+    already URL-safe, and percent-encoding it would be wrong in the other direction because the daemon
+    decodes the literal value it minted.
+  - **Falsified three ways.** Dropping the risk push in `list_path` fails the composed-surface step
+    (`**--risk critical must exclude the high-risk approval**`); reordering `LEVELS` fails both the
+    protocol spelling test and the infra ladder cross-check independently (`left: ["low","high",…]`); and
+    `--risk severe` is asserted to fail parsing rather than reach the daemon. Each restored to `0`.
+  - **Not done, and named.** `--risk` is a single level, not a set or `>=` range (the `Risk::ALL` order is
+    now available to build one); the other listing filters stay API-refused by name; and the CLI still
+    does not *follow* a `has_more` page automatically — an operator passes `--cursor` explicitly, which
+    is the honest shape while the listing is an inspection surface rather than a sync.
+  - 1595 workspace tests (+6: cli 42, protocol 49, domain 501, infra 695; plus 3 composed-surface CLI
+    steps in the journey). 201 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both docs gates),
+    all four hermetic journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

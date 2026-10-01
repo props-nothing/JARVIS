@@ -330,6 +330,17 @@ enum ApprovalsAction {
         /// The page size to request. The daemon clamps it to its own bound.
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
+        /// Narrow to one risk level. `critical` is the set that will demand a step-up.
+        #[arg(long, value_name = "LEVEL")]
+        risk: Option<RiskArg>,
+        /// Resume a page from the `next_cursor` a previous listing printed.
+        ///
+        /// Without this the daemon's own `next_cursor` was a value a client could **read and not use**:
+        /// the listing reported `has_more: true` and handed back a position, and the reference client had
+        /// no way to send it — the same dead end the cursor was introduced to close on the daemon side,
+        /// one layer out.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// Print one approval.
     Show {
@@ -973,6 +984,99 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
     }
 }
 
+/// A risk level a caller may narrow the approval listing to.
+///
+/// **The contract's closed set, spelled from the wire vocabulary rather than through
+/// `jarvis_domain::Risk`.** This crate depends on `jarvis-protocol` and `jarvis-infrastructure`, not on
+/// the domain crate, and the contract's rule is that the wire value is the contract's own spelling —
+/// so the four level names live in `jarvis_protocol::approval::risk` beside the `ApprovalView.risk`
+/// field they must agree with, and this argument parses from that same list. A local copy here would be
+/// a second spelling of a value the daemon sends, which is the two-spellings defect the project keeps
+/// finding.
+///
+/// **A closed set rather than a free string.** `--risk severe` must be refused by the client, not sent
+/// to the daemon to be refused there: the daemon answers `400 request.invalid`, but a client that
+/// forwarded an unknown level would be relying on the server to validate its own command line. The
+/// enum makes an unrecognised level a parse error before any request is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RiskArg {
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl RiskArg {
+    /// The contract spelling, which is what the query carries.
+    fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::Low => jarvis_protocol::approval::risk::LOW,
+            Self::Moderate => jarvis_protocol::approval::risk::MODERATE,
+            Self::High => jarvis_protocol::approval::risk::HIGH,
+            Self::Critical => jarvis_protocol::approval::risk::CRITICAL,
+        }
+    }
+
+    /// Parses the contract spelling, refusing anything else.
+    ///
+    /// Written against the protocol's own constant list rather than a local match so a fifth level
+    /// added to the wire vocabulary forces a decision here instead of being silently unselectable.
+    fn parse(value: &str) -> Result<Self, String> {
+        for (name, level) in [
+            (jarvis_protocol::approval::risk::LOW, Self::Low),
+            (jarvis_protocol::approval::risk::MODERATE, Self::Moderate),
+            (jarvis_protocol::approval::risk::HIGH, Self::High),
+            (jarvis_protocol::approval::risk::CRITICAL, Self::Critical),
+        ] {
+            if value == name {
+                return Ok(level);
+            }
+        }
+        Err(format!(
+            "unknown risk level {value:?}; expected one of {}",
+            jarvis_protocol::approval::risk::LEVELS.join(", "),
+        ))
+    }
+}
+
+impl std::str::FromStr for RiskArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// Builds the approvals listing path from the client's own arguments.
+///
+/// **Extracted as a pure function so the query-string construction is testable without a daemon.** The
+/// three parameters are the ones a `approvals list` may set, and the ordering is fixed (`limit`, `risk`,
+/// `cursor`) so the path is deterministic and a test can assert it byte for byte.
+///
+/// **The `cursor` value is inserted verbatim, and that is safe because it is already URL-safe.** The
+/// daemon's cursor is base64url-without-padding behind a `v1.` prefix, so it contains only
+/// `[A-Za-z0-9_-]` and a dot — no `&`, `=`, or space that would break the query — and it is an *opaque*
+/// position the client must not reinterpret. Percent-encoding it here would be wrong in the other
+/// direction: the daemon decodes the literal value it minted, so an encoded copy would name a position
+/// it never produced.
+fn list_path(limit: Option<u32>, risk: Option<RiskArg>, cursor: Option<&str>) -> String {
+    let mut query: Vec<String> = Vec::new();
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    if let Some(risk) = risk {
+        query.push(format!("risk={}", risk.as_contract_str()));
+    }
+    if let Some(cursor) = cursor {
+        query.push(format!("cursor={cursor}"));
+    }
+    if query.is_empty() {
+        "/api/v1/approvals".to_owned()
+    } else {
+        format!("/api/v1/approvals?{}", query.join("&"))
+    }
+}
+
 /// Approval inspection and decision.
 ///
 /// The daemon's own response is printed rather than a re-derived summary, so the client cannot
@@ -986,11 +1090,12 @@ async fn approvals(paths: &ProfilePaths, action: ApprovalsAction) -> ExitCode {
         Err(error) => return report_client_error(&error),
     };
     match action {
-        ApprovalsAction::List { limit } => {
-            let path = match limit {
-                Some(limit) => format!("/api/v1/approvals?limit={limit}"),
-                None => "/api/v1/approvals".to_owned(),
-            };
+        ApprovalsAction::List {
+            limit,
+            risk,
+            cursor,
+        } => {
+            let path = list_path(limit, risk, cursor.as_deref());
             print_daemon_response(
                 get_with_status(&state.discovered, &state.credential, &path, API_MAJOR, "").await,
             )
@@ -2140,10 +2245,10 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command, FollowStep,
-        InstallAction, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher, SseFrame, SseParser,
-        StatusBody, ask_body, event_stream_headers, follow_after, follow_run, follow_step,
-        idempotency_key, json_string, parse_status,
+        ApprovalsAction, AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command,
+        FollowStep, InstallAction, RiskArg, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher,
+        SseFrame, SseParser, StatusBody, ask_body, event_stream_headers, follow_after, follow_run,
+        follow_step, idempotency_key, json_string, list_path, parse_status,
     };
     use clap::Parser as _;
     use jarvis_infrastructure::client::Discovered;
@@ -3215,6 +3320,111 @@ mod tests {
         assert!(Cli::try_parse_from(["jarvis", "approvals"]).is_err());
         assert!(Cli::try_parse_from(["jarvis", "approvals", "list"]).is_ok());
         assert!(Cli::try_parse_from(["jarvis", "approvals", "show", "abc"]).is_ok());
+    }
+
+    #[test]
+    fn the_listing_accepts_a_risk_narrow_and_a_cursor() {
+        // **The client half of a feature that had none.** The daemon serves `?risk=` and hands back a
+        // `next_cursor`, but `approvals list` could send only `--limit` — so a client that printed
+        // `next_cursor` had no way to pass it back, the same read-but-unusable dead end the cursor was
+        // introduced on the daemon side to close. Both options must parse, and together with `--limit`,
+        // because a page is narrowed *and* resumed in real use.
+        let cli = Cli::try_parse_from([
+            "jarvis",
+            "approvals",
+            "list",
+            "--limit",
+            "5",
+            "--risk",
+            "critical",
+            "--cursor",
+            "v1.abc",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Approvals {
+                action:
+                    ApprovalsAction::List {
+                        limit,
+                        risk,
+                        cursor,
+                    },
+            } => {
+                assert_eq!(limit, Some(5));
+                assert_eq!(risk, Some(RiskArg::Critical));
+                assert_eq!(cursor.as_deref(), Some("v1.abc"));
+            }
+            other => unreachable!("expected approvals list, got {other:?}"),
+        }
+        // The shortest form names no filters, so a bare `list` is the un-narrowed first page.
+        let bare = Cli::try_parse_from(["jarvis", "approvals", "list"]).expect("parses");
+        assert!(matches!(
+            bare.command,
+            Command::Approvals {
+                action: ApprovalsAction::List {
+                    limit: None,
+                    risk: None,
+                    cursor: None,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_risk_level_is_refused_before_a_request_is_built() {
+        // A closed set parsed on the client, so `--risk severe` never reaches the daemon. The daemon
+        // would answer `400 request.invalid`, but a client that forwarded an unrecognised level would
+        // be trusting the server to validate its own command line — and the refusal would arrive as a
+        // network round trip rather than as a usage error.
+        assert!(Cli::try_parse_from(["jarvis", "approvals", "list", "--risk", "severe"]).is_err());
+        // Every level the wire vocabulary names is accepted, driven by `LEVELS` so a fifth level added
+        // to the contract is either selectable here or fails to parse — the assertion cannot go stale
+        // silently.
+        for level in jarvis_protocol::approval::risk::LEVELS {
+            let parsed = Cli::try_parse_from(["jarvis", "approvals", "list", "--risk", level])
+                .expect("every contract level must parse");
+            assert!(matches!(parsed.command, Command::Approvals { .. }));
+        }
+    }
+
+    #[test]
+    fn the_listing_path_carries_exactly_the_filters_the_client_was_given() {
+        // Byte-exact, because the path *is* the request: a transposed or dropped parameter is a
+        // different query, and the daemon reads the three by name. Asserting the string is what makes
+        // "the filter the user typed reaches the wire" checkable without a daemon — the same reason
+        // `ask_body` is asserted as JSON rather than inspected field by field.
+        assert_eq!(list_path(None, None, None), "/api/v1/approvals");
+        assert_eq!(
+            list_path(Some(25), None, None),
+            "/api/v1/approvals?limit=25"
+        );
+        assert_eq!(
+            list_path(None, Some(RiskArg::Critical), None),
+            "/api/v1/approvals?risk=critical",
+        );
+        assert_eq!(
+            list_path(None, None, Some("v1.abc")),
+            "/api/v1/approvals?cursor=v1.abc",
+        );
+        // All three, in the fixed order, so a resumed narrowed page composes rather than replacing.
+        assert_eq!(
+            list_path(Some(5), Some(RiskArg::High), Some("v1.xyz")),
+            "/api/v1/approvals?limit=5&risk=high&cursor=v1.xyz",
+        );
+        // Every level the protocol names renders as its own contract spelling, so the path cannot carry
+        // a spelling the daemon's `Risk::parse` would refuse.
+        for (level, expected) in [
+            (RiskArg::Low, "low"),
+            (RiskArg::Moderate, "moderate"),
+            (RiskArg::High, "high"),
+            (RiskArg::Critical, "critical"),
+        ] {
+            assert_eq!(level.as_contract_str(), expected);
+            assert_eq!(
+                list_path(None, Some(level), None),
+                format!("/api/v1/approvals?risk={expected}"),
+            );
+        }
     }
 
     #[test]

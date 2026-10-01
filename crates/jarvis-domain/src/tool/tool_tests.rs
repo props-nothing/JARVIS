@@ -492,6 +492,27 @@ fn every_effect_parses_from_its_contract_spelling() {
 }
 
 #[test]
+fn every_risk_level_parses_from_its_contract_spelling() {
+    // The guard on the risk vocabulary, mirroring `every_effect_parses_from_its_contract_spelling`.
+    // `Risk::ALL` is what a caller iterates to check "every level" — the approval listing's `risk`
+    // filter narrows to one of these, and the wire vocabulary is asserted equal to this list elsewhere
+    // — so a level added without a parse arm must fail here rather than making the new level
+    // unusable-but-silent.
+    for level in Risk::ALL {
+        assert_eq!(accepted(Risk::parse(level.as_contract_str())), Some(*level));
+    }
+    assert_eq!(Risk::ALL.len(), 4, "the contract lists four risk levels");
+    // The order is the ladder's own, which `Ord` provides and `ALL` must match: a caller relying on
+    // "this level or higher" iterates `ALL`, so a list out of ladder order would make that wrong
+    // without changing any spelling.
+    assert!(
+        Risk::ALL.windows(2).all(|pair| pair[0] < pair[1]),
+        "Risk::ALL must be in ascending ladder order: {:?}",
+        Risk::ALL,
+    );
+}
+
+#[test]
 fn consequential_effects_are_named_once() {
     // The classifier is what policy asks instead of keeping its own list, so a second list
     // would be the one that drifts. The assertion names the members rather than only counting

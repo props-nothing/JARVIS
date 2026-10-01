@@ -239,3 +239,62 @@ pub struct CancelApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
+
+/// The contract's risk-level vocabulary, as the wire spells it.
+///
+/// **The listing's `risk` filter and `ApprovalView.risk` are the same four values, so they are named
+/// once.** The filter's query parameter and the field a client reads back must agree about the
+/// spelling, and a filter that named a level the view rendered differently would let a client narrow to
+/// a set and then be unable to match the rows against the level it asked for. The list lives here, in
+/// the crate that owns the wire vocabulary, rather than being restated by the server's parser and the
+/// client's parser separately.
+///
+/// **Why constants and a `LEVELS` slice rather than an enum.** This crate carries the *wire* vocabulary,
+/// which is text: the domain owns `Risk` as a typed ladder for comparison, and the two must not be
+/// confused. A client that wants a closed set for its command line builds one over these names — which
+/// is exactly what `jarvis-cli`'s `RiskArg` does — while the daemon parses through `Risk::parse`, and
+/// both are held to this one list rather than to a copy.
+pub mod risk {
+    /// No meaningful consequence.
+    pub const LOW: &str = "low";
+    /// Recoverable, bounded consequence.
+    pub const MODERATE: &str = "moderate";
+    /// Hard to reverse or wide-reaching.
+    pub const HIGH: &str = "high";
+    /// Irreversible, financial, or privileged. The level that demands a step-up to decide.
+    pub const CRITICAL: &str = "critical";
+
+    /// Every level, in ascending order of consequence.
+    ///
+    /// A slice and not a set, because the order is meaningful: the domain ladder compares levels, and a
+    /// reader that wants "this level or higher" needs the order the levels actually have. It is the
+    /// single list a caller iterates to build a closed set, so a fifth level added here is reachable by
+    /// every consumer.
+    pub const LEVELS: &[&str] = &[LOW, MODERATE, HIGH, CRITICAL];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::risk;
+
+    #[test]
+    fn the_risk_vocabulary_is_the_four_contract_spellings_in_ladder_order() {
+        // **The list is the contract's, and both the filter and the view are held to it.** The failure
+        // this prevents is a filter that named a level the view spelled differently: a client narrows to
+        // `?risk=critical` and then cannot match the rows against the level it asked for. The spellings
+        // are asserted literally rather than from the constants, because a constant that disagreed with
+        // the contract would otherwise pass against itself.
+        assert_eq!(risk::LEVELS, ["low", "moderate", "high", "critical"]);
+        // The order is the domain ladder's, ascending by consequence, which a reader relying on
+        // "this level or higher" depends on — a reordering would be a silent semantic change.
+        assert_eq!(risk::LEVELS.len(), 4);
+        assert_eq!(risk::LOW, risk::LEVELS[0]);
+        assert_eq!(risk::CRITICAL, risk::LEVELS[3]);
+        // No duplicates, so a caller building a closed set over `LEVELS` cannot produce a repeated
+        // option.
+        let mut sorted = risk::LEVELS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), risk::LEVELS.len());
+    }
+}

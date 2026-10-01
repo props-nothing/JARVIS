@@ -1092,3 +1092,31 @@ fn the_reported_page_bound_is_the_one_the_store_enforces() {
         "the reported page bound and the enforced page bound must be the same limit",
     );
 }
+
+#[test]
+fn the_wire_risk_vocabulary_is_the_domain_ladder_in_ladder_order() {
+    // **The listing's `risk` filter is parsed through the domain ladder and spelled by the wire, so the
+    // two lists must be the same list.** `?risk=critical` is matched by `Risk::parse` against
+    // `Risk::ALL`'s contract spellings, and the client builds its closed set from
+    // `jarvis_protocol::approval::risk::LEVELS` — a level named in one list and not the other is a value
+    // the client offers and the daemon refuses, or a level the daemon accepts that no client can select.
+    //
+    // The comparison lives here for the reason `the_reported_page_bound_is_the_one_the_store_enforces`
+    // does: no single owning crate can see both. `jarvis-protocol` may not depend on `jarvis-domain`
+    // (the documented flow is `Protocol --> Domain`, so domain sits below protocol and cannot be reached
+    // upward), and the domain must not depend on the wire vocabulary. `jarvis-infrastructure` depends on
+    // both.
+    //
+    // The order is asserted too, not only the members: the ladder is what a future "this level or higher"
+    // filter would iterate, and a wire list that agreed on the set but not the order would make that
+    // filter wrong without changing any spelling.
+    let domain: Vec<&str> = Risk::ALL
+        .iter()
+        .map(|level| level.as_contract_str())
+        .collect();
+    assert_eq!(
+        jarvis_protocol::approval::risk::LEVELS,
+        domain.as_slice(),
+        "the wire risk vocabulary must be the domain ladder's spellings, in ladder order",
+    );
+}

@@ -844,6 +844,86 @@ async function main() {
       pass("`approvals list` prints the daemon's listing");
     }
 
+    // **The client half of the `risk` filter and the cursor, which `approvals list` could not send.**
+    // The daemon serves `?risk=` and hands back a `next_cursor`, but the reference client was wired for
+    // `--limit` only — so a cursor the CLI printed was a value an operator could read and not use, the
+    // same read-but-unusable dead end the cursor was introduced to close, one layer out. These steps
+    // drive the flags through the real binary: the two rows are **different** risks (the critical row
+    // and the paging row are both pending here), so a narrow that was dropped returns the wrong id and a
+    // narrow that applied a constant returns the wrong one too.
+    const byRiskCli = run(client, ["--profile", profile, "approvals", "list", "--risk", "critical"]);
+    if (byRiskCli.status !== 0) {
+      fail("`approvals list --risk critical` must succeed", byRiskCli.stderr || byRiskCli.stdout);
+    } else if (!byRiskCli.stdout.includes(CRITICAL_ID)) {
+      fail("`--risk critical` must include the critical approval", byRiskCli.stdout);
+    } else if (byRiskCli.stdout.includes(PAGING_ID)) {
+      fail(
+        "**`--risk critical` must exclude the high-risk approval**, or the narrow was dropped",
+        byRiskCli.stdout,
+      );
+    } else {
+      pass("`approvals list --risk critical` narrows to the critical approval");
+    }
+
+    // An unrecognised level is refused by the **client**, before a request is built — a usage error
+    // rather than a `400` from a round trip. The daemon would refuse it too; the point is that the
+    // client does not forward its own bad command line to the server.
+    const badRiskCli = run(client, ["--profile", profile, "approvals", "list", "--risk", "severe"]);
+    if (badRiskCli.status === 0) {
+      fail("**`--risk severe` must be refused, not sent to the daemon**", badRiskCli.stdout);
+    } else {
+      pass("an unknown risk level is refused by the client before any request");
+    }
+
+    // A page bound of one leaves a second pending row behind, so the daemon must hand back a cursor —
+    // and the CLI must be able to spend it. The two pages must be **different rows**, or a cursor that
+    // restarted from the start would loop forever re-reading one prompt.
+    const firstPageCli = run(client, [
+      "--profile",
+      profile,
+      "approvals",
+      "list",
+      "--limit",
+      "1",
+    ]);
+    let cursorFromCli = null;
+    try {
+      cursorFromCli = JSON.parse(firstPageCli.stdout)?.next_cursor ?? null;
+    } catch {
+      cursorFromCli = null;
+    }
+    if (firstPageCli.status !== 0 || typeof cursorFromCli !== "string") {
+      fail(
+        "**a bounded CLI listing must print a usable next_cursor**, or has_more names work nobody can reach",
+        firstPageCli.stdout || firstPageCli.stderr,
+      );
+    } else if (!firstPageCli.stdout.includes(PAGING_ID)) {
+      fail("the first CLI page must be the earliest-lapsing pending row", firstPageCli.stdout);
+    } else {
+      const secondPageCli = run(client, [
+        "--profile",
+        profile,
+        "approvals",
+        "list",
+        "--limit",
+        "1",
+        "--cursor",
+        cursorFromCli,
+      ]);
+      if (secondPageCli.status !== 0) {
+        fail("`approvals list --cursor` must succeed", secondPageCli.stderr || secondPageCli.stdout);
+      } else if (!secondPageCli.stdout.includes(CRITICAL_ID)) {
+        fail("the second CLI page must be the row after the first", secondPageCli.stdout);
+      } else if (secondPageCli.stdout.includes(PAGING_ID)) {
+        fail(
+          "**the CLI cursor must read a page that does not repeat the first**",
+          secondPageCli.stdout,
+        );
+      } else {
+        pass("`approvals list --cursor` resumes from the cursor the daemon printed");
+      }
+    }
+
     // A decision against an already-decided approval is a state conflict, and the CLI must report the
     // **daemon's own code** rather than a paraphrase — an operator needs the code.
     const rejectCli = run(client, [

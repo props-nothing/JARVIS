@@ -135,6 +135,16 @@ pub enum Risk {
 }
 
 impl Risk {
+    /// Every risk level, in ascending order of consequence.
+    ///
+    /// **A list rather than a bare enum, so "every level" has one definition.** `Effect` gained the same
+    /// `ALL` for the same reason: a caller that needs to check each level — an exhaustive table test, a
+    /// closed set for a command line, a comparison to the wire vocabulary — otherwise writes its own
+    /// four-item list, and adding a level then leaves that caller silently incomplete. The order is the
+    /// ladder's own (`Low < Moderate < High < Critical`, which the `Ord` derive provides), so a reader
+    /// that needs "this level or higher" iterates it in the order the comparison uses.
+    pub const ALL: &'static [Self] = &[Self::Low, Self::Moderate, Self::High, Self::Critical];
+
     /// Parses the contract spelling.
     ///
     /// # Errors
