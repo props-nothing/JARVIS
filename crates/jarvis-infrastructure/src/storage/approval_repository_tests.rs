@@ -20,7 +20,7 @@ use crate::storage::repositories::SqliteRepositories;
 use crate::storage::repositories::tests::{run_id, seed, workspace};
 use jarvis_application::repository::RepositoryError;
 use jarvis_application::repository::approval::{
-    ApprovalCursor, ApprovalRepository as _, DecideOutcome,
+    ApprovalCursor, ApprovalListFilter, ApprovalRepository as _, DecideOutcome,
 };
 use jarvis_application::testing::InMemoryRepositories;
 use jarvis_domain::ids::{ApprovalId, PrincipalId, ToolCallId, WorkspaceId};
@@ -800,7 +800,13 @@ async fn an_approval_in_another_workspace_is_not_found_rather_than_forbidden() {
     );
     assert!(
         approvals
-            .pending_in(other_workspace(), ApprovalChannel::Cli, 10, None)
+            .pending_in(
+                other_workspace(),
+                ApprovalChannel::Cli,
+                ApprovalListFilter::default(),
+                10,
+                None
+            )
             .await
             .expect("the listing succeeds")
             .approvals
@@ -810,7 +816,13 @@ async fn an_approval_in_another_workspace_is_not_found_rather_than_forbidden() {
     // And the owning workspace still sees it, so the refusal is about scope rather than about the row.
     assert_eq!(
         approvals
-            .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
+            .pending_in(
+                workspace(),
+                ApprovalChannel::Cli,
+                ApprovalListFilter::default(),
+                10,
+                None
+            )
             .await
             .expect("the listing succeeds")
             .approvals
@@ -1017,7 +1029,13 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
     approvals.request(&sooner).await.expect("inserted");
 
     let pending = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            10,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(pending.approvals.len(), 2);
@@ -1040,7 +1058,13 @@ async fn the_pending_listing_orders_by_what_lapses_soonest_and_excludes_decided_
         .await
         .expect("stored");
     let pending = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 10, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            10,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(
@@ -1125,7 +1149,13 @@ async fn a_listing_is_bounded_by_its_limit_and_reports_whether_more_remain() {
         approvals.request(&approval).await.expect("inserted");
     }
     let full = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 2, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            2,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(full.approvals.len(), 2, "the limit is honoured");
@@ -1137,13 +1167,122 @@ async fn a_listing_is_bounded_by_its_limit_and_reports_whether_more_remain() {
     // The complement on the same store: a page the store had nothing beyond is complete. Without this
     // half the first assertion would pass for a store that always reported `bounded`.
     let complete = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 5, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            5,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(complete.approvals.len(), 5);
     assert!(
         !complete.bounded,
         "five rows and a bound of five is complete"
+    );
+}
+
+#[tokio::test]
+async fn a_risk_narrow_is_applied_before_the_page_bound_and_yields_the_served_position() {
+    // **The two properties a filter must have, and they fail in opposite directions.** A filter applied
+    // *after* the `LIMIT` returns fewer rows than the caller asked for on a query that has more — a short
+    // page, which a client reads as "no more to decide", the exact defect the channel predicate exists to
+    // prevent. A filter that is not applied at all returns a **superset**, showing prompts the caller
+    // believed it had excluded. This asserts both: the narrowed page is full when the filtered set is, and
+    // the cursor points at the last returned row rather than at the page the filter never saw.
+    let (_database, approvals) = repository().await;
+    // Three `Critical` approvals interleaved in time with two `Low` ones, so a filter that ran over an
+    // already-bounded page would return the wrong rows *and* the wrong count — the fixture has to make
+    // the two mistakes distinguishable, which an all-one-risk fixture would not.
+    for (index, risk) in [
+        (0_u128, Risk::Low),
+        (1, Risk::Critical),
+        (2, Risk::Low),
+        (3, Risk::Critical),
+        (4, Risk::Critical),
+    ] {
+        let mut parts = parts();
+        parts.risk = risk;
+        // Ascending expiry, so the store's order is the fixture's order and the assertion below can name
+        // which rows a correct filter must return.
+        parts.expires_at = UtcTimestamp::parse(&format!("2026-09-27T12:1{index}:00Z"))
+            .expect("the fixture instant parses");
+        let mut approval = DurableApproval::request(parts);
+        approval.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(60 + index));
+        approvals.request(&approval).await.expect("inserted");
+    }
+
+    let critical = approvals
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter {
+                risk: Some(Risk::Critical),
+            },
+            2,
+            None,
+        )
+        .await
+        .expect("lists");
+    assert_eq!(
+        critical.approvals.len(),
+        2,
+        "**the narrow must be applied to the query, not over a bounded page**: three critical rows \
+         exist, so a page of two that came back short would mean the filter ran after the LIMIT",
+    );
+    assert!(
+        critical
+            .approvals
+            .iter()
+            .all(|row| row.risk == Risk::Critical),
+        "no other risk level may appear under a critical narrow: {critical:?}",
+    );
+    assert!(
+        critical.bounded,
+        "a third critical row remains behind the page"
+    );
+    // The cursor names the last returned row, so resuming continues inside the narrowed set rather than
+    // in the unfiltered queue.
+    let cursor = critical.next.expect("a bounded page carries a cursor");
+    let rest = approvals
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter {
+                risk: Some(Risk::Critical),
+            },
+            5,
+            Some(cursor),
+        )
+        .await
+        .expect("lists");
+    assert_eq!(
+        rest.approvals.len(),
+        1,
+        "resuming inside the narrow returns the remaining critical row",
+    );
+    assert!(
+        rest.approvals.iter().all(|row| row.risk == Risk::Critical),
+        "a resumed page must stay inside the narrow: {rest:?}",
+    );
+
+    // No narrow is a different request from any single level: it must include the low rows a narrow
+    // excludes, which is the half a filter that always applied a level would fail.
+    let unfiltered = approvals
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            10,
+            None,
+        )
+        .await
+        .expect("lists");
+    assert_eq!(
+        unfiltered.approvals.len(),
+        5,
+        "the default filter is no risk narrow",
     );
 }
 
@@ -1188,12 +1327,24 @@ async fn the_double_and_the_adapter_agree_on_a_cursor_for_another_channel() {
 
     // The adapter honours the **cursor's** channel, so the row is visible.
     let from_adapter = adapter
-        .pending_in(workspace(), ApprovalChannel::Desktop, 10, Some(forged))
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Desktop,
+            ApprovalListFilter::default(),
+            10,
+            Some(forged),
+        )
         .await
         .expect("the adapter lists");
     // The double must agree, not merely return some page.
     let from_double = double
-        .pending_in(workspace(), ApprovalChannel::Desktop, 10, Some(forged))
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Desktop,
+            ApprovalListFilter::default(),
+            10,
+            Some(forged),
+        )
         .await
         .expect("the double lists");
     assert_eq!(
@@ -1235,7 +1386,13 @@ async fn paging_through_the_listing_yields_every_row_exactly_once() {
     let mut pages = 0;
     loop {
         let page = approvals
-            .pending_in(workspace(), ApprovalChannel::Cli, 2, after)
+            .pending_in(
+                workspace(),
+                ApprovalChannel::Cli,
+                ApprovalListFilter::default(),
+                2,
+                after,
+            )
             .await
             .expect("lists");
         pages += 1;
@@ -1278,7 +1435,13 @@ async fn a_cursor_resumes_after_a_row_that_was_decided_between_pages() {
     }
 
     let first = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 2, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            2,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(first.approvals.len(), 2);
@@ -1317,7 +1480,13 @@ async fn a_cursor_resumes_after_a_row_that_was_decided_between_pages() {
         .expect("the decision is recorded");
 
     let second = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 2, Some(cursor))
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            2,
+            Some(cursor),
+        )
         .await
         .expect("lists");
     // Rows 3 and 4, not 4 and 5: the bound is the cursor's position, which the removal did not move.
@@ -1353,7 +1522,13 @@ async fn the_pending_listing_excludes_rows_the_channel_may_not_decide() {
     approvals.request(&cli_only).await.expect("inserted");
 
     let page = approvals
-        .pending_in(workspace(), ApprovalChannel::Cli, 1, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Cli,
+            ApprovalListFilter::default(),
+            1,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(page.approvals.len(), 1);
@@ -1370,7 +1545,13 @@ async fn the_pending_listing_excludes_rows_the_channel_may_not_decide() {
     // The desktop caller sees the other one, which is what makes the filter a *predicate* rather than a
     // preference — both rows exist and each channel sees exactly its own.
     let desktop_page = approvals
-        .pending_in(workspace(), ApprovalChannel::Desktop, 1, None)
+        .pending_in(
+            workspace(),
+            ApprovalChannel::Desktop,
+            ApprovalListFilter::default(),
+            1,
+            None,
+        )
         .await
         .expect("lists");
     assert_eq!(desktop_page.approvals.len(), 1);

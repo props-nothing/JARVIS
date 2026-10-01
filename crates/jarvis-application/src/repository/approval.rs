@@ -26,8 +26,36 @@ use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     ApprovalActor, ApprovalChannel, ApprovalTransitionRecord, ApprovalVersion, DurableApproval,
 };
+use jarvis_domain::tool::classification::Risk;
 
 use super::RepositoryFuture;
+
+/// The narrowing a listing applies beyond its workspace and channel.
+///
+/// **One value rather than a positional argument, and the argument count is the reason.** `pending_in`
+/// already takes the workspace, the channel, a limit, and a cursor — four values of three types, with
+/// two of them adjacent integers at the call site. Adding the filter as a fifth positional argument
+/// invites a transposition the compiler cannot see (a risk where a limit belongs is a type error only
+/// because they differ; the next scalar filter would not be), so the filters are grouped. A second
+/// filter is then a field here rather than a signature change at every call site — the same choice
+/// `RunRef`, `Step`, and `DeliveryTiming` record.
+///
+/// **The filter is a query predicate, not a post-filter, for the reason the channel is.** A caller's
+/// `limit` bounds the rows the *store* returns; applying a filter after that bound would spend the page
+/// on rows the caller excluded and return a short list, and a client that receives a short list
+/// concludes there is nothing more to act on. Every narrowing therefore has to reach the `WHERE` clause
+/// the `LIMIT` is applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ApprovalListFilter {
+    /// Restrict the page to approvals at this risk level, when set.
+    ///
+    /// The contract's `risk` filter, and the one filter whose meaning changed when `TLS-013` made the
+    /// step-up rule real: a client can now ask for the `critical` prompts that will demand a step-up
+    /// without fetching every prompt and discarding the rest. `None` is "no risk narrowing", which is
+    /// a different request from any single level — including a client that happens to want the common
+    /// case — and the two are kept apart by the type rather than by a sentinel level.
+    pub risk: Option<Risk>,
+}
 
 /// The largest number of pending approvals one listing may return.
 ///
@@ -213,6 +241,11 @@ pub trait ApprovalRepository: Send + Sync {
     /// a row decided or expired between two fetches shifts every later row by one under an offset, so
     /// page two would *skip* an approval, and a skipped approval is a prompt nobody decides.
     ///
+    /// **`filter` is applied to the same `WHERE` the limit bounds, not afterwards.** A filter that ran
+    /// over an already-bounded page would return fewer rows than the caller asked for on a query that has
+    /// more — the short-page defect the channel predicate exists to prevent, arriving by a second route —
+    /// so a narrowing the caller asks for must reach the statement that applies the `LIMIT`.
+    ///
     /// # Errors
     ///
     /// Returns [`RepositoryError::Query`](super::RepositoryError::Query) when the store cannot be read.
@@ -220,6 +253,7 @@ pub trait ApprovalRepository: Send + Sync {
         &self,
         workspace: WorkspaceId,
         channel: ApprovalChannel,
+        filter: ApprovalListFilter,
         limit: u32,
         after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage>;

@@ -27,7 +27,8 @@
 use sqlx::SqlitePool;
 
 use jarvis_application::repository::approval::{
-    ApprovalCursor, ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+    ApprovalCursor, ApprovalListFilter, ApprovalRepository, ApprovalsPage, DecideOutcome,
+    MAX_PENDING_PAGE,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{ApprovalId, PrincipalId, RunId, ToolCallId, WorkspaceId};
@@ -46,19 +47,31 @@ use super::repositories::{
     assurance_from_stored, assurance_stored, begin_write, int, opt_text, parse_time, text,
 };
 
-/// The `SELECT` for [`ApprovalRepository::load`].
+/// The column list every approval `SELECT` shares, expanded into each statement.
 ///
-/// **The column list is written out in each statement rather than interpolated from a constant.**
-/// `sqlx::query` refuses a dynamically built string, because it cannot audit one for injection — and it
-/// is right to refuse: a query assembled at run time is a query whose text no reviewer read. The three
-/// statements below therefore repeat the list, and this comment is what keeps them in step; the list is
-/// visible in one screen rather than scattered.
-const LOAD_SQL: &str = "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
-     tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
-     decided_assurance, decided_at, created_at, updated_at FROM approvals WHERE workspace_id = ? AND id = ?";
+/// **Written once and interpolated, where four hand-repeated copies stood before.** The copies were not
+/// only verbose: the comment over them said "the three statements below therefore repeat the list" while
+/// **four** statements did, and a column list that must stay synchronised is exactly the fact a wrong
+/// count hides — the same drift `LOAD_SQL`'s predecessor warned about. `sqlx::query` cannot take a string
+/// assembled at run time (it cannot audit one for injection, correctly), so the interpolation is textual:
+/// this macro expands to a single `concat!` literal that `sqlx` accepts and a reviewer reads as the one
+/// list it is.
+macro_rules! approval_select {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
+             tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
+             allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
+             decided_assurance, decided_at, created_at, updated_at FROM approvals ",
+            $tail,
+        )
+    };
+}
 
-/// The `SELECT` for [`ApprovalRepository::pending_in`].
+/// The `SELECT` for [`ApprovalRepository::load`].
+const LOAD_SQL: &str = approval_select!("WHERE workspace_id = ? AND id = ?");
+
+/// The `SELECT` for [`ApprovalRepository::pending_in`] with neither a risk narrow nor a cursor.
 ///
 /// **Three things in this statement are deliberate, and each fixes a way the listing silently
 /// short-changes an operator.**
@@ -81,14 +94,24 @@ const LOAD_SQL: &str = "SELECT id, workspace_id, requesting_principal_id, run_id
 /// exact crate version: 3.51.3), and a build without it would fail the query loudly rather than
 /// silently return every row — the right direction, since the alternative is a channel check that
 /// quietly stops applying.
-const PENDING_SQL: &str =
-    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
-     tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
-     decided_assurance, decided_at, 
-     created_at, updated_at FROM approvals WHERE workspace_id = ? AND state = 'pending' \
+const PENDING_SQL: &str = approval_select!(
+    "WHERE workspace_id = ? AND state = 'pending' \
      AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
-     ORDER BY expires_at ASC, id ASC LIMIT ?";
+     ORDER BY expires_at ASC, id ASC LIMIT ?"
+);
+
+/// The `risk`-narrowed sibling of [`PENDING_SQL`].
+///
+/// **The risk filter is applied inside the same `WHERE` the `LIMIT` bounds, never over a bounded page.**
+/// Filtering a page after the fact returns fewer rows than the caller asked for on a query that has more,
+/// which is the short-page defect the channel predicate was introduced to prevent arriving by a second
+/// route — so the contract's `risk` filter reaches the statement rather than the handler.
+const PENDING_RISK_SQL: &str = approval_select!(
+    "WHERE workspace_id = ? AND state = 'pending' \
+     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
+     AND risk = ? \
+     ORDER BY expires_at ASC, id ASC LIMIT ?"
+);
 
 /// The `SELECT` for [`ApprovalRepository::pending_in`] when resuming from a cursor.
 ///
@@ -96,33 +119,39 @@ const PENDING_SQL: &str =
 /// that makes the cursor a keyset.** A single statement would need either a nullable resume parameter
 /// in the `WHERE` — `(? IS NULL OR (expires_at, id) > (?, ?))`, which SQLite cannot index and which
 /// silently degrades every first-page fetch to a scan — or a string built by concatenation, which is
-/// how a user-supplied value reaches a statement. Two constants keep both statements indexable and
+/// how a user-supplied value reaches a statement. The constants keep both statements indexable and
 /// keep the values bound.
 ///
 /// The comparison is a **row-value** comparison over `(expires_at, id)`, matching the `ORDER BY`
 /// exactly. Comparing only `expires_at` with `>` would drop every row sharing the boundary instant,
 /// which is precisely the tie the identifier exists to break.
-const PENDING_AFTER_SQL: &str =
-    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
-     tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
-     decided_assurance, decided_at, 
-     created_at, updated_at FROM approvals WHERE workspace_id = ? AND state = 'pending' \
+const PENDING_AFTER_SQL: &str = approval_select!(
+    "WHERE workspace_id = ? AND state = 'pending' \
      AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
      AND (expires_at, id) > (?, ?) \
-     ORDER BY expires_at ASC, id ASC LIMIT ?";
+     ORDER BY expires_at ASC, id ASC LIMIT ?"
+);
+
+/// The `risk`-narrowed sibling of [`PENDING_AFTER_SQL`], completing the four shapes a listing can take.
+///
+/// The four combinations exist because SQLite cannot index a nullable parameter — see [`PENDING_RISK_SQL`]
+/// — so each (narrowed?, resuming?) pair is its own statement, sharing its column list through
+/// [`approval_select`] and differing only in the `WHERE` tail.
+const PENDING_RISK_AFTER_SQL: &str = approval_select!(
+    "WHERE workspace_id = ? AND state = 'pending' \
+     AND EXISTS (SELECT 1 FROM json_each(approvals.allowed_channels_json) WHERE value = ?) \
+     AND risk = ? \
+     AND (expires_at, id) > (?, ?) \
+     ORDER BY expires_at ASC, id ASC LIMIT ?"
+);
 
 /// The `SELECT` for [`ApprovalRepository::decided_by`], most recent first.
 ///
 /// The tie-break on `id` is the same requirement the pending listing records: `decided_at` alone is not
 /// total, and an order that is not total can show one decision twice and hide another.
-const DECIDED_SQL: &str =
-    "SELECT id, workspace_id, requesting_principal_id, run_id, tool_call_id, \
-     tool_identity_json, action_fingerprint, risk, effects_json, summary, preview_json, \
-     allowed_channels_json, expires_at, scope, state, version, decided_by, decided_via, \
-     decided_assurance, decided_at, 
-     created_at, updated_at FROM approvals WHERE workspace_id = ? AND decided_by = ? \
-     ORDER BY decided_at DESC, id ASC LIMIT ?";
+const DECIDED_SQL: &str = approval_select!(
+    "WHERE workspace_id = ? AND decided_by = ? ORDER BY decided_at DESC, id ASC LIMIT ?"
+);
 
 /// The `SELECT` for [`ApprovalRepository::transitions`], oldest first.
 ///
@@ -388,6 +417,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
         &self,
         workspace: WorkspaceId,
         channel: ApprovalChannel,
+        filter: ApprovalListFilter,
         limit: u32,
         after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage> {
@@ -401,13 +431,40 @@ impl ApprovalRepository for SqliteApprovalRepository {
             // `limit` rows makes "there are more" and "that was all" the same observation — and here
             // that ambiguity makes an operator believe the queue is empty.
             let probe = i64::from(limit.saturating_add(1));
-            let rows = match after {
+            // **Four statements, chosen by the two independent narrowings.** SQLite cannot index a
+            // nullable parameter, so a `risk` predicate cannot be `(? IS NULL OR risk = ?)` — that
+            // silently turns every first-page fetch into a scan — and the statement is selected rather
+            // than built, so no user value ever reaches the SQL text. Every branch binds the same
+            // parameters in the same order, so a mismatch is a compile-time arity error rather than a
+            // silently wrong value.
+            let risk = filter.risk.map(Risk::as_contract_str);
+            let rows = match (risk, after) {
                 // The channel is taken from the **cursor** rather than from the parameter, because a
                 // cursor is bound to the query that produced it: honouring a caller's channel here
                 // would let a cursor from one view be replayed against another and report whether
                 // rows exist outside it. The two are the same value on every real request — the
                 // handler builds one from the other — and this is the one that cannot be forged.
-                Some(cursor) => {
+                (Some(risk), Some(cursor)) => {
+                    sqlx::query(PENDING_RISK_AFTER_SQL)
+                        .bind(workspace.to_string())
+                        .bind(cursor.channel.as_contract_str())
+                        .bind(risk)
+                        .bind(cursor.expires_at.to_string())
+                        .bind(cursor.id.to_string())
+                        .bind(probe)
+                        .fetch_all(&self.pool)
+                        .await
+                }
+                (Some(risk), None) => {
+                    sqlx::query(PENDING_RISK_SQL)
+                        .bind(workspace.to_string())
+                        .bind(channel.as_contract_str())
+                        .bind(risk)
+                        .bind(probe)
+                        .fetch_all(&self.pool)
+                        .await
+                }
+                (None, Some(cursor)) => {
                     sqlx::query(PENDING_AFTER_SQL)
                         .bind(workspace.to_string())
                         .bind(cursor.channel.as_contract_str())
@@ -417,7 +474,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
                         .fetch_all(&self.pool)
                         .await
                 }
-                None => {
+                (None, None) => {
                     sqlx::query(PENDING_SQL)
                         .bind(workspace.to_string())
                         .bind(channel.as_contract_str())

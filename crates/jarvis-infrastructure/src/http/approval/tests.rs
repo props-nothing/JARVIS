@@ -264,6 +264,77 @@ async fn a_listing_returns_the_pending_approval_with_its_preview() {
 }
 
 #[tokio::test]
+async fn the_listing_narrows_to_a_risk_level_and_refuses_an_unknown_one() {
+    // **The contract's `risk` filter, end to end through the router.** `TLS-013` made the step-up rule
+    // real, so a `critical` narrow is the set of prompts that will demand an elevated session — a client
+    // that wants to show them needs this, and the alternative (fetch every prompt, discard the rest) is
+    // exactly the superset the listing's refusals exist to prevent.
+    //
+    // Two rows of **different** risk, so a filter that was dropped returns two rows and a filter that
+    // applied a constant returns one — the wrong answers are distinguishable, which a same-risk fixture
+    // would not achieve.
+    let critical = {
+        let mut row = pending();
+        row.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(0x6001));
+        row.risk = Risk::Critical;
+        row
+    };
+    let (app, token, seeded, dir) =
+        fixture_seeded_many("approval-risk", vec![pending(), critical]).await;
+    let high = &seeded[0];
+    let critical = &seeded[1];
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals?risk=critical",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(&critical.id.to_string()),
+        "the critical approval must be in a critical narrow: {body}",
+    );
+    assert!(
+        !body.contains(&high.id.to_string()),
+        "**a higher-risk row must not appear under a critical narrow**: {body}",
+    );
+    assert!(body.contains(r#""risk":"critical""#), "{body}");
+
+    // The default listing is not narrowed, which is the half an always-on filter would fail.
+    let (status, all) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert!(
+        all.contains(&critical.id.to_string()) && all.contains(&high.id.to_string()),
+        "an unfiltered listing shows every risk level: {all}",
+    );
+
+    // **An unrecognised value of a known key is refused, not defaulted.** Treating `?risk=severe` as "no
+    // narrow" would return every level — the superset the unknown-*key* refusal prevents, arriving
+    // through a known key — so it is a `400` with the same request-invalid code.
+    let (status, refusal) = send(
+        &app,
+        "GET",
+        "/api/v1/approvals?risk=severe",
+        &approval_headers(&token),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert!(refusal.contains("request.invalid"), "{refusal}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn the_listing_hands_back_a_cursor_that_reads_the_next_page() {
     // **The contract's cursor, end to end through the router.** `has_more` alone told a client that
     // more prompts awaited a decision and gave it no way to fetch one, which is worse than silence
@@ -946,18 +1017,52 @@ fn the_listing_query_parser_accepts_only_a_bounded_limit() {
     // on an approval listing, prompts the client believed it had excluded.
     use super::parse_list_query;
     use axum::http::Uri;
+    use jarvis_application::repository::approval::ApprovalListFilter;
+    use jarvis_domain::tool::classification::Risk;
 
     let uri = |query: &str| -> Uri { format!("/api/v1/approvals{query}").parse().expect("a uri") };
+    let none = ApprovalListFilter::default();
 
-    assert_eq!(parse_list_query(&uri("")).expect("no query"), (None, None));
+    assert_eq!(
+        parse_list_query(&uri("")).expect("no query"),
+        (None, None, none)
+    );
     assert_eq!(
         parse_list_query(&uri("?limit=25")).expect("a limit"),
-        (Some(25), None)
+        (Some(25), None, none)
     );
     assert_eq!(
         parse_list_query(&uri("?limit=0")).expect("zero is parseable"),
-        (Some(0), None)
+        (Some(0), None, none)
     );
+    // **`risk` is now served, and the value is validated rather than accepted.** A `critical` narrow
+    // is the filter whose meaning changed when the step-up rule became real: it is the set of prompts
+    // that will demand an elevated session.
+    assert_eq!(
+        parse_list_query(&uri("?risk=critical")).expect("a risk narrow"),
+        (
+            None,
+            None,
+            ApprovalListFilter {
+                risk: Some(Risk::Critical)
+            }
+        )
+    );
+    // The narrow and the bound compose, so a client can page within one risk level.
+    assert_eq!(
+        parse_list_query(&uri("?risk=high&limit=5")).expect("both"),
+        (
+            Some(5),
+            None,
+            ApprovalListFilter {
+                risk: Some(Risk::High)
+            }
+        )
+    );
+    // **An unrecognised `risk` value is refused, not treated as "no narrow".** Defaulting it to `None`
+    // would silently widen the result to every level — the same superset the unknown-key refusal
+    // prevents, arriving through a known key.
+    assert!(parse_list_query(&uri("?risk=severe")).is_err());
     // An unknown filter is a refusal, not a silently ignored parameter.
     assert!(parse_list_query(&uri("?state=pending")).is_err());
     assert!(parse_list_query(&uri("?limit=25&state=pending")).is_err());

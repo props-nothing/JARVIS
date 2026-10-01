@@ -274,35 +274,40 @@ fn the_contract_version_the_wire_types_declare_is_the_one_the_contract_states() 
 
 #[test]
 fn the_event_type_names_the_stream_contract_requires_are_all_defined() {
-    // The contract names a minimum set of event types for the first slice. A missing one
-    // would mean a client waiting for it waits forever, so the set is asserted rather than
-    // left to the constants' own spelling.
-    let required = [
+    // The event types this build publishes, one row per defined constant. The list is
+    // deliberately **every** constant rather than the contract's former "minimum set" of eight:
+    // enumerating a subset is what let `run.planning` and `run.responding` be published on every
+    // run while appearing in no document, because the guard checked a floor and not a ceiling.
+    let defined = [
         ("run.received", super::event_type::RECEIVED),
         ("run.context_building", super::event_type::CONTEXT_BUILDING),
+        ("run.planning", super::event_type::PLANNING),
         ("run.model_started", super::event_type::MODEL_STARTED),
         (
             "run.output_text.delta",
             super::event_type::OUTPUT_TEXT_DELTA,
         ),
         ("run.usage", super::event_type::USAGE),
+        ("run.responding", super::event_type::RESPONDING),
         ("run.completed", super::event_type::COMPLETED),
         ("run.failed", super::event_type::FAILED),
         ("run.cancelled", super::event_type::CANCELLED),
+        ("stream.overrun", super::event_type::STREAM_OVERRUN),
     ];
-    for (expected, actual) in required {
+    for (expected, actual) in defined {
         assert_eq!(expected, actual, "the wire name must be the contract's");
     }
 
-    // The contract states this minimum set in prose; assert it is still there, so removing
-    // the sentence without removing the types is caught.
+    // The contract publishes this complete set in a table; assert every constant is named, so a
+    // value the daemon sends without documenting it is caught rather than silently omitted —
+    // the exact defect this test previously permitted by checking a "minimum set".
     let contract =
         std::fs::read_to_string(repository_root().join("docs/contracts/local-control-api.md"))
             .expect("the contract reads");
-    for (name, _) in required {
+    for (name, _) in defined {
         assert!(
             contract.contains(name),
-            "the contract must still name {name}",
+            "the contract must name every event type the build sends, including {name}",
         );
     }
 }

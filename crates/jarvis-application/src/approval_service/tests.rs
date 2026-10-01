@@ -31,7 +31,7 @@ use jarvis_domain::tool::classification::{Effect, Risk};
 use crate::approval_service::{
     ApprovalService, Decision, DecisionCommand, MAX_CANCEL_REASON_BYTES,
 };
-use crate::repository::approval::ApprovalRepository;
+use crate::repository::approval::{ApprovalListFilter, ApprovalRepository};
 use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
 use crate::testing::InMemoryRepositories;
 use jarvis_domain::tool::approval::DecisionNote;
@@ -188,7 +188,13 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     let (service, _repositories, _approval) = fixture().await;
 
     let visible = service
-        .list(&context(RequestChannel::Cli), 50, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            50,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -199,13 +205,79 @@ async fn a_listing_shows_only_the_channels_the_caller_may_decide_on() {
     assert!(!visible.bounded, "one row cannot fill a page of fifty");
 
     let hidden = service
-        .list(&context(RequestChannel::Voice), 50, None, now())
+        .list(
+            &context(RequestChannel::Voice),
+            ApprovalListFilter::default(),
+            50,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert!(
         hidden.approvals.is_empty(),
         "**a channel the request excludes must not see it**: {hidden:?}",
     );
+}
+
+#[tokio::test]
+async fn a_risk_narrow_reaches_the_store_rather_than_being_dropped_on_the_way() {
+    // **The service is a pass-through for the filter, and a pass-through is exactly where a value goes
+    // missing.** The store's own test proves the SQL narrows; this proves the narrow survives the
+    // *service* — a `list` that took the filter and called `pending_in` without it would return every
+    // risk level, a superset, and nothing in the store tests would see it. Two rows of different risk
+    // are the fixture, so a dropped filter is a wrong *count*, not a wrong-looking empty page.
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut high = pending();
+    high.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(31));
+    high.risk = Risk::High;
+    // Later, so `critical` sorts first under the store's soonest-deadline order and the page of one is
+    // the row the filter must keep rather than the one it must drop.
+    high.expires_at = UtcTimestamp::parse("2026-09-27T12:30:00Z").expect("valid");
+    repositories.request(&high).await.expect("inserted");
+    let mut critical = pending();
+    critical.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(32));
+    critical.risk = Risk::Critical;
+    critical.expires_at = UtcTimestamp::parse("2026-09-27T12:05:00Z").expect("valid");
+    repositories.request(&critical).await.expect("inserted");
+
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+    let narrowed = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter {
+                risk: Some(Risk::Critical),
+            },
+            50,
+            None,
+            now(),
+        )
+        .await
+        .expect("the listing runs");
+    assert_eq!(
+        narrowed.approvals.len(),
+        1,
+        "a risk narrow the caller asked for must not be silently dropped: {narrowed:?}",
+    );
+    assert_eq!(
+        narrowed.approvals[0].risk,
+        Risk::Critical,
+        "only the narrowed level may appear",
+    );
+
+    // And the default is genuinely no narrow, which is the half a filter that always applied some
+    // level would fail.
+    let all = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            50,
+            None,
+            now(),
+        )
+        .await
+        .expect("the listing runs");
+    assert_eq!(all.approvals.len(), 2, "the default filter narrows nothing");
 }
 
 #[tokio::test]
@@ -248,7 +320,13 @@ async fn a_page_is_not_short_changed_by_rows_the_caller_cannot_decide() {
     // **A page of one.** The channel filter must run before the bound, so the one row returned is the
     // one the caller can decide — not the excluded row that happened to lapse sooner.
     let page = service
-        .list(&context(RequestChannel::Cli), 1, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            1,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -290,7 +368,13 @@ async fn a_full_page_reports_that_more_may_remain() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let full = service
-        .list(&context(RequestChannel::Cli), 2, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            2,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert_eq!(full.approvals.len(), 2, "the page respects its bound");
@@ -302,7 +386,13 @@ async fn a_full_page_reports_that_more_may_remain() {
     // And the complement, on the same store: a page the store had nothing beyond reports complete —
     // which is the half that makes the first assertion meaningful rather than a constant.
     let complete = service
-        .list(&context(RequestChannel::Cli), 3, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            3,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert_eq!(complete.approvals.len(), 3);
@@ -351,14 +441,26 @@ async fn a_cursor_bound_to_another_channel_is_refused() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let page = service
-        .list(&context(RequestChannel::Cli), 1, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            1,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     let cursor = page.next.expect("a bounded page carries a cursor");
 
     // The same cursor against a different channel's caller is refused by name.
     let error = service
-        .list(&context(RequestChannel::Voice), 1, Some(cursor), now())
+        .list(
+            &context(RequestChannel::Voice),
+            ApprovalListFilter::default(),
+            1,
+            Some(cursor),
+            now(),
+        )
         .await
         .expect_err("a cursor from another channel must be refused");
     assert_eq!(error.code(), "request.invalid_cursor", "{error:?}");
@@ -367,7 +469,13 @@ async fn a_cursor_bound_to_another_channel_is_refused() {
     // **binding** rather than a cursor that never round-trips at all. Without this half the test would
     // pass against an implementation that refused every cursor.
     let again = service
-        .list(&context(RequestChannel::Cli), 1, Some(cursor), now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            1,
+            Some(cursor),
+            now(),
+        )
         .await
         .expect("the minting channel's own cursor is accepted");
     assert!(
@@ -628,7 +736,13 @@ async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
     );
 
     let listing = service
-        .list(&context(RequestChannel::Cli), 50, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            50,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert!(
@@ -696,7 +810,13 @@ async fn a_listing_expires_lapsed_rows_and_does_not_return_a_short_page() {
     let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
 
     let page = service
-        .list(&context(RequestChannel::Cli), 2, None, now())
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter::default(),
+            2,
+            None,
+            now(),
+        )
         .await
         .expect("the listing runs");
     assert_eq!(
@@ -724,6 +844,77 @@ async fn a_listing_expires_lapsed_rows_and_does_not_return_a_short_page() {
             "a lapsed row must be transitioned, not merely filtered out of the page",
         );
     }
+}
+
+#[tokio::test]
+async fn a_lapsed_row_is_swept_without_widening_the_callers_risk_narrow() {
+    // **The sweep's re-read has to carry the caller's filter, and only a lapsed row that *matches* the
+    // narrow exposes it.** The listing expires lapsed rows and re-reads; if that re-read dropped the
+    // filter it would replace the caller's narrowed page with the unfiltered one, and the `risk` narrow a
+    // client asked for would silently vanish once any matching row lapsed — a superset arriving after the
+    // fact, which is the direction every refusal on this surface exists to prevent.
+    //
+    // The fixture is chosen so the two mistakes are distinguishable. A lapsed **critical** row (soonest,
+    // so the filtered first read returns it and the sweep runs at all) plus a live critical and a live
+    // high row whose deadlines put the high one **first** in an unfiltered re-read. So a dropped filter
+    // returns the high row where a correct one returns the critical, and the assertion can see which.
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut lapsed = pending();
+    lapsed.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(80));
+    lapsed.risk = Risk::Critical;
+    lapsed.expires_at = UtcTimestamp::parse("2026-09-27T11:00:00Z").expect("parses");
+    repositories.request(&lapsed).await.expect("inserted");
+    let mut live_critical = pending();
+    live_critical.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(81));
+    live_critical.risk = Risk::Critical;
+    live_critical.expires_at = UtcTimestamp::parse("2026-09-27T12:28:00Z").expect("parses");
+    repositories
+        .request(&live_critical)
+        .await
+        .expect("inserted");
+    let mut live_high = pending();
+    live_high.id = ApprovalId::from_uuid(uuid::Uuid::from_u128(82));
+    live_high.risk = Risk::High;
+    // Sooner than the live critical, so an **unfiltered** re-read returns this row first.
+    live_high.expires_at = UtcTimestamp::parse("2026-09-27T12:05:00Z").expect("parses");
+    repositories.request(&live_high).await.expect("inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+
+    let page = service
+        .list(
+            &context(RequestChannel::Cli),
+            ApprovalListFilter {
+                risk: Some(Risk::Critical),
+            },
+            2,
+            None,
+            now(),
+        )
+        .await
+        .expect("the listing runs");
+    assert_eq!(
+        page.approvals.len(),
+        1,
+        "the swept page must hold only the live critical row: {page:?}",
+    );
+    assert_eq!(
+        page.approvals[0].id, live_critical.id,
+        "**a dropped filter on the sweep's re-read returns the high row here**: {page:?}",
+    );
+    assert!(
+        page.approvals.iter().all(|row| row.risk == Risk::Critical),
+        "the narrow must survive the expiry sweep: {page:?}",
+    );
+    // The lapsed row was still recorded as expired, so the filter did not disable the sweep.
+    let swept = service
+        .read(&context(RequestChannel::Cli), lapsed.id, now())
+        .await
+        .expect("readable");
+    assert_eq!(
+        swept.state(),
+        ApprovalState::Expired,
+        "the sweep must still run under a narrow",
+    );
 }
 
 #[tokio::test]

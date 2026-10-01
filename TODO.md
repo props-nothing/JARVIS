@@ -5736,6 +5736,99 @@ Dependencies: Milestone 2 exit gate.
     scanner notes describe, in a hand search.
   - 1584 workspace tests (unchanged). 198 TODO IDs (+1). All gates green (fmt, clippy, test, doc, both
     docs gates), all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-077` Document the **event-type vocabulary** a client can receive — the residual `BRN-073`
+  and `BRN-074` each named and left — finding two events the daemon publishes on every run that
+  appeared in no document.
+  Evidence: the event-type table in `docs/contracts/local-control-api.md`,
+  `the_event_types_a_client_can_receive_are_all_documented` with its `declared_event_types` and
+  `documented_event_types` readers in `jarvis-infrastructure`'s `http` tests, and the widened
+  `the_event_type_names_the_stream_contract_requires_are_all_defined` in `jarvis-protocol`.
+  - **The finding: two of the eleven event types were in no file.** The contract enumerated a
+    "minimum event types" set of eight; the protocol's `event_type` module defines **eleven**. The
+    two unlisted — `run.planning` and `run.responding` — are published by the controller on **every**
+    run (`each_state_change_published_exactly_one_event` pins the seven-event sequence they appear
+    in), so a client following the stream received two events whose names it could look up nowhere.
+    This is structurally the same defect `BRN-073` found for the run resource's `error_code` field —
+    a client-visible vocabulary with no list — one vocabulary over, and it survived two rounds that
+    named it because each closed the *code* set and left the *event* set as residual.
+  - **A guard that checks a floor cannot see a value above it.** The existing protocol test asserted
+    the contract *contains* a required array of eight. So an event type the build sends that the
+    document never names passed silently — the guard was scoped to "are the required ones present",
+    which is true of a document that omits anything else. The fix reads the set from the protocol's
+    own `event_type` module and asserts **derived equivalence** with the table, so adding a constant
+    without documenting it now fails rather than shipping; the enumerated subset was replaced by the
+    full set for the same reason.
+  - **The reverse direction is checkable here, for the reason `BRN-074` established.** The table is
+    authored and contains only event types, so a row naming a value no constant declares is a stale
+    row — an event a client would wait for that the daemon never sends. Both directions are asserted.
+  - **⚠ A collision the change had to handle, and it is the `run.*`-prefix problem again.** The new
+    event table's rows are ``| `dotted.name` | … |``, which is shape-identical to the run error-code
+    table's rows (`| `run.no_model_served` | … |`). The run-error-code completeness check parsed rows
+    *by shape*, so once the event table existed it would have absorbed event types into the code set
+    and reported a correct document as wrong. Both tables are now parsed **by their header** — the
+    one thing that distinguishes two tables whose rows cannot be told apart, which is exactly the
+    mechanism `BRN-074` could not use for the *source* (an event literal and a code literal share the
+    `run.*` prefix with no header to separate them) but which a *document* provides.
+  - **Falsified in both directions, each naming its own failure.** Removing the `run.responding` row
+    fails with `every event type the build can send must be in the contract's event table … :
+    ["run.responding"]`; inserting a `run.ghost_event` row that no constant declares fails with
+    `… a row for an event nothing sends leaves a client waiting for one that never arrives :
+    ["run.ghost_event"]`. Restoring both returns the gate to `0`.
+  - **Not done, and named.** The set is checked against the protocol's constants, not against the
+    controller's *publication* sites. The equivalence holds today because `advance` and
+    `publish_usage` publish only through the constants, but a future path publishing a literal would
+    not be seen — the same limitation `BRN-075` recorded for pass-through codes, since a value that
+    never appears as a named constant is invisible to a scan of the constants. `stream.overrun` is
+    declared alongside the run event types even though it names the *connection* rather than the run,
+    which the module's own doc states; it is in the table with that note rather than excluded,
+    because a client must handle it.
+  - 1585 workspace tests (+1: infra 692). 199 TODO IDs (+1). All gates green (fmt, clippy, test, doc,
+    both docs gates), 23 validator tests, all four journeys pass. **DO NOT COMMIT.**
+- [x] `BRN-078` Serve the approval listing's **`risk` filter** — the residual `TLS-013` named and the
+  one filter whose meaning changed when the step-up rule became real.
+  Evidence: `ApprovalListFilter` (the port's filter value), the four `PENDING_RISK_*`/`PENDING_AFTER_*`
+  SQL constants and the `approval_select!` macro that shares their column list, the pass-through and
+  sweep re-read in `ApprovalService::list`/`expire_lapsed`, the `?risk=` parse in the listing handler,
+  and four tests — `a_risk_narrow_is_applied_before_the_page_bound_and_yields_the_served_position`
+  (adapter), `a_risk_narrow_reaches_the_store_rather_than_being_dropped_on_the_way` and
+  `a_lapsed_row_is_swept_without_widening_the_callers_risk_narrow` (service), and
+  `the_listing_narrows_to_a_risk_level_and_refuses_an_unknown_one` (wire).
+  - **The filter must run inside the `WHERE` the `LIMIT` bounds, and that is the whole design.** Applying
+    it over an already-bounded page returns fewer rows than the caller asked for on a query that has
+    more — a short page, which a client reads as "nothing more to decide". That is the exact defect the
+    *channel* predicate was introduced to prevent, arriving by a second route, so the risk narrow reaches
+    the statement rather than the handler and the sweep's re-read carries it too (a sweep that re-read
+    without the filter would replace the caller's narrowed page with the unfiltered one).
+  - **An unrecognised *value* of a known key is refused like an unknown key.** `?risk=severe` mapped to
+    "no narrow" would return every risk level — a **superset**, the very thing the unknown-key refusal
+    exists to prevent — so `Risk::parse`'s refusal is a `400 request.invalid`, asserted on the wire.
+  - **⚠ The comment over the SQL constants was wrong, and consolidating them proved it.** It said the
+    column list "the three statements below therefore repeat"; **four** statements did. `sqlx::query`
+    cannot take a run-time-assembled string (it cannot audit one for injection, correctly), so the list
+    is now interpolated by an `approval_select!` macro that expands to a single `concat!` literal — a
+    reviewer reads one list, and a new statement cannot silently disagree about a column. The four
+    listing shapes (narrowed? resuming?) exist as four constants because SQLite cannot index a nullable
+    parameter, so a `(? IS NULL OR risk = ?)` predicate would degrade every first-page fetch to a scan —
+    the same reason the cursor was already two statements rather than one.
+  - **The filter is a value, not a fifth positional argument.** `pending_in` already takes four values
+    of three types with two adjacent integers; adding the narrow positionally invites a transposition
+    the next scalar filter would make a compile error only by luck, and a second filter would then
+    change every call site. `ApprovalListFilter` groups them, the same choice `RunRef`/`Step` record.
+  - **Falsified four ways, each naming its own failure.** Applying the narrow with a wrong level
+    (`map(|_| "high")`) fails the adapter test with `left: 0, right: 2`; dropping the filter at the
+    service call (`ApprovalListFilter::default()`) fails `a_risk_narrow_reaches_the_store…` with
+    `left: 2, right: 1`; dropping it on the **sweep's** re-read instead fails
+    `a_lapsed_row_is_swept…` with `left: 2, right: 1` and the high-risk row in the body — the distinct
+    detector the sweep needed, since no non-lapsing fixture reaches that re-read; and removing the
+    parse's `Risk::parse` refusal would let `?risk=severe` through (the wire test asserts the `400`).
+    Each restored to `0`.
+  - **Not done, and named.** The other filters — `state`, `effect`, requesting run/tool, and the time
+    filters — remain refused by name, each still needing its own indexed statement, by the same
+    superset argument. The `risk` filter is a **single level**, not a set or a range: "critical or
+    higher" would need an ordering predicate and a schema decision (the `Risk` ladder is ordered, so
+    `>=` is available) that this increment did not take.
+  - 1589 workspace tests (+4: infra 693, application 267). 200 TODO IDs (+1). All gates green (fmt,
+    clippy, test, doc, both docs gates), all four hermetic journeys pass. **DO NOT COMMIT.**
 - [ ] `TLS-011` Define plugin manifest and process supervision contract.
 - [ ] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy.
 - [~] `TLS-013` Implement authenticated approval list, preview, decide, expire,

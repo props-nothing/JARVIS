@@ -38,7 +38,9 @@ use jarvis_domain::tool::approval::{
     DurableApproval,
 };
 
-use crate::repository::approval::{ApprovalCursor, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE};
+use crate::repository::approval::{
+    ApprovalCursor, ApprovalListFilter, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+};
 use crate::repository::conversation::{
     ConversationRepository, NewConversation, NewMessage, StoredConversation, StoredMessage,
 };
@@ -1754,6 +1756,7 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
         &self,
         workspace: WorkspaceId,
         channel: ApprovalChannel,
+        filter: ApprovalListFilter,
         limit: u32,
         after: Option<ApprovalCursor>,
     ) -> RepositoryFuture<'_, ApprovalsPage> {
@@ -1781,6 +1784,12 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                             // all — would let a short-changed page pass every test, which is the
                             // dangerous direction: a double enforcing less than its adapter.
                             && stored.allowed_channels.permits(filter_channel)
+                            // **The risk narrow is mirrored from the adapter's `risk = ?` predicate,
+                            // and it is applied here, before `limit`.** A double that narrowed after
+                            // the bound — or not at all — would let the short-page defect this filter
+                            // exists to prevent pass every test, which is a double enforcing less than
+                            // its adapter, the direction that hides a bug.
+                            && filter.risk.is_none_or(|risk| stored.risk == risk)
                     })
                     .cloned()
                     .collect();

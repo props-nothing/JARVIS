@@ -58,7 +58,8 @@ use jarvis_domain::tool::canonical::ActionDigest;
 
 use crate::repository::RepositoryError;
 use crate::repository::approval::{
-    ApprovalCursor, ApprovalRepository, ApprovalsPage, DecideOutcome, MAX_PENDING_PAGE,
+    ApprovalCursor, ApprovalListFilter, ApprovalRepository, ApprovalsPage, DecideOutcome,
+    MAX_PENDING_PAGE,
 };
 use crate::request_context::{AuthenticationAssurance, RequestChannel, RequestContext};
 
@@ -245,6 +246,12 @@ impl ApprovalService {
     /// applied here, because the bound has to run where the `LIMIT` runs: filtering a page here would
     /// apply the limit to the wrong window.
     ///
+    /// **`filter` is a narrowing the store applies to the same `WHERE` the `LIMIT` bounds**, for the
+    /// reason above: a risk filter applied here, over an already-bounded page, would return fewer rows
+    /// than the caller asked for on a query that has more — a short page, which a client reads as "no
+    /// more to decide". It is threaded to the store and to the expiry sweep's re-read alike, so the
+    /// page the caller receives and the page the sweep replaces are the same view.
+    ///
     /// `limit` is clamped to the store's bound rather than refused, so a client asking for more
     /// receives a full page.
     ///
@@ -255,6 +262,7 @@ impl ApprovalService {
     pub async fn list(
         &self,
         context: &RequestContext,
+        filter: ApprovalListFilter,
         limit: u32,
         after: Option<ApprovalCursor>,
         at: UtcTimestamp,
@@ -276,14 +284,16 @@ impl ApprovalService {
         }
         let page = self
             .approvals
-            .pending_in(context.workspace_id, channel, limit, after)
+            .pending_in(context.workspace_id, channel, filter, limit, after)
             .await
             .map_err(ApprovalServiceError::Storage)?;
         // **The contract's "expiry is evaluated on every read", which this method did not do.** A listing
         // is the surface a *prompt* appears on, so it is the one place a lapsed record must not be offered:
         // a client that received it would render a decision the daemon then refuses as expired, and — worse
         // — the page budget would be spent on rows nobody can act on.
-        Ok(self.expire_lapsed(context, page, limit, after, at).await)
+        Ok(self
+            .expire_lapsed(context, page, filter, limit, after, at)
+            .await)
     }
 
     /// Reads one approval, scoped to the caller's workspace.
@@ -603,6 +613,7 @@ impl ApprovalService {
         &self,
         context: &RequestContext,
         mut page: ApprovalsPage,
+        filter: ApprovalListFilter,
         limit: u32,
         after: Option<ApprovalCursor>,
         at: UtcTimestamp,
@@ -634,6 +645,7 @@ impl ApprovalService {
                 .pending_in(
                     context.workspace_id,
                     approval_channel_of(context.channel),
+                    filter,
                     limit,
                     after,
                 )

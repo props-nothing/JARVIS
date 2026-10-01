@@ -38,7 +38,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use jarvis_application::approval_service::{ApprovalServiceError, Decision, DecisionCommand};
-use jarvis_application::repository::approval::ApprovalCursor;
+use jarvis_application::repository::approval::{ApprovalCursor, ApprovalListFilter};
 use jarvis_application::request_context::RequestContext;
 use jarvis_domain::ids::ApprovalId;
 use jarvis_domain::time::UtcTimestamp;
@@ -46,6 +46,7 @@ use jarvis_domain::tool::approval::{
     ApprovalChannel, ApprovalVersion, DecisionNote, DurableApproval,
 };
 use jarvis_domain::tool::canonical::ActionDigest;
+use jarvis_domain::tool::classification::Risk;
 use jarvis_protocol::{
     ApprovalDecisionResponse, ApprovalListView, ApprovalView, CancelApprovalRequest,
     DecideApprovalRequest, MAX_APPROVAL_PAGE, PreviewRowView,
@@ -57,19 +58,26 @@ use crate::time::SystemClock;
 
 /// Query parameters for the listing.
 ///
-/// **`limit` and `cursor` are accepted; any other key is refused by name.**
+/// **`limit`, `cursor`, and `risk` are accepted; any other key is refused by name.**
 ///
 /// That narrowing is deliberate rather than an omission. The contract's filters are "schema-defined:
 /// state, risk, effect, requesting run/tool, and created/expiry time", and this build serves the
-/// default view — because an unrecognised filter that was silently *ignored* would return a superset
-/// of what a caller asked for, and on an approval listing that means showing prompts a client believed
-/// it had excluded. Refusing an unknown key makes the unsupported filters the next increment rather
-/// than a silently wrong answer, which is the same choice the write shapes make with
-/// `deny_unknown_fields`.
+/// default view plus the `risk` narrow — because an unrecognised filter that was silently *ignored*
+/// would return a superset of what a caller asked for, and on an approval listing that means showing
+/// prompts a client believed it had excluded. Refusing an unknown key keeps each unserved filter the
+/// next increment rather than a silently wrong answer, which is the same choice the write shapes make
+/// with `deny_unknown_fields`.
+///
+/// **`risk` is the first filter served, and it is the one whose meaning changed.** `TLS-013` made the
+/// step-up rule real, so a `critical` prompt is the one that will demand an elevated session — a client
+/// that wants to show "the prompts you must step up for" needs this narrow rather than every prompt and
+/// a client-side discard. The others (state, effect, requesting run/tool, time) remain refused, each
+/// needing its own indexed query.
 ///
 /// Parsed from the URI by hand rather than with `axum`'s `Query` extractor, because that extractor
 /// needs the `query` feature and this workspace's `axum` resolves with `http1`, `json`, and `tokio`
 /// only — adding a feature to the dependency graph is a research-gate change, not a convenience.
+///
 /// Why a listing query was refused.
 ///
 /// Two variants rather than one, because the refusals send a client to different inputs: an unknown
@@ -77,18 +85,21 @@ use crate::time::SystemClock;
 /// listing never handed out. Both are `400`, and the codes differ so a client can tell them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueryError {
-    /// A key this build does not serve, or a limit that does not parse.
+    /// A key this build does not serve, or a value that does not parse.
     Other,
     /// A cursor that is not a well-formed value this build produced.
     Cursor,
 }
 
-fn parse_list_query(uri: &Uri) -> Result<(Option<u32>, Option<ApprovalCursor>), QueryError> {
+fn parse_list_query(
+    uri: &Uri,
+) -> Result<(Option<u32>, Option<ApprovalCursor>, ApprovalListFilter), QueryError> {
     let Some(query) = uri.query() else {
-        return Ok((None, None));
+        return Ok((None, None, ApprovalListFilter::default()));
     };
     let mut limit = None;
     let mut cursor = None;
+    let mut filter = ApprovalListFilter::default();
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
@@ -96,6 +107,14 @@ fn parse_list_query(uri: &Uri) -> Result<(Option<u32>, Option<ApprovalCursor>), 
         let (key, value) = pair.split_once('=').ok_or(QueryError::Other)?;
         match key {
             "limit" => limit = Some(value.parse::<u32>().map_err(|_| QueryError::Other)?),
+            // **An unrecognised `risk` is refused, not defaulted to "no narrow".** `Risk::parse` refuses
+            // an unknown spelling, and mapping that refusal to `None` would silently widen the result to
+            // every risk level — returning a **superset** of what the caller asked for, which on this
+            // listing means showing prompts the client believed it had excluded. The whole reason the
+            // unknown-key branch exists applies to an unknown *value* of a known key.
+            "risk" => {
+                filter.risk = Some(Risk::parse(value).map_err(|_| QueryError::Other)?);
+            }
             // **A bad cursor reports its own code, not the generic body defect.** Both are `400`, and
             // the distinction is what tells a client which of its own inputs to fix: an unknown
             // *filter* means the request asked for something this build does not serve, while an
@@ -105,7 +124,7 @@ fn parse_list_query(uri: &Uri) -> Result<(Option<u32>, Option<ApprovalCursor>), 
             _ => return Err(QueryError::Other),
         }
     }
-    Ok((limit, cursor))
+    Ok((limit, cursor, filter))
 }
 
 /// Encodes a page position as an opaque query value.
@@ -222,7 +241,7 @@ pub async fn list_approvals(
     let Some(service) = state.approvals.as_ref() else {
         return runs::not_ready(request_id);
     };
-    let (limit, cursor) = match parse_list_query(&uri) {
+    let (limit, cursor, filter) = match parse_list_query(&uri) {
         Ok(parsed) => parsed,
         Err(QueryError::Cursor) => {
             return error_response_for(
@@ -250,7 +269,7 @@ pub async fn list_approvals(
     // be excluded as lapsed while another row in the same response reported `lapsed: false` against the
     // same deadline.
     let now = clock_now();
-    match service.list(&context, limit, cursor, now).await {
+    match service.list(&context, filter, limit, cursor, now).await {
         Ok(page) => {
             let view = ApprovalListView {
                 approvals: page

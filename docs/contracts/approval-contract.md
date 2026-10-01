@@ -371,9 +371,15 @@ cannot disagree, and its envelope on a refusal because the stable code is what a
   *creation* path is not.
 - **List filters and cursors.** `limit` is served and the response carries **`has_more`**, so a client
   can tell a full page from a complete one; the channel predicate runs **inside the query** (see below).
-  The other filters — `state`, `risk`, `effect`, requesting run/tool, and the time filters — are refused
-  **by name** rather than silently ignored, because an ignored filter would return a superset of what a
-  caller asked for, and on this listing that means showing prompts the client believed it had excluded.
+  **`risk` is served too** (`?risk=critical`), and it is the first filter beyond `limit`/`cursor` to be:
+  it narrows the same `WHERE` the `LIMIT` bounds, so a client asking for the prompts that will demand a
+  step-up gets a full page of them rather than a page of everything with the rest discarded. It was the
+  filter whose meaning changed when the step-up rule became real — a `critical` prompt is the one an
+  ordinary session cannot decide — which is why it is the one added first. An unrecognised *value*
+  (`?risk=severe`) is refused like an unknown *key*, because treating it as "no narrow" would return a
+  **superset** of what the caller asked for. The remaining filters — `state`, `effect`, requesting
+  run/tool, and the time filters — are refused **by name** rather than silently ignored, each still
+  needing its own indexed query, for the same superset reason.
 
   **A cursor is now served too** (`?cursor=`, answered as `next_cursor`), because `has_more` without one
   was a dead end: the daemon told a client that more prompts awaited a decision and gave it no way to

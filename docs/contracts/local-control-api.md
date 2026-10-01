@@ -490,10 +490,34 @@ Rules:
 - Output deltas contain valid UTF-8 boundaries. Stored/public event payloads are
   bounded and never contain hidden chain-of-thought or secrets.
 
-Minimum event types for the first slice are `run.received`,
-`run.context_building`, `run.model_started`, `run.output_text.delta`,
-`run.usage`, and the three terminal variants. Clients ignore unknown additive
-event types but never ignore a sequence gap or unknown terminal state.
+**The event types this build publishes, which is a closed set rather than a floor.** They are listed
+rather than described as a "minimum", because a floor tells a reader which names are *required* and
+leaves a client unable to find the names that are *sent*: an earlier revision enumerated eight and
+omitted `run.planning` and `run.responding`, so two events the daemon publishes on **every** run — one
+for the decision that a strategy was chosen, one for the phase in which the answer is produced — were
+documented in **no file at all**, and a client switching on the stream had nowhere to look them up.
+That is the same defect `BRN-073` found for the run resource's `error_code` field, one vocabulary over.
+The table is held in **both** directions to the protocol's `event_type` module by
+`the_event_types_a_client_can_receive_are_all_documented`, so a constant added without a row — or a row
+added without a constant — fails the build. That check covers the *names the protocol declares*; it does
+not read the controller's publication sites, so a future path that published a bare literal no constant
+declares would still be unseen.
+
+| Event type | Published by | Notes |
+| --- | --- | --- |
+| `run.received` | the run's creation | The opening event; sequence 1. |
+| `run.context_building` | the controller | Context is being resolved. |
+| `run.planning` | the controller | A strategy decision was taken. There is no persisted plan artifact, which the architecture permits: "Planning is a strategy, not a mandatory extra model call." |
+| `run.model_started` | the controller | The model call began. |
+| `run.output_text.delta` | the controller | One chunk of output, one event, at its own sequence. |
+| `run.responding` | the controller | The final answer is being produced. |
+| `run.usage` | the controller | Provider-reported counters; appended without a state change (see below). |
+| `run.completed` | the controller | Terminal. Carries no payload. |
+| `run.failed` | the controller, or the recovery pass | Terminal. Carries `{"code":…,"retryable":false}`. |
+| `run.cancelled` | the controller | Terminal. Carries `{"reason":…,"label":…}` when a caller asked. |
+| `stream.overrun` | the delivery path | **Not a run event.** It ends the *connection*, not the run; see the rule above. |
+
+Clients ignore unknown additive event types but never ignore a sequence gap or unknown terminal state.
 
 **"Never ignore a sequence gap" is a client obligation with an exact remedy, so it is stated rather
 than left to interpretation.** `sequence` starts at 1 and increases by exactly one, so a gap means the

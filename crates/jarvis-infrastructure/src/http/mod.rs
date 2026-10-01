@@ -5005,16 +5005,32 @@ pub(crate) mod tests {
 
         let document = contract_document();
         // The run resource's own table, which has **no status column** — its rows are
-        // `| `code` | meaning |`, unlike the minimum-code table's `| 500 | `code` | no |`. Parsed by
-        // that shape so the two tables in one file cannot be confused for each other.
-        let listed: std::collections::BTreeSet<String> = document
-            .lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix("| `")?;
-                let (code, _) = rest.split_once('`')?;
-                code.contains('.').then(|| code.to_owned())
-            })
-            .collect();
+        // `| `code` | meaning |`, unlike the minimum-code table's `| 500 | `code` | no |`. Parsed from
+        // its own table rather than by its row shape, because `BRN-077` added a second table
+        // (`| Event type | Published by | Notes |`) whose rows are `| `dotted.name` | … |`. A shape
+        // check cannot tell the two apart — the two vocabularies share the `run.*` prefix — so the
+        // comparison would have taken an event type for a code. The header is the one thing that
+        // distinguishes them.
+        let listed: std::collections::BTreeSet<String> = {
+            let mut lines = document
+                .lines()
+                .skip_while(|line| !line.trim_start().starts_with("| Code |"));
+            lines.next();
+            lines.next();
+            let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for line in lines {
+                let Some(rest) = line.strip_prefix("| `") else {
+                    break;
+                };
+                let Some((code, _)) = rest.split_once('`') else {
+                    break;
+                };
+                if code.contains('.') {
+                    out.insert(code.to_owned());
+                }
+            }
+            out
+        };
         assert!(
             listed.len() >= 20,
             "the run error-code table must have been parsed: {listed:?}",
@@ -5045,6 +5061,57 @@ pub(crate) mod tests {
             "every code the run error-code table documents must be emitted by a producer, because a \
              row for a value nothing produces sends a client looking for a cause that cannot occur: \
              {unproduced:?}",
+        );
+    }
+
+    #[test]
+    fn the_event_types_a_client_can_receive_are_all_documented() {
+        // **The vocabulary `BRN-073` and `BRN-074` each recorded as unenumerated, then left.** Those
+        // rounds closed the run resource's `error_code` set — the codes a client reads off a `200` —
+        // and named as residual that the *event types* sharing the `run.*` prefix were still listed
+        // nowhere. Checking it found the gap was not theoretical: `run.planning` and `run.responding`
+        // are published by the controller on **every** run (`each_state_change_published_exactly_one_event`
+        // pins the seven-event sequence they appear in), and the contract's "minimum event types"
+        // sentence enumerated eight that omitted both. So two events a client following the stream
+        // receives on every healthy run had no file to look them up in.
+        //
+        // The comparison is a **derived equivalence**, not a subset, and the difference is the whole
+        // point: the old guard asserted the contract *contains* a required set, so an event type the
+        // build sends that the document never names passed silently. Reading the set from the
+        // protocol's own `event_type` module makes the document and the constants two spellings of
+        // one fact, so adding a constant without documenting it fails here rather than shipping.
+        let root = repository_root();
+        let declared = declared_event_types(&root);
+        let document = contract_document();
+        let documented = documented_event_types(&document);
+        assert!(
+            documented.len() >= 8,
+            "the contract's event table must have been parsed: {documented:?}",
+        );
+
+        let undocumented: Vec<&String> = declared
+            .iter()
+            .filter(|name| !documented.contains(*name))
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "every event type the build can send must be in the contract's event table, because a \
+             client switches on the name and an event outside the list is nowhere to look: \
+             {undocumented:?}",
+        );
+
+        // The reverse direction, which is checkable here for the reason `BRN-074` established: the
+        // table is authored and contains only event types, so a row naming a value no constant
+        // declares is a stale row — an event a client would wait for that the daemon never sends.
+        let unproduced: Vec<&String> = documented
+            .iter()
+            .filter(|name| !declared.contains(*name))
+            .collect();
+        assert!(
+            unproduced.is_empty(),
+            "every event type the contract's table documents must be declared by the protocol, \
+             because a row for an event nothing sends leaves a client waiting for one that never \
+             arrives: {unproduced:?}",
         );
     }
 
@@ -5106,6 +5173,67 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Reads the event-type names the protocol declares in its `event_type` module.
+    ///
+    /// The module is the protocol layer's canonical spelling of every event a client can receive, and
+    /// the source of truth the `run.*` names are read from in both this file's run-code scan and the
+    /// event-type completeness test. A second, hand-maintained list of the same names is the defect this
+    /// workspace keeps finding (two spellings of one fact), so the names are read from the constants
+    /// rather than restated.
+    #[cfg(test)]
+    fn declared_event_types(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        let protocol = std::fs::read_to_string(root.join("crates/jarvis-protocol/src/run.rs"))
+            .expect("the protocol source reads");
+        let event_module = protocol
+            .find("pub mod event_type {")
+            .expect("the protocol declares its event types in a module");
+        let module_body = &protocol[event_module..];
+        let module_end = module_body.find("\n}").unwrap_or(module_body.len());
+        // Each constant is `pub const NAME: &str = "value";`, so the value is between the first pair of
+        // quotes on the line.
+        let mut event_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in protocol[event_module..event_module + module_end].lines() {
+            if let Some((_, rest)) = line.split_once(": &str = \"")
+                && let Some((value, _)) = rest.split_once('"')
+            {
+                event_types.insert(value.to_owned());
+            }
+        }
+        assert!(
+            event_types.len() >= 8,
+            "the event types must have been read from the protocol: {event_types:?}",
+        );
+        event_types
+    }
+
+    /// Reads the event types the contract enumerates in its event table.
+    ///
+    /// Parsed **by the table's header** rather than by a row shape, and that is the correction a row
+    /// shape would need: this table's rows and the run error-code table's rows are both
+    /// ``| `dotted.name` | … |``, so a shape check cannot tell an event row from a code row — the two
+    /// vocabularies share the `run.*` prefix, which is the whole reason `BRN-074` could not subtract
+    /// one from the other mechanically. The header is the one thing that distinguishes them.
+    #[cfg(test)]
+    fn documented_event_types(document: &str) -> std::collections::BTreeSet<String> {
+        let mut lines = document
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("| Event type |"));
+        // The header, then its `| --- |` separator: neither is a data row.
+        lines.next();
+        lines.next();
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in lines {
+            let Some(rest) = line.strip_prefix("| `") else {
+                break;
+            };
+            let Some((name, _)) = rest.split_once('`') else {
+                break;
+            };
+            out.insert(name.to_owned());
+        }
+        out
+    }
+
     /// Reads the run-resource code producers, applying the three distinctions documented above.
     #[cfg(test)]
     fn run_error_code_set() -> RunCodeProducers {
@@ -5151,27 +5279,7 @@ pub(crate) mod tests {
         ];
         // The `run.*` values that are event types, read from the protocol's own constants rather than
         // listed here.
-        let mut event_types: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let protocol = std::fs::read_to_string(root.join("crates/jarvis-protocol/src/run.rs"))
-            .expect("the protocol source reads");
-        let event_module = protocol
-            .find("pub mod event_type {")
-            .expect("the protocol declares its event types in a module");
-        let module_body = &protocol[event_module..];
-        let module_end = module_body.find("\n}").unwrap_or(module_body.len());
-        // Each constant is `pub const NAME: &str = "value";`, so the value is between the first pair of
-        // quotes on the line.
-        for line in protocol[event_module..event_module + module_end].lines() {
-            if let Some((_, rest)) = line.split_once(": &str = \"")
-                && let Some((value, _)) = rest.split_once('"')
-            {
-                event_types.insert(value.to_owned());
-            }
-        }
-        assert!(
-            event_types.len() >= 8,
-            "the event types must have been read from the protocol: {event_types:?}",
-        );
+        let event_types = declared_event_types(&root);
 
         let mut field_codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut every_value: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
