@@ -6109,7 +6109,7 @@ pub(crate) mod tests {
         // The exclusions, each with the fact that decides it. `run_controller.rs` and `model.rs` are
         // the two that carry a client-visible code onto a *field* rather than an envelope; the other
         // three have no HTTP production reference.
-        const EXCLUDED: [(&str, &str); 6] = [
+        const EXCLUDED: [(&str, &str); 7] = [
             (
                 "run_controller.rs",
                 "carries run.* onto the run resource's error_code field, read on a 200",
@@ -6129,6 +6129,11 @@ pub(crate) mod tests {
                 "no HTTP production reference in this build",
             ),
             ("recovery.rs", "no HTTP production reference in this build"),
+            (
+                "run_service/delegation.rs",
+                "a delegation refusal reaches the delegating model as a tool error class \
+                 (`agents.delegate@1`), never the HTTP envelope",
+            ),
             (
                 "tool_recovery.rs",
                 "no HTTP production reference in this build",
