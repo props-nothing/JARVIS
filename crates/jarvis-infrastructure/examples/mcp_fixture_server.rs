@@ -79,6 +79,21 @@ pub const FIXTURE_UNANSWERED: &str = "unanswered";
 /// complete, not that it completes slowly.
 pub const FIXTURE_UNANSWERED_DELAY_MS: u64 = 30_000;
 
+/// The variable's value for a peer that answers a call **after a bounded delay** rather than never.
+///
+/// **It exists to tell a short bound from a generous one by the OUTCOME rather than by the clock.** A fixture
+/// that never answers times out under any bound, so a test cannot distinguish "the request's 250 ms bound was
+/// enforced" from "the executor used its own 10 s fallback": both produce a timeout, one ten seconds later. A
+/// delayed answer separates them — a short bound yields `Ambiguous` while a generous one yields the fixture's
+/// text — so the assertion is a different *kind* of result rather than a shorter wait.
+pub const FIXTURE_SLOW: &str = "slow";
+
+/// How long the slow fixture withholds its answer before sending it.
+///
+/// Between the two bounds the executor tests use (250 ms and 10 s), so exactly one of them can elapse
+/// first. Chosen well inside that gap so neither side is a race.
+pub const FIXTURE_SLOW_DELAY_MS: u64 = 1_500;
+
 /// The tool name the standard and legacy fixtures offer.
 pub const FIXTURE_TOOL_NAME: &str = "read_file";
 
@@ -106,6 +121,12 @@ struct FixtureServer {
     tools: &'static [&'static str],
     /// Whether a call is accepted and then **never answered**, so the client's bound elapses.
     withhold_answer: bool,
+    /// How long to wait before answering a call, when the fixture is the slow one.
+    ///
+    /// `None` answers immediately. A duration rather than a flag beside `withhold_answer`, because the two are
+    /// different behaviours — one never answers, the other answers late — and a single boolean would have to
+    /// encode both.
+    answer_after_ms: Option<u64>,
 }
 
 impl ServerHandler for FixtureServer {
@@ -166,6 +187,7 @@ impl ServerHandler for FixtureServer {
         let name = request.name;
         let tools = self.tools;
         let withhold = self.withhold_answer;
+        let answer_after_ms = self.answer_after_ms;
         async move {
             if !tools.contains(&name.as_ref()) {
                 return Err(rmcp::ErrorData::new(
@@ -182,6 +204,11 @@ impl ServerHandler for FixtureServer {
                     FIXTURE_UNANSWERED_DELAY_MS,
                 ))
                 .await;
+            }
+            // Or answered **late**: accepted, waited on, and then served. Which of the two happens is what
+            // lets a test tell a short bound from a generous one by the result rather than by the clock.
+            if let Some(delay) = answer_after_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             Ok(CallToolResponse::Complete(CallToolResult::success(vec![
                 ContentBlock::Text(TextContent::new(FIXTURE_CALL_TEXT)),
@@ -202,16 +229,19 @@ fn selected_fixture() -> Option<FixtureServer> {
             supported: both,
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
+            answer_after_ms: None,
         },
         FIXTURE_LEGACY => FixtureServer {
             supported: vec![FIXTURE_LEGACY_VERSION],
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
+            answer_after_ms: None,
         },
         FIXTURE_ALL_REFUSED => FixtureServer {
             supported: both,
             tools: &[FIXTURE_UNUSABLE_TOOL_NAME],
             withhold_answer: false,
+            answer_after_ms: None,
         },
         FIXTURE_PARTIAL => FixtureServer {
             supported: both,
@@ -219,11 +249,19 @@ fn selected_fixture() -> Option<FixtureServer> {
             // a test that checked for a callable tool rather than for the refusal beside it.
             tools: &[FIXTURE_TOOL_NAME, FIXTURE_UNUSABLE_TOOL_NAME],
             withhold_answer: false,
+            answer_after_ms: None,
         },
         FIXTURE_UNANSWERED => FixtureServer {
             supported: both,
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: true,
+            answer_after_ms: None,
+        },
+        FIXTURE_SLOW => FixtureServer {
+            supported: both,
+            tools: &[FIXTURE_TOOL_NAME],
+            withhold_answer: false,
+            answer_after_ms: Some(FIXTURE_SLOW_DELAY_MS),
         },
         _ => return None,
     };

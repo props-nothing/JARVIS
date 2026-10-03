@@ -53,6 +53,19 @@ const FIXTURE_STANDARD: &str = "standard";
 /// The fixture that lists a tool, **accepts** a call, and never answers it.
 const FIXTURE_UNANSWERED: &str = "unanswered";
 
+/// The fixture that lists a tool, accepts a call, and answers it **after a bounded delay**.
+///
+/// Mirrored from the example. The delay matters rather than being an implementation detail: it sits between a
+/// short bound and a generous one, so a test can tell which bound was enforced by the *kind* of result rather
+/// than by how long it waited.
+const FIXTURE_SLOW: &str = "slow";
+
+/// The slow fixture's delay, mirrored from the example.
+///
+/// A `u32` because [`std::time::Duration::from_millis`] takes one, and the example's constant is a `u64` for
+/// consistency with the other delays there.
+const SLOW_FIXTURE_DELAY_MS: u32 = 1_500;
+
 /// The tool name the fixture offers, which deliberately differs from its canonical capability.
 ///
 /// Mirrored from the example rather than imported, because the example is a separate target — the same
@@ -511,6 +524,139 @@ async fn a_call_the_server_never_answers_reaches_the_port_as_ambiguous() {
         error,
         ToolExecutionError::Ambiguous,
         "a timeout means the effect may exist, which is what Ambiguous is for"
+    );
+
+    drop(session);
+    executor_shutdown(executor);
+}
+
+/// Proves the **request's** declared bound is the one enforced, not a value the executor chose at composition.
+///
+/// **The defect this closes is a write-only field.** `ToolExecutionRequest::timeout_ms` is documented as "the
+/// tool's declared timeout" and the pipeline fills it from `definition.execution.timeout_ms`, which is the
+/// bound a tool was *reviewed* with — but until this round no executor read it. `McpToolExecutor` captured its
+/// own value at composition time and measured every call against that, so the reviewed bound and the enforced
+/// bound were two answers to one question, and the one that ran was the one nobody reviewed.
+///
+/// ⚠ **The first version of this detector was vacuous, and the mutation is what said so.** It used the
+/// never-answering fixture with a short request bound and a generous fallback, and asserted `Ambiguous` —
+/// which **both** bounds produce, so making the executor ignore the request left the test passing (the run
+/// merely took 10 s instead of 0.3 s). A timeout is a timeout; the two implementations differed in *how long*
+/// they waited, and a duration is not an assertion.
+///
+/// So the fixture is the **slow** one, which answers after [`FIXTURE_SLOW_DELAY_MS`] — between the request's
+/// short bound and the executor's generous fallback. Now the two implementations produce different **kinds**
+/// of result: the request's bound elapses first and the call is `Ambiguous`, while an executor using its own
+/// field lets the fixture answer and returns its text. The assertion can tell them apart, which is what makes
+/// it about which bound was used rather than about whether one elapsed.
+#[tokio::test]
+async fn the_requests_own_bound_is_what_a_call_is_measured_against() {
+    let Some(program) =
+        program_or_skip("the_requests_own_bound_is_what_a_call_is_measured_against")
+    else {
+        return;
+    };
+    let discovered = discover_stdio_server(&spec_for(program, FIXTURE_SLOW), SERVER_NAME)
+        .await
+        .expect("the slow fixture must still be discoverable — it lists a tool");
+    let server = ServerConfigId::new(SERVER_NAME).expect("the fixture name is a usable identity");
+    let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
+    let report = register_catalog(&mut registry, &server, discovered.catalog());
+    assert!(report.is_clean(), "the fixture must register: {report:?}");
+    let pairs = publishable_pairs(&registry, &server, discovered.catalog())
+        .expect("the fixture offers distinct capabilities");
+    let identities: Vec<ToolIdentity> = pairs
+        .iter()
+        .map(|(definition, _)| definition.identity.clone())
+        .collect();
+    let (session, _, _) = discovered.into_session();
+    // The fallback is **generous enough for the slow fixture to answer within it**, so an executor measuring
+    // against this would succeed rather than time out.
+    let executor = McpToolExecutor::new(Arc::clone(&session), identities.clone(), CALL_TIMEOUT_MS);
+    assert!(
+        u64::from(SLOW_FIXTURE_DELAY_MS) < CALL_TIMEOUT_MS,
+        "the fallback must outlast the fixture's delay, or this proves nothing"
+    );
+
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        timeout_ms: SHORT_CALL_BOUND_MS,
+    };
+
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("the request's own short bound must end this call before the fixture answers");
+    assert_eq!(
+        error,
+        ToolExecutionError::Ambiguous,
+        "the request's bound elapsed while the fixture was still withholding, so the outcome is ambiguous — \
+         a success here would mean the executor used its own fallback instead of the request's bound"
+    );
+
+    drop(session);
+    executor_shutdown(executor);
+}
+
+/// Proves a request that declares **no** bound falls back rather than becoming unbounded.
+///
+/// The companion to the test above, and a different claim: `0` must not mean "wait forever". The pipeline
+/// always supplies a value, so this exercises the arm a caller outside it would reach — and a fallback is the
+/// only reading that keeps the port's promise that a server which accepts a request and never answers cannot
+/// hold the dispatcher open with no clock.
+#[tokio::test]
+async fn a_request_without_a_bound_falls_back_rather_than_becoming_unbounded() {
+    let Some(program) =
+        program_or_skip("a_request_without_a_bound_falls_back_rather_than_becoming_unbounded")
+    else {
+        return;
+    };
+    let discovered = discover_stdio_server(&spec_for(program, FIXTURE_UNANSWERED), SERVER_NAME)
+        .await
+        .expect("the unanswered fixture must still be discoverable — it lists a tool");
+    let server = ServerConfigId::new(SERVER_NAME).expect("the fixture name is a usable identity");
+    let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
+    let report = register_catalog(&mut registry, &server, discovered.catalog());
+    assert!(report.is_clean(), "the fixture must register: {report:?}");
+    let pairs = publishable_pairs(&registry, &server, discovered.catalog())
+        .expect("the fixture offers distinct capabilities");
+    let identities: Vec<ToolIdentity> = pairs
+        .iter()
+        .map(|(definition, _)| definition.identity.clone())
+        .collect();
+    let (session, _, _) = discovered.into_session();
+    let executor = McpToolExecutor::new(
+        Arc::clone(&session),
+        identities.clone(),
+        SHORT_CALL_BOUND_MS,
+    );
+
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        // No bound declared: the fallback must apply, and here the fallback is the short one.
+        timeout_ms: 0,
+    };
+
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("zero must fall back to a bound rather than meaning unbounded");
+    assert_eq!(
+        error,
+        ToolExecutionError::Ambiguous,
+        "the fallback bound elapsed, which is the only reason this call ended"
     );
 
     drop(session);

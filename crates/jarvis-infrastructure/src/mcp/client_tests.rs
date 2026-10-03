@@ -300,3 +300,64 @@ fn every_startup_code_is_namespaced_and_distinct() {
         "codes must be distinct: {codes:?}"
     );
 }
+
+/// Proves the real client's refusal helper carries JARVIS's own reason for **all three** input kinds.
+///
+/// **The defect this closes is a default rather than an omission, and it is the worst kind.** The SDK's
+/// multi-round-trip loop drives `input_required` rounds itself, routing each request to the client handler;
+/// `decide_response`'s `InputRequired` arm is therefore unreachable in production, and what a server meets is
+/// whatever `JarvisClient` answers. `JarvisClient` implemented nothing, so the defaults applied — and for
+/// **roots** the default is `Ok(ListRootsResult::default())`, a *success* carrying an empty list. A server
+/// asking JARVIS for the shape of its filesystem, which `invocation.rs` refuses as an information-disclosure
+/// primitive, was told it had none. Elicitation fared no better: the default returns
+/// `ElicitResult { action: Decline }`, which reaches the server as a *user decision* that no user made. Only
+/// sampling was refused by default (`method_not_found`).
+///
+/// This asserts the **construction** — one helper, three kinds, each carrying its own reason and a
+/// `-32602` code — so the three overrides cannot drift apart. `mcp_conversation.rs` asserts the wire half,
+/// where a real server sends the request and the refusal is what comes back.
+#[test]
+#[allow(deprecated)]
+fn every_input_kind_is_refused_with_its_own_reason() {
+    use crate::mcp::invocation::InputKind;
+
+    // `invalid_request` is `-32600`/`-32602`-family rather than `method_not_found`: the peer must learn the
+    // request was *understood and declined*, not that JARVIS does not implement the method. The difference
+    // matters to a server deciding whether to retry with a different shape.
+    for kind in [
+        InputKind::Sampling,
+        InputKind::Roots,
+        InputKind::Elicitation,
+    ] {
+        let error = super::refused_input(kind);
+        assert_eq!(
+            error.code,
+            ErrorCode::INVALID_REQUEST,
+            "{kind:?} must be refused as an invalid request rather than as an unimplemented method"
+        );
+        assert_eq!(
+            error.message.as_ref(),
+            kind.reason(),
+            "{kind:?} must carry its own contract reason, not a shared message"
+        );
+    }
+
+    // And the three reasons are distinct, which is what makes the assertion above meaningful: three calls to
+    // one helper returning one string would satisfy per-kind equality only if the reasons were the same.
+    let reasons: Vec<&str> = [
+        InputKind::Sampling,
+        InputKind::Roots,
+        InputKind::Elicitation,
+    ]
+    .into_iter()
+    .map(InputKind::reason)
+    .collect();
+    let mut unique = reasons.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        3,
+        "each kind names its own correction: {reasons:?}"
+    );
+}

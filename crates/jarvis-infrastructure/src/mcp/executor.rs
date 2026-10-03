@@ -82,12 +82,16 @@ pub struct McpToolExecutor {
     /// A **set of identities**, not the catalog itself: the call path needs membership, and holding the
     /// schemas here would put a second copy of them beside the argument validator's.
     callable: Arc<std::collections::BTreeSet<ToolIdentity>>,
-    /// How long one call may take, including every continuation.
-    timeout_ms: u64,
+    /// The server's own declared default bound, used only when a request arrives without one.
+    ///
+    /// **The call's bound comes from the request, not from here** — see [`Self::invoke`]. This is the
+    /// fallback for a caller that supplies `0`, which `ToolExecutionRequest` cannot forbid across a crate
+    /// boundary and which would otherwise mean "no bound at all".
+    default_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for McpToolExecutor {
-    /// Reports the callable count and the timeout, never the identities' sources or the session.
+    /// Reports the callable count and the fallback bound, never the identities' sources or the session.
     ///
     /// The session is not usefully printable, and an identity list can be long — the count is the fact a
     /// diagnostic line needs.
@@ -95,7 +99,7 @@ impl std::fmt::Debug for McpToolExecutor {
         formatter
             .debug_struct("McpToolExecutor")
             .field("callable", &self.callable.len())
-            .field("timeout_ms", &self.timeout_ms)
+            .field("default_timeout_ms", &self.default_timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -103,19 +107,19 @@ impl std::fmt::Debug for McpToolExecutor {
 impl McpToolExecutor {
     /// Builds an executor over a live session and the identities it may call.
     ///
-    /// `timeout_ms` is bounded by the caller, and every call is wrapped in it: without a bound a server that
-    /// accepts a request and never answers holds the dispatcher open with no clock, which is the failure the
-    /// `ToolExecutor` port's own documentation names.
+    /// `default_timeout_ms` is the **fallback** bound, not the bound a call uses: `ToolExecutor::execute`
+    /// carries the tool's declared timeout in its request, and that is what one call is measured against.
+    /// This value stands in only when a request supplies `0`.
     #[must_use]
     pub fn new(
         session: Arc<RunningService<RoleClient, JarvisClient>>,
         callable: impl IntoIterator<Item = ToolIdentity>,
-        timeout_ms: u64,
+        default_timeout_ms: u64,
     ) -> Self {
         Self {
             session,
             callable: Arc::new(callable.into_iter().collect()),
-            timeout_ms,
+            default_timeout_ms,
         }
     }
 
@@ -150,11 +154,18 @@ impl McpToolExecutor {
     /// Returns the class the call is recorded under. A refusal this adapter made itself (an unaddressable
     /// capability, an argument document that is not an object, an identity it may not call) carries the
     /// class `call.rs` assigns that refusal; a transport failure carries the class `outcome.rs` assigns it.
+    ///
+    /// `call_timeout_ms` is the bound the **caller's request** declared, not one this executor chose. The
+    /// port puts the tool's declared timeout in `ToolExecutionRequest`, and until this parameter existed that
+    /// value was written by the pipeline and read by nobody — so the bound a tool was reviewed with was not
+    /// the bound it ran under. A `0` means the caller supplied none, and falls back to the server's own
+    /// declared default rather than meaning "unbounded".
     async fn invoke(
         &self,
         identity: &ToolIdentity,
         arguments: &jarvis_domain::tool::call::ToolArguments,
         cancel: &CancellationScope,
+        call_timeout_ms: u64,
     ) -> Result<jarvis_domain::tool::call::ToolResultBody, ToolErrorClass> {
         // **Membership first, so an unauthorized identity never reaches the wire.** The pipeline authorized
         // this call against a grant, and the grant names an identity — a server that re-schemas a tool
@@ -191,10 +202,19 @@ impl McpToolExecutor {
         let call = self
             .session
             .call_tool_with_mrtr_max_rounds(params, MAX_MRTR_ROUNDS);
+        // **The bound is the caller's.** `ToolExecutionRequest::timeout_ms` is documented as "the tool's
+        // declared timeout", and it is what the pipeline reviewed the tool with — so measuring the call
+        // against anything else would enforce a bound nobody chose. `0` falls back to the server's declared
+        // default rather than to no bound, because a request without one must not mean "unbounded".
+        let bound_ms = if call_timeout_ms == 0 {
+            self.default_timeout_ms
+        } else {
+            call_timeout_ms
+        };
         // The timeout bounds the whole exchange including continuations, and the cancellation race is
         // **outside** it so a cancelled call reports `Cancelled` rather than a timeout: a caller that
         // stopped the work must not be told the server was slow.
-        let bounded = tokio::time::timeout(std::time::Duration::from_millis(self.timeout_ms), call);
+        let bounded = tokio::time::timeout(std::time::Duration::from_millis(bound_ms), call);
         let outcome = tokio::select! {
             // `biased` so a cancellation that is already signalled wins over a call that is already
             // finished — the caller's decision is the one to report.
@@ -243,7 +263,12 @@ impl ToolExecutor for McpToolExecutor {
     ) -> ToolExecutionFuture<'a> {
         Box::pin(async move {
             match self
-                .invoke(request.identity, request.arguments, cancel)
+                .invoke(
+                    request.identity,
+                    request.arguments,
+                    cancel,
+                    request.timeout_ms,
+                )
                 .await
             {
                 Ok(result) => Ok(result),

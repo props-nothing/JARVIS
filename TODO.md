@@ -5485,6 +5485,69 @@ Dependencies: Milestone 2 exit gate.
     re-launch. What changed is that the facts exist outside the daemon's own log: an operator can now ask a
     *live* daemon which servers are up, which were refused, and whether a retry could help. The supervisor is
     still the next unnamed slice.
+  - **Slice 24: the SDK's multi-round-trip loop does not call JARVIS's input-request policy, so two of the
+    three refusals were never made.** `RunningService::call_tool_with_mrtr_max_rounds` handles an
+    `input_required` response **itself**, routing each request to the client's `ClientHandler` — so
+    `decide_response`'s `InputRequired` arm is unreachable in production, and what a server actually meets is
+    whatever `JarvisClient` answers. `JarvisClient` implemented nothing, so the SDK's defaults applied, and
+    **two of the three defaults are not refusals**: `list_roots` returns `Ok(ListRootsResult::default())` — the
+    request is *served*, with an empty root list — and `create_elicitation` returns
+    `ElicitResult { action: Decline }`, i.e. declined **on the user's behalf**, which reaches the server as a
+    consent outcome no user gave. Only sampling was refused by default (`method_not_found`).
+  - **The roots default is the security-relevant one.** `invocation.rs` refuses roots as an
+    information-disclosure primitive — "roots asks JARVIS to enumerate its filesystem for a server". A server
+    asking that question was told JARVIS *has no roots*, which is a different statement and a permissive one:
+    the peer learns that its request was understood and answered, not that JARVIS declines to answer it.
+  - **All three are now overridden on `JarvisClient`**, each returning an `invalid_request` error carrying
+    `InputKind::reason()` — the same sentence `invocation.rs` refuses with, so the operator's log and the
+    server's error say one thing rather than two. Sampling is overridden even though the SDK's default already
+    refuses it, so all three share one vocabulary rather than one of them being phrased like an SDK error.
+  - **`#[allow(deprecated)]` is scoped to the three methods and the four imports, and that is deliberate.**
+    Roots and sampling are deprecated by SEP-2577 — but a deprecated *feature* still has to be *refused* while
+    it exists, and refusing it is how this adapter honours the deprecation. A file-level allow would also
+    silence the lint everywhere else in `client.rs`, where a deprecated item would be a genuine mistake.
+  - **The detector is a wire test with its own control, and the control is the round's key decision.** The
+    fixture server gained a `needs_roots` tool that, from inside a call, sends the client a real
+    `ListRootsRequest` (a server-initiated request, which is the exact shape the SDK routes to the handler) and
+    reports what came back. With a refusing client the tool reports `refused: roots`; with a client that
+    implements nothing — the same fixture, the same request — it reports **`served`**. Without that control,
+    "the server got an error" could have been the SDK refusing the request itself, and the override would be
+    untested.
+  - **Falsified by making the override serve instead**, which fails `a_server_asking_for_roots_reaches_a_handler_that_can_refuse_it` while the control stays green — so the two tests are a genuine pair rather than
+    one claim asserted twice.
+  - **A fixture lesson re-learned:** adding the roots tool unconditionally broke two existing tests that assert
+    a catalog of exactly one tool (`left: 2, right: 1`, and a name assertion reading `needs_roots` where it
+    expected `read_file`). The tool is now **opt-in per fixture instance** (`offer_roots_tool`), because a
+    fixture change that silently alters what other tests observe is how a suite starts proving something other
+    than what it says.
+  - **Slice 25: a port field the pipeline wrote and no executor read.** `ToolExecutionRequest::timeout_ms` is
+    documented as *"the tool's declared timeout"* and `ToolCallService` fills it from
+    `definition.execution.timeout_ms` — the bound a tool was **reviewed** with. But
+    `McpToolExecutor` captured its own value at composition time and measured every call against that, so the
+    reviewed bound and the enforced bound were two answers to one question, and the one that ran was the one
+    nobody reviewed. The whole workspace was swept: no executor read `request.timeout_ms`, and the two
+    *construction* sites that set it both set it from the same `ExecutionDefaults` — so the two values were
+    equal in practice and the defect was **latent**, which is why five rounds of call-path tests never showed
+    it. The MCP executor now enforces the request's bound, with `0` falling back to the server's declared
+    default rather than meaning "unbounded".
+  - **⚠ The first detector was vacuous, and the mutation is what said so — the most useful thing this round
+    produced.** It used the never-answering fixture with a short request bound and a generous fallback, and
+    asserted `Ambiguous`. Making the executor ignore the request left the test **passing**: both bounds produce
+    `Ambiguous`, so the implementations differed only in *how long* they waited — 10.03 s versus 0.29 s. A
+    duration is not an assertion, and an outcome both implementations produce cannot distinguish them.
+  - **The fix was a fixture that separates them by KIND.** `examples/mcp_fixture_server.rs` gained a `slow`
+    mode that answers after `FIXTURE_SLOW_DELAY_MS` (1.5 s) — between the short bound (250 ms) and the
+    generous fallback (10 s). Now the request's bound elapses first and the call is `Ambiguous`, while an
+    executor using its own field lets the fixture answer and returns its **text**. Re-running the same mutant
+    fails `the_requests_own_bound_is_what_a_call_is_measured_against`, which the previous version could not do.
+  - **The generalisable rule: a detector must produce a DIFFERENT KIND of result under the mutation, not a
+    different duration.** Any test where the mutant only changes timing is a test that cannot see the mutant.
+    This is the same family as the earlier `assert_ne!(SUCCESS)` finding, one step further: there the wrong
+    assertion was satisfied by a *different failure*; here it was satisfied by the *same* failure, merely later.
+  - **A companion test asserts a different claim:** `0` falls back rather than becoming unbounded, because the
+    port's own promise is that a server which accepts a request and never answers cannot hold the dispatcher
+    open with no clock. The pipeline always supplies a value, so this exercises the arm a caller outside it
+    would reach.
   - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
     dies *during* a run is not yet noticed and quarantined; the executor refuses a dispatch to it and `health`
     reports it, but **nothing acts on it** — no pass prunes, quarantines, or re-launches, and a dispatch that

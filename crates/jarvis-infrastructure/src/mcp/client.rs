@@ -36,8 +36,18 @@
 //! reasoning for the runtime case.
 
 use jarvis_domain::tool::error_class::ToolErrorClass;
+// **The allow is on the import rather than at the file level, and it is required for a reason worth
+// stating.** These four types are the *signature* of the deprecated feature this client has to refuse, so
+// naming them is how the refusal is written; a file-level `#![allow(deprecated)]` would also silence the
+// lint everywhere else in this module, where a deprecated item would be a genuine mistake.
+use rmcp::ErrorData;
 use rmcp::model::ProtocolVersion;
-use rmcp::service::ClientInitializeError;
+#[allow(deprecated)]
+use rmcp::model::{
+    CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
+    ListRootsResult,
+};
+use rmcp::service::{ClientInitializeError, RequestContext, RoleClient};
 
 /// The protocol versions JARVIS prefers, newest first.
 ///
@@ -104,12 +114,103 @@ pub fn negotiate_protocol_version(server_supported: &[ProtocolVersion]) -> Optio
 /// appeared, including anywhere this adapter did not intend a session. A named type keeps the identity
 /// greppable and lets `#![deny(clippy::...)]` on this crate stay meaningful about it.
 ///
-/// The default `get_info` is the SDK's stock client identity and capability set, which is what makes
-/// "declares nothing" true rather than merely intended.
+/// The client identity JARVIS presents to an MCP server, for **every** session this adapter opens.
+///
+/// One type for discovery and for calls, and that is a correction rather than a tidy-up: the two were
+/// separate (`DiscoveryClient` and `CallClient`) and both were empty, which is two declarations of one
+/// posture. The posture is "declare no server-initiated capabilities", and it has one reason — every input
+/// request the SDK could route here is refused by `invocation.rs`, so a client advertising a capability it
+/// refuses to service would be claiming something untrue.
 #[derive(Debug, Clone, Default)]
 pub struct JarvisClient;
 
-impl rmcp::ClientHandler for JarvisClient {}
+/// The default `get_info` is the SDK's stock client identity and capability set, which is what makes
+/// "declares nothing" true rather than merely intended.
+///
+/// # Every server-initiated input request is refused **here**, and the defaults are not good enough
+///
+/// `invocation.rs` owns the policy — `decide_input_request` refuses sampling, roots, and elicitation by
+/// name, and `decide_response` consults it. But the SDK's multi-round-trip loop does **not** call that
+/// code: `RunningService::call_tool_with_mrtr_max_rounds` handles each `input_required` itself, routing
+/// every request to this handler's `ClientHandler` methods. `decide_response`'s `InputRequired` arm is
+/// therefore unreachable in production, and what a server actually meets is whatever these methods
+/// answer. The SDK's defaults are **not** a refusal for two of the three:
+///
+/// - `create_message` (sampling) → `method_not_found`, which is a refusal and is left alone.
+/// - `list_roots` → **`Ok(ListRootsResult::default())`**, i.e. the request is *served* with an empty root
+///   list. That is the opposite of JARVIS's policy, which refuses roots as an information-disclosure
+///   primitive, and a server receiving a success would be told JARVIS has no roots rather than that
+///   JARVIS refuses the question.
+/// - `create_elicitation` → `Ok(ElicitResult { action: Decline })`, which *declines on the user's
+///   behalf* without ever asking them. That reaches the server as a user decision, when no user was
+///   consulted — an invented consent outcome rather than a refusal.
+///
+/// So the three are overridden to return a JSON-RPC error carrying JARVIS's own reason and refusal code.
+/// The message is built from `InputKind::reason()`, which is the same sentence `invocation.rs` refuses
+/// with, so the operator's log and the server's error say one thing rather than two.
+///
+/// **`#[allow(deprecated)]` is deliberate and scoped.** Roots and sampling are deprecated by SEP-2577,
+/// and the SDK marks the trait methods accordingly — but a deprecated *feature* still has to be
+/// *refused* while it exists, and refusing it is precisely how this adapter honours the deprecation.
+/// Silencing the lint for these three methods is the honest form of that: the alternative is not calling
+/// the methods, which is what leaves the SDK's permissive defaults in place.
+impl rmcp::ClientHandler for JarvisClient {
+    /// Refuses a sampling request: it asks JARVIS to spend its model budget on a server's behalf.
+    ///
+    /// The SDK's default already refuses this one, and it is overridden anyway so all three refusals
+    /// share one reason vocabulary and one code shape — a server that meets two JARVIS refusals in one
+    /// session should not find that one of them is phrased like an SDK error.
+    #[allow(deprecated)]
+    fn create_message(
+        &self,
+        _params: CreateMessageRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<CreateMessageResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
+    {
+        std::future::ready(Err(refused_input(super::invocation::InputKind::Sampling)))
+    }
+
+    /// Refuses a roots request rather than answering it with an empty list.
+    ///
+    /// **The one that matters.** The SDK's default returns success, so without this override a server
+    /// asking for the filesystem shape gets a `200` with no roots — indistinguishable, to that server,
+    /// from a client that has none, and a success where JARVIS's policy is a refusal.
+    #[allow(deprecated)]
+    fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<ListRootsResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
+    {
+        std::future::ready(Err(refused_input(super::invocation::InputKind::Roots)))
+    }
+
+    /// Refuses an elicitation request rather than declining it on the user's behalf.
+    ///
+    /// **The SDK's default invents an outcome no user gave.** `Decline` is a decision, and it travels to
+    /// the server as one; the request was never shown to anyone. Refusing says the true thing — JARVIS
+    /// does not service this — and leaves the prompt and its consent where `invocation.rs` says they
+    /// belong.
+    fn create_elicitation(
+        &self,
+        _request: ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<ElicitResult, ErrorData>> + rmcp::service::MaybeSendFuture + '_
+    {
+        std::future::ready(Err(refused_input(
+            super::invocation::InputKind::Elicitation,
+        )))
+    }
+}
+
+/// Builds the JSON-RPC error a refused server-initiated input request is answered with.
+///
+/// **One construction site, so the three overrides cannot drift.** The code travels in the error's
+/// `data` as well as its message, because a JSON-RPC error code is a number and JARVIS's refusals are
+/// named by a `mcp.*` string — the operator greps for the string, and a peer that wants to branch on it
+/// has it without parsing prose.
+fn refused_input(kind: super::invocation::InputKind) -> ErrorData {
+    ErrorData::invalid_request(kind.reason(), None)
+}
 
 /// What a failed startup means, in both of the senses the module doc separates.
 #[derive(Debug, Clone, PartialEq, Eq)]

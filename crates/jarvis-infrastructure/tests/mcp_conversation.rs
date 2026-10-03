@@ -45,7 +45,9 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ProtocolVersion,
     ServerCapabilities, ServerConfig, TextContent, Tool,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{
+    ClientInitializeError, RequestContext, RoleClient, RoleServer, RunningService,
+};
 use rmcp::{
     ClientHandler, ClientLifecycleMode, ServerHandler, serve_client_with_lifecycle, serve_server,
 };
@@ -77,6 +79,12 @@ struct FixtureServer {
     list_calls: Arc<AtomicUsize>,
     /// How many times the fixture was asked to call its tool.
     call_calls: Arc<AtomicUsize>,
+    /// Whether to **also** offer [`ROOTS_TOOL_NAME`].
+    ///
+    /// Opt-in rather than always present, because the tests that assert a catalog of exactly one tool would
+    /// otherwise be asserting about a fixture that no longer exists — a lesson this file has already learned
+    /// once, when a fixture's capability did not match what the test assumed it was proving.
+    offer_roots_tool: bool,
 }
 
 impl ServerHandler for FixtureServer {
@@ -100,31 +108,70 @@ impl ServerHandler for FixtureServer {
     ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>> + '_ {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         let tool = Tool::new(TOOL_NAME, "Read a file.", tool_schema());
+        let mut offered = vec![tool];
+        // The second tool exists so a call can make this server ask the **client** for its roots, which is
+        // the only way to exercise the SDK's server-initiated request dispatch from a test. Opt-in, so every
+        // other test still sees a catalog of exactly one tool.
+        if self.offer_roots_tool {
+            offered.push(Tool::new(ROOTS_TOOL_NAME, "Read a file.", tool_schema()));
+        }
         // `impl Future` rather than `async`, which is the shape the SDK's own default handlers use — an
         // `async fn` that never awaits is what clippy's `unused_async` flags, and matching the SDK means
         // there is nothing to allow.
-        std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(vec![tool])))
+        std::future::ready(Ok(rmcp::model::ListToolsResult::with_all_items(offered)))
     }
 
+    /// Answers a call — and for [`ROOTS_TOOL_NAME`], **asks the client for its roots first**.
+    ///
+    /// An `async` block rather than `std::future::ready` in each branch, because this handler awaits the
+    /// client's answer. That is exactly the shape under test: a server-initiated request from inside a
+    /// request handler, which the SDK routes to the client's `ClientHandler`. Whether it is answered
+    /// permissively or refused is the client's choice, and that is what the test below observes.
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + '_ {
         self.call_calls.fetch_add(1, Ordering::SeqCst);
-        // A tool the fixture does not offer is a protocol error rather than a reported failure: the
-        // distinction is what `outcome.rs` maps to `NotFound` versus `ProviderError`, and the fixture
-        // should be able to produce both.
-        if request.name != TOOL_NAME {
-            return std::future::ready(Err(rmcp::ErrorData::new(
-                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
-                "no such tool",
-                None,
-            )));
+        let peer = context.peer.clone();
+        let wanted_roots = request.name == ROOTS_TOOL_NAME;
+        async move {
+            if wanted_roots {
+                // The **refusal or the answer** decides what this tool reports, so the test reads the client's
+                // behaviour through a value the server produced rather than through the client's own return.
+                //
+                // `ListRootsRequest` is deprecated by SEP-2577 — and *sending* it is the whole point of the
+                // fixture, because the deprecated feature still has to be refused while it exists. The allow
+                // is on the statement rather than the file, so a deprecated item used elsewhere in this suite
+                // would still be reported.
+                #[allow(deprecated)]
+                let outcome = match peer
+                    .send_request(rmcp::model::ServerRequest::ListRootsRequest(
+                        rmcp::model::ListRootsRequest::default(),
+                    ))
+                    .await
+                {
+                    Ok(_) => "served".to_owned(),
+                    Err(error) => format!("refused: {error}"),
+                };
+                return Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::Text(TextContent::new(outcome)),
+                ])));
+            }
+            // A tool the fixture does not offer is a protocol error rather than a reported failure: the
+            // distinction is what `outcome.rs` maps to `NotFound` versus `ProviderError`, and the fixture
+            // should be able to produce both.
+            if request.name != TOOL_NAME {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    "no such tool",
+                    None,
+                ));
+            }
+            Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::Text(TextContent::new(CALL_TEXT)),
+            ])))
         }
-        std::future::ready(Ok(CallToolResponse::Complete(CallToolResult::success(
-            vec![ContentBlock::Text(TextContent::new(CALL_TEXT))],
-        ))))
     }
 }
 
@@ -149,12 +196,10 @@ const TOOL_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalPropert
 /// `result_large_err`; boxing it would make the test read around the type rather than about it, and this is
 /// a test helper rather than a production path.
 #[allow(clippy::result_large_err)]
-async fn connect_fixture(
+async fn connect_with<H: ClientHandler>(
+    client: H,
     server: FixtureServer,
-) -> Result<
-    rmcp::service::RunningService<rmcp::RoleClient, FixtureClient>,
-    rmcp::service::ClientInitializeError,
-> {
+) -> Result<RunningService<RoleClient, H>, ClientInitializeError> {
     let (server_end, client_end) = tokio::io::duplex(8 * 1024);
     let (server_read, server_write) = tokio::io::split(server_end);
     let (client_read, client_write) = tokio::io::split(client_end);
@@ -177,7 +222,7 @@ async fn connect_fixture(
         }
     });
     serve_client_with_lifecycle(
-        FixtureClient,
+        client,
         client_transport,
         ClientLifecycleMode::Discover {
             preferred_versions: preferred_protocol_versions(),
@@ -186,10 +231,44 @@ async fn connect_fixture(
     .await
 }
 
-/// Connects to a fixture that must start, panicking with the refusal if it does not.
-async fn connected(
+/// Connects a fixture server to the file's default client, **splitting each end once**.
+///
+/// The allow is the same one [`connect_with`] carries: `ClientInitializeError` is large enough to trip
+/// `result_large_err`, and boxing it would make this helper read around the type rather than about it.
+#[allow(clippy::result_large_err)]
+async fn connect_fixture(
     server: FixtureServer,
-) -> rmcp::service::RunningService<rmcp::RoleClient, FixtureClient> {
+) -> Result<RunningService<RoleClient, FixtureClient>, ClientInitializeError> {
+    connect_with(FixtureClient, server).await
+}
+
+/// Connects a fixture server to `client`, panicking if the handshake does not complete.
+#[allow(clippy::result_large_err)]
+async fn client_with<H: ClientHandler>(
+    client: H,
+    server: FixtureServer,
+) -> RunningService<RoleClient, H> {
+    connect_with(client, server)
+        .await
+        .expect("the fixture handshake must complete")
+}
+
+/// Reads the first text block out of a completed call response.
+///
+/// A helper rather than a `match` in each test, so the two roots tests read as the different assertion
+/// rather than as two copies of the same destructuring.
+fn fixture_text(response: &CallToolResponse) -> String {
+    let CallToolResponse::Complete(result) = response else {
+        panic!("the fixture answers with a completed result");
+    };
+    let Some(ContentBlock::Text(text)) = result.content.first() else {
+        panic!("the fixture answers with one text block");
+    };
+    text.text.clone()
+}
+
+/// Connects to a fixture that must start, panicking with the refusal if it does not.
+async fn connected(server: FixtureServer) -> RunningService<RoleClient, FixtureClient> {
     connect_fixture(server)
         .await
         .expect("the fixture handshake must complete")
@@ -203,8 +282,21 @@ fn standard_fixture() -> (FixtureServer, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         supported: vec![ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25],
         list_calls: Arc::clone(&list_calls),
         call_calls: Arc::clone(&call_calls),
+        // One tool, so every test that asserts about *the* tool keeps seeing exactly one — the shape those
+        // tests were written against.
+        offer_roots_tool: false,
     };
     (server, list_calls, call_calls)
+}
+
+/// A fixture server that offers **both** tools, for the two roots tests.
+fn roots_fixture() -> FixtureServer {
+    FixtureServer {
+        supported: vec![ProtocolVersion::V_2026_07_28],
+        list_calls: Arc::new(AtomicUsize::new(0)),
+        call_calls: Arc::new(AtomicUsize::new(0)),
+        offer_roots_tool: true,
+    }
 }
 
 #[tokio::test]
@@ -394,6 +486,127 @@ async fn a_protocol_error_from_the_server_classifies_as_not_found() {
     client.cancel().await.expect("the client must shut down");
 }
 
+/// A client handler that overrides the three input-request methods **the way `JarvisClient` does**.
+///
+/// A minimal mirror rather than the real type, because this file's fixture pairs a handler with a
+/// hand-written server over a duplex pipe; the real `JarvisClient` is exercised against a spawned child in
+/// `mcp_executor_process.rs`. What this proves is the *wire* behaviour of a client that refuses these three:
+/// the SDK's MRTR loop drives the round itself, so what a server meets is the handler's answer.
+///
+/// It is deliberately **not** `JarvisClient::default()` even though that would be more faithful: the point of
+/// this fixture is the SDK's dispatch, and using the real type would make the assertion depend on
+/// `invocation.rs`'s message text as well.
+#[derive(Debug, Clone, Default)]
+struct RefusingClient;
+
+#[allow(deprecated)]
+impl ClientHandler for RefusingClient {
+    fn create_message(
+        &self,
+        _params: rmcp::model::CreateMessageRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp::model::CreateMessageResult, rmcp::ErrorData>> + '_ {
+        std::future::ready(Err(rmcp::ErrorData::invalid_request(
+            "refused: sampling",
+            None,
+        )))
+    }
+
+    /// **The one the SDK's default gets wrong, and the wire test below depends on this override existing.**
+    fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp::model::ListRootsResult, rmcp::ErrorData>> + '_ {
+        std::future::ready(Err(rmcp::ErrorData::invalid_request(
+            "refused: roots",
+            None,
+        )))
+    }
+
+    fn create_elicitation(
+        &self,
+        _request: rmcp::model::ElicitRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp::model::ElicitResult, rmcp::ErrorData>> + '_ {
+        std::future::ready(Err(rmcp::ErrorData::invalid_request(
+            "refused: elicitation",
+            None,
+        )))
+    }
+}
+
+/// A tool name that makes the fixture server ask the **client** for its roots before answering.
+///
+/// This is the only way to exercise the SDK's input-request dispatch from a test: the server has to
+/// *initiate* a request from inside handling one, which is what a real MCP server does when it needs a
+/// directory it was not given.
+const ROOTS_TOOL_NAME: &str = "needs_roots";
+
+/// A client handler that **leaves `list_roots` at the SDK's default**, to show what that default does.
+///
+/// The control for the test below: the same server, the same request, and no override — so the difference in
+/// what comes back is attributable to the override rather than to the fixture.
+#[derive(Debug, Clone, Default)]
+struct PermissiveClient;
+
+impl ClientHandler for PermissiveClient {}
+
+#[tokio::test]
+async fn a_server_asking_for_roots_reaches_a_handler_that_can_refuse_it() {
+    // **The wire-level fact, and the one the SDK's defaults get wrong.** `call_tool_with_mrtr_max_rounds`
+    // handles an `input_required` response *itself*, routing the request to the client handler rather than
+    // returning it to the caller — so `decide_response`'s `InputRequired` arm is unreachable in production,
+    // and what a server meets is the handler's answer.
+    //
+    // The fixture's `needs_roots` tool asks the client for its roots from inside a call, which is a real
+    // server-initiated request and the exact shape whose answer depends on the override. This asserts the
+    // **refusal** travels back to the server.
+    let server = roots_fixture();
+    let client = client_with(RefusingClient, server).await;
+
+    let called = client
+        .call_tool_once(CallToolRequestParams::new(ROOTS_TOOL_NAME))
+        .await
+        .expect("the fixture must answer its own tool");
+    let text = fixture_text(&called);
+    assert!(
+        text.starts_with("refused:"),
+        "the server must be told the request was refused, got {text:?}"
+    );
+    assert!(
+        text.contains("refused: roots"),
+        "and the refusal must be the handler's own, got {text:?}"
+    );
+    client.cancel().await.expect("the client must shut down");
+}
+
+#[tokio::test]
+async fn the_sdks_own_default_answers_a_roots_request_with_success() {
+    // **The control, and the reason this slice exists.** Same fixture, same request, and a client that
+    // implements nothing — so the SDK's default `list_roots` runs, and it returns
+    // `Ok(ListRootsResult::default())`. The server is told the request *succeeded* with an empty list.
+    //
+    // Asserting the control is what makes the test above about the override rather than about the fixture:
+    // without this, "the server got an error" could have been the SDK refusing the request itself, and the
+    // override would be untested. A `list_roots` that returns a success where JARVIS's policy is a refusal is
+    // the defect — a server asking for the filesystem shape is told there is none rather than that JARVIS
+    // declines to say.
+    let server = roots_fixture();
+    let client = client_with(PermissiveClient, server).await;
+
+    let called = client
+        .call_tool_once(CallToolRequestParams::new(ROOTS_TOOL_NAME))
+        .await
+        .expect("the fixture must answer its own tool");
+    let text = fixture_text(&called);
+    assert_eq!(
+        text, "served",
+        "the SDK's default must answer a roots request with success — that is the behaviour \
+         `JarvisClient` overrides, and this test is what proves the override is doing something"
+    );
+    client.cancel().await.expect("the client must shut down");
+}
+
 #[tokio::test]
 async fn a_peer_that_cannot_speak_the_preferred_version_fails_as_a_permanent_startup_failure() {
     // The compatibility failure the note's error table names, produced **by a real peer** rather than by
@@ -408,6 +621,7 @@ async fn a_peer_that_cannot_speak_the_preferred_version_fails_as_a_permanent_sta
         supported: Vec::new(),
         list_calls,
         call_calls: Arc::new(AtomicUsize::new(0)),
+        offer_roots_tool: false,
     };
 
     let error = connect_fixture(server)
