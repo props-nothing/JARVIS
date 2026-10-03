@@ -59,6 +59,7 @@ use crate::tool_schema::ToolSchema;
 
 pub mod call;
 pub mod client;
+pub mod composition;
 pub mod discovery;
 pub mod executor;
 pub mod invocation;

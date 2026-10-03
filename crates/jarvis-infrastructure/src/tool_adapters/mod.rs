@@ -620,6 +620,12 @@ impl ActionFingerprint for FingerprintHasher {
     }
 }
 
+/// Routing by source kind, the answer to the pipeline's single executor slot.
+///
+/// Declared last, beside the other adapters, so the module's shape reads as "the pieces the composition
+/// needs, then the one that chooses between them".
+pub mod routing;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

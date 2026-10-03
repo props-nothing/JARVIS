@@ -878,7 +878,22 @@ pub(crate) fn tool_fabric_over(
         crate::storage::tool_grant_repository::SqliteToolGrantRepository::new(pool.clone()),
     );
     let grants = StoredGrants::new(Arc::clone(&store), defaults, &tools);
-    let executor = crate::native_tools::NativeExecutor::new(Arc::clone(&clock));
+    // **The pipeline gets a router, not the native executor directly.** The port takes one executor, so a
+    // second source of tools — an MCP server today, a connector or runtime later — has no way to be reached
+    // through a slot that already holds native. Registering native *by kind* keeps the pipeline's shape and
+    // makes the choice a value: a call whose source kind is not routed is `NotFound` rather than silently
+    // served by the wrong implementation. See `tool_adapters::routing`.
+    //
+    // Only `Native` is registered, because it is the only kind the daemon can currently implement: the MCP
+    // adapter's executor needs a live session and a server declaration, and neither exists in configuration
+    // yet. Stating that here rather than registering a placeholder is deliberate — a router with a kind that
+    // cannot answer would refuse calls the daemon appears to support.
+    let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> =
+        Arc::new(crate::native_tools::NativeExecutor::new(Arc::clone(&clock)));
+    let executor = crate::tool_adapters::routing::RoutingExecutor::new([(
+        jarvis_domain::tool::identity::SourceKind::Native,
+        native,
+    )]);
     let ledger = crate::storage::tool_call_repository::SqliteToolCallRepository::new(pool.clone());
     let approvals = crate::storage::approval_repository::SqliteApprovalRepository::new(pool);
     let pipeline = Arc::new(ToolCallService::new(

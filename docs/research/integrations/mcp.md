@@ -476,6 +476,103 @@ Three mutations falsify the executor, each in the test named for it: dropping th
 One consolidation: `DiscoveryClient` and `CallClient` were two empty declarations of one posture in two
 modules, and are now a single `JarvisClient`.
 
+### Routing: the pipeline takes one executor, so the choice has to be a value
+
+`ToolCallService::new` holds a single `Arc<dyn ToolExecutor>`, and the composition passes native. That is a
+deliberate shape in the port — a *list* of executors would make dispatch order invisible — but it means a
+second source of tools has nowhere to go. `RoutingExecutor` fills the one slot and routes by the tool's
+**source kind**, and is registered in `daemon::tool_fabric_over`, which is the adapter's first production
+caller.
+
+**The key is the kind, not the capability namespace.** A namespace is a contract's rather than a transport's
+— this adapter deliberately reuses one constant for every server — and it is not trusted the way a source is:
+by the time a call reaches an executor the identity has been authorized and `ToolIdentity::authorizes`
+compared the source. A tool named `mcp.something` from a native build would route to a server that never
+offered it if the namespace decided.
+
+**An unrouted kind is `NotFound`, never a fallback.** The fallback is what a hurried version writes ("native
+is the common case") and its failure is a *misroute*: a server's tool name in front of the daemon's own clock
+or filesystem.
+
+Only `Native` is registered, because it is the only kind the daemon can currently implement — an MCP executor
+needs a live session and a server declaration, and neither exists in configuration yet. **So the named
+remaining gap is an MCP server configuration section**: without a way for an operator to declare a server,
+`discover_stdio_server` has no input and the `McpServer` kind cannot be registered.
+
+⚠ **The first misroute test did not test the misroute.** It routed a `Native` tool and asserted native ran —
+which a fallback implementation does identically, because that kind *is* routed. The mutation was caught only
+by the unrouted-refusal test, revealing that the name claimed a state its fixture never created. Rewritten to
+register only native and attempt an MCP call; re-running the mutant then failed both tests. **Re-run a
+mutation after fixing its fixture, or the fix is an assumption.**
+
+### The declaration: a server's environment is references, never literals
+
+That remaining gap is now closed by `config/mcp.rs` — an optional `[mcp]` table whose entries declare a name,
+a **resolved** program, arguments, an environment, and a startup timeout.
+
+**The environment holds `SecretReference` values, and that is strictly stronger than the launcher's own
+literal pairs.** The environment is where an MCP server's credentials live, and those are exactly what
+`AGENTS.md` forbids in a configuration file. Requiring a reference per entry means a credential **cannot be
+written into a profile at all** rather than being discouraged by a comment — and because the reference grammar
+already refuses a locator outside the `JARVIS_` prefix, a profile also cannot name an unrelated ambient secret
+such as a cloud credential. `McpLaunchSpec` still takes literal pairs; the *composition* resolves the
+references, so no literal ever arrives from a file. The rule is asserted through **TOML text**, because a
+profile is what an operator writes and a struct literal would bypass the deserializer where the refusal lives.
+
+Two further decisions worth recording:
+
+- **Both name rules are checked before anything is spawned.** `ServerConfigId` accepts a leading digit; a tool
+  source owner requires an initial letter. A name satisfying one and failing the other produces an all-refused
+  catalog at discovery — a server-shaped symptom of a name-shaped cause.
+- **A duplicate name is refused, not deduplicated.** The name is the trusted identity every registration and
+  grant is recorded against, so two servers claiming it would register one's tools under an identity an
+  operator believed belonged to the other, and the second would then fail with a source collision the operator
+  never caused.
+
+The program is required **resolved**, with deliberately no command-plus-arguments shorthand: `env_clear`
+removes `PATH`, so a bare `npx` cannot be resolved by the child and must be resolved by the daemon at
+configuration time. A shorthand would read as convenience and fail at spawn with `SpawnFailed`, naming the
+child rather than the configuration.
+
+Three mutations falsify the section, each in its own test: dropping the owner rule, dropping the duplicate-name
+check, and filtering disabled declarations **before** validating them.
+
+### Composition: the chain, and the fan-out the router cannot do
+
+`mcp/composition.rs` runs the whole chain in order — resolve, spawn, handshake, list, normalize, register,
+publish what was admitted, dispatch by identity — and is exercised end to end against spawned children in
+`tests/mcp_composition_process.rs`.
+
+**The fan-out has to live inside the source kind, and that is a consequence rather than a preference.** Every
+MCP server's tools declare `SourceKind::McpServer`, and `RoutingExecutor` holds **at most one** executor per
+kind by construction (two for one kind would leave the choice to insertion order). So a profile with two
+servers cannot dispatch through the router, and `ComposedMcpExecutor` fans out *inside* the kind, keyed by the
+**whole identity**: the identity includes the source owner, and registration already compares that owner
+against the trusted configuration identity, so an identity belonging to one server cannot match another's
+admitted set. Dispatch is a membership test rather than a string comparison, and there is no ambiguity for a
+lookup order to resolve. An identity no server admitted is `NotFound`, matching the router's own answer for an
+unrouted kind.
+
+**One failing server does not abort the others.** A profile may declare several and the failure modes are
+per-server, so aborting on the first would let one typo take down every server an operator configured.
+`McpComposition` returns the composed servers *and* the refusals with their reasons, because "three declared,
+two running, one token unresolvable" is the operator fact — and a *profile-level* fault (a duplicate name, an
+unusable identity) is still refused before anything spawns, since the declaration's own validation catches it.
+
+**The order is `enabled`, then resolve, then spawn.** Secret material is resolved at "the last responsible
+moment", which for a launch is immediately before the spawn — resolving later is impossible because the child
+needs it in its environment. Checking `enabled` first means a server an operator switched off never has its
+secret read, and an unresolvable reference is reported as the *secret* code rather than as a server that failed
+to start.
+
+⚠ **Two of my own tests were wrong first, and the mutations found both** — the third time this has happened in
+this session. `a_disabled_server_is_never_spawned` passed the **already-filtered** list, so it proved that
+`enabled_declarations()` filters rather than that the composition skips; the ordering claim was untested until
+it passed `declarations()` instead, at which point the mutant failed. And the recording double was a `match`
+with one catch-all arm — clippy flagged it as replaceable by its scrutinee, which is a lint *and* a real
+defect: an arm matching everything means the binding was never used, so the comment claiming it "records which
+identity it was asked for" was false. **A mutation caught by the wrong test means the fixture, not the guard.**
+
 ## Version Matrix
 
 | Component | JARVIS target | Documentation target | Compatibility status |

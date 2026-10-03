@@ -7,6 +7,7 @@
 
 pub mod atomic;
 pub mod loader;
+pub mod mcp;
 pub mod secret;
 
 pub use atomic::{MAX_CONFIG_BYTES, read_bounded, read_tail_window, write_atomic};
@@ -79,6 +80,18 @@ pub enum ConfigError {
         /// The field that was rejected. The value is never included, because a reason is operator text.
         field: &'static str,
     },
+    /// A declared MCP server is unusable.
+    ///
+    /// **Its own variant rather than reusing `InvalidToolDenyRule`**, and the reason is the operator action:
+    /// both are semantic faults in a well-formed document that name a field, but they are *different*
+    /// documents — an operator reading `jarvis.config_tool_deny_invalid` about a server declaration would go
+    /// and look at `[[tools.deny]]`. Two faults that need two different corrections get two codes, which is
+    /// the same rule `TLS-004` records for refusals a user reacts to differently.
+    #[error("a declared MCP server names an unusable field")]
+    InvalidMcpServer {
+        /// The field that was rejected. The value is never included, because a name is operator text.
+        field: &'static str,
+    },
 }
 
 impl ConfigError {
@@ -96,6 +109,7 @@ impl ConfigError {
             Self::SecretUnavailable => "jarvis.secret_unavailable",
             Self::Write { .. } => "jarvis.config_write",
             Self::InvalidToolDenyRule { .. } => "jarvis.config_tool_deny_invalid",
+            Self::InvalidMcpServer { .. } => "jarvis.config_mcp_invalid",
         }
     }
 
@@ -111,7 +125,10 @@ impl ConfigError {
             | Self::EnvOverrideInvalid { .. }
             | Self::SecretReferenceInvalid
             | Self::SecretUnavailable
-            | Self::InvalidToolDenyRule { .. } => false,
+            | Self::InvalidToolDenyRule { .. }
+            // A declaration an operator wrote is wrong until they change it, so a retry reads the same
+            // document and fails identically.
+            | Self::InvalidMcpServer { .. } => false,
         }
     }
 }

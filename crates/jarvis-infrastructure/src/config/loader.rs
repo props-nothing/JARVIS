@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ConfigError;
 use super::atomic::{read_bounded, write_atomic};
+use super::mcp::McpSection;
 use super::secret::SecretReference;
 
 /// The largest deny reason a reviewed refusal may carry.
@@ -356,6 +357,15 @@ pub struct Config {
     /// See [`ToolsSection::deny`] for why grants are deliberately absent here.
     #[serde(default)]
     pub tools: ToolsSection,
+    /// The MCP servers this profile launches, as reviewed configuration.
+    ///
+    /// **A second table about tools, and it is not part of `tools` on purpose.** That table holds
+    /// *refusals* — restrictions on tools JARVIS already has — while this one declares *sources* of tools it
+    /// does not have yet. Merging them would put a launchable process and an authorization rule in one
+    /// namespace, and the two are validated against different rules: a refusal names a capability or an
+    /// effect, a server names an identity, a program, and an environment of secret references.
+    #[serde(default, skip_serializing_if = "McpSection::is_empty")]
+    pub mcp: McpSection,
     /// Privacy defaults.
     #[serde(default)]
     pub privacy: PrivacySection,
@@ -369,6 +379,7 @@ impl Default for Config {
             storage: StorageSection::default(),
             model: ModelSection::default(),
             tools: ToolsSection::default(),
+            mcp: McpSection::default(),
             privacy: PrivacySection::default(),
         }
     }
