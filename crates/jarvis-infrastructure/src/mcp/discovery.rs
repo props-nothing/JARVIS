@@ -208,7 +208,7 @@ fn listing_refusal(error: &rmcp::ServiceError, diagnostics: String) -> McpStartu
 /// keeps the handle.
 pub struct DiscoveredServer {
     /// The client, for `tools/call` and any later re-listing. Also the owner of the child.
-    client: rmcp::service::RunningService<rmcp::RoleClient, DiscoveryClient>,
+    client: rmcp::service::RunningService<rmcp::RoleClient, crate::mcp::client::JarvisClient>,
     /// The server's trusted configuration identity.
     server: ServerConfigId,
     /// The normalized catalog: what the server offered, and what was refused.
@@ -249,7 +249,9 @@ impl DiscoveredServer {
 
     /// Returns the client, for calling tools.
     #[must_use]
-    pub fn client(&self) -> &rmcp::service::RunningService<rmcp::RoleClient, DiscoveryClient> {
+    pub fn client(
+        &self,
+    ) -> &rmcp::service::RunningService<rmcp::RoleClient, crate::mcp::client::JarvisClient> {
         &self.client
     }
 
@@ -276,6 +278,34 @@ impl DiscoveredServer {
             .map(|info| info.protocol_version.clone())
     }
 
+    /// Hands the live session to a caller, with the catalog it produced.
+    ///
+    /// **`Arc` rather than a reference**, because `McpToolExecutor` holds the session for as long as it may
+    /// be asked to call a tool, and `RunningService` is not `Clone`. The handle is **consumed**, which is the
+    /// correct ownership: a caller that has given the session to an executor no longer holds a
+    /// `DiscoveredServer` to shut down, and the executor's last reference is what ends the child.
+    ///
+    /// The diagnostics come back too, because a session that fails *after* the handshake is exactly the case
+    /// this handle was added for — see [`Self::diagnostics`].
+    #[must_use]
+    pub fn into_session(
+        self,
+    ) -> (
+        std::sync::Arc<
+            rmcp::service::RunningService<rmcp::RoleClient, crate::mcp::client::JarvisClient>,
+        >,
+        NormalizedCatalog,
+        McpDiagnostics,
+    ) {
+        let Self {
+            client,
+            catalog,
+            diagnostics,
+            server: _,
+        } = self;
+        (std::sync::Arc::new(client), catalog, diagnostics)
+    }
+
     /// Ends the session and returns the catalog.
     ///
     /// Cancelling the client stops the worker, which drops the transport, which kills the child — so this is
@@ -300,20 +330,6 @@ impl DiscoveredServer {
         (catalog, outcome)
     }
 }
-
-/// A client handler with no server-initiated capabilities.
-///
-/// **Empty on purpose.** Every input request the SDK could route here is refused by `invocation.rs`, and a
-/// client that declared capabilities it refuses to service would be advertising them. Declaring none is the
-/// honest posture: the server learns from it that JARVIS will not run model calls, enumerate directories, or
-/// prompt its user on request.
-///
-/// The default `get_info` is the SDK's stock client identity and capability set, which is what makes "declares
-/// nothing" true rather than merely intended.
-#[derive(Debug, Clone, Default)]
-pub struct DiscoveryClient;
-
-impl rmcp::ClientHandler for DiscoveryClient {}
 
 /// Spawns a configured MCP server, discovers what it offers, and normalizes the listing.
 ///
@@ -354,7 +370,7 @@ pub async fn discover_stdio_server(
     };
     let started = tokio::time::timeout(
         DISCOVERY_TIMEOUT,
-        rmcp::serve_client_with_lifecycle(DiscoveryClient, transport, lifecycle),
+        rmcp::serve_client_with_lifecycle(crate::mcp::client::JarvisClient, transport, lifecycle),
     )
     .await;
 

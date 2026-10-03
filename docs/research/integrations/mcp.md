@@ -441,6 +441,41 @@ refuses any name it did not list — answers `McpError(ErrorCode(-32601), "no su
 mutation. **A wiring test must let the peer detect the fault; an assertion placed before the call makes it a
 second copy of the unit test.**
 
+### The executor: the MRTR loop is the SDK's, and JARVIS decides which rounds to stop on
+
+`McpToolExecutor` closes the last gap between the decisions above and the `ToolExecutor` port. It holds a live
+session plus the identities **registration admitted**, and drives `tools/call` through `execute`. Two
+corrections came out of building it, and neither was visible from documentation:
+
+**⚠ The MRTR loop is not on `Peer`.** `Peer<RoleClient>` owns the single-round-trip senders
+(`call_tool_once`); `call_tool_with_mrtr_max_rounds` is implemented on `RunningService<RoleClient, S>`,
+because it drives several round trips and needs the client handler to fulfil the intermediate requests.
+Holding only a cloned peer — my first version — would have meant reimplementing the loop, which is precisely
+the second implementation this module exists to avoid. **So the executor holds the session behind an `Arc`,**
+and JARVIS supplies only the *round cap*: `MAX_MRTR_ROUNDS`, asserted below the SDK's own default at compile
+time, so an operator reading `mcp.round_limit_exceeded` learns JARVIS's bound rather than the SDK's.
+
+**⚠ A fixture that lists a tool must be able to serve it.** `examples/mcp_fixture_server.rs` implemented
+`list_tools` but not `call_tool`, so the SDK's **default handler** answered every call with
+`METHOD_NOT_FOUND "no such tool"` — for a tool the fixture had just listed. The executor returned `NotFound`,
+which reads exactly like a wrong-name bug and is not one. It was diagnosed by printing the name actually sent
+(`read_file`, correct) and then checking which handlers the fixture implemented. The fixture now serves its
+tool and keeps the refusal for a name it did not list, which is what lets the executor suite rely on the peer
+to detect a wrong name.
+
+**The safety-relevant mapping is `Ambiguous`.** `Timeout` and `ProviderError` mean an effect **may exist**;
+the port separates `Ambiguous` from `Failed` because the recovery pass treats them differently, and reporting
+an unsettled class as a plain failure tells it a possibly-executed call did nothing — the duplicate-effect
+direction this note's retry table exists to prevent. The mapping lives inside `execute`, so no unit test can
+reach it: the fixture gained an **`unanswered` mode** (it accepts the call and withholds the answer for 30 s)
+and the test uses a 250 ms bound, making the timeout deterministic rather than a race.
+
+Three mutations falsify the executor, each in the test named for it: dropping the `Ambiguous` arm
+(`left: Failed(Timeout)`), skipping the membership check, and dropping the cancellation race.
+
+One consolidation: `DiscoveryClient` and `CallClient` were two empty declarations of one posture in two
+modules, and are now a single `JarvisClient`.
+
 ## Version Matrix
 
 | Component | JARVIS target | Documentation target | Compatibility status |

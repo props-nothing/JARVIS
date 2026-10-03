@@ -5117,12 +5117,46 @@ Dependencies: Milestone 2 exit gate.
     different row from `TransportClosed` → `ProviderError` (may have executed, outcome unsettled). Reporting a
     lost response as `Unavailable` would tell a caller a write can be safely repeated when it may already have
     happened, so the mapping stays in `outcome.rs` and this module neither restates nor re-exports it.
-  - **Still to do (`TLS-008` and sibling items):** the daemon-side wiring that **calls** `discover_stdio_server`,
-    registers the result with `register_catalog`, and builds the dispatch catalog from `publishable_pairs` (the
-    join is now admission-aware, so the composition is the remaining step); a `ToolExecutor` that drives
-    `call_params`/`decide_response` against a live session (the four decisions exist and are tested; the MRTR
-    **loop** over them does not); heartbeat/idle/shutdown supervision; a reviewed TLS choice before the remote
-    half; the remaining `Test Plan` items; and `TLS-009`/`TLS-010`.
+  - **Slice 12: `executor.rs`, the MRTR loop — the last piece between the call decisions and `ToolExecutor`.**
+    `McpToolExecutor` holds a live session and the identities registration **admitted**, and drives
+    `tools/call` through `ToolExecutor::execute`. It does not reimplement multi round-trip continuation: the
+    SDK's loop already does it, so JARVIS's contribution is which rounds to *stop* on, by passing
+    `MAX_MRTR_ROUNDS` explicitly.
+  - **⚠ A wrong assumption found by compiling: the MRTR loop is NOT on `Peer`.** My first version held a
+    cloned `Peer<RoleClient>` and called `call_tool_with_mrtr_max_rounds` — which does not exist there.
+    `Peer` owns the single-round-trip senders (`call_tool_once`), while the MRTR loop lives on
+    `RunningService<RoleClient, S>` because it drives several round trips and needs the handler to fulfil the
+    intermediate requests. Holding only the peer would have meant reimplementing the loop — exactly the second
+    implementation this module exists to avoid. The executor now holds the session behind an `Arc`.
+  - **⚠ A fixture defect, not a code defect, and it read like a name-mapping bug.** `examples/mcp_fixture_server.rs`
+    implemented `list_tools` but **not** `call_tool`, so the SDK's default handler answered every call with
+    `METHOD_NOT_FOUND "no such tool"` — for a tool the fixture had just listed. The executor returned
+    `NotFound`, which looks exactly like "the wrong name was sent". Diagnosed by printing the name actually
+    sent (`read_file`, correct) and then checking the fixture's handler list. **A fixture that lists a tool
+    must be able to serve it, or anything built on it tests the SDK's default rather than the adapter.**
+  - **`Ambiguous` is the port's own word for an unsettled outcome, and that mapping is the slice's safety
+    property.** `Timeout` and `ProviderError` mean an effect **may exist**, so reporting them as a plain
+    `Failed` would tell the recovery pass a possibly-executed call did nothing — the duplicate-effect
+    direction. The fixture gained an `unanswered` mode (accepts the call, withholds the answer 30 s) so the
+    arm is reachable with a 250 ms bound; **no unit test can reach it**, because the mapping is inside
+    `execute`.
+  - **Three mutations, each killed by the test named for it:** dropping the `Ambiguous` arm
+    (`left: Failed(Timeout)`), skipping the membership check (the `ACC-024`-shaped refusal), and dropping the
+    cancellation race (a cancelled call would proceed).
+  - **The membership refusal reuses the guard's own class deliberately.** One condition must have one class
+    whichever layer notices it — `decide_response`'s `ToolIdentityChanged` → `Unavailable` — rather than
+    inventing a `PermissionDenied` here, which would make one identity change report as two different failures
+    depending on whether the server had answered yet.
+  - **`DiscoveryClient` and `CallClient` are consolidated into one `JarvisClient`.** Both were empty and in
+    different modules: two declarations of one posture ("declare no server-initiated capabilities"). The
+    newtype is kept rather than implementing `ClientHandler` for `()`, which would make the unit type the
+    client identity everywhere it appeared.
+  - **Still to do (`TLS-008` and sibling items):** the **daemon-side composition** that calls
+    `discover_stdio_server`, registers the result with `register_catalog`, builds the dispatch catalog from
+    `publishable_pairs`, and constructs a `McpToolExecutor` — every piece now exists and is tested
+    end-to-end against a spawned child, and nothing in `jarvisd` composes them yet; heartbeat/idle/shutdown
+    supervision; a reviewed TLS choice before the remote half; the remaining `Test Plan` items; and
+    `TLS-009`/`TLS-010`.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
   the source layers a policy version was merged from, so the contract's `GET` requirement stops being

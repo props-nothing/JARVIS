@@ -30,8 +30,9 @@
 use std::borrow::Cow;
 
 use rmcp::model::{
-    Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+    TextContent, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, serve_server};
@@ -55,11 +56,32 @@ pub const FIXTURE_LEGACY: &str = "legacy";
 /// it and the discovery must report an all-refused catalog rather than an empty one.
 pub const FIXTURE_ALL_REFUSED: &str = "all-refused";
 
+/// The variable's value for a peer that **lists and accepts a call but never answers it**.
+///
+/// This exists so a timeout can be produced deterministically. A timeout is the one class that reaches the
+/// `ToolExecutor` port as `Ambiguous`, and that arm is the most safety-relevant decision in the executor: a
+/// class meaning "an effect may exist" reported as a plain failure would let the recovery pass treat a
+/// possibly-executed call as one that provably did nothing. A fixture that answers promptly cannot exercise
+/// it, and no unit test can, because the mapping is inside `execute`.
+pub const FIXTURE_UNANSWERED: &str = "unanswered";
+
+/// How long the unanswered fixture withholds its answer.
+///
+/// Far longer than any test's call bound, so the timeout is not a race: the point is that the call does not
+/// complete, not that it completes slowly.
+pub const FIXTURE_UNANSWERED_DELAY_MS: u64 = 30_000;
+
 /// The tool name the standard and legacy fixtures offer.
 pub const FIXTURE_TOOL_NAME: &str = "read_file";
 
 /// The tool name the all-refused fixture offers.
 pub const FIXTURE_UNUSABLE_TOOL_NAME: &str = "Read File";
+
+/// The text a fixture returns from a successful call.
+///
+/// Exported so a test asserts against the same constant the fixture sends, rather than against a literal that
+/// could drift from it — the failure mode a shared fixture constant exists to prevent.
+pub const FIXTURE_CALL_TEXT: &str = "fixture result for read_file";
 
 /// The version the legacy fixture reports, and the only one it reports.
 pub const FIXTURE_LEGACY_VERSION: ProtocolVersion = ProtocolVersion::V_2025_06_18;
@@ -71,6 +93,8 @@ struct FixtureServer {
     supported: Vec<ProtocolVersion>,
     /// The tool name this fixture offers.
     tool: &'static str,
+    /// Whether a call is accepted and then **never answered**, so the client's bound elapses.
+    withhold_answer: bool,
 }
 
 impl ServerHandler for FixtureServer {
@@ -105,6 +129,50 @@ impl ServerHandler for FixtureServer {
         let tool = Tool::new(self.tool, "Read a file.", map);
         std::future::ready(Ok(ListToolsResult::with_all_items(vec![tool])))
     }
+
+    /// Answers a call for the tool this fixture listed, and refuses anything else.
+    ///
+    /// **Implementing this is what makes the fixture usable for the executor suite, and its absence was a real
+    /// defect in the fixture rather than in the code under test.** Without an override the SDK's default
+    /// handler answers every call with `METHOD_NOT_FOUND`, so a client exercising the call path saw "no such
+    /// tool" for a tool the fixture had just listed — which reads exactly like a name-mapping bug and is not
+    /// one. A fixture that lists a tool must be able to serve it, or anything built on it is testing the
+    /// default rather than the adapter.
+    ///
+    /// The refusal is kept for a name this fixture did not list, so the **wrong-name** case is still
+    /// observable as a protocol error: the executor suite relies on the peer being the thing that complains.
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + '_ {
+        // Copied out of `self` before the block, so the returned future holds no borrow of the server — the
+        // shape the SDK's own handlers use, and what lets `+ '_` stay honest.
+        let name = request.name;
+        let tool = self.tool;
+        let withhold = self.withhold_answer;
+        async move {
+            if name != tool {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    "no such tool",
+                    None,
+                ));
+            }
+            // The name is right, so the tool is *accepted* — and then the answer is withheld. Nothing is
+            // refused: the client's own bound is what ends the call, which is what makes this a timeout
+            // rather than a protocol error.
+            if withhold {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    FIXTURE_UNANSWERED_DELAY_MS,
+                ))
+                .await;
+            }
+            Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::Text(TextContent::new(FIXTURE_CALL_TEXT)),
+            ])))
+        }
+    }
 }
 
 /// Selects the fixture named by the environment, or `None` when the variable is absent.
@@ -118,14 +186,22 @@ fn selected_fixture() -> Option<FixtureServer> {
         FIXTURE_STANDARD => FixtureServer {
             supported: both,
             tool: FIXTURE_TOOL_NAME,
+            withhold_answer: false,
         },
         FIXTURE_LEGACY => FixtureServer {
             supported: vec![FIXTURE_LEGACY_VERSION],
             tool: FIXTURE_TOOL_NAME,
+            withhold_answer: false,
         },
         FIXTURE_ALL_REFUSED => FixtureServer {
             supported: both,
             tool: FIXTURE_UNUSABLE_TOOL_NAME,
+            withhold_answer: false,
+        },
+        FIXTURE_UNANSWERED => FixtureServer {
+            supported: both,
+            tool: FIXTURE_TOOL_NAME,
+            withhold_answer: true,
         },
         _ => return None,
     };

@@ -91,6 +91,26 @@ pub fn negotiate_protocol_version(server_supported: &[ProtocolVersion]) -> Optio
     rmcp::select_protocol_version(&preferred_protocol_versions(), server_supported)
 }
 
+/// The client identity JARVIS presents to an MCP server, for **every** session this adapter opens.
+///
+/// One type for discovery and for calls, and that is a correction rather than a tidy-up: the two were
+/// separate (`DiscoveryClient` and `CallClient`) and both were empty, which is two declarations of one
+/// posture. The posture is "declare no server-initiated capabilities", and it has one reason — every input
+/// request the SDK could route here is refused by `invocation.rs`, so a client advertising a capability it
+/// refuses to service would be claiming something untrue.
+///
+/// **A newtype rather than implementing `ClientHandler` for the unit type.** The SDK already provides
+/// `impl ClientHandler for ()`, and implementing it here would make `()` the client identity everywhere it
+/// appeared, including anywhere this adapter did not intend a session. A named type keeps the identity
+/// greppable and lets `#![deny(clippy::...)]` on this crate stay meaningful about it.
+///
+/// The default `get_info` is the SDK's stock client identity and capability set, which is what makes
+/// "declares nothing" true rather than merely intended.
+#[derive(Debug, Clone, Default)]
+pub struct JarvisClient;
+
+impl rmcp::ClientHandler for JarvisClient {}
+
 /// What a failed startup means, in both of the senses the module doc separates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupFailure {
