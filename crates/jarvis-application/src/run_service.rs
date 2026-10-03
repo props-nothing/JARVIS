@@ -281,6 +281,21 @@ pub struct CreatedRun {
     pub replayed: bool,
 }
 
+/// What a stop-everything command did, run by run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StopSummary {
+    /// Runs that were executing and were signalled; each ends `cancelled` when its controller observes it.
+    pub signalled: u32,
+    /// Runs parked on an approval that were cancelled directly, their approvals withdrawn.
+    pub parked_cancelled: u32,
+    /// Active runs this process has no task for, so nothing could be signalled.
+    pub unsignalled: u32,
+    /// Runs that finished between the listing and the stop.
+    pub already_ended: u32,
+    /// Whether more active runs existed than one listing returns; a second stop reaches the rest.
+    pub bounded: bool,
+}
+
 /// Tracks the cancellation scope of every running run.
 ///
 /// A run is a background task, so the only handle to it is the scope registered at
@@ -1098,6 +1113,70 @@ impl RunService {
             };
         }
         Ok(stored.state)
+    }
+
+    /// Lists the caller's runs that are still active, newest first.
+    ///
+    /// "What is JARVIS doing right now?" is the first question oversight asks, and a run parked on an approval
+    /// is part of the answer, so it is included.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::Storage`] when the read fails.
+    pub async fn list_active(
+        &self,
+        context: &RequestContext,
+    ) -> Result<crate::repository::run::ActiveRuns, RunServiceError> {
+        Ok(self.ports.runs.active_runs(context.workspace_id).await?)
+    }
+
+    /// **The kill switch**: asks every active run in the caller's workspace to stop.
+    ///
+    /// A running run is signalled and ends `cancelled` when its controller observes it; a run parked on an
+    /// approval has no task, so it is cancelled directly and its approval is withdrawn. It takes **no
+    /// idempotency key** because it is naturally idempotent — repeating it stops whatever is still active —
+    /// and a control that a person reaches for in a hurry should not be refused for a missing header. A run
+    /// that moved on between the listing and the stop is counted `already_ended`, not as a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::Storage`] when the listing fails; a failure to stop one run is counted in
+    /// the summary rather than aborting the rest, because a kill switch that stops at the first error stops
+    /// nothing after it.
+    pub async fn stop_all(
+        &self,
+        context: &RequestContext,
+        reason: &str,
+    ) -> Result<StopSummary, RunServiceError> {
+        let active = self.ports.runs.active_runs(context.workspace_id).await?;
+        let mut summary = StopSummary {
+            bounded: active.bounded,
+            ..StopSummary::default()
+        };
+        for stored in active.runs {
+            if self
+                .cancellations
+                .cancel_with_reason(stored.id, Some(reason))
+            {
+                summary.signalled += 1;
+                continue;
+            }
+            if stored.state != RunState::AwaitingApproval {
+                // Active in the store but with no task to signal: an orphan this process does not own.
+                // It is reported rather than hidden, because the person pressing stop needs to know.
+                summary.unsignalled += 1;
+                continue;
+            }
+            match self
+                .controller()
+                .cancel_parked(context.workspace_id, stored.id, reason)
+                .await
+            {
+                Ok(()) => summary.parked_cancelled += 1,
+                Err(_) => summary.already_ended += 1,
+            }
+        }
+        Ok(summary)
     }
 
     /// Reads one run in the caller's scope.

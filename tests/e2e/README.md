@@ -385,6 +385,19 @@ run **continues**: the tool runs in the MCP child and the model answers with the
 produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
 a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
 
+## `kill-switch.mjs`
+
+Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a fake model, on one profile.
+One run is **parked on an approval** (the fixture tool asks at the default level) and another is **mid-way through a
+slow model call**. `runs list` shows both and only the parked one says `awaiting_approval`; `runs stop-all` reports one
+run signalled and one parked run cancelled; both end `cancelled`, the approval the parked run waited on is withdrawn,
+nothing is listed as active, repeating the command stops nothing, and a new run is still accepted afterwards (a stop,
+not a latch). Making `stop_all` signal nothing fails three journey checks and a unit test.
+
+```bash
+node tests/e2e/kill-switch.mjs target/debug
+```
+
 ## `files-journey.mjs`
 
 Deterministic (no model, no network): a real `jarvisd` and CLI over temporary directories declared as

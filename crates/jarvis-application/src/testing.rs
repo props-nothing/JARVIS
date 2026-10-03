@@ -49,9 +49,9 @@ use crate::repository::model_call::{
     StoredModelCall,
 };
 use crate::repository::run::{
-    IdempotencyClaim, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord,
-    NewRun, RecoveryPage, RunEventPage, RunRepository, RunResumeState, StoredActivityEvent,
-    StoredRun, validate_idempotency_key,
+    ActiveRuns, IdempotencyClaim, MAX_ACTIVE_RUNS, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
+    NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage, RunEventPage, RunRepository,
+    RunResumeState, StoredActivityEvent, StoredRun, validate_idempotency_key,
 };
 use crate::repository::tool_call::{EffectingScan, ToolCallRepository};
 use crate::repository::{RepositoryError, RepositoryFuture};
@@ -847,6 +847,25 @@ impl RunRepository for InMemoryRepositories {
                     runs: incomplete,
                     bounded,
                 })
+            })
+        })
+    }
+
+    fn active_runs(&self, workspace: WorkspaceId) -> RepositoryFuture<'_, ActiveRuns> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut runs: Vec<StoredRun> = store
+                    .runs
+                    .values()
+                    .filter(|row| {
+                        row.workspace_id == workspace && !row.lifecycle.state().is_terminal()
+                    })
+                    .map(RunRow::stored)
+                    .collect();
+                runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
+                let bounded = runs.len() > MAX_ACTIVE_RUNS as usize;
+                runs.truncate(MAX_ACTIVE_RUNS as usize);
+                Ok(ActiveRuns { runs, bounded })
             })
         })
     }

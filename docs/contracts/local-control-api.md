@@ -138,6 +138,8 @@ GET  /health/live
 GET  /health/ready
 GET  /api/v1/system/status
 POST /api/v1/runs
+GET  /api/v1/runs
+POST /api/v1/runs/stop-all
 GET  /api/v1/runs/{run_id}
 GET  /api/v1/runs/{run_id}/events
 POST /api/v1/runs/{run_id}/cancel
@@ -455,6 +457,27 @@ The generalisable lesson, worth stating because it was learned twice in three ro
 escaping" — and "blocked on a dependency" — are claims about a *specific value* or *specific feature*.
 They have to name it. This payload contains one value that needs no escaping and one that does, and
 the earlier revision got the wrong answer for both.
+
+### Active Runs and the Kill Switch
+
+Oversight needs two controls an operator can reach for in a hurry, and a client must not have to know a run
+identifier to use either.
+
+`GET /api/v1/runs` lists the caller's workspace's runs that are **not yet terminal**, newest first, at most 100,
+as `{"runs":[{"run_id","conversation_id","state","awaiting_approval","created_at","updated_at","path"}],"bounded":false}`.
+A run parked on an approval is included, and `awaiting_approval` says so: the coarse wire `state` reads
+`model_running` for it, and it is the run an operator most needs to find. The listing is scoped to the caller's
+workspace in the query, so another workspace's runs are never returned.
+
+`POST /api/v1/runs/stop-all` is the **kill switch**. It asks every active run in the caller's workspace to stop and
+answers `200` with `{"signalled","parked_cancelled","unsignalled","already_ended","bounded"}`: an executing run is
+signalled and ends `cancelled` when its controller observes it (the same truthful-state rule as a single cancel), a
+run parked on an approval is cancelled directly and its approval withdrawn, and a run the daemon has no task for is
+**counted `unsignalled` rather than hidden**. The body is optional (`{"reason":"…"}`, bounded like a single cancel's,
+default `kill_switch`) and **no `Idempotency-Key` is required**: the command is naturally idempotent — repeating it
+stops whatever is still active — and a control reached for in a hurry must not be refused for a missing header. It
+is a stop, not a latch: a run created afterwards is accepted. When `bounded` is true more than 100 runs were active
+and a second call reaches the rest.
 
 ## Run Event Stream
 

@@ -41,9 +41,10 @@ use jarvis_domain::run::retry::{RetryError, RetryPolicy};
 use jarvis_domain::run::state::RunState;
 use jarvis_protocol::run::run_links;
 use jarvis_protocol::{
-    CancelRunRequest, CreateRunRequest, CreateRunResponse, MAX_CANCEL_REASON_BYTES,
-    MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RetryRequest,
-    RunEventFrame, RunLimitsView, RunUsageView, RunView, SseEvent,
+    ActiveRunListView, ActiveRunView, CancelRunRequest, CreateRunRequest, CreateRunResponse,
+    MAX_CANCEL_REASON_BYTES, MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME,
+    RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunLimitsView, RunUsageView, RunView,
+    SseEvent, StopRunsRequest, StopRunsView,
 };
 
 use crate::http::{ApiState, AuthenticatedClient, RequestIdOf, error_response_for};
@@ -402,6 +403,101 @@ pub async fn read_run(
                         max_output_tokens: stored.budget.max_output_tokens,
                         max_cost_microunits: stored.budget.max_cost_microunits,
                     }),
+            },
+        ),
+        Err(error) => service_error_response(request_id, &error),
+    }
+}
+
+/// The reason recorded when a stop-everything command names none.
+const KILL_SWITCH_REASON: &str = "kill_switch";
+
+/// Handles `GET /api/v1/runs`: the runs that are still active, newest first.
+///
+/// **What JARVIS is doing right now**, including runs parked on an approval. Scoped to the caller's
+/// workspace in the query, and bounded.
+pub async fn list_runs(
+    State(state): State<Arc<ApiState>>,
+    client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
+) -> Response {
+    let request_id = request_id.as_deref();
+    let Some(service) = state.runs.as_ref() else {
+        return not_ready(request_id);
+    };
+    let context = context_for(&client, request_id);
+    match service.list_active(&context).await {
+        Ok(active) => json_response(
+            request_id,
+            StatusCode::OK,
+            &ActiveRunListView {
+                runs: active
+                    .runs
+                    .iter()
+                    .map(|run| ActiveRunView {
+                        run_id: run.id.to_string(),
+                        conversation_id: run.conversation_id.to_string(),
+                        state: wire_state(run.state).to_owned(),
+                        awaiting_approval: run.state == RunState::AwaitingApproval,
+                        created_at: run.created_at.to_string(),
+                        updated_at: run.updated_at.to_string(),
+                        path: format!("/api/v1/runs/{}", run.id),
+                    })
+                    .collect(),
+                bounded: active.bounded,
+            },
+        ),
+        Err(error) => service_error_response(request_id, &error),
+    }
+}
+
+/// Handles `POST /api/v1/runs/stop-all`: the kill switch.
+///
+/// Asks every active run in the caller's workspace to stop. **No idempotency key is required**: the command is
+/// naturally idempotent and a control reached for in a hurry must not be refused for a missing header. An empty
+/// body is accepted; a reason may be given and is bounded like a single cancel's.
+pub async fn stop_all_runs(
+    State(state): State<Arc<ApiState>>,
+    client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
+    body: Bytes,
+) -> Response {
+    let request_id = request_id.as_deref();
+    let Some(service) = state.runs.as_ref() else {
+        return not_ready(request_id);
+    };
+    let reason = if body.is_empty() {
+        KILL_SWITCH_REASON.to_owned()
+    } else {
+        match serde_json::from_slice::<StopRunsRequest>(&body) {
+            Ok(command) => command
+                .reason
+                .unwrap_or_else(|| KILL_SWITCH_REASON.to_owned()),
+            Err(_) => {
+                return invalid_request(
+                    request_id,
+                    "The request body is not valid for this endpoint.",
+                );
+            }
+        }
+    };
+    if reason.is_empty() || reason.len() > MAX_CANCEL_REASON_BYTES || reason.contains('\0') {
+        return invalid_request(
+            request_id,
+            "The stop reason is empty or over the bounded limit.",
+        );
+    }
+    let context = context_for(&client, request_id);
+    match service.stop_all(&context, &reason).await {
+        Ok(summary) => json_response(
+            request_id,
+            StatusCode::OK,
+            &StopRunsView {
+                signalled: summary.signalled,
+                parked_cancelled: summary.parked_cancelled,
+                unsignalled: summary.unsignalled,
+                already_ended: summary.already_ended,
+                bounded: summary.bounded,
             },
         ),
         Err(error) => service_error_response(request_id, &error),

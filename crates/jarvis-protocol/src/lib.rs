@@ -30,10 +30,10 @@ pub use policy::{
     PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView, SourceLayerView,
 };
 pub use run::{
-    CancelRunRequest, CreateRunRequest, CreateRunResponse, DEFAULT_RETRY_MAX_ATTEMPTS,
-    MAX_CANCEL_REASON_BYTES, MAX_RUN_INPUT_BYTES, ModelPolicyRef, NATIVE_RUNTIME,
-    RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunInput, RunLimitsView, RunLinks,
-    RunUsageView, RunView, SseEvent, event_type,
+    ActiveRunListView, ActiveRunView, CancelRunRequest, CreateRunRequest, CreateRunResponse,
+    DEFAULT_RETRY_MAX_ATTEMPTS, MAX_CANCEL_REASON_BYTES, MAX_RUN_INPUT_BYTES, ModelPolicyRef,
+    NATIVE_RUNTIME, RUN_CONTRACT_VERSION, RetryRequest, RunEventFrame, RunInput, RunLimitsView,
+    RunLinks, RunUsageView, RunView, SseEvent, StopRunsRequest, StopRunsView, event_type,
 };
 pub use tool_grant::{
     DenyRuleCreatedView, DenyRuleView, GrantView, ToolDenyRuleListView, ToolGrantListView,

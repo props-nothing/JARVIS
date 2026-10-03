@@ -32,9 +32,10 @@ use jarvis_application::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelDeliverySamples, NewModelCall, StoredModelCall,
 };
 use jarvis_application::repository::run::{
-    EventVisibility, IdempotencyClaim, IncompleteRun, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
-    NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage, RunEventPage, RunRepository,
-    RunResumeState, RunRuntime, RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
+    ActiveRuns, EventVisibility, IdempotencyClaim, IncompleteRun, MAX_ACTIVE_RUNS, MAX_EVENT_PAGE,
+    MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage,
+    RunEventPage, RunRepository, RunResumeState, RunRuntime, RunWrite, StoredActivityEvent,
+    StoredRun, validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
@@ -1151,6 +1152,32 @@ impl RunRepository for SqliteRepositories {
                 runs: incomplete,
                 bounded,
             })
+        })
+    }
+
+    fn active_runs(&self, workspace: WorkspaceId) -> RepositoryFuture<'_, ActiveRuns> {
+        Box::pin(async move {
+            // The workspace is in the predicate, and one past the bound is read so `bounded` is observed.
+            let limit = i64::from(MAX_ACTIVE_RUNS) + 1;
+            let rows = sqlx::query(concat!(
+                "SELECT ",
+                run_columns!(),
+                " FROM agent_runs \
+                 WHERE workspace_id = ? AND state NOT IN ('completed', 'failed', 'cancelled') \
+                 ORDER BY created_at DESC LIMIT ?"
+            ))
+            .bind(workspace.to_string())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            let bounded = rows.len() > MAX_ACTIVE_RUNS as usize;
+            let runs = rows
+                .iter()
+                .take(MAX_ACTIVE_RUNS as usize)
+                .map(stored_run)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ActiveRuns { runs, bounded })
         })
     }
 }

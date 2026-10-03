@@ -151,6 +151,65 @@ pub struct CancelRunRequest {
     pub reason: String,
 }
 
+/// One entry of the active-run listing: what JARVIS is doing right now.
+///
+/// Deliberately smaller than [`RunView`]: it answers "what is running and what is it waiting on", not "how did
+/// it go", so it carries no usage or limits. `awaiting_approval` is published because the coarse `state` reads
+/// `model_running` for a run parked on a person, and that is exactly the run an operator most needs to find.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveRunView {
+    /// The run identifier.
+    pub run_id: String,
+    /// The conversation it belongs to.
+    pub conversation_id: String,
+    /// Its client-visible state.
+    pub state: String,
+    /// Whether the run is parked on an approval a person has not decided.
+    pub awaiting_approval: bool,
+    /// When it was created.
+    pub created_at: String,
+    /// When it last changed.
+    pub updated_at: String,
+    /// The run's own resource path.
+    pub path: String,
+}
+
+/// The active-run listing, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveRunListView {
+    /// The runs that are not yet in a terminal state.
+    pub runs: Vec<ActiveRunView>,
+    /// Whether more active runs existed than one listing returns.
+    pub bounded: bool,
+}
+
+/// The stop-everything command (the kill switch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopRunsRequest {
+    /// Why everything is being stopped; defaults to `kill_switch` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What a stop-everything command did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopRunsView {
+    /// Executing runs that were signalled and end `cancelled` when their controller observes it.
+    pub signalled: u32,
+    /// Runs parked on an approval that were cancelled directly, their approvals withdrawn.
+    pub parked_cancelled: u32,
+    /// Active runs the daemon has no task for, which nothing could be signalled to stop.
+    pub unsignalled: u32,
+    /// Runs that finished between the listing and the stop.
+    pub already_ended: u32,
+    /// Whether more active runs existed than one listing returns; stopping again reaches the rest.
+    pub bounded: bool,
+}
+
 /// The links a client follows for a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,6 +631,30 @@ mod tests {
         RunLinks, RunView, STREAM_OVERRUN_CODE, SseEvent, event_type, keepalive_frame,
         output_text_delta_payload, run_links, stream_overrun_frame,
     };
+
+    #[test]
+    fn the_stop_command_and_its_summary_round_trip_and_refuse_unknown_fields() {
+        let none: super::StopRunsRequest =
+            serde_json::from_str("{}").expect("an empty body is a stop");
+        assert_eq!(none.reason, None);
+        let some: super::StopRunsRequest =
+            serde_json::from_str(r#"{"reason":"leaving the house"}"#).expect("parses");
+        assert_eq!(some.reason.as_deref(), Some("leaving the house"));
+        assert!(serde_json::from_str::<super::StopRunsRequest>(r#"{"all":true}"#).is_err());
+
+        let view = super::StopRunsView {
+            signalled: 2,
+            parked_cancelled: 1,
+            unsignalled: 0,
+            already_ended: 0,
+            bounded: false,
+        };
+        let text = serde_json::to_string(&view).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<super::StopRunsView>(&text).expect("parses"),
+            view
+        );
+    }
 
     #[test]
     fn a_create_request_parses_the_contract_example() {

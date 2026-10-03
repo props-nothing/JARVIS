@@ -911,6 +911,30 @@ pub trait RunRepository: Send + Sync {
     /// assumed it saw everything would report a clean recovery while leaving the newest runs
     /// non-terminal — see [`MAX_INCOMPLETE_RUNS`].
     fn incomplete_runs(&self) -> RepositoryFuture<'_, RecoveryPage>;
+
+    /// Lists the runs in `workspace` that are not in a terminal state, newest first.
+    ///
+    /// **A client read, unlike [`incomplete_runs`](Self::incomplete_runs)**: it is scoped to the caller's
+    /// workspace in the query, and it **includes** a run parked on an approval, because "what is JARVIS doing
+    /// right now, and what is it waiting on" is the question it answers and a parked run is part of the answer.
+    /// At most [`MAX_ACTIVE_RUNS`] are returned; the flag says whether more existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Corrupted`] for a stored state this build cannot interpret.
+    fn active_runs(&self, workspace: WorkspaceId) -> RepositoryFuture<'_, ActiveRuns>;
+}
+
+/// The most active runs one listing returns.
+pub const MAX_ACTIVE_RUNS: u32 = 100;
+
+/// A bounded page of active runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRuns {
+    /// The runs, newest first.
+    pub runs: Vec<StoredRun>,
+    /// Whether the read stopped at [`MAX_ACTIVE_RUNS`] with more behind it.
+    pub bounded: bool,
 }
 
 #[cfg(test)]

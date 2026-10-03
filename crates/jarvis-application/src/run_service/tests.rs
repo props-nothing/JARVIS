@@ -2073,3 +2073,112 @@ fn a_controller_failure_is_recorded_on_the_run_rather_than_reported_to_the_submi
         "a run that found no model is not fixed by resending the same request",
     );
 }
+
+#[tokio::test]
+async fn the_active_listing_shows_a_live_run_to_its_own_workspace_only() {
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+
+    let own = fixture
+        .service
+        .list_active(&context())
+        .await
+        .expect("lists");
+    assert_eq!(own.runs.len(), 1);
+    assert_eq!(own.runs[0].id, created.run_id);
+
+    let foreign = api_request_context(
+        WorkspaceId::from_uuid(id(99)),
+        principal(),
+        RequestId::from_uuid(id(5)),
+        CorrelationId::from_uuid(id(6)),
+    );
+    let other = fixture.service.list_active(&foreign).await.expect("lists");
+    assert!(other.runs.is_empty(), "another workspace sees nothing");
+
+    fixture.spawner.run_all().await;
+    let after = fixture
+        .service
+        .list_active(&context())
+        .await
+        .expect("lists");
+    assert!(after.runs.is_empty(), "a finished run is no longer active");
+}
+
+#[tokio::test]
+async fn stop_all_signals_every_active_run_and_each_ends_cancelled() {
+    let fixture = fixture();
+    let first = create(&fixture, "one", "key-1").await;
+    let second = create(&fixture, "two", "key-2").await;
+
+    let summary = fixture
+        .service
+        .stop_all(&context(), "kill_switch")
+        .await
+        .expect("stops");
+    assert_eq!(summary.signalled, 2);
+    assert_eq!(summary.unsignalled, 0);
+
+    fixture.spawner.run_all().await;
+    for run in [first.run_id, second.run_id] {
+        let stored = fixture
+            .repositories
+            .load(workspace(), run)
+            .await
+            .expect("loads");
+        assert_eq!(stored.state, RunState::Cancelled);
+    }
+    let again = fixture
+        .service
+        .stop_all(&context(), "kill_switch")
+        .await
+        .expect("stops");
+    assert_eq!(
+        again,
+        super::StopSummary::default(),
+        "repeating it is harmless"
+    );
+}
+
+#[tokio::test]
+async fn stop_all_does_not_touch_another_workspaces_runs() {
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    let foreign = api_request_context(
+        WorkspaceId::from_uuid(id(99)),
+        principal(),
+        RequestId::from_uuid(id(5)),
+        CorrelationId::from_uuid(id(6)),
+    );
+    let summary = fixture
+        .service
+        .stop_all(&foreign, "kill_switch")
+        .await
+        .expect("stops");
+    assert_eq!(summary, super::StopSummary::default());
+    fixture.spawner.run_all().await;
+    let stored = fixture
+        .repositories
+        .load(workspace(), created.run_id)
+        .await
+        .expect("loads");
+    assert_eq!(
+        stored.state,
+        RunState::Completed,
+        "the other workspace's run was left alone"
+    );
+}
+
+#[tokio::test]
+async fn an_active_run_this_process_has_no_task_for_is_reported_not_hidden() {
+    let fixture = fixture();
+    let created = create(&fixture, "hello", "key-1").await;
+    fixture.cancellations.forget(created.run_id);
+    let summary = fixture
+        .service
+        .stop_all(&context(), "kill_switch")
+        .await
+        .expect("stops");
+    assert_eq!(summary.unsignalled, 1);
+    assert_eq!(summary.signalled, 0);
+}

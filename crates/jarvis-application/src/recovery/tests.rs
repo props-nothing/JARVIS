@@ -533,6 +533,13 @@ impl RunRepository for StallingWrites {
         self.inner.incomplete_runs()
     }
 
+    fn active_runs(
+        &self,
+        workspace: WorkspaceId,
+    ) -> crate::repository::RepositoryFuture<'_, crate::repository::run::ActiveRuns> {
+        self.inner.active_runs(workspace)
+    }
+
     fn load_for_resume(
         &self,
         workspace: WorkspaceId,
@@ -868,6 +875,13 @@ async fn a_read_failure_is_reported_rather_than_looking_like_a_clean_pass() {
         fn incomplete_runs(
             &self,
         ) -> crate::repository::RepositoryFuture<'_, crate::repository::run::RecoveryPage> {
+            Box::pin(async { Err(crate::repository::RepositoryError::Query) })
+        }
+
+        fn active_runs(
+            &self,
+            _workspace: WorkspaceId,
+        ) -> crate::repository::RepositoryFuture<'_, crate::repository::run::ActiveRuns> {
             Box::pin(async { Err(crate::repository::RepositoryError::Query) })
         }
     }

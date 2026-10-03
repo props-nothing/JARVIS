@@ -329,10 +329,21 @@ async fn run(cli: Cli) -> ExitCode {
 
 /// Run inspection a caller can request.
 ///
-/// `show` and `events` are read-only; `cancel` changes durable state and is therefore its
-/// own explicit action, so a bare `jarvis runs` can never stop anything.
+/// `list`, `show` and `events` are read-only; `cancel` and `stop-all` change durable state and are therefore
+/// their own explicit actions, so a bare `jarvis runs` can never stop anything.
 #[derive(Debug, Subcommand)]
 enum RunsAction {
+    /// List what JARVIS is doing right now: the runs that have not finished, including any waiting on an approval.
+    List,
+    /// **The kill switch**: ask every active run to stop and withdraw the approvals they are waiting on.
+    ///
+    /// Safe to repeat; it stops whatever is still active. Tool calls already in flight are cancelled where the
+    /// tool supports it, and nothing new starts for those runs.
+    StopAll {
+        /// Why everything is being stopped, for the audit trail.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
     /// Print one run's state.
     Show {
         /// The run identifier.
@@ -1174,6 +1185,37 @@ fn follow_after(
     }
 }
 
+/// Calls a run-collection endpoint (`GET` without a body, `POST` with one) and prints the daemon's own answer.
+///
+/// The daemon's response is printed rather than a re-derived summary, so the client cannot disagree with the
+/// daemon about what is running or what a stop did.
+async fn print_run_call(state: &ClientState, path: &str, post_body: Option<&str>) -> ExitCode {
+    let result = match post_body {
+        None => get_with_status(&state.discovered, &state.credential, path, API_MAJOR, "").await,
+        Some(body) => {
+            post_authenticated(
+                &state.discovered,
+                &state.credential,
+                path,
+                API_MAJOR,
+                "",
+                body,
+            )
+            .await
+        }
+    };
+    match result {
+        Ok((status, body)) if (200..300).contains(&status) => {
+            println!("{body}");
+            ExitCode::SUCCESS
+        }
+        Ok((_, body)) => {
+            eprintln!("error: {body}");
+            ExitCode::from(EXIT_ATTENTION)
+        }
+        Err(error) => report_client_error(&error),
+    }
+}
 /// Inspects a run.
 async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
     let state = match daemon_client(paths) {
@@ -1202,6 +1244,14 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
             // the client cannot disagree with the daemon about a run's state.
             println!("{body}");
             ExitCode::SUCCESS
+        }
+        RunsAction::List => print_run_call(&state, "/api/v1/runs", None).await,
+        RunsAction::StopAll { reason } => {
+            let body = reason.map_or_else(
+                || "{}".to_owned(),
+                |text| serde_json::json!({ "reason": text }).to_string(),
+            );
+            print_run_call(&state, "/api/v1/runs/stop-all", Some(&body)).await
         }
         RunsAction::Events {
             run_id,
@@ -3965,6 +4015,12 @@ mod tests {
             (vec!["jarvis", "install"], "install"),
             (vec!["jarvis", "ask", "hello"], "ask"),
             (vec!["jarvis", "runs", "show", "abc"], "runs"),
+            (vec!["jarvis", "runs", "list"], "runs"),
+            (vec!["jarvis", "runs", "stop-all"], "runs"),
+            (
+                vec!["jarvis", "runs", "stop-all", "--reason", "leaving"],
+                "runs",
+            ),
             (vec!["jarvis", "approvals", "list"], "approvals"),
             (vec!["jarvis", "grants", "list"], "grants"),
             (vec!["jarvis", "memory", "list"], "memory"),

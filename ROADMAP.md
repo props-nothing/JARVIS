@@ -65,6 +65,12 @@ read-write); `files.list`, `files.read` and `files.write` act only inside them t
 reads unprompted and writes asking (or running at `autonomous`), and approval prompts show the path and the start of the
 content so a decision is informed.
 
+Update 2026-10-03 (Oversight): the "show me what it is doing, and let me stop it" half of the fourth hallmark now exists on the
+control API and CLI. `jarvis runs list` (`GET /api/v1/runs`) shows every unfinished run, including ones parked on an
+approval, and `jarvis runs stop-all` (`POST /api/v1/runs/stop-all`) is the kill switch: it signals executing runs,
+cancels parked ones and withdraws their approvals, needs no idempotency key, is safe to repeat, and is not a latch. A
+HUD or a voice command ("Jarvis, stop everything") is now a client over one call.
+
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or
 create an unverified parallel implementation.

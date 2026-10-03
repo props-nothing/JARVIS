@@ -665,6 +665,35 @@ struct StorageStatus {
     status: &'static str,
 }
 
+/// The run routes.
+///
+/// Always *routable*, answering `service.not_ready` when no storage is configured rather than being absent: a
+/// client then receives a parseable envelope instead of the generic unknown-route refusal, which would tell it
+/// the endpoint does not exist. `stop-all` (the kill switch) is a static segment, so it is never read as a run
+/// identifier. Every route is wrapped by the caller's `authenticated`, so none can be added without it.
+fn run_routes(
+    authenticated: &impl Fn(MethodRouter<Arc<ApiState>>) -> MethodRouter<Arc<ApiState>>,
+) -> Router<Arc<ApiState>> {
+    Router::new()
+        .route(
+            "/api/v1/runs",
+            authenticated(post(runs::create_run).get(runs::list_runs)),
+        )
+        .route(
+            "/api/v1/runs/stop-all",
+            authenticated(post(runs::stop_all_runs)),
+        )
+        .route("/api/v1/runs/{run_id}", authenticated(get(runs::read_run)))
+        .route(
+            "/api/v1/runs/{run_id}/cancel",
+            authenticated(post(runs::cancel_run)),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/events",
+            authenticated(get(runs::run_events)),
+        )
+}
+
 /// Builds the router for `state`.
 ///
 /// Layer order is load-bearing, and the first entry is the **outermost** layer:
@@ -702,20 +731,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness_handler))
         .route("/api/v1/system/status", authenticated(get(system_status)))
-        // The run routes are always *routable* and answer `service.not_ready` when no
-        // storage is configured, rather than being absent. A client then receives a
-        // parseable envelope instead of the generic unknown-route refusal, which would
-        // tell it the endpoint does not exist.
-        .route("/api/v1/runs", authenticated(post(runs::create_run)))
-        .route("/api/v1/runs/{run_id}", authenticated(get(runs::read_run)))
-        .route(
-            "/api/v1/runs/{run_id}/cancel",
-            authenticated(post(runs::cancel_run)),
-        )
-        .route(
-            "/api/v1/runs/{run_id}/events",
-            authenticated(get(runs::run_events)),
-        )
+        .merge(run_routes(&authenticated))
         // The policy routes follow the same shape as the run routes: always routable, and
         // answering `service.not_ready` when no storage is configured, so a client receives a
         // parseable envelope rather than the generic unknown-route refusal.
