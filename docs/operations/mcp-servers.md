@@ -101,8 +101,8 @@ jarvis approvals approve <id> --fingerprint <fp> --version <n>
 
 A decided approval **continues the run**: approved, the tool runs in the server and the model answers from its
 result; rejected or withdrawn, the model is told the call was refused and the tool never runs. An approval is
-spent by the call it authorizes, so the same action asks again. A run still waiting when the daemon restarts is
-failed, not resumed (`docs/architecture/agent-runtime.md`, "Resuming after an approval"). One more limit to know: a
+spent by the call it authorizes, so the same action asks again. A run waiting on an approval survives a daemon restart and continues when the approval is decided
+(`docs/architecture/agent-runtime.md`, "Resuming after an approval"). One more limit to know: a
 client cannot ask the daemon for its own principal id today; for the enrolled `owner`
 client it is the first sixteen bytes of the SHA-256 of `owner`, written as a UUID. A secret reference in a server's
 `env` must begin with `JARVIS_` (for example `env:JARVIS_ACME_TOKEN`); a differently named one makes the

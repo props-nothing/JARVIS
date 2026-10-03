@@ -392,12 +392,14 @@ fake OpenAI-compatible server standing in for the model. Its first request propo
 `read_file` tool and its second answers; **every request is recorded**, so the assertions are on what the daemon
 actually sent the model.
 
-Four scenarios on one daemon: **approve** (the run stays open on a pending approval with the tool not run; the CLI
+Five scenarios on one daemon (the fifth restarts it): **approve** (the run stays open on a pending approval with the tool not run; the CLI
 decision continues the *same run*; the model's second request carries the tool's own output; the event stream shows
 the park, the resumed execution and the completion in order; the one-shot approval is `consumed`), **the same action
 asks again** (a second run raises a new approval instead of reusing the spent one), **reject** (the run still
 completes, the model is told `tool.approval_rejected`, and the tool never ran), and **cancel while parked** (a run
-with no task to signal is cancelled rather than left waiting).
+with no task to signal is cancelled, and its prompt is withdrawn rather than left pending), and **restart** (a run parked
+before the daemon is killed and restarted keeps its pending approval, is not failed by recovery, and continues to
+completion when the approval is decided on the new daemon; falsified by breaking the run-recovery exclusion).
 
 ```bash
 cargo build -p jarvisd -p jarvis-cli && cargo build -p jarvis-infrastructure --example mcp_fixture_server

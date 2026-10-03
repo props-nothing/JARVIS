@@ -1142,7 +1142,11 @@ a startup concern of the whole profile. Scoping it to one workspace would leave 
   instant was somehow absent is still found, and a state the domain cannot interpret is
   reported as an error rather than skipped — skipping would leave the run non-terminal
   with nobody aware, which is the failure the read exists to prevent.
-- **Nothing is resumed.** Both classifications settle the run at `Failed`. Resuming
+- **Nothing is resumed by this pass, except that a run parked on an approval is not touched when it
+  has a resume record.** A run in `awaiting_approval` with a durable resume record is waiting rather
+  than interrupted: the read excludes it, the approval stays listed, and a decision continues it (see
+  `agent-runtime.md`, "Resuming after an approval"). Every other classification settles the run at
+  `Failed`, as does a parked run with no record. Resuming
   means re-running a model call, and nothing knows what the interrupted call produced;
   the contract's "never inferred complete from partial text" rule and the
   cannot-resume case are the same case. A parked run is still *classified* separately

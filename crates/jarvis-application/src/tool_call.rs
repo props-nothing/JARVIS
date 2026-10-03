@@ -951,6 +951,68 @@ impl ToolCallService {
         }
     }
 
+    /// Withdraws the prompt of a run that was cancelled while parked, and stops its waiting call.
+    ///
+    /// **A cancelled run must not leave a prompt behind.** Without this the approval stayed `pending` for
+    /// a run that no longer existed: it listed as something to decide, a decision on it released nothing,
+    /// and the call's ledger row stayed `waiting_approval` until a restart cancelled it. A prompt already
+    /// decided is left as it is — the decision is the more recent fact, and the run that raced it is the
+    /// caller's to reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolServiceError`] for a storage or clock fault.
+    pub async fn abandon_waiting(
+        &self,
+        workspace: WorkspaceId,
+        approval: ApprovalId,
+    ) -> Result<(), ToolServiceError> {
+        let now = self.now()?;
+        let mut stored = self.approvals.load(workspace, approval).await?;
+        if stored.state() == ApprovalState::Pending {
+            let expected = stored.version();
+            let reason =
+                jarvis_domain::tool::approval::DecisionNote::new("the run was cancelled").ok();
+            let transition = stored
+                .apply(
+                    ApprovalState::Cancelled,
+                    expected,
+                    ApprovalActor::Cancelled {
+                        by: stored.requesting_principal,
+                        reason,
+                    },
+                    now,
+                )
+                .map_err(|error| ToolServiceError::Internal { code: error.code() })?;
+            match self
+                .approvals
+                .apply_transition(workspace, &transition, expected, &transition.actor, &stored)
+                .await
+            {
+                // Decided while this ran: the decision stands.
+                Ok(_) | Err(RepositoryError::VersionConflict { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut entry = self
+            .ledger
+            .load(
+                workspace,
+                ToolCallRecordId::from_uuid(stored.tool_call.as_uuid()),
+            )
+            .await?;
+        if entry.state() == ToolCallState::WaitingApproval {
+            self.transition(
+                &mut entry,
+                ToolCallState::Cancelled,
+                Some(ToolErrorClass::Cancelled),
+                now,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Closes a waiting row as denied and reports the refusal.
     async fn deny_waiting(
         &self,

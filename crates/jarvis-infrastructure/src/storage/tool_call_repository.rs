@@ -98,6 +98,13 @@ const EFFECTING_SQL: &str = select_sql!(
 
 /// The `SELECT` for the **conversion input**.
 ///
+/// **A `waiting_approval` row whose run has a durable resume record is not offered.** The call is
+/// waiting on a person and the run can still be continued; cancelling the row would make the decision,
+/// when it came, release a call that no longer exists. The exclusion shrinks the set rather than
+/// growing it, so the paging argument below is unchanged: a row that is excluded is neither converted
+/// nor re-read as work. When the run ends without its record being used the record is discarded, the
+/// row is offered again, and the next pass settles it.
+///
 /// **Every non-terminal state except `reconciling`, and the exact list is load-bearing twice over.**
 ///
 /// The pass *classifies* six non-terminal states: `classify_interrupted` answers `Reconcile` for
@@ -122,7 +129,12 @@ const EFFECTING_SQL: &str = select_sql!(
 /// both the domain's table and this string compile on their own.
 const AWAITING_CONVERSION_SQL: &str = select_sql!(
     "state IN ('requested', 'validated', 'waiting_approval', 'approved', 'reserved', 'executing') \
-     AND outcome IS NULL ORDER BY updated_at ASC LIMIT ?"
+     AND outcome IS NULL \
+     AND NOT (state = 'waiting_approval' AND EXISTS ( \
+         SELECT 1 FROM run_resume_states parked \
+         WHERE parked.workspace_id = tool_call_records.workspace_id \
+         AND parked.run_id = tool_call_records.run_id)) \
+     ORDER BY updated_at ASC LIMIT ?"
 );
 
 /// The SQLite-backed tool-call ledger.

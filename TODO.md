@@ -7144,10 +7144,16 @@ Dependencies: Milestone 2 exit gate.
   spends the approval; the same action asks again; a rejected record never authorizes; double resume runs once),
   five controller tests, three repository contract tests, `tests/e2e/approval-resume.mjs` (a real daemon, the real
   CLI and the MCP child against a recording fake model; falsified by dropping the HTTP hook), and
-  `tests/e2e/mcp-live.mjs` now asserting the whole leg against `deepseek-v4.1-flash:cloud`. **Still open:** a
-  restart fails a parked run (the record is durable but startup recovery and the tool-call recovery pass still
-  settle the run and its waiting row); an undecided approval never lapses its run; approvals decided by a
-  principal other than the requester are not seen by policy; provider-safe tool names for strict providers.
+  `tests/e2e/mcp-live.mjs` now asserting the whole leg against `deepseek-v4.1-flash:cloud`. **Parked runs survive a restart
+  (2026-10-03).** Recovery excludes a run in `awaiting_approval` that has a resume record, and the tool-call pass
+  excludes its waiting call (both in the SQL the passes page over, so the exclusion cannot disagree with the page
+  bound); `parked_runs::supervise_parked_runs` continues a run whose decided approval lost its continuation and
+  records a lapse so an undecided prompt no longer waits for ever; a tool never runs for a run past its deadline;
+  and cancelling a parked run withdraws its prompt and stops its waiting call (found by the restart journey: the
+  prompt of a cancelled run stayed `pending`). Evidence: seven controller/service tests, a real-SQL exclusion test,
+  and the kill-and-restart scenario in `tests/e2e/approval-resume.mjs`, falsified by breaking the exclusion.
+  **Still open:** approvals decided by a principal other than the requester are not seen by policy; the sweep is
+  bounded to 200 records; provider-safe tool names for strict providers.
   **The native route is now
   proven and reachable; the MCP and runtime routes do not exist yet, so their proof is not
   attempted.** The native proof is not a test over a hypothetical path — it is the only path a

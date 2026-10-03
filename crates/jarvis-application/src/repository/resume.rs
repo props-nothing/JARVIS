@@ -23,6 +23,9 @@ use super::RepositoryFuture;
 /// the honest answer — a run that cannot be resumed must not be parked.
 pub const MAX_RESUME_RECORD_BYTES: usize = 1_048_576;
 
+/// How many records [`RunResumeRepository::parked`] returns.
+pub const MAX_PARKED_SCAN: u32 = 200;
+
 /// The format version of [`ResumeRecord`]. A store refuses a record it does not recognise.
 pub const RESUME_RECORD_VERSION: u32 = 1;
 
@@ -104,6 +107,22 @@ pub trait RunResumeRepository: Send + Sync {
         workspace: WorkspaceId,
         run: RunId,
     ) -> RepositoryFuture<'_, Option<ResumeRecord>>;
+
+    /// Lists the records of runs that may be waiting, oldest first, at most [`MAX_PARKED_SCAN`].
+    ///
+    /// Unscoped by workspace, like the other startup-and-supervision reads: a sweep that looked at one
+    /// workspace would leave every other workspace's decided approvals unanswered. **Bounded, not
+    /// exhaustive**: a run waiting on an approval nobody has decided stays in the page, so with more
+    /// than [`MAX_PARKED_SCAN`] such runs the newest are not seen by the sweep. The decision endpoints
+    /// continue a run directly and do not depend on this read; it is the backstop for a decision whose
+    /// continuation was lost, and for a lapse nobody was there to record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Corrupted`](super::RepositoryError::Corrupted) for a record that
+    /// cannot be interpreted and [`RepositoryError::Query`](super::RepositoryError::Query) for a driver
+    /// failure.
+    fn parked(&self) -> RepositoryFuture<'_, Vec<ResumeRecord>>;
 
     /// Removes the run's record. Removing an absent one is not an error.
     ///

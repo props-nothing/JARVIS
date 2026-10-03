@@ -10,7 +10,8 @@
 use sqlx::SqlitePool;
 
 use jarvis_application::repository::resume::{
-    MAX_RESUME_RECORD_BYTES, RESUME_RECORD_VERSION, ResumeRecord, RunResumeRepository,
+    MAX_PARKED_SCAN, MAX_RESUME_RECORD_BYTES, RESUME_RECORD_VERSION, ResumeRecord,
+    RunResumeRepository,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{RunId, WorkspaceId};
@@ -79,22 +80,7 @@ impl RunResumeRepository for SqliteResumeRepository {
             else {
                 return Ok(None);
             };
-            let version: i64 = sqlx::Row::try_get(&row, "state_version").map_err(|_| {
-                RepositoryError::Corrupted {
-                    column: "state_version",
-                }
-            })?;
-            if version != i64::from(RESUME_RECORD_VERSION) {
-                return Err(RepositoryError::Corrupted {
-                    column: "state_version",
-                });
-            }
-            let record: ResumeRecord =
-                serde_json::from_str(&text(&row, "state_json")?).map_err(|_| {
-                    RepositoryError::Corrupted {
-                        column: "state_json",
-                    }
-                })?;
+            let record = parse_record(&row)?;
             // The record's own identity must be the row's, or a hand-edited row could resume a run
             // with another run's calls.
             if record.workspace != workspace || record.run != run {
@@ -103,6 +89,26 @@ impl RunResumeRepository for SqliteResumeRepository {
                 });
             }
             Ok(Some(record))
+        })
+    }
+
+    fn parked(&self) -> RepositoryFuture<'_, Vec<ResumeRecord>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT workspace_id, run_id, state_version, state_json FROM run_resume_states \
+                 ORDER BY created_at ASC, run_id ASC LIMIT ?",
+            )
+            .bind(i64::from(MAX_PARKED_SCAN))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            let mut records = Vec::with_capacity(rows.len());
+            for row in &rows {
+                // One uninterpretable row is reported rather than skipped: skipping would leave its run
+                // parked with nobody aware, the failure this table exists to prevent.
+                records.push(parse_record(row)?);
+            }
+            Ok(records)
         })
     }
 
@@ -117,6 +123,22 @@ impl RunResumeRepository for SqliteResumeRepository {
             Ok(())
         })
     }
+}
+
+/// Reads one stored record, refusing a version this build does not know.
+fn parse_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResumeRecord, RepositoryError> {
+    let version: i64 =
+        sqlx::Row::try_get(row, "state_version").map_err(|_| RepositoryError::Corrupted {
+            column: "state_version",
+        })?;
+    if version != i64::from(RESUME_RECORD_VERSION) {
+        return Err(RepositoryError::Corrupted {
+            column: "state_version",
+        });
+    }
+    serde_json::from_str(&text(row, "state_json")?).map_err(|_| RepositoryError::Corrupted {
+        column: "state_json",
+    })
 }
 
 #[cfg(test)]

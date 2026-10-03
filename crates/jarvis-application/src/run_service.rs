@@ -414,6 +414,21 @@ pub struct RunPorts {
     pub tools: Option<Arc<crate::tool_call::ToolCallService>>,
 }
 
+/// What one [`RunService::resume_parked`] sweep did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParkedSweep {
+    /// Resume records read.
+    pub examined: u64,
+    /// Runs whose decided approval was handed to a continuation.
+    pub resumed: u64,
+    /// Runs still waiting on an undecided, unexpired approval.
+    pub waiting: u64,
+    /// Records of terminal runs that were discarded.
+    pub discarded: u64,
+    /// Runs the sweep could not read or continue; they are looked at again next sweep.
+    pub failed: u64,
+}
+
 /// Orchestrates run creation, execution, and cancellation.
 pub struct RunService {
     ports: RunPorts,
@@ -928,6 +943,73 @@ impl RunService {
             registry.forget(run_id);
         }));
         Ok(true)
+    }
+
+    /// Continues every parked run whose approval has been decided, and records every lapse.
+    ///
+    /// **The backstop for the decision endpoints, not their replacement.** A decision continues its run
+    /// directly; this finds the runs where that did not happen — the daemon stopped between the decision
+    /// and the continuation, or restarted with a run still waiting and an approval decided in the
+    /// meantime — and the approvals that lapsed with nobody there to record it. Reading an approval
+    /// through [`ApprovalService::read`](crate::approval_service::ApprovalService::read) is what records a lapse, so an undecided prompt that passed its
+    /// deadline becomes `expired` here and its run continues with a refusal rather than waiting for ever.
+    ///
+    /// A record whose run is **terminal** is discarded: it can no longer be used, and leaving it would
+    /// keep the run's waiting tool-call row excluded from recovery. A run in any other state is left
+    /// alone, because a record written moments before a park is legitimate.
+    ///
+    /// Safe to repeat and safe to race with a decision: continuing is idempotent (the first transition
+    /// out of `AwaitingApproval` wins).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::Storage`] when the records cannot be read. A failure on one run is
+    /// counted in the report rather than returned, so one bad run cannot starve the others.
+    pub async fn resume_parked(
+        &self,
+        approvals: &crate::approval_service::ApprovalService,
+        spawn: &dyn RunSpawner,
+        at: jarvis_domain::time::UtcTimestamp,
+    ) -> Result<ParkedSweep, RunServiceError> {
+        let mut sweep = ParkedSweep::default();
+        let Some(resumes) = self.resumes.as_ref() else {
+            return Ok(sweep);
+        };
+        for record in resumes.parked().await? {
+            sweep.examined += 1;
+            let Ok(stored) = self.ports.runs.load(record.workspace, record.run).await else {
+                sweep.failed += 1;
+                continue;
+            };
+            if stored.state.is_terminal() {
+                let _ = resumes.discard(record.workspace, record.run).await;
+                sweep.discarded += 1;
+                continue;
+            }
+            if stored.state != RunState::AwaitingApproval {
+                continue;
+            }
+            let context = api_request_context(
+                record.workspace,
+                stored.principal_id,
+                RequestId::from_uuid(uuid::Uuid::now_v7()),
+                CorrelationId::from_uuid(uuid::Uuid::now_v7()),
+            );
+            let Ok(approval) = approvals.read(&context, record.approval, at).await else {
+                sweep.failed += 1;
+                continue;
+            };
+            if approval.state() == jarvis_domain::tool::approval::ApprovalState::Pending {
+                sweep.waiting += 1;
+                continue;
+            }
+            match self.resume_after_decision(&context, &approval, spawn).await {
+                Ok(true) => sweep.resumed += 1,
+                Ok(false) => {}
+                Err(_) => sweep.failed += 1,
+            }
+        }
+        Ok(sweep)
     }
 
     /// Records cancellation intent for `run` and signals its scope.

@@ -493,6 +493,17 @@ impl RunningDaemon {
             ));
         }
 
+        // **Parked runs are supervised for as long as the daemon serves.** The first sweep runs at once, so
+        // a restart continues a run whose approval was decided while nothing was listening, and the timer
+        // records a lapse nobody was there to see.
+        let parked_stop = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(crate::parked_runs::supervise_parked_runs(
+            Arc::clone(&self.runs),
+            Arc::clone(&self.approvals),
+            crate::parked_runs::PARKED_RUN_SWEEP_INTERVAL,
+            Arc::clone(&parked_stop),
+        ));
+
         // Readiness was set before `start` returned, so the surface is ready the
         // moment it accepts a connection. Graceful shutdown stops new admission
         // and drains in-flight connections before it resolves.
@@ -501,6 +512,7 @@ impl RunningDaemon {
         if serving.await.is_err() {
             // A serve error is not a successful drain.
             let _ = drain.begin();
+            parked_stop.notify_one();
             mcp_stop.notify_one();
             stop_mcp_servers(&mcp_servers).await;
             return false;
@@ -509,6 +521,7 @@ impl RunningDaemon {
         // Stop admitting and unpublish after connections have drained, so no
         // client discovers a daemon that is already stopping.
         if drain.begin().is_err() {
+            parked_stop.notify_one();
             mcp_stop.notify_one();
             stop_mcp_servers(&mcp_servers).await;
             return false;
@@ -518,6 +531,7 @@ impl RunningDaemon {
         // this process, so exiting without asking them to stop orphans them — and for a supervised server an
         // orphan is the state a supervisor cannot distinguish from a crash loop. Stopping them here also means
         // the grace window below bounds *their* shutdown as well as the application's.
+        parked_stop.notify_one();
         mcp_stop.notify_one();
         stop_mcp_servers(&mcp_servers).await;
 

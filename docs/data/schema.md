@@ -223,7 +223,8 @@ approval needs in order to continue: the batch of tool calls the model proposed,
 ones that already settled, the index of the one that is waiting, the turn, and the objective.
 `(workspace_id, run_id)` is the primary key, so a run has **at most one** record and parking again
 replaces it — a stale record would resume the wrong call. The record is written **before** the run is
-parked and removed when the run leaves the wait; a run whose record cannot be written is failed rather than
+parked and removed when the run leaves the wait; the run-recovery read and the tool-call recovery read
+both exclude a parked run that has one, which is what lets the wait survive a restart; a run whose record cannot be written is failed rather than
 parked. `state_json` is bounded by a `CHECK` as well as by the writer, and `state_version` lets a reader
 refuse a record whose shape it does not know (reported as corruption, never guessed at). It is not
 foreign-keyed to `agent_runs`: every statement scopes by `workspace_id`, and a cascading delete would

@@ -276,12 +276,23 @@ write a version conflict and that call is refused.
 
 **Known limits, stated rather than hidden:**
 
-- **A restart fails a parked run** (see below). The record is durable, but startup recovery and the
-  tool-call recovery pass still settle the run and its waiting ledger row.
-- **An approval nobody decides never lapses the run.** Expiry is applied when a decision arrives,
-  not by a timer, so an undecided prompt leaves its run parked until someone cancels it or the
-  daemon restarts. The run's own deadline is wall-clock and keeps counting, so a decision after it
-  fails the run `run.deadline_exceeded` at the next model turn.
+- **A restart does not disturb a parked run.** The record is durable; startup recovery and the
+  tool-call recovery pass leave the run and its waiting call alone, the pending approval is still
+  listed, and a decision taken on the restarted daemon continues the run (proven by
+  `tests/e2e/approval-resume.mjs`, which kills and restarts a real daemon, and falsified by breaking
+  the run-recovery exclusion).
+- **A parked-run supervisor is the backstop.** `parked_runs::supervise_parked_runs` runs
+  `RunService::resume_parked` once at start and every ten seconds: it continues a run whose approval
+  was decided but whose continuation was lost (the daemon stopped between the two), and reading an
+  approval through the service **records a lapse**, so an undecided prompt past its deadline becomes
+  `expired` and its run carries on with a refusal instead of waiting for ever. It discards the record
+  of a run that already ended, which is also what lets recovery settle that run's waiting call.
+  The scan is bounded (`MAX_PARKED_SCAN`, 200, oldest first), so with more than that many runs
+  waiting on undecided prompts the newest are not swept; decisions still continue their runs directly.
+- **A tool never runs for a run that is out of time.** The run's deadline keeps counting while it
+  waits; a decision after it fails the run `run.deadline_exceeded` **before** the call is released.
+- **Cancelling a parked run withdraws its prompt** (`pending -> cancelled`) and stops its waiting
+  ledger row, so no prompt is left for a run that no longer exists.
 - **Only the requesting principal's own decisions are seen by policy.** The approvals policy reads
   are the ones decided *by* the requesting principal. A second principal deciding on the first's
   behalf is not modelled yet, and would park the run again on a fresh prompt.
@@ -318,14 +329,11 @@ Two consequences of this work are worth recording:
    forbids. The state machine models a resumable wait (`Waiting` carries a
    `WaitingOn`); the recovery path does not yet use it, and that is a gap rather than
    a design.
-2. **A run parked on an approval is re-woken by the decision, within one daemon
-   lifetime — not across a restart.** See "Resuming after an approval" below. `Waiting`
-   (timers, events) is still settled `Failed` because nothing that could satisfy it
-   exists yet. Surviving a restart needs two more things the resume record does not
-   do by itself: the startup recovery pass must leave a run with a resume record
-   alone, and the tool-call recovery pass — which cancels a never-dispatched
-   `waiting_approval` ledger row — must leave the row of a parked call alone too.
-   Until both change, restart fails the run and its record is left behind unreferenced.
+2. **A run parked on an approval survives a restart.** See "Resuming after an approval" below.
+   Recovery leaves a run in `AwaitingApproval` **that has a resume record** alone (the read it
+   pages over excludes it, and the tool-call pass excludes its waiting call), and fails one that
+   has none, since nothing could ever release it. `Waiting` (timers, events) is still settled
+   `Failed` because nothing that could satisfy it exists yet.
 
 The pass is safe to run against a live database for one structural reason: the
 transition it writes carries the version it **read**, so a run that completed in

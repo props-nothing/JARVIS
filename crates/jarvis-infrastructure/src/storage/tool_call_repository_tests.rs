@@ -1152,3 +1152,103 @@ async fn an_unsettled_duplicate_asks_for_reconciliation_and_names_the_row() {
         "an unsettled call must never be retried, even though it might never have happened",
     );
 }
+
+#[tokio::test]
+async fn a_parked_run_with_a_resume_record_keeps_its_waiting_call_and_its_own_run_row() {
+    // **Restart must not undo a pending approval.** Both recovery reads are predicates over real SQL, so
+    // only the database proves them: a waiting call whose run has a resume record is not offered to the
+    // tool pass, and the parked run itself is not offered to the run pass. Without the record, both are.
+    use jarvis_application::repository::resume::{
+        RESUME_RECORD_VERSION, ResumeRecord, RunResumeRepository as _,
+    };
+    use jarvis_application::repository::run::{RunRepository as _, RunWrite, WaitingOn};
+    use jarvis_domain::run::lifecycle::RunTransition;
+    use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
+
+    let (database, ledger) = repository().await;
+    let runs = SqliteRepositories::new(database.pool().clone());
+    let resumes =
+        crate::storage::resume_repository::SqliteResumeRepository::new(database.pool().clone());
+
+    let mut waiting = entry();
+    ledger.reserve(&waiting).await.expect("granted");
+    drive(&ledger, &mut waiting, ToolCallState::WaitingApproval, None).await;
+
+    let path = [
+        (RunState::Received, RunState::ContextBuilding),
+        (RunState::ContextBuilding, RunState::Planning),
+        (RunState::Planning, RunState::AwaitingModel),
+        (RunState::AwaitingModel, RunState::ExecutingTool),
+        (RunState::ExecutingTool, RunState::AwaitingApproval),
+    ];
+    let mut version = RunVersion::FIRST;
+    for (index, (from, to)) in path.iter().enumerate() {
+        let transition = RunTransition::new(
+            *from,
+            *to,
+            version,
+            TransitionActor::Controller,
+            TransitionReason::new("step").expect("valid"),
+            now(),
+        );
+        let event = jarvis_application::repository::run::NewActivityEvent {
+            run_id: run_id(),
+            sequence: index as u64 + 2,
+            event_type: "run.step".to_owned(),
+            payload_json: None,
+            visibility: jarvis_application::repository::run::EventVisibility::Public,
+            occurred_at: now(),
+        };
+        let mut write = RunWrite::new(&transition, event);
+        if *to == RunState::AwaitingApproval {
+            write = write.waiting_on(WaitingOn::new("approval", "a-1").expect("valid"));
+        }
+        version = runs
+            .transition(workspace(), write)
+            .await
+            .expect("legal")
+            .version;
+    }
+
+    let record = ResumeRecord {
+        version: RESUME_RECORD_VERSION,
+        run: run_id(),
+        workspace: workspace(),
+        conversation: jarvis_domain::ids::ConversationId::from_uuid(uuid::Uuid::from_u128(0x50)),
+        approval: jarvis_domain::ids::ApprovalId::from_uuid(uuid::Uuid::from_u128(0x51)),
+        turn_index: 1,
+        objective: "x".to_owned(),
+        objective_message: None,
+        calls: Vec::new(),
+        waiting_index: 0,
+        settled: Vec::new(),
+    };
+    resumes.save(&record).await.expect("saves");
+    assert_eq!(resumes.parked().await.expect("reads"), vec![record.clone()]);
+
+    let with_record = runs.incomplete_runs().await.expect("reads");
+    assert!(
+        with_record.runs.is_empty(),
+        "a parked run with a record is waiting, not interrupted"
+    );
+    let tool_scan = ledger.awaiting_conversion(10).await.expect("reads");
+    assert!(
+        tool_scan.records.is_empty(),
+        "its waiting call is not stranded"
+    );
+
+    resumes
+        .discard(workspace(), run_id())
+        .await
+        .expect("discards");
+    assert_eq!(runs.incomplete_runs().await.expect("reads").runs.len(), 1);
+    assert_eq!(
+        ledger
+            .awaiting_conversion(10)
+            .await
+            .expect("reads")
+            .records
+            .len(),
+        1
+    );
+}

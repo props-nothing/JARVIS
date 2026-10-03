@@ -4110,6 +4110,8 @@ struct ToolFixture {
     repositories: Arc<InMemoryRepositories>,
     executions: Arc<AtomicU32>,
     second_request: Arc<Mutex<Option<bool>>>,
+    clock: Arc<ManualClock>,
+    tools: Arc<crate::tool_call::ToolCallService>,
 }
 
 /// Builds a controller whose run proposes one tool and then answers.
@@ -4117,6 +4119,7 @@ fn tool_fixture() -> ToolFixture {
     let repositories = Arc::new(InMemoryRepositories::new());
     let executions = Arc::new(AtomicU32::new(0));
     let second_request = Arc::new(Mutex::new(None));
+    let clock = Arc::new(ManualClock::new(now()));
     let tools = Arc::new(crate::tool_call::ToolCallService::new(
         Arc::new(OneToolCatalog),
         Arc::new(FixtureGrants),
@@ -4127,7 +4130,7 @@ fn tool_fixture() -> ToolFixture {
         }),
         Arc::clone(&repositories) as Arc<dyn crate::repository::tool_call::ToolCallRepository>,
         Arc::clone(&repositories) as Arc<dyn crate::repository::approval::ApprovalRepository>,
-        Arc::new(ManualClock::new(now())),
+        Arc::clone(&clock) as Arc<dyn jarvis_domain::clock::Clock>,
     ));
     let controller = RunController::new(
         Arc::clone(&repositories) as Arc<dyn RunRepository>,
@@ -4136,14 +4139,16 @@ fn tool_fixture() -> ToolFixture {
         Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
         Arc::new(ToolThenAnswer::new(model(), Arc::clone(&second_request)))
             as Arc<dyn ModelProvider>,
-        Arc::new(ManualClock::new(now())),
+        Arc::clone(&clock) as Arc<dyn jarvis_domain::clock::Clock>,
     )
-    .with_tools(tools);
+    .with_tools(Arc::clone(&tools));
     ToolFixture {
         controller,
         repositories,
         executions,
         second_request,
+        clock,
+        tools,
     }
 }
 
@@ -4398,6 +4403,7 @@ fn ask_fixture() -> ToolFixture {
     let repositories = Arc::new(InMemoryRepositories::new());
     let executions = Arc::new(AtomicU32::new(0));
     let second_request = Arc::new(Mutex::new(None));
+    let clock = Arc::new(ManualClock::new(now()));
     let tools = Arc::new(crate::tool_call::ToolCallService::new(
         Arc::new(AskCatalog),
         Arc::new(AskGrants),
@@ -4408,7 +4414,7 @@ fn ask_fixture() -> ToolFixture {
         }),
         Arc::clone(&repositories) as Arc<dyn crate::repository::tool_call::ToolCallRepository>,
         Arc::clone(&repositories) as Arc<dyn crate::repository::approval::ApprovalRepository>,
-        Arc::new(ManualClock::new(now())),
+        Arc::clone(&clock) as Arc<dyn jarvis_domain::clock::Clock>,
     ));
     let controller = RunController::new(
         Arc::clone(&repositories) as Arc<dyn RunRepository>,
@@ -4417,9 +4423,9 @@ fn ask_fixture() -> ToolFixture {
         Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
         Arc::new(ToolThenAnswer::new(model(), Arc::clone(&second_request)))
             as Arc<dyn ModelProvider>,
-        Arc::new(ManualClock::new(now())),
+        Arc::clone(&clock) as Arc<dyn jarvis_domain::clock::Clock>,
     )
-    .with_tools(tools)
+    .with_tools(Arc::clone(&tools))
     .with_resume_store(
         Arc::clone(&repositories) as Arc<dyn crate::repository::resume::RunResumeRepository>
     );
@@ -4428,11 +4434,18 @@ fn ask_fixture() -> ToolFixture {
         repositories,
         executions,
         second_request,
+        clock,
+        tools,
     }
 }
 
 /// Creates the conversation and run a controller drives.
 async fn seed_run(store: &Arc<InMemoryRepositories>) {
+    seed_run_with(store, RunBudget::default()).await;
+}
+
+/// Creates the conversation and a run carrying `budget`.
+async fn seed_run_with(store: &Arc<InMemoryRepositories>, budget: RunBudget) {
     store
         .create_conversation(
             NewConversation::new(
@@ -4449,13 +4462,14 @@ async fn seed_run(store: &Arc<InMemoryRepositories>) {
         .expect("the conversation is created");
     store
         .create(
-            NewRun::new(
+            NewRun::with_budget(
                 run(),
                 context().workspace_id,
                 conversation(),
                 PrincipalId::from_uuid(id(3)),
                 Some("objective".to_owned()),
                 now(),
+                budget,
             )
             .expect("valid"),
             crate::repository::run::run_received_event(run(), now()),
@@ -4727,4 +4741,378 @@ async fn a_parked_run_with_no_resume_record_is_failed_rather_than_left_waiting()
         stored.error_code.as_deref(),
         Some("run.resume_state_missing")
     );
+}
+
+#[tokio::test]
+async fn a_parked_run_whose_deadline_passed_while_it_waited_does_not_run_the_tool() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let deadline = UtcTimestamp::parse("2026-09-22T13:00:00Z").expect("valid");
+    seed_run_with(&fixture.repositories, RunBudget::with_deadline(deadline)).await;
+    let outcome = fixture
+        .controller
+        .execute(
+            &context(),
+            run(),
+            conversation(),
+            "write a file",
+            None,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("parks");
+    assert_eq!(outcome.state, RunState::AwaitingApproval);
+    let approval = crate::repository::resume::RunResumeRepository::load(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        run(),
+    )
+    .await
+    .expect("reads")
+    .expect("record")
+    .approval;
+    let decided = decide(&fixture, approval, ApprovalState::Approved).await;
+
+    // The prompt sat open past the run's own deadline.
+    fixture
+        .clock
+        .set(UtcTimestamp::parse("2026-09-22T14:00:00Z").expect("valid"));
+    let error = fixture
+        .controller
+        .resume(&context(), run(), &decided, &CancellationScope::new())
+        .await
+        .expect_err("an expired run is not continued");
+    assert_eq!(error, ControllerError::DeadlineExceeded);
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        0,
+        "no effect for a dead run"
+    );
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::Failed);
+}
+
+// ---------------------------------------------------------------------------------------
+// The parked-run sweep: the backstop for a decision whose continuation was lost.
+// ---------------------------------------------------------------------------------------
+
+/// Collects scheduled tasks so a test runs them when it chooses.
+#[derive(Default)]
+struct CollectingSpawner {
+    tasks: Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+}
+
+impl std::fmt::Debug for CollectingSpawner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CollectingSpawner")
+    }
+}
+
+impl crate::run_service::RunSpawner for CollectingSpawner {
+    fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+        self.tasks.lock().expect("lock").push(task);
+    }
+}
+
+impl CollectingSpawner {
+    fn scheduled(&self) -> usize {
+        self.tasks.lock().expect("lock").len()
+    }
+
+    async fn run_all(&self) {
+        let tasks: Vec<_> = self.tasks.lock().expect("lock").drain(..).collect();
+        for task in tasks {
+            task.await;
+        }
+    }
+}
+
+/// A run service over the fixture's own stores, so a sweep sees the run the controller parked.
+fn service_over(fixture: &ToolFixture) -> crate::run_service::RunService {
+    let repositories = &fixture.repositories;
+    crate::run_service::RunService::new(
+        crate::run_service::RunPorts {
+            runs: Arc::clone(repositories) as Arc<dyn RunRepository>,
+            conversations: Arc::clone(repositories) as Arc<dyn ConversationRepository>,
+            model_calls: Arc::clone(repositories) as Arc<dyn ModelCallRepository>,
+            deltas: Arc::clone(repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+            provider: Arc::new(ToolThenAnswer::new(
+                model(),
+                Arc::clone(&fixture.second_request),
+            )) as Arc<dyn ModelProvider>,
+            clock: Arc::clone(&fixture.clock) as Arc<dyn jarvis_domain::clock::Clock>,
+            policies: None,
+            delivery_campaigns: Vec::new(),
+            tools: Some(Arc::clone(&fixture.tools)),
+        },
+        Arc::new(crate::run_service::RunCancellationRegistry::new()),
+    )
+    .with_resume_store(
+        Arc::clone(repositories) as Arc<dyn crate::repository::resume::RunResumeRepository>
+    )
+}
+
+fn approvals_over(fixture: &ToolFixture) -> crate::approval_service::ApprovalService {
+    crate::approval_service::ApprovalService::new(Arc::clone(&fixture.repositories)
+        as Arc<dyn crate::repository::approval::ApprovalRepository>)
+}
+
+#[tokio::test]
+async fn a_sweep_continues_a_run_whose_approval_was_decided_and_leaves_an_undecided_one_alone() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let service = service_over(&fixture);
+    let approvals = approvals_over(&fixture);
+    let spawner = CollectingSpawner::default();
+
+    let waiting = service
+        .resume_parked(&approvals, &spawner, now())
+        .await
+        .expect("sweeps");
+    assert_eq!(
+        (waiting.examined, waiting.waiting, waiting.resumed),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        spawner.scheduled(),
+        0,
+        "an undecided approval must not move the run"
+    );
+
+    // The decision was taken but its continuation was lost (the daemon stopped in between).
+    let _ = decide(&fixture, approval, ApprovalState::Approved).await;
+    let swept = service
+        .resume_parked(&approvals, &spawner, now())
+        .await
+        .expect("sweeps");
+    assert_eq!(swept.resumed, 1);
+    spawner.run_all().await;
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::Completed);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 1);
+
+    // A second sweep finds nothing to do, and the record is gone with the wait.
+    let again = service
+        .resume_parked(&approvals, &spawner, now())
+        .await
+        .expect("sweeps");
+    assert_eq!(again.examined, 0);
+}
+
+#[tokio::test]
+async fn a_sweep_records_a_lapsed_approval_and_the_run_carries_on_with_a_refusal() {
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let service = service_over(&fixture);
+    let approvals = approvals_over(&fixture);
+    let spawner = CollectingSpawner::default();
+
+    // Nobody decided, and the prompt's window has long passed.
+    let later = UtcTimestamp::parse("2027-09-22T12:00:00Z").expect("valid");
+    fixture.clock.set(later);
+    let swept = service
+        .resume_parked(&approvals, &spawner, later)
+        .await
+        .expect("sweeps");
+    assert_eq!(swept.resumed, 1, "{swept:?}");
+    spawner.run_all().await;
+
+    let stored = crate::repository::approval::ApprovalRepository::load(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        approval,
+    )
+    .await
+    .expect("loads");
+    assert_eq!(
+        stored.state(),
+        jarvis_domain::tool::approval::ApprovalState::Expired
+    );
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        0,
+        "a lapsed prompt never runs the tool"
+    );
+    let run_state = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads")
+        .state;
+    assert_eq!(
+        run_state,
+        RunState::Completed,
+        "the model was told it was refused and answered"
+    );
+}
+
+#[tokio::test]
+async fn a_sweep_discards_the_record_of_a_run_that_already_ended() {
+    let fixture = ask_fixture();
+    let _approval = park_the_run(&fixture).await;
+    let service = service_over(&fixture);
+    let approvals = approvals_over(&fixture);
+    let spawner = CollectingSpawner::default();
+    fixture
+        .controller
+        .cancel_parked(context().workspace_id, run(), "no longer needed")
+        .await
+        .expect("cancels");
+    // `cancel_parked` discards its own record, so put one back as a crash between the two would leave.
+    let record = crate::repository::resume::ResumeRecord {
+        version: crate::repository::resume::RESUME_RECORD_VERSION,
+        run: run(),
+        workspace: context().workspace_id,
+        conversation: conversation(),
+        approval: jarvis_domain::ids::ApprovalId::from_uuid(Uuid::from_u128(0x77)),
+        turn_index: 1,
+        objective: "x".to_owned(),
+        objective_message: None,
+        calls: Vec::new(),
+        waiting_index: 0,
+        settled: Vec::new(),
+    };
+    crate::repository::resume::RunResumeRepository::save(fixture.repositories.as_ref(), &record)
+        .await
+        .expect("saves");
+    let swept = service
+        .resume_parked(&approvals, &spawner, now())
+        .await
+        .expect("sweeps");
+    assert_eq!(swept.discarded, 1);
+    assert!(
+        crate::repository::resume::RunResumeRepository::load(
+            fixture.repositories.as_ref(),
+            context().workspace_id,
+            run()
+        )
+        .await
+        .expect("reads")
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn recovery_leaves_a_run_parked_on_an_approval_alone_and_fails_one_with_no_record() {
+    let fixture = ask_fixture();
+    let _approval = park_the_run(&fixture).await;
+    let runs: Arc<dyn RunRepository> = Arc::clone(&fixture.repositories) as Arc<dyn RunRepository>;
+
+    let kept = crate::recovery::reconcile(&runs, now())
+        .await
+        .expect("reconciles");
+    assert_eq!(
+        kept.summary.total(),
+        0,
+        "a run waiting on a person is not interrupted"
+    );
+    assert_eq!(
+        fixture
+            .repositories
+            .load(context().workspace_id, run())
+            .await
+            .expect("loads")
+            .state,
+        RunState::AwaitingApproval
+    );
+
+    // Nothing could ever release a parked run with no record, so it is settled like any other.
+    crate::repository::resume::RunResumeRepository::discard(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        run(),
+    )
+    .await
+    .expect("discards");
+    let failed = crate::recovery::reconcile(&runs, now())
+        .await
+        .expect("reconciles");
+    assert_eq!(failed.summary.total(), 1);
+    assert_eq!(
+        fixture
+            .repositories
+            .load(context().workspace_id, run())
+            .await
+            .expect("loads")
+            .state,
+        RunState::Failed
+    );
+}
+
+#[tokio::test]
+async fn tool_recovery_leaves_the_waiting_call_of_a_parked_run_alone() {
+    use crate::repository::tool_call::ToolCallRepository;
+    let fixture = ask_fixture();
+    let _approval = park_the_run(&fixture).await;
+    let ledger: Arc<dyn ToolCallRepository> =
+        Arc::clone(&fixture.repositories) as Arc<dyn ToolCallRepository>;
+
+    let kept = crate::tool_recovery::reconcile_tool_calls(&ledger, now())
+        .await
+        .expect("reconciles");
+    assert_eq!(
+        kept.changed(),
+        0,
+        "the call is waiting on a person, not stranded"
+    );
+
+    crate::repository::resume::RunResumeRepository::discard(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        run(),
+    )
+    .await
+    .expect("discards");
+    let settled = crate::tool_recovery::reconcile_tool_calls(&ledger, now())
+        .await
+        .expect("reconciles");
+    assert_eq!(
+        settled.cancelled, 1,
+        "without a record nothing can release it"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_parked_run_withdraws_its_prompt_and_stops_its_waiting_call() {
+    use crate::repository::tool_call::ToolCallRepository as _;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    fixture
+        .controller
+        .cancel_parked(context().workspace_id, run(), "no longer needed")
+        .await
+        .expect("cancels");
+
+    let prompt = crate::repository::approval::ApprovalRepository::load(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        approval,
+    )
+    .await
+    .expect("loads");
+    assert_eq!(
+        prompt.state(),
+        jarvis_domain::tool::approval::ApprovalState::Cancelled,
+        "a prompt for a run that no longer exists must not stay pending"
+    );
+    let stranded = fixture
+        .repositories
+        .awaiting_conversion(10)
+        .await
+        .expect("reads")
+        .records;
+    assert!(
+        stranded.is_empty(),
+        "the waiting call was stopped, not left for recovery: {stranded:?}"
+    );
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
 }

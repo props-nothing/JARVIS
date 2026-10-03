@@ -1106,6 +1106,12 @@ impl RunRepository for SqliteRepositories {
             // interrupted runs non-terminal forever, which is why it is unscoped and
             // each entry carries its own workspace.
             //
+            // **A run waiting on an approval with a durable resume record is not interrupted: it is
+            // waiting**, and the record is exactly what lets a decision continue it after a restart. It
+            // is excluded here, in the one read recovery pages over, so the exclusion cannot disagree
+            // with the page bound. A parked run **without** a record is still offered, because nothing
+            // could ever release it.
+            //
             // **One past the bound**, so `bounded` is observed rather than inferred. Reading
             // exactly the bound and comparing the length would report "complete" for a store
             // holding exactly the bound, and would silently start lying if the bound changed;
@@ -1116,6 +1122,10 @@ impl RunRepository for SqliteRepositories {
                 run_columns!(),
                 " FROM agent_runs \
                  WHERE state NOT IN ('completed', 'failed', 'cancelled') \
+                 AND NOT (state = 'awaiting_approval' AND EXISTS ( \
+                     SELECT 1 FROM run_resume_states parked \
+                     WHERE parked.workspace_id = agent_runs.workspace_id \
+                     AND parked.run_id = agent_runs.id)) \
                  ORDER BY created_at ASC LIMIT ?"
             ))
             .bind(limit)

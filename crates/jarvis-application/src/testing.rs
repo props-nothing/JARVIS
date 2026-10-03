@@ -807,6 +807,11 @@ impl RunRepository for InMemoryRepositories {
                     .runs
                     .values()
                     .filter(|row| !row.lifecycle.state().is_terminal())
+                    // A run parked on an approval with a resume record is waiting, not interrupted.
+                    .filter(|row| {
+                        !(row.lifecycle.state() == RunState::AwaitingApproval
+                            && store.resumes.contains_key(&(row.workspace_id, row.stored().id)))
+                    })
                     .map(|row| crate::repository::run::IncompleteRun {
                         workspace_id: row.workspace_id,
                         run: row.stored(),
@@ -1958,6 +1963,19 @@ impl crate::repository::resume::RunResumeRepository for InMemoryRepositories {
         )
     }
 
+    fn parked(&self) -> RepositoryFuture<'_, Vec<crate::repository::resume::ResumeRecord>> {
+        Box::pin(async move {
+            self.with(|store| {
+                Ok(store
+                    .resumes
+                    .values()
+                    .take(crate::repository::resume::MAX_PARKED_SCAN as usize)
+                    .cloned()
+                    .collect())
+            })
+        })
+    }
+
     fn discard(&self, workspace: WorkspaceId, run: RunId) -> RepositoryFuture<'_, ()> {
         Box::pin(async move {
             self.with(|store| {
@@ -2076,7 +2094,11 @@ impl ToolCallRepository for InMemoryRepositories {
                     .filter(|row| {
                         // Every non-terminal state **except `reconciling`**, the excluded set the
                         // port's own doc calls a requirement rather than an optimisation.
-                        !row.state().is_terminal() && row.state() != ToolCallState::Reconciling
+                        !row.state().is_terminal()
+                            && row.state() != ToolCallState::Reconciling
+                            // A waiting call whose run has a resume record is not stranded.
+                            && !(row.state() == ToolCallState::WaitingApproval
+                                && store.resumes.contains_key(&(row.key.workspace, row.run)))
                     })
                     .cloned()
                     .collect();

@@ -31,12 +31,24 @@ impl RunController {
         requester_reason: &str,
     ) -> Result<(), ControllerError> {
         let run = RunRef { workspace, run_id };
+        // The record is read first, because it is what names the approval to withdraw — and the run's
+        // own transition is the arbiter: a decision that already moved the run makes it fail, and the
+        // prompt is then left to that decision.
+        let record = match self.resumes.as_ref() {
+            Some(resumes) => resumes.load(workspace, run_id).await.ok().flatten(),
+            None => None,
+        };
         self.finish(
             run,
             Step::cancelled_from(RunState::AwaitingApproval, "cancelled_while_waiting")
                 .with_requester_reason(Some(requester_reason.to_owned())),
         )
         .await?;
+        // Best effort from here: the run is already cancelled, which is what the caller asked for. A
+        // prompt left behind is still caught by the next restart's recovery pass once the record is gone.
+        if let (Some(record), Some(tools)) = (record.as_ref(), self.tools.as_ref()) {
+            let _ = tools.abandon_waiting(workspace, record.approval).await;
+        }
         if let Some(resumes) = self.resumes.as_ref() {
             let _ = resumes.discard(workspace, run_id).await;
         }
@@ -100,6 +112,23 @@ impl RunController {
                 return Err(error);
             }
         };
+
+        // **A tool is never run for a run that is out of time.** The run's deadline kept counting while
+        // it waited, and the wait can be long; running the call and then discovering at the next model
+        // turn that the run had already expired would perform an effect nobody is going to read.
+        if !budget.permits_step_at(self.now()?) {
+            self.finish(
+                run,
+                Step::failed(
+                    RunState::AwaitingApproval,
+                    "run.failed",
+                    "deadline_exceeded_before_resume",
+                    ControllerError::DeadlineExceeded.code(),
+                ),
+            )
+            .await?;
+            return Err(ControllerError::DeadlineExceeded);
+        }
 
         self.step_unless_cancelled(
             run,

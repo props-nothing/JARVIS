@@ -20,6 +20,7 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod model_providers;
 pub mod native_tools;
+pub mod parked_runs;
 pub mod paths;
 pub mod plugin;
 pub mod profile;
