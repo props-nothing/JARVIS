@@ -44,6 +44,12 @@ Update 2026-10-03 (Brain): the OpenAI-compatible adapter can now reach a named c
 `docs/research/integrations/openai-compatible-model.md`. No live cloud call has been made; that needs a
 provider account and spend approval.
 
+Update 2026-10-03 (Tools): an approval now **moves the run it was raised for**. A real model proposes a call to an MCP
+server's tool, the run parks on a durable approval, and `jarvis approvals approve` continues the same run: the tool runs
+in the server and the model answers from its result (proven against a real daemon with a fake model, and live against
+`deepseek-v4.1-flash:cloud`). Reaching it fixed two defects beneath it — a run needing approval never actually parked, and
+a decided approval (a rejected one included) was never usable or spent. A restart still fails a parked run.
+
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or
 create an unverified parallel implementation.

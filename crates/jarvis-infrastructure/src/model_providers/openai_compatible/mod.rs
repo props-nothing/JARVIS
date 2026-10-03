@@ -591,10 +591,18 @@ impl OpenAiCompatibleProvider {
                 .tools
                 .iter()
                 .map(|name| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": { "name": name, "parameters": {"type": "object"} },
-                    })
+                    let offer = request.tool_offers.iter().find(|offer| &offer.name == name);
+                    let mut function = serde_json::json!({
+                        "name": name,
+                        "parameters": offer_parameters(offer),
+                    });
+                    if let Some(description) = offer
+                        .map(|offer| offer.description.as_str())
+                        .filter(|d| !d.is_empty())
+                    {
+                        function["description"] = serde_json::Value::String(description.to_owned());
+                    }
+                    serde_json::json!({ "type": "function", "function": function })
                 })
                 .collect();
             body["tools"] = serde_json::Value::Array(tools);
@@ -645,6 +653,20 @@ fn message_text(blocks: &[ContentBlock]) -> Option<String> {
         }
     }
     Some(text)
+}
+
+/// The `parameters` document for one offered tool.
+///
+/// The tool's own JSON Schema when it parses as an **object**; otherwise the empty object schema. A
+/// schema that does not parse, or is not an object, is not repaired — sending the bare fallback is the
+/// behaviour a tool with no schema always had, and the pipeline validates the arguments against the
+/// real schema regardless of what the model was shown.
+fn offer_parameters(offer: Option<&jarvis_domain::model::stream::ToolOffer>) -> serde_json::Value {
+    offer
+        .and_then(|offer| offer.input_schema.as_deref())
+        .and_then(|schema| serde_json::from_str::<serde_json::Value>(schema).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}))
 }
 
 /// Returns the protocol's role name for a normalized role.
@@ -1769,6 +1791,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_offered_tool_carries_its_description_and_schema_to_the_model() {
+        use jarvis_domain::model::stream::ToolOffer;
+        let adapter = provider();
+        let mut request = request_for(&adapter);
+        request.tools = vec!["mcp.read_file@1".to_owned(), "clock.now@1".to_owned()];
+        request.tool_offers = vec![ToolOffer {
+            name: "mcp.read_file@1".to_owned(),
+            description: "Reads a file".to_owned(),
+            input_schema: Some(
+                r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
+                    .to_owned(),
+            ),
+        }];
+        let body = adapter.build_body(&request).expect("builds");
+        let tools = body["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2);
+        let read = &tools[0]["function"];
+        assert_eq!(read["description"], "Reads a file");
+        assert_eq!(read["parameters"]["required"][0], "path");
+        // A tool with no offer keeps the bare object schema and no description, as before.
+        let clock = &tools[1]["function"];
+        assert_eq!(clock["parameters"], serde_json::json!({"type": "object"}));
+        assert!(clock.get("description").is_none());
+    }
+
+    #[test]
+    fn a_schema_that_is_not_an_object_is_not_forwarded() {
+        use jarvis_domain::model::stream::ToolOffer;
+        let adapter = provider();
+        let mut request = request_for(&adapter);
+        request.tools = vec!["t.one@1".to_owned(), "t.two@1".to_owned()];
+        request.tool_offers = ["not json", "[1,2]"]
+            .iter()
+            .zip(["t.one@1", "t.two@1"])
+            .map(|(schema, name)| ToolOffer {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: Some((*schema).to_owned()),
+            })
+            .collect();
+        let body = adapter.build_body(&request).expect("builds");
+        for tool in body["tools"].as_array().expect("tools") {
+            assert_eq!(
+                tool["function"]["parameters"],
+                serde_json::json!({"type": "object"})
+            );
+        }
+    }
     /// Builds a minimal valid request for `adapter`'s served model.
     fn request_for(adapter: &OpenAiCompatibleProvider) -> ModelCallRequest {
         use jarvis_domain::ids::{ModelCallId, RunId};
@@ -1797,6 +1868,7 @@ mod tests {
             }])
             .expect("the fixture is valid"),
             tools: Vec::new(),
+            tool_offers: Vec::new(),
             output_schema: None,
             settings: PortableSettings::default(),
             limits: CallLimits {

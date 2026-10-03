@@ -26,7 +26,8 @@ stateDiagram-v2
     AwaitingModel --> ExecutingTool: allowed tool intent
     AwaitingModel --> AwaitingApproval: approval required
     AwaitingApproval --> ExecutingTool: approved
-    AwaitingApproval --> Observing: rejected/expired
+    AwaitingApproval --> Observing: rejected/expired (unused: see below)
+    ExecutingTool --> AwaitingApproval: a dispatched call needs approval
     ExecutingTool --> Observing
     Observing --> Planning: more work
     Observing --> Waiting: event/time dependency
@@ -56,9 +57,20 @@ stateDiagram-v2
     Completed --> [*]
 ```
 
-Nine edges have been **added** to this diagram, and the reason is worth recording
+Ten edges have been **added** to this diagram, and the reason is worth recording
 because each was a defect the diagram had rather than a stylistic choice:
 
+- `ExecutingTool --> AwaitingApproval`. A tool call learns that it needs a human **while it is
+  being dispatched**, so the run is in `ExecutingTool` when it must park. The controller used to
+  take `ExecutingTool --> Observing` first (claiming the call settled) and then ask for
+  `AwaitingModel --> AwaitingApproval`, which the stored state no longer matched: the park was
+  refused as an illegal transition, the error was swallowed by the detached task, and a run that
+  needed approval read as live for ever. A controller test that drives a call needing approval and
+  reads the **stored** state is what found it — no test had driven that path. A decided approval
+  never takes `AwaitingApproval --> Observing` either: the run always re-enters `ExecutingTool` to
+  release the call (or to record that it was refused) and leaves through the same `Observing` every
+  other tool call uses, so there is one path from "tool settled" to the next model turn rather than
+  two.
 - `AwaitingModel --> Responding`. Without it the native runtime's own instruction —
   "ask a model for either a final response or typed tool intent" — had no legal
   completion path: a plain question-and-answer run could reach neither `Responding`
@@ -218,6 +230,69 @@ against it would prove only self-consistency.
    on would be the same kind of false record the state machine's consistency rules
    exist to prevent.
 
+### Resuming after an approval
+
+A tool call that needs a human parks the run, and the human's decision moves it again.
+
+**Parking.** The dispatch that learns a call needs approval stops its batch there. Before the run
+is parked the controller writes a **resume record** (`run_resume_states`, migration 14): the whole
+batch the model proposed, the observations of the calls that already settled, the index of the one
+that is waiting, the turn, the objective, and the approval. The record is written **first**, so a
+run that reads as waiting always has the state to continue from; a record that cannot be written
+fails the run rather than parking it, because "waiting for ever" is a worse answer than a failure a
+caller can see. The park is `ExecutingTool --> AwaitingApproval` and names its dependency
+(`waiting_on = approval:<id>`) on the run's own row.
+
+**Resuming.** Taking the decision — through `POST /api/v1/approvals/{id}/decide` or `/cancel` —
+hands the approval to `RunService::resume_after_decision`, which schedules `RunController::resume`
+as the principal that **started** the run, not the one that decided (the pipeline authorizes
+against the requester's grants and approvals). `resume`:
+
+1. reads the record and refuses a decision about any approval but the one the run waits on;
+2. rebuilds the context from the stored objective — from `AwaitingApproval`, so a rebuild failure
+   fails the run from the state it is actually in;
+3. moves `AwaitingApproval --> ExecutingTool`, an optimistic write on the run's version, so two
+   decisions arriving together cannot both dispatch: one wins the transition and the other is
+   refused before anything runs;
+4. releases the waiting call through `ToolCallService::resume` — **the same ledger row** carries it
+   from `WaitingApproval` to its outcome — and dispatches whatever follows it, which may park
+   again;
+5. hands the observations to the ordinary turn loop through `Observing`, exactly as a run that
+   never waited does.
+
+**What the model is told.** An approved call runs and its result is the observation. A rejected,
+withdrawn, or lapsed one is **a refusal the model reads** (`tool.approval_rejected` /
+`tool.approval_expired`), not a run failure: the run carries on and the model answers with what it
+has. A record that is missing fails the run `run.resume_state_missing`.
+
+**Approvals are spent.** An approved one-shot approval authorizes exactly one call. Policy matches
+only `Approved` records — a *rejected* record is in the principal's decided list and previously
+read as permission — and the pipeline moves the matched approval `Approved --> Consumed` before the
+call is reserved, so the same action asks again. A concurrent call that spent it first makes the
+write a version conflict and that call is refused.
+
+**Cancelling a parked run** has no task to signal, so `RunService::cancel` cancels it directly
+(`AwaitingApproval --> Cancelled`, `cancelled_while_waiting`) and discards the record.
+
+**Known limits, stated rather than hidden:**
+
+- **A restart fails a parked run** (see below). The record is durable, but startup recovery and the
+  tool-call recovery pass still settle the run and its waiting ledger row.
+- **An approval nobody decides never lapses the run.** Expiry is applied when a decision arrives,
+  not by a timer, so an undecided prompt leaves its run parked until someone cancels it or the
+  daemon restarts. The run's own deadline is wall-clock and keeps counting, so a decision after it
+  fails the run `run.deadline_exceeded` at the next model turn.
+- **Only the requesting principal's own decisions are seen by policy.** The approvals policy reads
+  are the ones decided *by* the requesting principal. A second principal deciding on the first's
+  behalf is not modelled yet, and would park the run again on a fresh prompt.
+- **Observations replace rather than accumulate.** Turn *n+1* is given turn *n*'s tool results, not
+  every earlier turn's — the loop's existing behaviour, which resuming inherits.
+
+Evidence: controller tests drive the park, an approved and a rejected resume, a stale decision, a
+repeated resume, and a missing record against in-memory stores; `tests/e2e/approval-resume.mjs`
+drives a real `jarvisd`, the real CLI, and the MCP fixture child process against a fake model that
+records what the daemon sends it; `tests/e2e/mcp-live.mjs` does the same against a real model.
+
 ### Implemented evidence (`BRN-008`, startup recovery)
 
 The restart half of this document's durability rule now has code: the local control
@@ -235,7 +310,7 @@ non-terminal forever.
 
 Two consequences of this work are worth recording:
 
-1. **Nothing is resumed, and the code says so.** Both classifications settle a run at
+1. **Restart resumes nothing, and the code says so.** Both classifications settle a run at
    `Failed`; a parked run is classified separately (`was_resumable`, plus `parked_in`
    in the event payload) so the distinction is recorded, but the outcome is the same.
    Resuming means re-running a model call, and nothing knows what the interrupted call
@@ -243,12 +318,14 @@ Two consequences of this work are worth recording:
    forbids. The state machine models a resumable wait (`Waiting` carries a
    `WaitingOn`); the recovery path does not yet use it, and that is a gap rather than
    a design.
-2. **A parked run cannot be re-woken.** `AwaitingApproval` and `Waiting` are settled
-   `Failed` because no dependency a run could be waiting on exists yet, so there is
-   nothing that could satisfy it. When approvals and timers land, the
-   `RecoveryAction::Resumable` classification is already where their resume hook
-   belongs — the payload and the actor already distinguish the case, so the change is
-   to the action's target rather than to the read, the write, or the report.
+2. **A run parked on an approval is re-woken by the decision, within one daemon
+   lifetime — not across a restart.** See "Resuming after an approval" below. `Waiting`
+   (timers, events) is still settled `Failed` because nothing that could satisfy it
+   exists yet. Surviving a restart needs two more things the resume record does not
+   do by itself: the startup recovery pass must leave a run with a resume record
+   alone, and the tool-call recovery pass — which cancels a never-dispatched
+   `waiting_approval` ledger row — must leave the row of a parked call alone too.
+   Until both change, restart fails the run and its record is left behind unreferenced.
 
 The pass is safe to run against a live database for one structural reason: the
 transition it writes carries the version it **read**, so a run that completed in

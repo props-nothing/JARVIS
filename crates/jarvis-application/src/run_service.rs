@@ -425,6 +425,8 @@ pub struct RunService {
     live: crate::live_events::RunStreamNotifier,
     /// The store runs recall memories from, when one is composed.
     memories: Option<Arc<dyn crate::repository::memory::MemoryRepository>>,
+    /// The store a run parked on an approval continues from, when one is composed.
+    resumes: Option<Arc<dyn crate::repository::resume::RunResumeRepository>>,
 }
 
 impl std::fmt::Debug for RunService {
@@ -494,7 +496,19 @@ impl RunService {
             cancellations,
             live: crate::live_events::RunStreamNotifier::new(),
             memories: None,
+            resumes: None,
         }
+    }
+
+    /// Attaches the store a parked run continues from, which is what makes a decided approval able
+    /// to move the run it was raised for.
+    #[must_use]
+    pub fn with_resume_store(
+        mut self,
+        resumes: Arc<dyn crate::repository::resume::RunResumeRepository>,
+    ) -> Self {
+        self.resumes = Some(resumes);
+        self
     }
 
     /// Attaches the memory store runs recall from.
@@ -547,8 +561,12 @@ impl RunService {
             Some(tools) => controller.with_tools(Arc::clone(tools)),
             None => controller,
         };
-        match self.memories.as_ref() {
+        let controller = match self.memories.as_ref() {
             Some(memories) => controller.with_memories(Arc::clone(memories)),
+            None => controller,
+        };
+        match self.resumes.as_ref() {
+            Some(resumes) => controller.with_resume_store(Arc::clone(resumes)),
             None => controller,
         }
     }
@@ -849,6 +867,69 @@ impl RunService {
         }));
     }
 
+    /// Continues the run `approval` was raised for, now that it has been decided.
+    ///
+    /// Returns whether a task was scheduled. `false` is an answer rather than a fault: the run is not
+    /// waiting (it already continued, finished, or was failed by restart recovery), and a decision
+    /// may legitimately be repeated. The decision itself is already durable by the time this is
+    /// called, so a failure here never undoes it.
+    ///
+    /// **The resumed run acts as the principal that started it, not as the one that decided.** The
+    /// tool pipeline authorizes against the requesting principal's grants and the approval records
+    /// bound to them; running the continuation as the decider would authorize the call against the
+    /// wrong person's permissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::NotFound`] for a run outside the caller's scope and
+    /// [`RunServiceError::Storage`] when it cannot be read.
+    pub async fn resume_after_decision(
+        &self,
+        context: &RequestContext,
+        approval: &jarvis_domain::tool::approval::DurableApproval,
+        spawn: &dyn RunSpawner,
+    ) -> Result<bool, RunServiceError> {
+        let stored = self
+            .ports
+            .runs
+            .load(context.workspace_id, approval.run)
+            .await?;
+        if stored.state != RunState::AwaitingApproval {
+            return Ok(false);
+        }
+        let scope = CancellationScope::new();
+        let run_id = stored.id;
+        self.cancellations.register(run_id, scope.clone());
+
+        let controller = self.controller();
+        let registry = Arc::clone(&self.cancellations);
+        let approval = approval.clone();
+        let request_context = RequestContext::new(
+            context.request_id,
+            context.correlation_id,
+            stored.principal_id,
+            context.assurance,
+            context.workspace_id,
+            RequestChannel::Api,
+        )
+        .with_cancellation(scope);
+
+        spawn.spawn(Box::pin(async move {
+            // As in `spawn_run`, the outcome is not propagated: the run's state is durable and is
+            // what a client reads.
+            let _outcome = controller
+                .resume(
+                    &request_context,
+                    run_id,
+                    &approval,
+                    request_context.cancellation(),
+                )
+                .await;
+            registry.forget(run_id);
+        }));
+        Ok(true)
+    }
+
     /// Records cancellation intent for `run` and signals its scope.
     ///
     /// The intent is claimed under the caller's idempotency key first, so a repeated
@@ -918,7 +999,22 @@ impl RunService {
         if stored.state.is_terminal() {
             return Ok(stored.state);
         }
-        self.cancellations.cancel_with_reason(run, Some(reason));
+        let signalled = self.cancellations.cancel_with_reason(run, Some(reason));
+        // A run parked on an approval has no task to signal: it is waiting on a person, not running.
+        // Left alone, a cancel of it would be accepted and never expressed, so it is cancelled here.
+        if !signalled && stored.state == RunState::AwaitingApproval {
+            return match self
+                .controller()
+                .cancel_parked(context.workspace_id, run, reason)
+                .await
+            {
+                Ok(()) => Ok(RunState::Cancelled),
+                Err(ControllerError::Repository(error)) => Err(error.into()),
+                // Anything else means the run moved on between the read and the write, which is
+                // the ordinary race a cancel has with a decision; the stored state is what is true.
+                Err(_) => Ok(self.ports.runs.load(context.workspace_id, run).await?.state),
+            };
+        }
         Ok(stored.state)
     }
 

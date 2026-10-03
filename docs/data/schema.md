@@ -212,6 +212,24 @@ contract expected a value. Both are nullable because a row written before they h
 truthful value to give, and a row carrying **one** of the pair is reported as corruption rather than
 as absent — half an identity cannot be validated against anything.
 
+### `run_resume_states`
+
+```text
+workspace_id, run_id, approval_id, state_version, state_json, created_at
+```
+
+**Implemented (migration `000014_run_resume_states.sql`, schema version 14).** What a run parked on an
+approval needs in order to continue: the batch of tool calls the model proposed, the observations of the
+ones that already settled, the index of the one that is waiting, the turn, and the objective.
+`(workspace_id, run_id)` is the primary key, so a run has **at most one** record and parking again
+replaces it — a stale record would resume the wrong call. The record is written **before** the run is
+parked and removed when the run leaves the wait; a run whose record cannot be written is failed rather than
+parked. `state_json` is bounded by a `CHECK` as well as by the writer, and `state_version` lets a reader
+refuse a record whose shape it does not know (reported as corruption, never guessed at). It is not
+foreign-keyed to `agent_runs`: every statement scopes by `workspace_id`, and a cascading delete would
+let a pruned run silently remove evidence. See `docs/architecture/agent-runtime.md`, "Resuming after
+an approval".
+
 ### `agent_steps`
 
 ```text

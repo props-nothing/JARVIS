@@ -35,6 +35,7 @@ use super::error::StorageError;
 /// | 11 | `000011_policy_version_layers.sql` — a policy version's layer provenance |
 /// | 12 | `000012_tool_grants.sql` — the configurable tool-grant store and deny rules |
 /// | 13 | `000013_memories.sql` — explicit, workspace-scoped durable memories |
+/// | 14 | `000014_run_resume_states.sql` — what a run parked on an approval needs to continue |
 ///
 /// **The table above was five rows short until this round, and the constant's own paragraph warned
 /// about exactly that.** Migrations `000007` through `000011` were each added without a row, so the
@@ -46,7 +47,7 @@ use super::error::StorageError;
 ///
 /// The minimum reader stays at `1`: every later migration is purely additive, so a binary that
 /// understands only the initial schema can still read a database that has the added tables.
-pub const TARGET_SCHEMA_VERSION: i64 = 13;
+pub const TARGET_SCHEMA_VERSION: i64 = 14;
 
 /// The lowest schema version this binary can still read.
 ///

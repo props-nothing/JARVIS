@@ -7118,7 +7118,37 @@ Dependencies: Milestone 2 exit gate.
     Implementation Status rather than implied to be wired. `TLS-015` still owns the decision to carry a
     grant forward (it may refuse even when all four conditions hold) and every producer that would write
     one.
-- [~] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy. **The native route is now
+- [~] `TLS-012` Prove native/MCP/runtime routes cannot bypass policy. **MCP tools reach a model (2026-10-03).** A live
+  run against an Ollama cloud model found that the daemon composed MCP servers and could route to them but built
+  the pipeline's catalog from native tools alone, so an MCP tool was never offered to the model, never grantable,
+  and `tool.not_found` if proposed. Fixed: `ComposedMcpServer::resolved_tools` feeds the catalog (a capability
+  collision is left out and logged), and the model is now told each tool's description and schema
+  (`ModelCallRequest::tool_offers`) — without which a real model supplied arguments that failed the schema.
+  Evidence: `tests/e2e/mcp-tool-offer.mjs` (deterministic; fails if the daemon stops passing MCP tools to the
+  catalog), `tests/e2e/mcp-live.mjs` (real model: composed, offered, granted through the CLI, the call withheld
+  pending an approval, the approval recorded). **Resume-after-approval (2026-10-03).** The live run also found
+  that a decided approval never moved the run it was raised for — and tracing why found two defects beneath
+  it. (1) **A call that needed approval never parked its run**: the controller took `ExecutingTool -> Observing`
+  and then asked for `AwaitingModel -> AwaitingApproval`, the stored state no longer matched, the store refused
+  the write (`run_write_inconsistent`), and the detached task swallowed it — the run read as running beside a
+  pending approval, for ever. Found by a controller test that reads the **stored** state (none had driven the
+  path); fixed with the legal edge `ExecutingTool -> AwaitingApproval` and a park that names its dependency.
+  (2) **Approvals were never usable**: the pipeline turned every decided approval — a *rejected* one included —
+  into a record policy could match, flagged every one-shot as already consumed, and nothing ever consumed one.
+  Policy now sees only `Approved` records, and the matched one-shot is moved `Approved -> Consumed` before the
+  call is reserved (a concurrent spender gets a version conflict and is refused). The resume itself: a durable
+  `run_resume_states` record (migration 14) written **before** the park, `RunController::resume` continuing the
+  same run and `ToolCallService::resume` continuing the same ledger row, hooked from the approval decide/cancel
+  handlers, with a rejected/withdrawn/lapsed decision delivered to the model as a refusal rather than a failure,
+  and `RunService::cancel` cancelling a parked run directly. Evidence: five pipeline tests (approved resume
+  spends the approval; the same action asks again; a rejected record never authorizes; double resume runs once),
+  five controller tests, three repository contract tests, `tests/e2e/approval-resume.mjs` (a real daemon, the real
+  CLI and the MCP child against a recording fake model; falsified by dropping the HTTP hook), and
+  `tests/e2e/mcp-live.mjs` now asserting the whole leg against `deepseek-v4.1-flash:cloud`. **Still open:** a
+  restart fails a parked run (the record is durable but startup recovery and the tool-call recovery pass still
+  settle the run and its waiting row); an undecided approval never lapses its run; approvals decided by a
+  principal other than the requester are not seen by policy; provider-safe tool names for strict providers.
+  **The native route is now
   proven and reachable; the MCP and runtime routes do not exist yet, so their proof is not
   attempted.** The native proof is not a test over a hypothetical path — it is the only path a
   native tool has, and the milestone's real defect was that the path did not exist at all.
@@ -7764,7 +7794,10 @@ Dependencies: Milestone 3 exit gate.
   `scan_bounded`, and **recall into runs**: the objective is searched, at most five hits compete under the
   run's budget and sensitivity ceiling, and the matching question carries the memory on the wire while an
   unrelated one does not. Not done: a full-text index, the versioned score breakdown `ACC-036` requires, and a
-  persisted context ledger (`MEM-008`).
+  persisted context ledger (`MEM-008`). **Live proof (2026-10-03):** `tests/e2e/memory-live.mjs` drives the real
+  `jarvisd` and `jarvis` binaries against an Ollama cloud model (`deepseek-v4.1-flash:cloud`): with nothing
+  remembered the model does not know an arbitrary fact; after `jarvis memory remember` it answers with it; an
+  unrelated question is unaffected; it survives a daemon restart; after `jarvis memory forget` it is gone.
 - [ ] `MEM-011` Implement the procedural memory lifecycle and the learned-skill
   record: a learned procedure is a durable memory carrying the provenance every
   memory class carries plus the canonical identities and schema fingerprints of the

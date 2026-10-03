@@ -108,6 +108,22 @@ impl std::fmt::Debug for RegistryCatalog {
     }
 }
 
+/// The longest tool description sent to a model, in characters.
+const MAX_OFFER_DESCRIPTION_CHARS: usize = 512;
+
+/// Bounds and cleans a definition's purpose for a prompt: control characters become spaces, whitespace is
+/// collapsed, and the result is cut at [`MAX_OFFER_DESCRIPTION_CHARS`].
+pub(crate) fn offer_description(purpose: &str) -> String {
+    purpose
+        .split(|character: char| character.is_control() || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_OFFER_DESCRIPTION_CHARS)
+        .collect()
+}
+
 impl ToolCatalog for RegistryCatalog {
     fn resolve(&self, _workspace: WorkspaceId, capability: &str) -> Option<ResolvedTool> {
         // The scope is **accepted and not yet a filter**, and saying so here is better than a
@@ -123,6 +139,21 @@ impl ToolCatalog for RegistryCatalog {
         // `BTreeMap` order, so the list is stable across calls and a test can assert on it — the
         // same reason `ToolRegistry::all_unfiltered` is ordered by identity.
         self.by_capability.keys().cloned().collect()
+    }
+
+    fn offers(&self) -> Vec<jarvis_domain::model::stream::ToolOffer> {
+        // The definition's own purpose and the schema its identity binds, in the same order as
+        // `capabilities`. The purpose of an MCP tool is **text a server wrote**, so it is bounded and
+        // stripped of control characters here: it goes into a model prompt, and a server must not be
+        // able to smuggle an instruction block or an escape sequence in through a tool description.
+        self.by_capability
+            .iter()
+            .map(|(name, tool)| jarvis_domain::model::stream::ToolOffer {
+                name: name.clone(),
+                description: offer_description(&tool.definition.purpose),
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect()
     }
 }
 

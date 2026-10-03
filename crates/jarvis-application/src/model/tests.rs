@@ -57,6 +57,7 @@ fn request() -> ModelCallRequest {
         route_requirements: RouteRequirements::text(),
         input: InputItems::new(Vec::new()).expect("an empty list is valid"),
         tools: Vec::new(),
+        tool_offers: Vec::new(),
         output_schema: None,
         settings: jarvis_domain::model::stream::PortableSettings::default(),
         limits: CallLimits {

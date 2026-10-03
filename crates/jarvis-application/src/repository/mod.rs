@@ -25,6 +25,7 @@ pub mod conversation;
 pub mod memory;
 pub mod model_call;
 pub mod policy;
+pub mod resume;
 pub mod run;
 pub mod tool_call;
 pub mod tool_grant;

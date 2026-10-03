@@ -112,6 +112,7 @@ fn request_for(provider: &OpenAiCompatibleProvider) -> ModelCallRequest {
         }])
         .expect("the fixture is valid"),
         tools: Vec::new(),
+        tool_offers: Vec::new(),
         output_schema: None,
         settings: PortableSettings::default(),
         limits: CallLimits {

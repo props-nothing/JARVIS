@@ -21,6 +21,7 @@ Lifecycle: DRAFT
   },
   "input": [],
   "tools": [],
+  "tool_offers": [],
   "output_schema": null,
   "settings": {},
   "limits": {
@@ -47,6 +48,16 @@ booleans — a parallel set of flags would let a requirement exist that no capab
 could satisfy, and both sides would still compile. Structured output is requested through
 `output_schema` and tool calling through `required_capabilities`, so there is exactly one
 way to ask for each.
+
+`tools` holds the canonical names the call may propose. `tool_offers` (optional, omitted when empty) is
+what the model is **told** about them: for each name, a `description` and the tool's own JSON Schema as
+`input_schema`. A name alone lets a proposal be *resolved* but not *made* — a live run showed a model shown only
+`mcp.read_file@1` guessing arguments that failed the tool's schema — and the offer adds no authority, since
+advertising a tool is not a grant to execute it. A description originating from an MCP server is untrusted text
+that goes into a prompt, so the catalog bounds it (512 characters) and strips control characters before it is
+offered. An adapter ignores an offer whose name is not in `tools`, and sends a bare object schema for a tool it
+has no offer for. Provider-safe tool *names* are a separate gap: the canonical names contain `.` and `@`, which a
+strict provider (OpenAI's own API requires `^[a-zA-Z0-9_-]+$`) refuses, while Ollama accepts them.
 
 Principal/workspace/security context is trusted application context and not an
 arbitrary request body field.

@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use jarvis_application::cancellation::CancellationScope;
-use jarvis_application::tool_call::{ToolExecutionError, ToolExecutionRequest, ToolExecutor};
+use jarvis_application::tool_call::{
+    ToolCatalog as _, ToolExecutionError, ToolExecutionRequest, ToolExecutor,
+};
 use jarvis_domain::tool::call::ToolArguments;
 use jarvis_domain::tool::error_class::ToolErrorClass;
 use jarvis_domain::tool::registry::ToolRegistry;
@@ -722,4 +724,69 @@ async fn a_launch_specification_for_a_declaration_resolves_the_fixture_selector(
         !spec.env.iter().any(|(_, value)| value.contains("env:")),
         "a reference must never reach the process table"
     );
+}
+
+#[tokio::test]
+async fn a_composed_servers_tool_reaches_the_catalog_and_the_models_offer() {
+    // **The wiring gap this guards.** The daemon composed MCP servers and routed their identities to an
+    // executor, but built the pipeline's catalog from native tools alone — so an MCP tool was callable in
+    // principle and never offered to a model, never grantable, and `tool.not_found` if proposed. The catalog
+    // is what a run resolves a model's tool name against, so the tools a composition publishes must be exactly
+    // what a catalog built from it resolves and offers.
+    let Some(program) =
+        program_or_skip("a_composed_servers_tool_reaches_the_catalog_and_the_models_offer")
+    else {
+        return;
+    };
+    let section = McpSection {
+        servers: vec![declaration_for("acme-files", &program, FIXTURE_STANDARD)],
+    };
+    let declarations = section.enabled_declarations().expect("valid");
+    let secrets = resolver_for(&[("acme-files", FIXTURE_STANDARD)]);
+    let mut registry = ToolRegistry::new();
+    let composition = compose_declared_servers(&mut registry, &declarations, &secrets)
+        .await
+        .expect("valid");
+    assert!(composition.is_clean(), "{:?}", composition.refused());
+
+    let resolved: Vec<_> = composition
+        .servers()
+        .iter()
+        .flat_map(jarvis_infrastructure::mcp::composition::ComposedMcpServer::resolved_tools)
+        .collect();
+    assert_eq!(resolved.len(), 1, "one admitted tool is one published tool");
+    assert_eq!(
+        composition.servers()[0].admitted()[0],
+        *resolved[0].identity(),
+        "the catalog entry is the identity the executor may call"
+    );
+    assert!(
+        resolved[0].input_schema.is_some(),
+        "the schema its identity binds travels with it"
+    );
+
+    let catalog = jarvis_infrastructure::tool_adapters::RegistryCatalog::new(
+        resolved
+            .iter()
+            .map(|tool| (tool.definition.clone(), tool.input_schema.clone())),
+    );
+    let capability = resolved[0].definition.capability().to_string();
+    assert!(
+        catalog
+            .resolve(
+                jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::from_u128(1)),
+                &capability
+            )
+            .is_some(),
+        "a model's proposal of the tool resolves"
+    );
+    let offers = catalog.offers();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].name, capability);
+    assert!(
+        offers[0].input_schema.is_some(),
+        "the model is shown the argument schema, not a bare object"
+    );
+
+    let _ = composition.shutdown().await;
 }

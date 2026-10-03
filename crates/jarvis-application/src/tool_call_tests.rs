@@ -862,3 +862,202 @@ async fn the_catalog_is_never_asked_absent_a_capability() {
         "the model must be told exactly what the catalog can dispatch",
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// A parked call is resumed from its decided approval, on the same ledger row.
+// ---------------------------------------------------------------------------------------
+
+/// Decides `approval` as `to`, the way the approval service would, and returns the stored record.
+async fn decide_approval(
+    fixture: &Fixture,
+    approval: jarvis_domain::ids::ApprovalId,
+    to: jarvis_domain::tool::approval::ApprovalState,
+) -> jarvis_domain::tool::approval::DurableApproval {
+    use jarvis_domain::tool::approval::{ApprovalActor, ApprovalChannel};
+    let mut stored = ApprovalRepository::load(fixture.repository.as_ref(), workspace(), approval)
+        .await
+        .expect("the prompt is durable");
+    let version = stored.version();
+    let transition = stored
+        .apply(
+            to,
+            version,
+            ApprovalActor::Decided {
+                principal: principal(),
+                channel: ApprovalChannel::Cli,
+                assurance: jarvis_domain::model::exception::RequiredAssurance::Standard,
+                note: None,
+            },
+            now(),
+        )
+        .expect("a pending approval can be decided");
+    ApprovalRepository::apply_transition(
+        fixture.repository.as_ref(),
+        workspace(),
+        &transition,
+        version,
+        &transition.actor,
+        &stored,
+    )
+    .await
+    .expect("the decision is stored");
+    stored
+}
+
+/// Parks one consequential call and returns the approval it is waiting on.
+async fn park_send(fixture: &Fixture, key: &str) -> jarvis_domain::ids::ApprovalId {
+    let outcome = fixture
+        .service
+        .invoke(
+            &context(),
+            run(),
+            &intent("email.send@1", r#"{"path":"/tmp"}"#),
+            key,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the pipeline reaches an outcome");
+    let ToolCallOutcome::WaitingApproval { approval } = outcome else {
+        unreachable!("a consequential call must wait on a prompt, got {outcome:?}");
+    };
+    approval
+}
+
+fn send_fixture() -> Fixture {
+    let tool = resolved_send_tool();
+    Fixture::build(vec![tool.clone()], vec![grant_for_send(&tool)], false, None)
+}
+
+#[tokio::test]
+async fn an_approved_call_resumes_on_its_own_row_and_spends_the_approval() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = send_fixture();
+    let approval = park_send(&fixture, "call-1").await;
+    let decided = decide_approval(&fixture, approval, ApprovalState::Approved).await;
+    assert_eq!(
+        fixture.executions_count(),
+        0,
+        "a decision is not an execution"
+    );
+
+    let outcome = fixture
+        .service
+        .resume(
+            &context(),
+            run(),
+            &decided,
+            &intent("email.send@1", r#"{"path":"/tmp"}"#),
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the resume reaches an outcome");
+    assert!(
+        matches!(outcome, ToolCallOutcome::Completed { .. }),
+        "an approved call must run: {outcome:?}",
+    );
+    assert_eq!(fixture.executions_count(), 1);
+
+    // The approval is spent: one-shot means one call.
+    let after = ApprovalRepository::load(fixture.repository.as_ref(), workspace(), approval)
+        .await
+        .expect("loads");
+    assert_eq!(after.state(), ApprovalState::Consumed);
+
+    // And the row that parked is the row that finished, rather than a second row beside it.
+    let rows = fixture
+        .repository
+        .awaiting_conversion(u32::MAX)
+        .await
+        .expect("reads")
+        .records;
+    assert!(
+        rows.iter().all(|row| row.run != run()),
+        "no row for this run may be left non-terminal: {rows:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_second_identical_call_after_the_approval_was_spent_asks_again() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = send_fixture();
+    let approval = park_send(&fixture, "call-1").await;
+    let decided = decide_approval(&fixture, approval, ApprovalState::Approved).await;
+    fixture
+        .service
+        .resume(
+            &context(),
+            run(),
+            &decided,
+            &intent("email.send@1", r#"{"path":"/tmp"}"#),
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("resumes");
+
+    // The same action again, under a new key: the approval was one-shot, so it must ask rather than
+    // run — which is the difference between one email and two.
+    let second = park_send(&fixture, "call-2").await;
+    assert_ne!(second, approval);
+    assert_eq!(
+        fixture.executions_count(),
+        1,
+        "the second call must not run"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_approval_refuses_the_call_and_never_authorizes_another() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = send_fixture();
+    let approval = park_send(&fixture, "call-1").await;
+    let decided = decide_approval(&fixture, approval, ApprovalState::Rejected).await;
+
+    let outcome = fixture
+        .service
+        .resume(
+            &context(),
+            run(),
+            &decided,
+            &intent("email.send@1", r#"{"path":"/tmp"}"#),
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the resume reaches an outcome");
+    assert!(
+        matches!(
+            outcome,
+            ToolCallOutcome::Refused {
+                class: ToolErrorClass::ApprovalRejected,
+                state: ToolCallState::Denied,
+            }
+        ),
+        "a rejection must refuse the call: {outcome:?}",
+    );
+
+    // A **rejected** record is in the principal's decided list, and it must not read as permission.
+    let again = park_send(&fixture, "call-2").await;
+    assert_ne!(again, approval);
+    assert_eq!(fixture.executions_count(), 0, "nothing may have run");
+}
+
+#[tokio::test]
+async fn resuming_twice_does_not_run_the_call_twice() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = send_fixture();
+    let approval = park_send(&fixture, "call-1").await;
+    let decided = decide_approval(&fixture, approval, ApprovalState::Approved).await;
+    for _ in 0..2 {
+        fixture
+            .service
+            .resume(
+                &context(),
+                run(),
+                &decided,
+                &intent("email.send@1", r#"{"path":"/tmp"}"#),
+                &CancellationScope::new(),
+            )
+            .await
+            .expect("resumes");
+    }
+    assert_eq!(fixture.executions_count(), 1);
+}

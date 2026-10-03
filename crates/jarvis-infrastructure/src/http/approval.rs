@@ -449,15 +449,40 @@ pub async fn decide_approval(
         )
         .await
     {
-        Ok(decided) => runs::json_response(
-            request_id,
-            StatusCode::OK,
-            &ApprovalDecisionResponse {
-                approval: view_of(&decided.approval, clock_now()),
-                applied: decided.applied,
-            },
-        ),
+        Ok(decided) => {
+            continue_run(&state, &context, &decided.approval).await;
+            runs::json_response(
+                request_id,
+                StatusCode::OK,
+                &ApprovalDecisionResponse {
+                    approval: view_of(&decided.approval, clock_now()),
+                    applied: decided.applied,
+                },
+            )
+        }
         Err(error) => approval_error_response(request_id, &error),
+    }
+}
+
+/// Continues the run a decided approval was raised for.
+///
+/// **Best effort by design: the decision is already durable and is what the response reports.** A run
+/// that cannot be continued here — it already moved, restart recovery failed it, the store is
+/// unreachable — must not turn a recorded decision into an error the caller would retry, because the
+/// retry would answer "already decided" and the continuation would still not happen. The run's own
+/// state is what a client reads to learn what became of it.
+async fn continue_run(state: &ApiState, context: &RequestContext, approval: &DurableApproval) {
+    let Some(runs) = state.runs.as_ref() else {
+        return;
+    };
+    if let Err(error) = runs
+        .resume_after_decision(context, approval, state.spawner.as_ref())
+        .await
+    {
+        log::warn!(
+            "a decided approval could not continue its run: code={}",
+            error.code()
+        );
     }
 }
 
@@ -533,14 +558,18 @@ pub async fn cancel_approval(
         )
         .await
     {
-        Ok(cancelled) => runs::json_response(
-            request_id,
-            StatusCode::OK,
-            &ApprovalDecisionResponse {
-                approval: view_of(&cancelled.approval, clock_now()),
-                applied: cancelled.applied,
-            },
-        ),
+        Ok(cancelled) => {
+            // A withdrawn prompt is a decision too: the run reads it as a refusal and carries on.
+            continue_run(&state, &context, &cancelled.approval).await;
+            runs::json_response(
+                request_id,
+                StatusCode::OK,
+                &ApprovalDecisionResponse {
+                    approval: view_of(&cancelled.approval, clock_now()),
+                    applied: cancelled.applied,
+                },
+            )
+        }
         Err(error) => approval_error_response(request_id, &error),
     }
 }

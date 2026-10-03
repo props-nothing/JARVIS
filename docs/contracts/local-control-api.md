@@ -373,6 +373,7 @@ branches on the field, and a value a client branches on needs a list.
 | `run.stream_rejected` | The model stream was refused as invalid. |
 | `run.tools_not_implemented` | The run proposed a tool call and the daemon was composed with **no tool pipeline**, so none could be dispatched. |
 | `run.turn_budget_exhausted` | The run took more model turns than it is allowed, which is a model **looping** rather than a run that was slow. |
+| `run.resume_state_missing` | The run was waiting on an approval that was then decided, but the record of what it was doing could not be found or did not describe a call the run proposed, so there was nothing to continue. The run is failed rather than left waiting for a decision that could not change anything. |
 | `run.output_not_persisted` | Produced output could not be recorded. |
 | `run.clock_unavailable` | The clock could not provide an instant. |
 | `run.deadline_exceeded` | The run exceeded its wall-clock budget. |
@@ -537,7 +538,7 @@ declares would still be unseen.
 | `run.model_started` | the controller | The model call began. |
 | `run.tool_executing` | the controller | The model's tool calls are being dispatched through the policy/approval/ledger pipeline. |
 | `run.observing` | the controller | The dispatched tool calls settled and their results are being assembled for the next turn. |
-| `run.approval_requested` | the controller | A tool call needs a human decision. **Not terminal**: the approval is durable and the run resumes when it is decided. |
+| `run.approval_requested` | the controller | A tool call needs a human decision. **Not terminal**: the approval is durable and the run resumes when it is decided — approved, the call runs and the model receives its result; rejected, withdrawn, or lapsed, the model receives a refusal and the run carries on. A resumed run publishes `run.tool_executing` again, then continues exactly as a run that never waited. |
 | `run.output_text.delta` | the controller | One chunk of output, one event, at its own sequence. |
 | `run.responding` | the controller | The final answer is being produced. |
 | `run.usage` | the controller | Provider-reported counters; appended without a state change (see below). |

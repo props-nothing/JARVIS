@@ -64,6 +64,7 @@ use jarvis_domain::run::lifecycle::RunTransition;
 use jarvis_domain::run::retry::{FailureClass, FailureSite, RetryDecision};
 use jarvis_domain::run::state::{RunState, RunVersion, TransitionActor, TransitionReason};
 use jarvis_domain::time::UtcTimestamp;
+use jarvis_domain::tool::approval::DurableApproval;
 use jarvis_domain::tool::call::{ContentBlock, ToolArguments, ToolCallIntent, ToolResultBody};
 use jarvis_domain::tool::error_class::ToolErrorClass;
 
@@ -224,6 +225,12 @@ pub enum ControllerError {
         /// The stable, namespaced code from the tool service.
         code: &'static str,
     },
+    /// A run waiting on an approval had nothing to continue from.
+    ///
+    /// The run is failed rather than left parked: with no record of the batch it was running there
+    /// is no call to release, so a decision could never change the outcome and the run would wait
+    /// for ever. Distinct from a store fault because the store answered — it holds no record.
+    ResumeStateMissing,
 }
 
 impl ControllerError {
@@ -253,6 +260,7 @@ impl ControllerError {
             Self::Cancelled => "The run was cancelled.",
             Self::TurnBudgetExceeded => "The run took more turns than it is allowed.",
             Self::ToolRefused { .. } => "A tool call could not be dispatched.",
+            Self::ResumeStateMissing => "The run could not be continued after the decision.",
         }
     }
 
@@ -280,7 +288,8 @@ impl ControllerError {
             | Self::TurnBudgetExceeded
             // A dispatch fault is not retryable: the same composition fails the same way, and a
             // repeat would spend a budget on a certain failure.
-            | Self::ToolRefused { .. } => false,
+            | Self::ToolRefused { .. }
+            | Self::ResumeStateMissing => false,
         }
     }
 
@@ -305,6 +314,7 @@ impl ControllerError {
             Self::ContextUnassembled { code } | Self::ToolRefused { code } => code,
             Self::Cancelled => "run.cancelled",
             Self::TurnBudgetExceeded => "run.turn_budget_exhausted",
+            Self::ResumeStateMissing => "run.resume_state_missing",
         }
     }
 
@@ -334,7 +344,8 @@ impl ControllerError {
             // A dispatch fault leaves the run `Failed` for the same reason a store fault does: it is
             // a fault rather than a decision, and a run whose tool pipeline is unreachable cannot
             // produce an answer.
-            | Self::ToolRefused { .. } => RunState::Failed,
+            | Self::ToolRefused { .. }
+            | Self::ResumeStateMissing => RunState::Failed,
         }
     }
 
@@ -375,6 +386,7 @@ impl fmt::Display for ControllerError {
             Self::Cancelled => "the run was cancelled",
             Self::TurnBudgetExceeded => "the run exceeded its turn budget",
             Self::ToolRefused { .. } => "a tool call could not be dispatched",
+            Self::ResumeStateMissing => "the parked run had no state to continue from",
         };
         formatter.write_str(text)
     }
@@ -434,6 +446,9 @@ struct Step {
     /// and it is **owned** because the caller's text comes from a scope rather than a literal — which
     /// is also why this is the one field on `Step` that can contain text needing escaping.
     requester_reason: Option<String>,
+    /// The dependency a step into a waiting state names. A waiting run **must** say what it waits
+    /// for, so the write is refused without it.
+    waiting: Option<crate::repository::run::WaitingOn>,
 }
 
 impl Step {
@@ -451,6 +466,21 @@ impl Step {
             reason,
             outcome: None,
             requester_reason: None,
+            waiting: None,
+        }
+    }
+
+    /// A step into a waiting state, naming what the run waits for.
+    fn parked_on(
+        from: RunState,
+        to: RunState,
+        event_type: &'static str,
+        reason: &'static str,
+        waiting: crate::repository::run::WaitingOn,
+    ) -> Self {
+        Self {
+            waiting: Some(waiting),
+            ..Self::new(from, to, event_type, reason)
         }
     }
 
@@ -475,6 +505,7 @@ impl Step {
             reason,
             outcome: Some(TerminalOutcome::failed(code)),
             requester_reason: None,
+            waiting: None,
         }
     }
 
@@ -510,6 +541,7 @@ impl Step {
             // from `reason` and `requester_reason` in `payload` instead, so this stays what it is.
             outcome: None,
             requester_reason: None,
+            waiting: None,
         }
     }
 
@@ -757,10 +789,24 @@ enum TurnOutcome {
         observations: Vec<ToolObservation>,
     },
     /// A call is blocked on a human decision, so the run waits.
-    WaitingApproval {
-        /// The approval the caller must list and decide.
-        approval: ApprovalId,
-    },
+    WaitingApproval(ParkedBatch),
+}
+
+/// A turn's batch of tool calls, stopped at the call that needs a decision.
+///
+/// Everything a later resume needs: the whole batch, because the calls after the waiting one have
+/// not run yet; the observations of the ones before it, because they have; and the approval the
+/// waiting one is blocked on.
+#[derive(Debug)]
+struct ParkedBatch {
+    /// The approval to list and decide.
+    approval: ApprovalId,
+    /// The turn's full batch, in the order the model proposed it.
+    calls: Vec<CapturedToolCall>,
+    /// The index in `calls` of the call waiting on `approval`.
+    waiting_index: usize,
+    /// The observations of `calls[..waiting_index]`.
+    settled: Vec<ToolObservation>,
 }
 
 /// What dispatching one turn's tool calls produced.
@@ -776,6 +822,10 @@ enum DispatchOutcome {
     WaitingApproval {
         /// The approval to list and decide.
         approval: ApprovalId,
+        /// The index of the waiting call within the batch.
+        waiting_index: usize,
+        /// The observations of the calls before it.
+        settled: Vec<ToolObservation>,
     },
 }
 
@@ -787,7 +837,7 @@ enum DispatchOutcome {
 /// perfectly. The capability is the name the call was announced under, which is what the catalog
 /// resolves; the identity it resolves to is what policy authorizes and the ledger keys on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CapturedToolCall {
+pub(crate) struct CapturedToolCall {
     /// The provider's canonical call id, shared by the call and its result.
     call_id: String,
     /// The capability name the model used.
@@ -1018,6 +1068,107 @@ struct DrainedTurn {
     output_delta_count: u32,
 }
 
+/// Where a turn loop begins.
+///
+/// A fresh run begins at turn one with no observations. A **resumed** run begins at the turn whose
+/// tool calls were parked, with the observations they have now produced, and has to take the same
+/// `Observing -> Planning -> AwaitingModel` steps a run that never waited takes — which is why the
+/// start says so rather than the resume duplicating the loop's own transitions.
+struct TurnStart {
+    /// The one-based turn whose tool calls were just settled, or `1` for a fresh run.
+    turn_index: u32,
+    /// What the previous turn's calls produced, in call order.
+    observations: Vec<ToolObservation>,
+    /// Whether the run is in `Observing` and must advance to a new model turn before asking.
+    after_tools: bool,
+}
+
+impl TurnStart {
+    /// The start of a run that has not taken a turn.
+    fn first() -> Self {
+        Self {
+            turn_index: 1,
+            observations: Vec::new(),
+            after_tools: false,
+        }
+    }
+}
+
+/// Which calls of a batch to dispatch, and how.
+struct DispatchPlan<'a> {
+    /// The turn's full batch.
+    calls: &'a [CapturedToolCall],
+    /// The index to start at; earlier calls already produced `settled`.
+    first: usize,
+    /// The decided approval that releases the call at `first`, for a resumed batch.
+    decided: Option<&'a DurableApproval>,
+    /// The observations of the calls before `first`.
+    settled: Vec<ToolObservation>,
+}
+
+impl<'a> DispatchPlan<'a> {
+    /// A batch that has not started.
+    fn fresh(calls: &'a [CapturedToolCall]) -> Self {
+        Self {
+            calls,
+            first: 0,
+            decided: None,
+            settled: Vec::new(),
+        }
+    }
+}
+
+/// What dispatching one call produced.
+enum DispatchStep {
+    /// The call settled and the model can read the result.
+    Observed(ToolObservation),
+    /// The call needs a decision first.
+    Waiting(ApprovalId),
+}
+
+impl From<&CapturedToolCall> for crate::repository::resume::ResumeCall {
+    fn from(call: &CapturedToolCall) -> Self {
+        Self {
+            call_id: call.call_id.clone(),
+            capability: call.capability.clone(),
+            arguments: call.arguments.clone(),
+        }
+    }
+}
+
+impl From<&crate::repository::resume::ResumeCall> for CapturedToolCall {
+    fn from(call: &crate::repository::resume::ResumeCall) -> Self {
+        Self {
+            call_id: call.call_id.clone(),
+            capability: call.capability.clone(),
+            arguments: call.arguments.clone(),
+        }
+    }
+}
+
+impl From<&ToolObservation> for crate::repository::resume::ResumeObservation {
+    fn from(observation: &ToolObservation) -> Self {
+        Self {
+            call_id: observation.call_id.clone(),
+            capability: observation.capability.clone(),
+            arguments: observation.arguments.clone(),
+            is_error: observation.is_error,
+            content: observation.content.clone(),
+        }
+    }
+}
+
+impl From<&crate::repository::resume::ResumeObservation> for ToolObservation {
+    fn from(observation: &crate::repository::resume::ResumeObservation) -> Self {
+        Self {
+            call_id: observation.call_id.clone(),
+            capability: observation.capability.clone(),
+            arguments: observation.arguments.clone(),
+            is_error: observation.is_error,
+            content: observation.content.clone(),
+        }
+    }
+}
 /// Everything a turn needs that does not change between turns.
 ///
 /// Grouped so [`RunController::drive_turns`] takes one argument rather than seven, following
@@ -1026,6 +1177,9 @@ struct DrainedTurn {
 struct TurnInputs<'a> {
     context: &'a RequestContext,
     conversation_id: ConversationId,
+    /// The run's objective, kept so a parked run can be rebuilt from durable state.
+    objective: &'a str,
+    objective_message: Option<MessageId>,
     items: &'a [RetainedItem],
     model: &'a ModelRef,
     budget: &'a RunBudget,
@@ -1067,6 +1221,12 @@ pub struct RunController {
     /// assembled from the conversation alone. Recall is read-only, scoped to the run's own workspace by the
     /// port, and bounded by [`MEMORY_RECALL_LIMIT`].
     memories: Option<Arc<dyn crate::repository::memory::MemoryRepository>>,
+    /// Where a run parked on an approval keeps what it needs to continue.
+    ///
+    /// `None` means a parked run **cannot be resumed**: it is parked all the same, because refusing
+    /// the tool call would be a different behaviour than the one policy decided, but a decision
+    /// leaves it parked. Every daemon composition attaches a store.
+    resumes: Option<Arc<dyn crate::repository::resume::RunResumeRepository>>,
 }
 
 impl fmt::Debug for RunController {
@@ -1108,7 +1268,18 @@ impl RunController {
             // exists to make impossible.
             tools: None,
             memories: None,
+            resumes: None,
         }
+    }
+
+    /// Attaches the store a run parked on an approval continues from.
+    #[must_use]
+    pub fn with_resume_store(
+        mut self,
+        resumes: Arc<dyn crate::repository::resume::RunResumeRepository>,
+    ) -> Self {
+        self.resumes = Some(resumes);
+        self
     }
 
     /// Attaches the memory store runs recall from.
@@ -1220,7 +1391,13 @@ impl RunController {
         .await?;
 
         let (budget, assembled) = self
-            .build_context(run, conversation_id, objective, objective_message)
+            .build_context(
+                run,
+                conversation_id,
+                objective,
+                objective_message,
+                RunState::ContextBuilding,
+            )
             .await?;
 
         // ContextBuilding -> Planning. There is no persisted plan artifact yet, which
@@ -1295,11 +1472,14 @@ impl RunController {
             &TurnInputs {
                 context,
                 conversation_id,
+                objective,
+                objective_message,
                 items: &assembled.items,
                 model: &model,
                 budget: &budget,
                 cancel,
             },
+            TurnStart::first(),
         )
         .await
     }
@@ -1320,10 +1500,63 @@ impl RunController {
         &self,
         run: RunRef,
         turn: &TurnInputs<'_>,
+        start: TurnStart,
     ) -> Result<RunOutcome, ControllerError> {
-        let mut observations: Vec<ToolObservation> = Vec::new();
-        let mut turn_index: u32 = 1;
+        let TurnStart {
+            mut turn_index,
+            mut observations,
+            mut after_tools,
+        } = start;
         loop {
+            if after_tools {
+                // A further model turn is permitted only while the run has turns left. The bound
+                // is checked **before** the loop continues, so an exhausted budget fails the run
+                // with a named reason rather than looping until the deadline does it — which
+                // would report a slow run for one that asked for too many turns.
+                turn_index = turn_index.saturating_add(1);
+                if turn_index > MAX_MODEL_TURNS {
+                    self.finish(
+                        run,
+                        Step::failed(
+                            RunState::Observing,
+                            "run.failed",
+                            "turn_budget_exhausted",
+                            ControllerError::TurnBudgetExceeded.code(),
+                        ),
+                    )
+                    .await?;
+                    return Err(ControllerError::TurnBudgetExceeded);
+                }
+                // **The run returns to `Planning` and then to `AwaitingModel`.** The architecture's
+                // diagram routes a settled tool observation through `Observing -> Planning`, so the
+                // next turn is a fresh decision about what to do with the result rather than a
+                // continuation of the same model call — and the two transitions are the domain's own
+                // legal edges rather than a shortcut, which is what keeps the run's recorded state
+                // path a path the table permits.
+                self.step_unless_cancelled(
+                    run,
+                    Step::new(
+                        RunState::Observing,
+                        RunState::Planning,
+                        "run.planning",
+                        "observation_ready",
+                    ),
+                    turn.cancel,
+                )
+                .await?;
+                self.step_unless_cancelled(
+                    run,
+                    Step::new(
+                        RunState::Planning,
+                        RunState::AwaitingModel,
+                        "run.model_started",
+                        "model_call_requested",
+                    ),
+                    turn.cancel,
+                )
+                .await?;
+            }
+
             let outcome = self
                 .ask_model(
                     run,
@@ -1344,92 +1577,19 @@ impl RunController {
                 TurnOutcome::ToolResults {
                     observations: produced,
                 } => {
-                    // A further model turn is permitted only while the run has turns left. The bound
-                    // is checked **before** the loop continues, so an exhausted budget fails the run
-                    // with a named reason rather than looping until the deadline does it — which
-                    // would report a slow run for one that asked for too many turns.
-                    turn_index = turn_index.saturating_add(1);
-                    if turn_index > MAX_MODEL_TURNS {
-                        self.finish(
-                            run,
-                            Step::failed(
-                                RunState::Observing,
-                                "run.failed",
-                                "turn_budget_exhausted",
-                                ControllerError::TurnBudgetExceeded.code(),
-                            ),
-                        )
-                        .await?;
-                        return Err(ControllerError::TurnBudgetExceeded);
-                    }
-                    // **The run returns to `Planning` and then to `AwaitingModel`.** The architecture's
-                    // diagram routes a settled tool observation through `Observing -> Planning`, so the
-                    // next turn is a fresh decision about what to do with the result rather than a
-                    // continuation of the same model call — and the two transitions are the domain's own
-                    // legal edges rather than a shortcut, which is what keeps the run's recorded state
-                    // path a path the table permits.
-                    self.step_unless_cancelled(
-                        run,
-                        Step::new(
-                            RunState::Observing,
-                            RunState::Planning,
-                            "run.planning",
-                            "observation_ready",
-                        ),
-                        turn.cancel,
-                    )
-                    .await?;
-                    self.step_unless_cancelled(
-                        run,
-                        Step::new(
-                            RunState::Planning,
-                            RunState::AwaitingModel,
-                            "run.model_started",
-                            "model_call_requested",
-                        ),
-                        turn.cancel,
-                    )
-                    .await?;
                     observations = produced;
+                    after_tools = true;
                 }
                 // A tool call is blocked on a human. The run is left **waiting** rather than
                 // terminal, which is the whole point of a durable approval: the prompt is recorded
                 // and the run resumes when it is decided. A terminal state here would make the
                 // approval useless.
-                TurnOutcome::WaitingApproval { approval } => {
-                    self.finish(
-                        run,
-                        Step::new(
-                            RunState::AwaitingModel,
-                            RunState::AwaitingApproval,
-                            "run.approval_requested",
-                            "tool_approval_pending",
-                        ),
-                    )
-                    .await?;
-                    // **No `error_code` is fabricated, and the approval is not encoded into one.**
-                    // A run waiting on a decision has not failed: putting a code on its row would
-                    // make a successful request read as a failure, and appending the approval id to
-                    // a fixed code would make `error_code` a dynamic value the client-visible
-                    // vocabulary cannot enumerate — the defect the vocabulary test caught. A caller
-                    // learns which approval to decide from the run's `run.approval_requested` event
-                    // and from `GET /api/v1/approvals`, which is the surface that lists it.
-                    //
-                    // The approval identity is deliberately **not** logged here either: this layer
-                    // has no tracing dependency, and the value is already durable in the approval
-                    // store and named by the transition's reason.
-                    let _ = approval;
-                    return Ok(RunOutcome {
-                        run_id: run.run_id,
-                        state: RunState::AwaitingApproval,
-                        answer: None,
-                        error_code: None,
-                    });
+                TurnOutcome::WaitingApproval(parked) => {
+                    return self.park(run, turn, turn_index, parked).await;
                 }
             }
         }
     }
-
     /// Reads the run's budget, the transcript, and the budgeted prompt.
     ///
     /// One method rather than inline, because the stage has three failure modes with three
@@ -1454,6 +1614,7 @@ impl RunController {
         conversation_id: ConversationId,
         objective: &str,
         objective_message: Option<MessageId>,
+        origin: RunState,
     ) -> Result<(RunBudget, context_assembly::AssembledInput), ControllerError> {
         let budget = self.load(run).await?.budget;
 
@@ -1514,13 +1675,13 @@ impl RunController {
         ) {
             Ok(assembled) => assembled,
             Err(error) => {
-                self.fail_context_building(run, "context_unassembled", error.code())
+                self.fail_context_building(run, origin, "context_unassembled", error.code())
                     .await?;
                 return Err(ControllerError::ContextUnassembled { code: error.code() });
             }
         };
 
-        self.refuse_a_context_without_its_objective(run, &assembled.manifest)
+        self.refuse_a_context_without_its_objective(run, origin, &assembled.manifest)
             .await?;
         Ok((budget, assembled))
     }
@@ -1533,14 +1694,12 @@ impl RunController {
     async fn fail_context_building(
         &self,
         run: RunRef,
+        origin: RunState,
         reason: &'static str,
         code: &'static str,
     ) -> Result<(), ControllerError> {
-        self.finish(
-            run,
-            Step::failed(RunState::ContextBuilding, "run.failed", reason, code),
-        )
-        .await
+        self.finish(run, Step::failed(origin, "run.failed", reason, code))
+            .await
     }
 
     /// Refuses to continue when the context budget dropped the run's own objective.
@@ -1564,6 +1723,7 @@ impl RunController {
     async fn refuse_a_context_without_its_objective(
         &self,
         run: RunRef,
+        origin: RunState,
         manifest: &ContextManifest,
     ) -> Result<(), ControllerError> {
         if manifest
@@ -1575,6 +1735,7 @@ impl RunController {
         }
         self.fail_context_building(
             run,
+            origin,
             "context_objective_dropped",
             ControllerError::ContextUnassembled {
                 code: "run.context_objective_dropped",
@@ -1839,7 +2000,7 @@ impl RunController {
             turn.model,
             turn.items,
             turn.observations,
-            &self.tool_names(),
+            &self.tool_offers(),
             turn.budget,
         )?;
 
@@ -2148,7 +2309,14 @@ impl RunController {
         )
         .await?;
 
-        let dispatched = self.dispatch_tools(run, turn, &drained.tool_calls).await?;
+        let dispatched = self
+            .dispatch_tools(
+                run,
+                turn.context,
+                turn.cancel,
+                DispatchPlan::fresh(&drained.tool_calls),
+            )
+            .await?;
 
         // The model call is closed **before** the observation is acted on, so a call that proposed
         // tools is not left open while the run moves on. The finish reason travels with it, so an
@@ -2174,56 +2342,70 @@ impl RunController {
             self.publish_usage(run, call_id, reported).await?;
         }
 
-        self.step(
-            run,
-            Step::new(
-                RunState::ExecutingTool,
-                RunState::Observing,
-                "run.observing",
-                "tool_calls_settled",
-            ),
-        )
-        .await?;
-
         Ok(match dispatched {
             DispatchOutcome::Observations(observations) => {
+                self.step(
+                    run,
+                    Step::new(
+                        RunState::ExecutingTool,
+                        RunState::Observing,
+                        "run.observing",
+                        "tool_calls_settled",
+                    ),
+                )
+                .await?;
                 // The observation is carried to the next turn rather than stored: it is in-flight
                 // context, and the durable record of what a tool did is the ledger row and the model
                 // call, not a transcript entry that a resumed run would re-send.
                 AttemptOutcome::Completed(TurnOutcome::ToolResults { observations })
             }
-            DispatchOutcome::WaitingApproval { approval } => {
-                AttemptOutcome::Completed(TurnOutcome::WaitingApproval { approval })
-            }
+            // The run stays in `ExecutingTool` for the caller to park: nothing has settled, so
+            // `Observing` would be a claim the run cannot make.
+            DispatchOutcome::WaitingApproval {
+                approval,
+                waiting_index,
+                settled,
+            } => AttemptOutcome::Completed(TurnOutcome::WaitingApproval(ParkedBatch {
+                approval,
+                calls: drained.tool_calls,
+                waiting_index,
+                settled,
+            })),
         })
     }
 
-    /// Dispatches every captured tool call through the governed pipeline.
+    /// Dispatches a batch of captured tool calls through the governed pipeline.
     ///
     /// **One call may wait for an approval, and that stops the batch.** A run whose second tool call
     /// is blocked on a human cannot proceed with a third, because the model's next turn needs an
-    /// observation this call has not produced — so the batch returns `WaitingApproval` and the run
-    /// moves to `AwaitingApproval`. The alternative — dispatching the rest and returning a partial
-    /// set — would send the model a transcript with a call that has no result, which
-    /// `InputItems::new` refuses and which would be a lie about what happened.
+    /// observation this call has not produced — so the batch returns `WaitingApproval`, carrying
+    /// what had already settled, and the run is parked. The alternative — dispatching the rest and
+    /// returning a partial set — would send the model a transcript with a call that has no result,
+    /// which `InputItems::new` refuses and which would be a lie about what happened.
+    ///
+    /// A resumed batch starts at the call that waited and releases it through the approval that was
+    /// decided; the calls before it are not run again.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError`] only for a **fault**: a store failure, a clock failure, or the
     /// absence of the tool pipeline. A tool that refused the call is an **observation**, not an
-    /// error — the model must be told, and a run-level fault would deny it the chance to react.
+    /// error — the model must be told, and a run-level fault would deny it the chance to react. A
+    /// fault leaves the run `Failed`: the run is mid-dispatch and nothing else will move it.
     async fn dispatch_tools(
         &self,
         run: RunRef,
-        turn: &ModelTurn<'_>,
-        calls: &[CapturedToolCall],
+        context: &RequestContext,
+        cancel: &CancellationScope,
+        plan: DispatchPlan<'_>,
     ) -> Result<DispatchOutcome, ControllerError> {
         // **No pipeline means the capability is absent, and that is refused by name rather than
         // approximated.** This is the state every controller test that composes no tool stack is in,
         // and it keeps `run.tools_not_implemented` honest: it now means "this deployment has no tool
         // pipeline", not "the fabric was never built".
         let Some(service) = self.tools.as_ref() else {
-            let name = calls
+            let name = plan
+                .calls
                 .first()
                 .map(|call| call.capability.clone())
                 .unwrap_or_default();
@@ -2243,65 +2425,193 @@ impl RunController {
             return Err(ControllerError::ToolsNotImplemented { tool_name: name });
         };
 
-        let mut observations: Vec<ToolObservation> = Vec::with_capacity(calls.len());
-        for call in calls {
-            // The intent is built from the captured pair: the name the model emitted becomes a
-            // capability the catalog resolves, and the argument document is carried as the
-            // **unvalidated** text the domain's `ToolArguments` wraps. The domain deliberately does
-            // not parse it — validating against a schema is the validator's job — so a malformed
-            // document is refused by `tool.schema_invalid` rather than at construction, which is the
-            // diagnosis a model can act on.
-            let Ok(arguments) = ToolArguments::new(&call.arguments) else {
-                // An argument document that cannot even be wrapped — empty, over the byte bound, or
-                // carrying a NUL — is refused as a schema failure. Building an intent would be
-                // impossible, so the model is told its arguments were unusable, and the remaining
-                // calls in the batch are still dispatched.
-                observations.push(ToolObservation {
-                    call_id: call.call_id.clone(),
-                    capability: call.capability.clone(),
-                    arguments: call.arguments.clone(),
-                    is_error: true,
-                    content: format!(
-                        "{{\"refused\":\"{}\",\"detail\":\"the arguments were empty or \
-                         exceeded the accepted size\"}}",
-                        ToolErrorClass::SchemaInvalid.as_contract_str(),
-                    ),
-                });
-                continue;
-            };
-            let intent = ToolCallIntent::new(
-                ToolCallId::from_uuid(uuid::Uuid::now_v7()),
-                &call.capability,
-                arguments,
-                None,
-            )
-            .map_err(|error| ControllerError::StreamRejected { code: error.code() })?;
-
-            // The idempotency key is the provider's own call id, scoped by the service's
-            // `ReservationKey` to identity, workspace, and principal. That is deliberately the
-            // **provider's** identifier rather than a fresh one: a provider that re-sends the same
-            // call id within one turn is making the same logical call, and the reservation's whole
-            // purpose is to recognise it. A fresh key per dispatch would make every repeat look like
-            // a new call and duplicate the effect.
-            let outcome = service
-                .invoke(
-                    turn.context,
-                    run.run_id,
-                    &intent,
-                    &call.call_id,
-                    turn.cancel,
-                )
+        let DispatchPlan {
+            calls,
+            first,
+            decided,
+            settled,
+        } = plan;
+        let mut observations = settled;
+        for (index, call) in calls.iter().enumerate().skip(first) {
+            // Only the call that waited is released by the decision; every later one is dispatched
+            // as a fresh call and may itself need a prompt.
+            let released = decided.filter(|_| index == first);
+            let step = match self
+                .dispatch_one(service, run, context, cancel, call, released)
                 .await
-                .map_err(|error| ControllerError::ToolRefused { code: error.code() })?;
-
-            if let crate::tool_call::ToolCallOutcome::WaitingApproval { approval } = outcome {
-                return Ok(DispatchOutcome::WaitingApproval { approval });
+            {
+                Ok(step) => step,
+                Err(error) => {
+                    // A fault mid-dispatch has no caller that will move the run, so it is failed here
+                    // rather than left in `ExecutingTool` for restart recovery to find.
+                    self.finish(
+                        run,
+                        Step::failed(
+                            RunState::ExecutingTool,
+                            "run.failed",
+                            "tool_dispatch_failed",
+                            error.code(),
+                        ),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            match step {
+                DispatchStep::Observed(observation) => observations.push(observation),
+                DispatchStep::Waiting(approval) => {
+                    return Ok(DispatchOutcome::WaitingApproval {
+                        approval,
+                        waiting_index: index,
+                        settled: observations,
+                    });
+                }
             }
-            observations.push(observation_of(call, &outcome));
         }
         Ok(DispatchOutcome::Observations(observations))
     }
 
+    /// Dispatches one call, or releases it when `released` names the approval that was decided.
+    async fn dispatch_one(
+        &self,
+        service: &crate::tool_call::ToolCallService,
+        run: RunRef,
+        context: &RequestContext,
+        cancel: &CancellationScope,
+        call: &CapturedToolCall,
+        released: Option<&DurableApproval>,
+    ) -> Result<DispatchStep, ControllerError> {
+        // The intent is built from the captured pair: the name the model emitted becomes a
+        // capability the catalog resolves, and the argument document is carried as the
+        // **unvalidated** text the domain's `ToolArguments` wraps. The domain deliberately does
+        // not parse it — validating against a schema is the validator's job — so a malformed
+        // document is refused by `tool.schema_invalid` rather than at construction, which is the
+        // diagnosis a model can act on.
+        let Ok(arguments) = ToolArguments::new(&call.arguments) else {
+            // An argument document that cannot even be wrapped — empty, over the byte bound, or
+            // carrying a NUL — is refused as a schema failure. Building an intent would be
+            // impossible, so the model is told its arguments were unusable, and the remaining
+            // calls in the batch are still dispatched.
+            return Ok(DispatchStep::Observed(ToolObservation {
+                call_id: call.call_id.clone(),
+                capability: call.capability.clone(),
+                arguments: call.arguments.clone(),
+                is_error: true,
+                content: format!(
+                    "{{\"refused\":\"{}\",\"detail\":\"the arguments were empty or \
+                     exceeded the accepted size\"}}",
+                    ToolErrorClass::SchemaInvalid.as_contract_str(),
+                ),
+            }));
+        };
+        let intent = ToolCallIntent::new(
+            ToolCallId::from_uuid(uuid::Uuid::now_v7()),
+            &call.capability,
+            arguments,
+            None,
+        )
+        .map_err(|error| ControllerError::StreamRejected { code: error.code() })?;
+
+        // The idempotency key is the provider's own call id, scoped by the service's
+        // `ReservationKey` to identity, workspace, and principal. That is deliberately the
+        // **provider's** identifier rather than a fresh one: a provider that re-sends the same
+        // call id within one turn is making the same logical call, and the reservation's whole
+        // purpose is to recognise it. A fresh key per dispatch would make every repeat look like
+        // a new call and duplicate the effect.
+        let outcome = match released {
+            // A released call continues **its own ledger row** rather than reserving a new key, so
+            // the row that asked is the row that finishes.
+            Some(approval) => {
+                service
+                    .resume(context, run.run_id, approval, &intent, cancel)
+                    .await
+            }
+            None => {
+                service
+                    .invoke(context, run.run_id, &intent, &call.call_id, cancel)
+                    .await
+            }
+        }
+        .map_err(|error| ControllerError::ToolRefused { code: error.code() })?;
+
+        if let crate::tool_call::ToolCallOutcome::WaitingApproval { approval } = outcome {
+            return Ok(DispatchStep::Waiting(approval));
+        }
+        Ok(DispatchStep::Observed(observation_of(call, &outcome)))
+    }
+
+    /// Parks a run on the approval its batch is blocked on.
+    ///
+    /// **The resume record is written before the run is parked**, so a run that reads as waiting
+    /// always has the state to continue from. A record that cannot be written fails the run: a run
+    /// parked without one could never be released, and "waiting for ever" is a worse answer than a
+    /// failure the caller can see and retry.
+    async fn park(
+        &self,
+        run: RunRef,
+        turn: &TurnInputs<'_>,
+        turn_index: u32,
+        parked: ParkedBatch,
+    ) -> Result<RunOutcome, ControllerError> {
+        if let Some(resumes) = self.resumes.as_ref() {
+            let record = crate::repository::resume::ResumeRecord {
+                version: crate::repository::resume::RESUME_RECORD_VERSION,
+                run: run.run_id,
+                workspace: run.workspace,
+                conversation: turn.conversation_id,
+                approval: parked.approval,
+                turn_index,
+                objective: turn.objective.to_owned(),
+                objective_message: turn.objective_message,
+                calls: parked.calls.iter().map(Into::into).collect(),
+                waiting_index: u32::try_from(parked.waiting_index).unwrap_or(u32::MAX),
+                settled: parked.settled.iter().map(Into::into).collect(),
+            };
+            if let Err(error) = resumes.save(&record).await {
+                let error = ControllerError::Repository(error);
+                self.finish(
+                    run,
+                    Step::failed(
+                        RunState::ExecutingTool,
+                        "run.failed",
+                        "resume_state_unsaved",
+                        error.code(),
+                    ),
+                )
+                .await?;
+                return Err(error);
+            }
+        }
+        // The run is parked from `ExecutingTool`, the state the dispatch that learned an approval
+        // was needed is in. **It is not moved through `Observing` first**: that edge claims the call
+        // settled, and the earlier version of this code took it and then asked for a transition
+        // from `AwaitingModel`, which the stored state no longer matched — so the park was refused
+        // and the run read as live for ever.
+        self.finish(
+            run,
+            Step::parked_on(
+                RunState::ExecutingTool,
+                RunState::AwaitingApproval,
+                "run.approval_requested",
+                "tool_approval_pending",
+                // The approval the run waits on is recorded on the run itself, so the dependency
+                // survives in the run's own row rather than only in the resume record.
+                crate::repository::run::WaitingOn::new("approval", &parked.approval.to_string())
+                    .map_err(ControllerError::Repository)?,
+            ),
+        )
+        .await?;
+        // **No `error_code` is fabricated, and the approval is not encoded into one.** A run waiting
+        // on a decision has not failed: a code on its row would make a successful request read as a
+        // failure. A caller learns which approval to decide from the run's
+        // `run.approval_requested` event and from `GET /api/v1/approvals`.
+        Ok(RunOutcome {
+            run_id: run.run_id,
+            state: RunState::AwaitingApproval,
+            answer: None,
+            error_code: None,
+        })
+    }
     /// Drives a successful run through `Responding` to `Completed`, storing the answer first.
     ///
     /// The order is the guarantee: the answer is persisted **before** the run reaches `Completed`,
@@ -2961,6 +3271,10 @@ impl RunController {
             Some(outcome) => RunWrite::new(&transition, event).failed_with(outcome),
             None => RunWrite::new(&transition, event),
         };
+        let write = match step.waiting {
+            Some(waiting) => write.waiting_on(waiting),
+            None => write,
+        };
         let stored = self
             .runs
             .transition(run.workspace, write)
@@ -3032,10 +3346,10 @@ impl RunController {
     /// than from a second list, so what the model is offered and what policy can authorize are the
     /// same set — a catalog the model saw but the service could not resolve would produce
     /// `tool.not_found` for a tool the model was told about, which reads as a JARVIS bug.
-    fn tool_names(&self) -> Vec<String> {
+    fn tool_offers(&self) -> Vec<jarvis_domain::model::stream::ToolOffer> {
         self.tools
             .as_ref()
-            .map(|tools| tools.capabilities())
+            .map(|tools| tools.offers())
             .unwrap_or_default()
     }
 
@@ -3046,6 +3360,8 @@ impl RunController {
             .map_err(|_| ControllerError::ClockUnavailable)
     }
 }
+
+mod resume;
 
 #[cfg(test)]
 mod tests;
@@ -3316,7 +3632,7 @@ fn build_request(
     model: &ModelRef,
     items: &[RetainedItem],
     observations: &[ToolObservation],
-    tools: &[String],
+    offers: &[jarvis_domain::model::stream::ToolOffer],
     budget: &RunBudget,
 ) -> Result<ModelCallRequest, ControllerError> {
     let mut input: Vec<InputItem> = vec![InputItem::SystemPolicyRef {
@@ -3366,7 +3682,8 @@ fn build_request(
         // state (no pipeline composed, or a catalog with nothing in it) and tells the model it has
         // no tools — which is honest, where omitting the field entirely would look like a provider
         // that does not support the feature.
-        tools: tools.to_vec(),
+        tools: offers.iter().map(|offer| offer.name.clone()).collect(),
+        tool_offers: offers.to_vec(),
         output_schema: None,
         settings: PortableSettings::default(),
         // The run's budget, not an empty set of limits. Sending `None` here was the

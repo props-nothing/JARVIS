@@ -593,6 +593,25 @@ impl<'de> Deserialize<'de> for InputItems {
     }
 }
 
+/// One tool a call may propose, with what a model needs to use it well.
+///
+/// A name alone is enough to *resolve* a proposal but not to *make* one: a model shown only
+/// `mcp.read_file@1` has to guess what the tool does and what arguments it takes, and a live run showed it
+/// guessing wrong — its arguments failed the tool's schema. The description and the input schema are what
+/// the reviewed definition already carries, so offering them adds no authority: advertising a tool is still
+/// not a grant to execute it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOffer {
+    /// The canonical name, the same string as an entry of [`ModelCallRequest::tools`].
+    pub name: String,
+    /// What the tool does, in the definition's own words. Empty when none is known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// The JSON Schema document for the tool's arguments, when one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<String>,
+}
+
 /// A normalized model call request.
 ///
 /// A provider extension map is deliberately absent: the contract makes extensions
@@ -622,6 +641,10 @@ pub struct ModelCallRequest {
     /// The canonical tool names available to this call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// What the model is told about those tools. May be empty (an adapter then sends names alone); an
+    /// entry whose name is not in [`Self::tools`] is ignored by an adapter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_offers: Vec<ToolOffer>,
     /// The requested output schema document, when structured output is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<JsonText>,
@@ -1858,6 +1881,7 @@ mod tests {
             route_requirements: RouteRequirements::text(),
             input: InputItems::new(Vec::new()).expect("an empty list is valid"),
             tools: Vec::new(),
+            tool_offers: Vec::new(),
             output_schema: None,
             settings: PortableSettings::default(),
             limits: CallLimits {

@@ -313,6 +313,7 @@ mod tests {
             reviewed,
             Arc::new(executor),
             clock,
+            Vec::new(),
         )
         .expect("the reviewed definitions are consistent");
         let repositories = Arc::new(crate::storage::repositories::SqliteRepositories::new(

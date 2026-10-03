@@ -330,3 +330,87 @@ Two additions and one defect, and none was visible from the contract or from a f
   chunks, puts a size line inside a `data:` line, and `jarvis ask` prints a truncated answer and
   exits 0. See `BRN-003` for why the socket-level test, not the decoder's unit tests, was what caught
   it.
+## `memory-live.mjs`
+
+The gated **live memory journey**, run against a real model (Ollama on loopback, including its `:cloud`
+models) through the real `jarvisd` and `jarvis` binaries:
+
+```bash
+cargo build -p jarvisd -p jarvis-cli
+node tests/e2e/memory-live.mjs target/debug
+```
+
+It asks a question the model cannot know the answer to (a favourite slide-deck colour) and shows, in order:
+the model does **not** know it with nothing remembered (the control that makes the rest mean something);
+`jarvis memory remember` stores it and `jarvis memory search` finds it by words; the real model then answers
+with it; an unrelated question is unaffected; after a real daemon restart the model still answers with it;
+and after `jarvis memory forget` it no longer does. The assertions are about what JARVIS owns (the fact reached
+the prompt, and stopped reaching it), never about a model obeying an instruction in general.
+
+Gated like `provider-smoke.mjs`: with no server on the Ollama port it prints `skip` and exits 0, and the summary
+says nothing was proved. `tests/memory_recall.rs` is the deterministic counterpart that runs everywhere.
+
+### What this harness found
+
+Its first run failed the restart step with `jarvis.transport_failed`, and the cause was the harness, not the
+product: on Windows `kill()` ends the daemon abruptly, so its `discovery.json` stays behind, and the script read
+that stale file before the new daemon had published its own. The harness now removes the stale file when it
+restarts, and says why. The client's behaviour on a stale file — reporting the daemon unreachable — was correct.
+## `mcp-tool-offer.mjs`
+
+Deterministic (no model, no network): a real `jarvisd` composes the repository's MCP fixture server as a child
+process and a local fake OpenAI-compatible server records the request the daemon sends. It asserts the model is
+**offered the MCP tool** with its description and its own argument schema, and that the native tool is still
+offered beside it. This is the check that fails if the daemon stops passing composed MCP tools to the pipeline's
+catalog — verified by making it do exactly that.
+
+```bash
+cargo build -p jarvisd && cargo build -p jarvis-infrastructure --example mcp_fixture_server
+node tests/e2e/mcp-tool-offer.mjs target/debug
+```
+
+### What this harness found
+
+It exists because of a live run: the daemon composed MCP servers and could route to them, yet built the tool
+catalog from native tools alone, so no model was ever told an MCP tool existed. No unit test could see it — each
+layer was correct, and the defect was in the composition root. A first capture also showed the model was offered
+only a name and an empty object schema, so a real model's arguments failed the tool's schema.
+
+## `mcp-live.mjs`
+
+The gated live counterpart, against a real model (Ollama, including `:cloud` models): the daemon composes the
+fixture server, an operator grants the tool through `jarvis grants create`, the model proposes a call, the
+pipeline **withholds** it and raises an approval, and `jarvis approvals approve` records the decision. Then the
+run **continues**: the tool runs in the MCP child and the model answers with the sentence only that child could
+produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
+a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
+
+## `approval-resume.mjs`
+
+Deterministic (no model, no network): a real `jarvisd`, the real CLI, and the MCP fixture child process, with a
+fake OpenAI-compatible server standing in for the model. Its first request proposes a call to the fixture's
+`read_file` tool and its second answers; **every request is recorded**, so the assertions are on what the daemon
+actually sent the model.
+
+Four scenarios on one daemon: **approve** (the run stays open on a pending approval with the tool not run; the CLI
+decision continues the *same run*; the model's second request carries the tool's own output; the event stream shows
+the park, the resumed execution and the completion in order; the one-shot approval is `consumed`), **the same action
+asks again** (a second run raises a new approval instead of reusing the spent one), **reject** (the run still
+completes, the model is told `tool.approval_rejected`, and the tool never ran), and **cancel while parked** (a run
+with no task to signal is cancelled rather than left waiting).
+
+```bash
+cargo build -p jarvisd -p jarvis-cli && cargo build -p jarvis-infrastructure --example mcp_fixture_server
+node tests/e2e/approval-resume.mjs target/debug     # JARVIS_E2E_DEBUG=1 prints the daemon log on failure
+```
+
+### What this harness found
+
+Before it existed, a call that needed approval **never parked the run at all**: the controller moved through
+`Observing` and then asked for a transition from a state the run was no longer in, the store refused it, and the
+detached task swallowed the error — so the run read as running for ever beside a pending approval. A controller
+test that reads the *stored* state found that; this harness proves the fix on a real daemon. Dropping the HTTP
+handler's hook that continues the run fails it with `timed out waiting for the run to complete after approval`,
+while every handler and controller test stays green — the composition-root gap this directory exists for. It also
+established that the public run state is deliberately coarse (a parked run reads `model_running`), so the
+journey identifies a parked run by its pending approval and an unanswered model rather than by a state name.

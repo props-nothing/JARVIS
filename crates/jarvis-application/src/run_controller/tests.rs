@@ -4292,12 +4292,439 @@ async fn the_tool_names_the_model_is_offered_are_the_catalogs_own() {
     // model believes exists, which reads as a JARVIS bug rather than as a refusal.
     let tool_only = tool_fixture();
     assert_eq!(
-        tool_only.controller.tool_names(),
+        tool_only
+            .controller
+            .tool_offers()
+            .into_iter()
+            .map(|offer| offer.name)
+            .collect::<Vec<_>>(),
         vec![TOOL_CAPABILITY.to_owned()]
     );
 
     // And a controller with no pipeline offers nothing, rather than offering the catalog it does not
     // have.
     let plain = fixture(answering("hi"));
-    assert!(plain.controller.tool_names().is_empty());
+    assert!(plain.controller.tool_offers().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// A tool call that needs a human: the run parks, and a decision resumes it.
+// ---------------------------------------------------------------------------------------
+
+/// The same tool, classified as one that **writes** and must be asked about.
+fn ask_definition() -> jarvis_domain::tool::definition::ToolDefinition {
+    use jarvis_domain::model::policy::Sensitivity;
+    use jarvis_domain::tool::classification::{
+        ApprovalHint, DataClasses, Effect, ExecutionDefaults, Idempotency, Risk,
+    };
+    use jarvis_domain::tool::identity::{
+        SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
+    };
+    let source = ToolSource::new(
+        SourceKind::Native,
+        "test.publisher",
+        ToolVersion::parse("1.0.0").expect("valid"),
+    )
+    .expect("valid");
+    jarvis_domain::tool::definition::ToolDefinition::new(
+        ToolIdentity {
+            capability: ToolCapability::parse(TOOL_CAPABILITY).expect("valid"),
+            source,
+            schema_fingerprint: SchemaFingerprint::from_bytes([0x33; 32]),
+        },
+        "Write a file",
+        "Writes a path the caller names.",
+        vec![Effect::Write],
+        Risk::Moderate,
+        Vec::new(),
+        ApprovalHint::Ask,
+        Idempotency::None,
+        DataClasses::new(Sensitivity::Public, Sensitivity::Internal).expect("valid"),
+        ExecutionDefaults::new(5_000, 1).expect("valid"),
+    )
+    .expect("consistent")
+}
+
+struct AskCatalog;
+
+impl crate::tool_call::ToolCatalog for AskCatalog {
+    fn resolve(
+        &self,
+        _workspace: WorkspaceId,
+        capability: &str,
+    ) -> Option<crate::tool_call::ResolvedTool> {
+        (capability == TOOL_CAPABILITY).then(|| crate::tool_call::ResolvedTool {
+            definition: ask_definition(),
+            input_schema: Some(READ_SCHEMA.to_owned()),
+        })
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec![TOOL_CAPABILITY.to_owned()]
+    }
+}
+
+/// Grants the write tool at exactly its own ceiling; policy then asks, because the hint is `Ask`.
+struct AskGrants;
+
+impl crate::tool_call::ToolGrantSource for AskGrants {
+    fn read(
+        &self,
+        principal: PrincipalId,
+        workspace: WorkspaceId,
+    ) -> crate::tool_call::GrantReadFuture<'_> {
+        use jarvis_domain::tool::classification::{Effect, Risk};
+        let grants = vec![jarvis_domain::tool::policy::Grant {
+            identity: ask_definition().identity,
+            workspace,
+            principal,
+            scopes: std::collections::BTreeSet::new(),
+            effects: [Effect::Write].into_iter().collect(),
+            risk_ceiling: Risk::Moderate,
+            sensitivity_ceiling: jarvis_domain::model::policy::Sensitivity::Internal,
+            expires_at: None,
+        }];
+        Box::pin(async move {
+            Ok(crate::tool_call::GrantRead {
+                grants,
+                deny_rules: Vec::new(),
+            })
+        })
+    }
+}
+
+/// A fixture whose model proposes the tool that needs approval.
+fn ask_fixture() -> ToolFixture {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let executions = Arc::new(AtomicU32::new(0));
+    let second_request = Arc::new(Mutex::new(None));
+    let tools = Arc::new(crate::tool_call::ToolCallService::new(
+        Arc::new(AskCatalog),
+        Arc::new(AskGrants),
+        Arc::new(AcceptAll),
+        Arc::new(FixedFingerprint),
+        Arc::new(RecordingNative {
+            calls: Arc::clone(&executions),
+        }),
+        Arc::clone(&repositories) as Arc<dyn crate::repository::tool_call::ToolCallRepository>,
+        Arc::clone(&repositories) as Arc<dyn crate::repository::approval::ApprovalRepository>,
+        Arc::new(ManualClock::new(now())),
+    ));
+    let controller = RunController::new(
+        Arc::clone(&repositories) as Arc<dyn RunRepository>,
+        Arc::clone(&repositories) as Arc<dyn ConversationRepository>,
+        Arc::clone(&repositories) as Arc<dyn ModelCallRepository>,
+        Arc::clone(&repositories) as Arc<dyn crate::live_events::StreamDeltaSink>,
+        Arc::new(ToolThenAnswer::new(model(), Arc::clone(&second_request)))
+            as Arc<dyn ModelProvider>,
+        Arc::new(ManualClock::new(now())),
+    )
+    .with_tools(tools)
+    .with_resume_store(
+        Arc::clone(&repositories) as Arc<dyn crate::repository::resume::RunResumeRepository>
+    );
+    ToolFixture {
+        controller,
+        repositories,
+        executions,
+        second_request,
+    }
+}
+
+/// Creates the conversation and run a controller drives.
+async fn seed_run(store: &Arc<InMemoryRepositories>) {
+    store
+        .create_conversation(
+            NewConversation::new(
+                conversation(),
+                context().workspace_id,
+                PrincipalId::from_uuid(id(3)),
+                Some("first".to_owned()),
+                "cli".to_owned(),
+                now(),
+            )
+            .expect("valid"),
+        )
+        .await
+        .expect("the conversation is created");
+    store
+        .create(
+            NewRun::new(
+                run(),
+                context().workspace_id,
+                conversation(),
+                PrincipalId::from_uuid(id(3)),
+                Some("objective".to_owned()),
+                now(),
+            )
+            .expect("valid"),
+            crate::repository::run::run_received_event(run(), now()),
+        )
+        .await
+        .expect("the run is created");
+}
+
+#[tokio::test]
+async fn a_call_that_needs_approval_parks_the_run_in_awaiting_approval_without_executing() {
+    let fixture = ask_fixture();
+    seed_run(&fixture.repositories).await;
+
+    let outcome = fixture
+        .controller
+        .execute(
+            &context(),
+            run(),
+            conversation(),
+            "write a file",
+            None,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("a parked run is an outcome, not an error");
+
+    assert_eq!(outcome.state, RunState::AwaitingApproval);
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        0,
+        "the tool must not run before a human decides"
+    );
+    // The **stored** state, not only the returned one: the controller's own report is what a swallowed
+    // transition error would leave looking right.
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::AwaitingApproval);
+}
+
+/// Parks the fixture's run and returns the approval it is waiting on.
+async fn park_the_run(fixture: &ToolFixture) -> jarvis_domain::ids::ApprovalId {
+    seed_run(&fixture.repositories).await;
+    let outcome = fixture
+        .controller
+        .execute(
+            &context(),
+            run(),
+            conversation(),
+            "write a file",
+            None,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("a parked run is an outcome");
+    assert_eq!(outcome.state, RunState::AwaitingApproval);
+    crate::repository::resume::RunResumeRepository::load(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        run(),
+    )
+    .await
+    .expect("reads")
+    .expect("a parked run has its resume record")
+    .approval
+}
+
+/// Decides `approval` as the run's own principal would.
+async fn decide(
+    fixture: &ToolFixture,
+    approval: jarvis_domain::ids::ApprovalId,
+    to: jarvis_domain::tool::approval::ApprovalState,
+) -> jarvis_domain::tool::approval::DurableApproval {
+    use crate::repository::approval::ApprovalRepository;
+    use jarvis_domain::tool::approval::{ApprovalActor, ApprovalChannel};
+    let mut stored = ApprovalRepository::load(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        approval,
+    )
+    .await
+    .expect("the prompt is durable");
+    let version = stored.version();
+    let transition = stored
+        .apply(
+            to,
+            version,
+            ApprovalActor::Decided {
+                principal: context().principal_id,
+                channel: ApprovalChannel::Cli,
+                assurance: jarvis_domain::model::exception::RequiredAssurance::Standard,
+                note: None,
+            },
+            now(),
+        )
+        .expect("a pending approval can be decided");
+    ApprovalRepository::apply_transition(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        &transition,
+        version,
+        &transition.actor,
+        &stored,
+    )
+    .await
+    .expect("the decision is stored");
+    stored
+}
+
+#[tokio::test]
+async fn an_approved_run_resumes_runs_the_tool_and_answers() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let decided = decide(&fixture, approval, ApprovalState::Approved).await;
+
+    let outcome = fixture
+        .controller
+        .resume(&context(), run(), &decided, &CancellationScope::new())
+        .await
+        .expect("the resume reaches an outcome")
+        .expect("a parked run is resumed");
+
+    assert_eq!(outcome.state, RunState::Completed);
+    assert_eq!(outcome.answer.as_deref(), Some("the tool answered"));
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        1,
+        "the tool ran once"
+    );
+    assert_eq!(
+        *fixture.second_request.lock().expect("not poisoned"),
+        Some(true),
+        "the model must be given the result of the call it was waiting on",
+    );
+    // The same path a run that never waited takes once its tools settle.
+    let events = fixture.repositories.recorded_events().expect("readable");
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "run.received",
+            "run.context_building",
+            "run.planning",
+            "run.model_started",
+            "run.tool_executing",
+            "run.approval_requested",
+            "run.tool_executing",
+            "run.observing",
+            "run.planning",
+            "run.model_started",
+            "run.output_text.delta",
+            "run.responding",
+            "run.completed",
+        ],
+    );
+    // The record is spent with the wait.
+    assert!(
+        crate::repository::resume::RunResumeRepository::load(
+            fixture.repositories.as_ref(),
+            context().workspace_id,
+            run(),
+        )
+        .await
+        .expect("reads")
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_run_tells_the_model_it_was_refused_and_never_runs_the_tool() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let decided = decide(&fixture, approval, ApprovalState::Rejected).await;
+
+    let outcome = fixture
+        .controller
+        .resume(&context(), run(), &decided, &CancellationScope::new())
+        .await
+        .expect("the resume reaches an outcome")
+        .expect("a parked run is resumed");
+
+    // A refusal is information, not a failure: the model reads it and answers.
+    assert_eq!(outcome.state, RunState::Completed);
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        0,
+        "a rejection never runs the tool"
+    );
+    assert_eq!(
+        *fixture.second_request.lock().expect("not poisoned"),
+        Some(true),
+        "the model must receive the refusal as a tool result",
+    );
+}
+
+#[tokio::test]
+async fn a_decision_about_another_approval_does_not_move_the_run() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let mut decided = decide(&fixture, approval, ApprovalState::Approved).await;
+    decided.id = jarvis_domain::ids::ApprovalId::from_uuid(Uuid::from_u128(0x9999));
+
+    let outcome = fixture
+        .controller
+        .resume(&context(), run(), &decided, &CancellationScope::new())
+        .await
+        .expect("a stale decision is not a fault");
+    assert!(outcome.is_none());
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::AwaitingApproval);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn resuming_a_run_that_is_not_waiting_does_nothing() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    let decided = decide(&fixture, approval, ApprovalState::Approved).await;
+    for _ in 0..2 {
+        let _ = fixture
+            .controller
+            .resume(&context(), run(), &decided, &CancellationScope::new())
+            .await;
+    }
+    assert_eq!(
+        fixture.executions.load(Ordering::SeqCst),
+        1,
+        "a repeated decision must not run the tool twice",
+    );
+}
+
+#[tokio::test]
+async fn a_parked_run_with_no_resume_record_is_failed_rather_than_left_waiting() {
+    use jarvis_domain::tool::approval::ApprovalState;
+    let fixture = ask_fixture();
+    let approval = park_the_run(&fixture).await;
+    crate::repository::resume::RunResumeRepository::discard(
+        fixture.repositories.as_ref(),
+        context().workspace_id,
+        run(),
+    )
+    .await
+    .expect("discards");
+    let decided = decide(&fixture, approval, ApprovalState::Approved).await;
+
+    let error = fixture
+        .controller
+        .resume(&context(), run(), &decided, &CancellationScope::new())
+        .await
+        .expect_err("nothing to continue from");
+    assert_eq!(error, ControllerError::ResumeStateMissing);
+    let stored = fixture
+        .repositories
+        .load(context().workspace_id, run())
+        .await
+        .expect("loads");
+    assert_eq!(stored.state, RunState::Failed);
+    assert_eq!(
+        stored.error_code.as_deref(),
+        Some("run.resume_state_missing")
+    );
 }

@@ -31,6 +31,7 @@ pub mod error;
 pub mod memory_repository;
 pub mod migrate;
 pub mod repositories;
+pub mod resume_repository;
 pub mod schema;
 pub mod tool_call_repository;
 pub mod tool_grant_repository;

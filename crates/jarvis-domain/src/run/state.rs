@@ -145,7 +145,17 @@ impl RunState {
                 Self::Failed,
                 Self::Cancelled,
             ],
-            Self::ExecutingTool => &[Self::Observing, Self::Failed, Self::Cancelled],
+            // `ExecutingTool --> AwaitingApproval` is the edge a call that needs a human takes: the
+            // run is in `ExecutingTool` **because** it is dispatching, and it is the dispatch that
+            // learns an approval is required. Routing through `Observing` first would claim the
+            // call settled; the previous implementation did exactly that and the park was then
+            // refused as an illegal edge, leaving the run looking live for ever.
+            Self::ExecutingTool => &[
+                Self::Observing,
+                Self::AwaitingApproval,
+                Self::Failed,
+                Self::Cancelled,
+            ],
             Self::Observing => &[Self::Planning, Self::Waiting, Self::Failed, Self::Cancelled],
             // A failure or a cancellation *while producing the final answer* is a
             // real outcome, not an impossible one: the provider can fail mid-stream
@@ -424,7 +434,12 @@ mod tests {
             ),
             (
                 RunState::ExecutingTool,
-                &[RunState::Observing, RunState::Failed, RunState::Cancelled],
+                &[
+                    RunState::Observing,
+                    RunState::AwaitingApproval,
+                    RunState::Failed,
+                    RunState::Cancelled,
+                ],
             ),
             (
                 RunState::Observing,

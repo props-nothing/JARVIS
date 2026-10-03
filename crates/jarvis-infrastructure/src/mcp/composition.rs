@@ -152,6 +152,17 @@ pub struct ComposedMcpServer {
     normalized_refusals: Vec<super::McpToolRefusal>,
     /// The identities that are now callable, which is what a router is built from.
     admitted: Vec<ToolIdentity>,
+    /// The definitions and schema documents behind [`Self::admitted`], which is what the tool pipeline's
+    /// **catalog** is built from.
+    ///
+    /// The executor can dispatch an identity, but a call only reaches it if the pipeline can *resolve* the
+    /// model's tool name to a definition and a schema. Until the daemon read these, an MCP tool was
+    /// composed and executable and yet absent from the catalog: never offered to the model, never grantable,
+    /// and refused `tool.not_found` if proposed.
+    published: Vec<(
+        jarvis_domain::tool::definition::ToolDefinition,
+        Option<String>,
+    )>,
 }
 
 impl std::fmt::Debug for ComposedMcpServer {
@@ -199,6 +210,24 @@ impl ComposedMcpServer {
     #[must_use]
     pub fn admitted(&self) -> &[ToolIdentity] {
         &self.admitted
+    }
+
+    /// Returns the published tools as the pipeline's catalog entries.
+    ///
+    /// Discovery is not authorization: a tool in the catalog is **resolvable and offered**, and still
+    /// needs a grant before a call is allowed, then (for an MCP tool) an approval, because an MCP server's
+    /// annotations can propose but never permit.
+    #[must_use]
+    pub fn resolved_tools(&self) -> Vec<jarvis_application::tool_call::ResolvedTool> {
+        self.published
+            .iter()
+            .map(
+                |(definition, schema)| jarvis_application::tool_call::ResolvedTool {
+                    definition: definition.clone(),
+                    input_schema: schema.clone(),
+                },
+            )
+            .collect()
     }
 
     /// Returns every offered tool that never became callable, from **both** stages.
@@ -471,6 +500,7 @@ pub fn compose_discovered(
         report,
         normalized_refusals,
         admitted,
+        published: pairs,
     })
 }
 

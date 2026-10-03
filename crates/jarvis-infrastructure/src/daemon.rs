@@ -694,11 +694,13 @@ pub async fn start(
     // the result here. What is true is narrower and worth stating: the *default* profile ships no refusals, so
     // every existing configuration loads unchanged, and the stored deny rules an operator writes through
     // `/api/v1/tool-grants/deny-rules` reach the evaluator independently from the same store handle.
+    let mcp_tools = mcp_catalog_tools(&mcp);
     let (tools, tool_grants) = tool_fabric_with(
         database.pool().clone(),
         config.reviewed_deny_rules().to_vec(),
         Arc::new(executor),
         clock,
+        mcp_tools,
     )?;
     let ports = run_ports(
         Arc::clone(&repositories),
@@ -771,13 +773,9 @@ pub async fn start(
         crate::time::SystemClock::new().now().ok(),
     ));
 
-    // One memory service for the API and for run recall, so a memory written through the API is the one
-    // the next run recalls: two stores would let a client remember something no run could ever see.
+    // One memory service for the API and for run recall, so a memory written is the one recalled.
     let memories = memory_service_over(&database);
-    let runs = Arc::new(
-        RunService::new(ports, Arc::new(RunCancellationRegistry::new()))
-            .with_memories(Arc::clone(memories.store())),
-    );
+    let runs = run_service_with(ports, &memories, &database);
 
     // The policy surface reads the same pool the run service writes, so the rules a route is
     // evaluated against are the ones this daemon stores. `repositories` here is the *same* value
@@ -817,6 +815,24 @@ pub async fn start(
         mcp_declarations: config.mcp_servers().to_vec(),
         guard,
     })
+}
+
+/// The run service, recalling from the same memory store the API writes and parking runs in the
+/// daemon's own database, so a decided approval can continue the run it was raised for.
+fn run_service_with(
+    ports: jarvis_application::run_service::RunPorts,
+    memories: &Arc<jarvis_application::memory_service::MemoryService>,
+    database: &crate::storage::Database,
+) -> Arc<RunService> {
+    Arc::new(
+        RunService::new(ports, Arc::new(RunCancellationRegistry::new()))
+            .with_memories(Arc::clone(memories.store()))
+            .with_resume_store(Arc::new(
+                crate::storage::resume_repository::SqliteResumeRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+    )
 }
 
 /// Builds the memory service over the daemon's own pool.
@@ -966,6 +982,47 @@ fn run_ports(
     }
 }
 
+/// The composed MCP servers' tools, as catalog entries.
+///
+/// **Their absence from the catalog was a real gap.** The router could dispatch an MCP identity, but the pipeline
+/// resolves a model's tool name against the catalog — so an MCP tool was composed and callable in principle
+/// while never offered to the model, never grantable, and refused `tool.not_found` if proposed. Discovery still
+/// grants nothing: each tool needs a stored grant, and then an approval, before it runs.
+fn mcp_catalog_tools(
+    mcp: &crate::mcp::composition::McpComposition,
+) -> Vec<jarvis_application::tool_call::ResolvedTool> {
+    mcp.servers()
+        .iter()
+        .flat_map(crate::mcp::composition::ComposedMcpServer::resolved_tools)
+        .collect()
+}
+
+/// Appends `extra` to the native catalog, refusing a tool whose capability is already taken.
+///
+/// The catalog is keyed by capability, so two tools under one capability cannot both be held — and silently
+/// keeping the later one would let an MCP server shadow a native tool or another server's. The **first** wins
+/// (native tools come first), and the one dropped is logged so the smaller catalog is visible rather than
+/// something an operator finds by a missing tool. The fail-closed direction is a smaller catalog.
+fn merge_catalog(
+    mut native: Vec<jarvis_application::tool_call::ResolvedTool>,
+    extra: Vec<jarvis_application::tool_call::ResolvedTool>,
+) -> Vec<jarvis_application::tool_call::ResolvedTool> {
+    for tool in extra {
+        let capability = tool.definition.capability().to_string();
+        if native
+            .iter()
+            .any(|held| held.definition.capability().to_string() == capability)
+        {
+            log::warn!(
+                "tool left out of the catalog because its capability is already taken: capability={capability}"
+            );
+            continue;
+        }
+        native.push(tool);
+    }
+    native
+}
+
 /// Builds the governed tool-call pipeline over the daemon's catalog and stores.
 ///
 /// **Every port is the real adapter**, which is the point: the catalog is the daemon's own reviewed
@@ -1022,6 +1079,7 @@ pub(crate) fn tool_fabric_with(
     deny_rules: Vec<crate::config::ReviewedDenyRule>,
     executor: Arc<dyn jarvis_application::tool_call::ToolExecutor>,
     clock: Arc<dyn jarvis_domain::clock::Clock>,
+    extra_tools: Vec<jarvis_application::tool_call::ResolvedTool>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -1044,13 +1102,14 @@ pub(crate) fn tool_fabric_with(
     // and a tool an operator's configuration authorizes are the same set. Two lists would let a tool
     // be dispatchable while ungranted, or granted while unresolvable, and both read as a daemon fault
     // rather than as configuration.
-    let tools: Vec<jarvis_application::tool_call::ResolvedTool> = definitions
+    let native: Vec<jarvis_application::tool_call::ResolvedTool> = definitions
         .into_iter()
         .map(|tool| jarvis_application::tool_call::ResolvedTool {
             definition: tool.definition,
             input_schema: Some(tool.input_schema),
         })
         .collect();
+    let tools = merge_catalog(native, extra_tools);
     let catalog =
         Arc::new(RegistryCatalog::new(tools.iter().map(|tool| {
             (tool.definition.clone(), tool.input_schema.clone())
@@ -1711,6 +1770,31 @@ mod tests {
 
     /// The router is the executor `start` hands the pipeline, and it answers for a native identity.
     ///
+    /// A second tool under a capability the catalog already holds is left out, and the first wins.
+    ///
+    /// The catalog is keyed by capability, so keeping the later tool would let an MCP server shadow a native
+    /// tool; the native tool is first, so it stays.
+    #[test]
+    fn a_tool_whose_capability_is_taken_does_not_replace_the_one_that_holds_it() {
+        let native: Vec<_> = crate::native_tools::definitions()
+            .expect("the reviewed definitions are consistent")
+            .into_iter()
+            .map(|tool| jarvis_application::tool_call::ResolvedTool {
+                definition: tool.definition,
+                input_schema: Some(tool.input_schema),
+            })
+            .collect();
+        let held = native.len();
+        assert!(held > 0);
+        // The same tool again, with its schema blanked so a replacement would be visible.
+        let shadow = jarvis_application::tool_call::ResolvedTool {
+            input_schema: None,
+            ..native[0].clone()
+        };
+        let merged = super::merge_catalog(native.clone(), vec![shadow]);
+        assert_eq!(merged.len(), held, "the colliding tool was not added");
+        assert_eq!(merged[0], native[0], "and the original is unchanged");
+    }
     /// The second half of the wiring: the *daemon's* router must actually resolve the tools the catalog
     /// offers. A router whose kind did not match would produce a daemon that starts, reports ready, and
     /// refuses every tool call — the failure mode that reads as `tool.not_found` for a tool the catalog lists.

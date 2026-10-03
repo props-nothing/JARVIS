@@ -58,12 +58,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use jarvis_domain::clock::Clock;
-use jarvis_domain::ids::{ApprovalId, PrincipalId, RunId, ToolCallId, WorkspaceId};
+use jarvis_domain::ids::{
+    ApprovalId, PrincipalId, RunId, ToolCallId, ToolCallRecordId, WorkspaceId,
+};
 use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
-    AllowedChannels, ApprovalChannel, ApprovalPreview, ApprovalRequestParts, ApprovalScopeKind,
-    ApprovalSummary, DurableApproval, PreviewItem,
+    AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
+    ApprovalScopeKind, ApprovalState, ApprovalSummary, DurableApproval, PreviewItem,
 };
 use jarvis_domain::tool::call::{ToolArguments, ToolCallIntent, ToolResultBody};
 use jarvis_domain::tool::canonical::{
@@ -78,7 +80,8 @@ use jarvis_domain::tool::ledger::{
     ToolCallVersion,
 };
 use jarvis_domain::tool::policy::{
-    ApprovalRecord, DenyRule, Grant, PolicyInputs, PolicyOutcome, PolicyRequest, evaluate,
+    ApprovalRecord, DenyRule, Grant, PolicyInputs, PolicyOutcome, PolicyReason, PolicyRequest,
+    evaluate,
 };
 
 use crate::cancellation::CancellationScope;
@@ -157,6 +160,21 @@ pub trait ToolCatalog: Send + Sync {
     /// would produce `tool.not_found` for a tool the model believes exists, which reads as a JARVIS
     /// bug rather than as a refusal. Ordering is the implementation's, and stable within one catalog.
     fn capabilities(&self) -> Vec<String>;
+
+    /// Returns what the model should be told about each tool: its name, description, and argument schema.
+    ///
+    /// Defaults to names alone, so a catalog that knows nothing more is still correct; an implementation
+    /// that holds definitions overrides it. The names are exactly [`Self::capabilities`], in the same order.
+    fn offers(&self) -> Vec<jarvis_domain::model::stream::ToolOffer> {
+        self.capabilities()
+            .into_iter()
+            .map(|name| jarvis_domain::model::stream::ToolOffer {
+                name,
+                description: String::new(),
+                input_schema: None,
+            })
+            .collect()
+    }
 }
 
 /// The future a [`ToolGrantSource`] returns.
@@ -663,6 +681,12 @@ impl ToolCallService {
         self.catalog.capabilities()
     }
 
+    /// Returns what the model is told about each tool, from the same catalog as [`Self::capabilities`].
+    #[must_use]
+    pub fn offers(&self) -> Vec<jarvis_domain::model::stream::ToolOffer> {
+        self.catalog.offers()
+    }
+
     /// Runs `intent` through the pipeline and reports what happened.
     ///
     /// The workspace and principal are taken from `context`, which only trusted code can build —
@@ -729,6 +753,12 @@ impl ToolCallService {
         // releases and the record was unusable for the resume it exists to enable.
         let call_id = canonical_call_id(intent.call_id.as_uuid());
         let mut entry = LedgerEntry::reserve(call_id, 1, run, key, LedgerOperation::Execute, now);
+        // The row's own identifier **is** the call's identifier, so an approval that names the call
+        // can name its row. A parked call is resumed from the approval alone — nothing else survives a
+        // restart that says which row it was — and a random row identifier would make that lookup
+        // impossible without a second index. The two ids never refer to different things: a row is one
+        // attempt of one call.
+        entry.id = ToolCallRecordId::from_uuid(call_id.as_uuid());
         // Each arm below is a **decision** the ledger already settled: an equivalent call that
         // finished, one still in flight, or one whose outcome is unknown. All three are answers
         // rather than faults, so they arrive as `Some` and `?` is left for the storage errors that
@@ -797,6 +827,143 @@ impl ToolCallService {
             cancel,
         )
         .await
+    }
+
+    /// Continues a call that parked on an approval, now that the approval has been decided.
+    ///
+    /// **The same ledger row carries the call from `WaitingApproval` to its outcome**, so one row tells
+    /// the whole story: asked, decided, executed. An approved decision re-enters the pipeline at
+    /// policy — the approval is evidence for policy to weigh, not a bypass — so a grant revoked or a
+    /// tool changed while the prompt sat open still refuses the call. A decision that is not an
+    /// approval closes the row `Denied` with the matching class, and the model reads it as a refusal.
+    ///
+    /// Idempotent: a row that is no longer waiting reports what it settled as instead of running the
+    /// call again, so a repeated resume cannot double an effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolServiceError`] for a storage or clock fault, or when the approval does not
+    /// belong to `run` and the context's principal — a mismatch is a bug in the caller, never a
+    /// refusal a model should read.
+    pub async fn resume(
+        &self,
+        context: &RequestContext,
+        run: RunId,
+        approval: &DurableApproval,
+        intent: &ToolCallIntent,
+        cancel: &CancellationScope,
+    ) -> Result<ToolCallOutcome, ToolServiceError> {
+        let workspace = context.workspace_id;
+        let principal = context.principal_id;
+        let now = self.now()?;
+        let mut entry = self
+            .ledger
+            .load(
+                workspace,
+                ToolCallRecordId::from_uuid(approval.tool_call.as_uuid()),
+            )
+            .await?;
+        if entry.run != run
+            || approval.run != run
+            || approval.workspace != workspace
+            || entry.key.principal != principal
+        {
+            return Err(ToolServiceError::Internal {
+                code: "tool.resume_mismatch",
+            });
+        }
+        if entry.state() != ToolCallState::WaitingApproval {
+            return Ok(if entry.state().is_terminal() {
+                ToolCallOutcome::Duplicate {
+                    state: entry.state(),
+                    class: entry.outcome(),
+                }
+            } else {
+                ToolCallOutcome::Refused {
+                    class: ToolErrorClass::Conflict,
+                    state: entry.state(),
+                }
+            });
+        }
+        let refusal = match approval.state() {
+            ApprovalState::Approved => None,
+            ApprovalState::Expired => Some(ToolErrorClass::ApprovalExpired),
+            ApprovalState::Rejected
+            | ApprovalState::Cancelled
+            | ApprovalState::Consumed
+            | ApprovalState::Invalidated => Some(ToolErrorClass::ApprovalRejected),
+            ApprovalState::Pending => {
+                return Err(ToolServiceError::Internal {
+                    code: "tool.resume_undecided",
+                });
+            }
+        };
+        if let Some(class) = refusal {
+            return self.deny_waiting(&mut entry, class, now).await;
+        }
+
+        // Everything below re-checks what the first pass checked, because the catalog, the grants,
+        // and the schema may all have moved while a person decided.
+        let Some(tool) = self.catalog.resolve(workspace, &intent.capability) else {
+            return self
+                .deny_waiting(&mut entry, ToolErrorClass::NotFound, now)
+                .await;
+        };
+        if tool.definition.identity != entry.key.identity {
+            return self
+                .deny_waiting(&mut entry, ToolErrorClass::Conflict, now)
+                .await;
+        }
+        if let Err(refusal) = self.validator.validate(&tool, &intent.arguments) {
+            return self
+                .deny_waiting(&mut entry, refusal.error_class(), now)
+                .await;
+        }
+        let definition = tool.definition.clone();
+        match self
+            .decide(
+                &mut entry,
+                &definition,
+                workspace,
+                principal,
+                run,
+                &intent.arguments,
+                now,
+            )
+            .await?
+        {
+            Decision::Permitted => {
+                let identity = definition.identity.clone();
+                self.apply_permitted(
+                    &mut entry,
+                    &definition,
+                    &identity,
+                    &intent.arguments,
+                    cancel,
+                )
+                .await
+            }
+            Decision::Denied => Ok(ToolCallOutcome::Refused {
+                class: entry.outcome().unwrap_or(ToolErrorClass::PermissionDenied),
+                state: entry.state(),
+            }),
+            Decision::Waiting { approval } => Ok(ToolCallOutcome::WaitingApproval { approval }),
+        }
+    }
+
+    /// Closes a waiting row as denied and reports the refusal.
+    async fn deny_waiting(
+        &self,
+        entry: &mut LedgerEntry,
+        class: ToolErrorClass,
+        at: UtcTimestamp,
+    ) -> Result<ToolCallOutcome, ToolServiceError> {
+        self.transition(entry, ToolCallState::Denied, Some(class), at)
+            .await?;
+        Ok(ToolCallOutcome::Refused {
+            class,
+            state: ToolCallState::Denied,
+        })
     }
 
     /// Marks the decision durably, runs the effect, and records the outcome.
@@ -942,9 +1109,10 @@ impl ToolCallService {
             .map_err(ToolServiceError::Storage)?;
         let grants_read = grants.grants;
         let deny_rules = grants.deny_rules;
-        let approvals = self
-            .approval_records(workspace, principal, &definition.identity)
+        let approved = self
+            .approved_for(workspace, principal, &definition.identity)
             .await?;
+        let approvals: Vec<ApprovalRecord> = approved.iter().map(record_of).collect();
         let effects: BTreeSet<Effect> = definition.effects.iter().copied().collect();
         let scopes: BTreeSet<jarvis_domain::tool::classification::Scope> =
             definition.required_scopes.iter().cloned().collect();
@@ -999,11 +1167,79 @@ impl ToolCallService {
                 // The row carries **no** outcome class here, because a pending call has not been
                 // refused by anything: it is a live request waiting on a person, and stamping it
                 // with a refusal class would make an unanswered prompt read as a decision.
-                self.transition(entry, ToolCallState::WaitingApproval, None, now)
-                    .await?;
+                // A call being **resumed** is already `WaitingApproval`; the edge from a state to
+                // itself is not in the table, and the row correctly keeps waiting on the new prompt.
+                if entry.state() != ToolCallState::WaitingApproval {
+                    self.transition(entry, ToolCallState::WaitingApproval, None, now)
+                        .await?;
+                }
                 Ok(Decision::Waiting { approval })
             }
+            PolicyOutcome::Allow if decision.reasons.contains(&PolicyReason::ApprovalMatched) => {
+                self.spend_approval(entry, &approved, (workspace, principal), digest, now)
+                    .await
+            }
             PolicyOutcome::Allow => Ok(Decision::Permitted),
+        }
+    }
+
+    /// Spends the one-shot approval that let a call through.
+    ///
+    /// **Policy says an approval matched; it does not say which, and it cannot spend one.** The
+    /// consumption belongs here, before the call is reserved: an approval left `Approved` would
+    /// authorize the same action again, which is the difference between one email and two. A
+    /// concurrent call that spent it first makes this write a version conflict, and that call is
+    /// refused rather than allowed to share the approval.
+    async fn spend_approval(
+        &self,
+        entry: &mut LedgerEntry,
+        approved: &[DurableApproval],
+        scope: (WorkspaceId, PrincipalId),
+        digest: ActionDigest,
+        now: UtcTimestamp,
+    ) -> Result<Decision, ToolServiceError> {
+        let (workspace, principal) = scope;
+        // The same four conditions policy matched on, so this picks the approval policy relied on.
+        let Some(matched) = approved.iter().find(|approval| {
+            approval.workspace == workspace
+                && approval.requesting_principal == principal
+                && approval.action_digest == digest
+                && now < approval.expires_at
+        }) else {
+            return Ok(Decision::Permitted);
+        };
+        if !matched.scope.is_consumed_on_use() {
+            return Ok(Decision::Permitted);
+        }
+        let mut spent = matched.clone();
+        let expected = spent.version();
+        let transition = spent
+            .apply(
+                ApprovalState::Consumed,
+                expected,
+                ApprovalActor::Consumed {
+                    tool_call: entry.call_id,
+                },
+                now,
+            )
+            .map_err(|error| ToolServiceError::Internal { code: error.code() })?;
+        match self
+            .approvals
+            .apply_transition(workspace, &transition, expected, &transition.actor, &spent)
+            .await
+        {
+            Ok(_) => Ok(Decision::Permitted),
+            Err(RepositoryError::VersionConflict { .. }) => {
+                self.transition(
+                    entry,
+                    ToolCallState::Denied,
+                    Some(ToolErrorClass::ApprovalRejected),
+                    now,
+                )
+                .await?;
+                Ok(Decision::Denied)
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1066,30 +1302,25 @@ impl ToolCallService {
     /// is scoped to the tool and a principal's whole decision history would grow without bound. The
     /// filter is a **narrowing**, not a decision: policy still re-checks the digest, the workspace,
     /// and the expiry, so a row that slipped through this read could not authorize anything.
-    async fn approval_records(
+    async fn approved_for(
         &self,
         workspace: WorkspaceId,
         principal: PrincipalId,
         identity: &ToolIdentity,
-    ) -> Result<Vec<ApprovalRecord>, ToolServiceError> {
+    ) -> Result<Vec<DurableApproval>, ToolServiceError> {
         let decided = self
             .approvals
             .decided_by(workspace, principal, MAX_APPROVAL_READ)
             .await?;
+        // **Only `Approved` records can authorize anything.** The read returns everything the
+        // principal decided, and the first version of this function turned every one of those into
+        // a record policy could match — a *rejected* approval then read as permission. A spent
+        // approval is `Consumed` and a withdrawn one `Cancelled`, so excluding all but `Approved`
+        // is also what makes a one-shot approval single-use without a second flag.
         Ok(decided
             .into_iter()
-            .filter(|approval| &approval.identity == identity)
-            .map(|approval| ApprovalRecord {
-                identity: approval.identity.clone(),
-                principal: approval.requesting_principal,
-                workspace: approval.workspace,
-                action_digest: approval.action_digest,
-                expires_at: approval.expires_at,
-                // A one-shot approval is spent by the call it authorizes, so a call that already
-                // dispatched it is consumed. The standing case is not consumed by a use, which is
-                // what `is_consumed_on_use` decides — reading the scope rather than assuming
-                // one-shot is what keeps a standing approval from being refused after its first use.
-                consumed: approval.scope.is_consumed_on_use(),
+            .filter(|approval| {
+                &approval.identity == identity && approval.state() == ApprovalState::Approved
             })
             .collect())
     }
@@ -1184,6 +1415,21 @@ impl ToolCallService {
         self.clock
             .now()
             .map_err(|_| ToolServiceError::ClockUnavailable)
+    }
+}
+
+/// Renders an approved approval as the record policy matches against.
+///
+/// `consumed` is always false: an approval that was spent is no longer `Approved`, so reaching this
+/// function already means it has not been.
+fn record_of(approval: &DurableApproval) -> ApprovalRecord {
+    ApprovalRecord {
+        identity: approval.identity.clone(),
+        principal: approval.requesting_principal,
+        workspace: approval.workspace,
+        action_digest: approval.action_digest,
+        expires_at: approval.expires_at,
+        consumed: false,
     }
 }
 

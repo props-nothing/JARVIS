@@ -215,6 +215,8 @@ struct Store {
     /// A double keyed by the caller's string alone would make a retry from one principal collide with
     /// another's fresh call, which is the duplicate the reservation exists to prevent.
     ledger: BTreeMap<ToolCallReservationKey, LedgerEntry>,
+    /// Parked-run resume records, one per run.
+    resumes: BTreeMap<(WorkspaceId, RunId), crate::repository::resume::ResumeRecord>,
 }
 
 /// In-memory implementations of the three repositories over one shared store.
@@ -1930,6 +1932,37 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
                         .cmp(&(right.occurred_at, right.id.to_string()))
                 });
                 Ok(trail)
+            })
+        })
+    }
+}
+
+impl crate::repository::resume::RunResumeRepository for InMemoryRepositories {
+    fn save(&self, record: &crate::repository::resume::ResumeRecord) -> RepositoryFuture<'_, ()> {
+        let record = record.clone();
+        Box::pin(async move {
+            self.with(|store| {
+                store.resumes.insert((record.workspace, record.run), record);
+                Ok(())
+            })
+        })
+    }
+
+    fn load(
+        &self,
+        workspace: WorkspaceId,
+        run: RunId,
+    ) -> RepositoryFuture<'_, Option<crate::repository::resume::ResumeRecord>> {
+        Box::pin(
+            async move { self.with(|store| Ok(store.resumes.get(&(workspace, run)).cloned())) },
+        )
+    }
+
+    fn discard(&self, workspace: WorkspaceId, run: RunId) -> RepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.with(|store| {
+                store.resumes.remove(&(workspace, run));
+                Ok(())
             })
         })
     }
