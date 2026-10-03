@@ -199,10 +199,19 @@ fn compose_provider(
     // record that must stay correct — the composition skips it, so a broken one would sit in the file doing
     // nothing while its author believed it was merely switched off.
     let mcp_servers = layered.mcp.declarations().map_err(|error| error.code())?;
+    // **The file roots are validated here too**: a name that is not a short lowercase slug, a path that is not
+    // absolute, or a repeated name is a configuration fault that fails startup rather than a tool that later
+    // refuses every call. Whether the directory exists is checked when the daemon opens it.
+    let file_roots = layered
+        .tools
+        .files
+        .declarations()
+        .map_err(|error| error.code())?;
     Ok(config
         .with_provider(provider)
         .with_reviewed_deny_rules(reviewed)
         .with_autonomy(layered.tools.autonomy)
+        .with_file_roots(file_roots)
         .with_mcp_servers(mcp_servers))
 }
 

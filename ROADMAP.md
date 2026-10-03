@@ -60,6 +60,11 @@ The remaining gaps against the four hallmarks of a real Jarvis are voice (and so
 presence, and supervised sub-agents; all three are client work over the same daemon, and approvals already have the
 durable, restart-safe, channel-scoped shape a voice or HUD surface needs.
 
+Update 2026-10-03 (Files): JARVIS can now work on files. `[[tools.files.roots]]` declares named directories (read or
+read-write); `files.list`, `files.read` and `files.write` act only inside them through `cap-std` directory handles, with
+reads unprompted and writes asking (or running at `autonomous`), and approval prompts show the path and the start of the
+content so a decision is informed.
+
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or
 create an unverified parallel implementation.

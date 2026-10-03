@@ -385,6 +385,20 @@ run **continues**: the tool runs in the MCP child and the model answers with the
 produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
 a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
 
+## `files-journey.mjs`
+
+Deterministic (no model, no network): a real `jarvisd` and CLI over temporary directories declared as
+`[[tools.files.roots]]`, with a recording fake model that proposes scripted file-tool calls. At `balanced`: a read runs
+with no prompt and its text reaches the model; a write raises a prompt whose preview shows the **path and the start of
+the content**, nothing is written while it is open, and `approve --remember` creates the file and lets the next write run
+without asking; a write into a read-only root and a `../secret.txt` read are refused, and a sentinel file beside the
+root never reaches the model. At `autonomous` a write runs with no prompt, and a profile with no roots is never offered
+a file tool. Removing the writable check fails two journey checks and a unit test.
+
+```bash
+node tests/e2e/files-journey.mjs target/debug
+```
+
 ## `autonomy-journey.mjs`
 
 Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a recording fake model, on

@@ -65,7 +65,8 @@ use jarvis_domain::run::budget::RunBudget;
 use jarvis_domain::time::UtcTimestamp;
 use jarvis_domain::tool::approval::{
     AllowedChannels, ApprovalActor, ApprovalChannel, ApprovalPreview, ApprovalRequestParts,
-    ApprovalScopeKind, ApprovalState, ApprovalSummary, DurableApproval, PreviewItem,
+    ApprovalScopeKind, ApprovalState, ApprovalSummary, DurableApproval, MAX_PREVIEW_ITEMS,
+    PreviewItem,
 };
 use jarvis_domain::tool::call::{ToolArguments, ToolCallIntent, ToolResultBody};
 use jarvis_domain::tool::canonical::{
@@ -165,6 +166,20 @@ pub trait ToolCatalog: Send + Sync {
     ///
     /// Defaults to names alone, so a catalog that knows nothing more is still correct; an implementation
     /// that holds definitions overrides it. The names are exactly [`Self::capabilities`], in the same order.
+    /// Returns the argument rows an approval prompt shows, as `(key, value)` pairs.
+    ///
+    /// **Untrusted model text shown to a person**, so an implementation must bound and sanitize it: the
+    /// rows are rebuilt through `PreviewItem::new`, which refuses control characters, but a catalog that
+    /// renders them is the one that knows which arguments are worth showing. The default shows nothing,
+    /// which is the original behaviour: a prompt about the tool and its effects.
+    fn argument_preview(
+        &self,
+        _definition: &ToolDefinition,
+        _arguments: &ToolArguments,
+    ) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     fn offers(&self) -> Vec<jarvis_domain::model::stream::ToolOffer> {
         self.capabilities()
             .into_iter()
@@ -1454,10 +1469,21 @@ impl ToolCallService {
         .map_err(|_| ToolServiceError::Internal {
             code: "tool.approval_summary_unusable",
         })?;
-        let preview = ApprovalPreview::new(preview_items(definition, arguments)).map_err(|_| {
-            ToolServiceError::Internal {
-                code: "tool.approval_preview_unusable",
+        let mut items = preview_items(definition, arguments);
+        // What the call would act on — the path, the recipient, the first characters of the text — is what
+        // makes the prompt informed consent rather than a prompt about a tool name. The catalog renders it
+        // (it can read JSON; this layer does not), already bounded and stripped of control characters, and
+        // each row is rebuilt through `PreviewItem::new` here so a value that would not pass is dropped.
+        for (key, value) in self.catalog.argument_preview(definition, arguments) {
+            if items.len() >= MAX_PREVIEW_ITEMS {
+                break;
             }
+            if let Ok(item) = PreviewItem::new(&key, &value) {
+                items.push(item);
+            }
+        }
+        let preview = ApprovalPreview::new(items).map_err(|_| ToolServiceError::Internal {
+            code: "tool.approval_preview_unusable",
         })?;
         // The permitted channels are the two this build can actually verify a decision on. A
         // `desktop` or `voice` channel would be a prompt no surface can answer, which is the "no

@@ -4665,8 +4665,19 @@ Dependencies: Milestone 2 exit gate.
   because each needs an artifact store, a step writer, or an external runtime, none of which exists — so
   the row records the *reservation and its outcome* and not the call's payload.
 - [~] `TLS-007` Implement safe reference filesystem read and write-plan tools. **The authorization half
-  is done; the enforcement half is not, and cannot be without a dependency decision — the `~` is the
-  honest state.**
+  is done, and (2026-10-03) the enforcement half now exists for list, read and write; what is still open is
+  the "write-plan" half — a previewed diff — and a Windows symlink and macOS/Linux verification — the `~` is
+  the honest state.**
+  Update 2026-10-03: `files.list@1`, `files.read@1` and `files.write@1` are native tools over operator-declared
+  `[[tools.files.roots]]` (name, absolute path, `read`/`read_write`), enforced by `cap-std` 4.0.3 directory
+  handles (evidence: [filesystem-capability.md](docs/research/integrations/filesystem-capability.md)). The model
+  names a root and a relative path only; shape traversal is refused by the domain, structural escape by the
+  handle (a directory junction out of a root is proved not followed). Reads are `Low` and run unprompted at the
+  default autonomy, writes are `Moderate` and ask (or run at `autonomous`, or under a standing approval), a
+  write never creates directories and never overwrites unless asked, and no root means no tool is offered. The
+  approval prompt now shows the bounded scalar arguments (path, start of content). Proof:
+  `native_tools/files_tests.rs`, `tool_adapters/preview_tests.rs`, and `tests/e2e/files-journey.mjs` on a real
+  daemon (falsified by removing the writable check: two journey checks and a unit test fail).
   Evidence: `jarvis_domain::tool::path_grant` implements the security architecture's filesystem rule —
   *"Canonicalize paths and defend against traversal, symlink/junction/reparse-point races, alternate
   data streams, reserved names, and case differences"* and *"File grants are rooted and mode-specific:

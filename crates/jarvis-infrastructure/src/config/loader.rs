@@ -331,6 +331,89 @@ pub struct ToolsSection {
     /// constraint still wins. A model or a tool cannot change it; only this file can.
     #[serde(default, skip_serializing_if = "is_default_autonomy")]
     pub autonomy: jarvis_domain::tool::policy::AutonomyLevel,
+    /// The directories the file tools may reach.
+    ///
+    /// Empty by default, and **empty means the file tools are not offered at all**: a fresh profile exposes no
+    /// filesystem capability. Each root is a named directory with a mode, and the model can only ever name a
+    /// root and a path inside it.
+    #[serde(default, skip_serializing_if = "FilesSection::is_empty")]
+    pub files: FilesSection,
+}
+
+/// The `[tools.files]` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesSection {
+    /// The declared roots, in the order the tools describe them.
+    #[serde(default)]
+    pub roots: Vec<FileRootSection>,
+}
+
+/// One `[[tools.files.roots]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRootSection {
+    /// The name the model uses: lowercase letters, digits, `_` and `-`, at most 32 characters.
+    pub name: String,
+    /// The absolute directory.
+    pub path: String,
+    /// `read` (the default) or `read_write`.
+    #[serde(default)]
+    pub mode: FileRootMode,
+}
+
+/// What a file root allows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRootMode {
+    /// List and read only.
+    #[default]
+    Read,
+    /// List, read, and create or replace files.
+    ReadWrite,
+}
+
+impl FilesSection {
+    fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// Validates every declared root and returns it in the form the tools use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidFileRoot`] naming the field of the first unusable entry: a name that is
+    /// not a short lowercase slug, a path that is not absolute, or a name used twice. Existence is checked
+    /// when the daemon opens the root, because a directory can appear after the file is read.
+    pub fn declarations(
+        &self,
+    ) -> Result<Vec<crate::native_tools::files::RootDeclaration>, ConfigError> {
+        let mut out: Vec<crate::native_tools::files::RootDeclaration> = Vec::new();
+        for root in &self.roots {
+            let name_ok = !root.name.is_empty()
+                && root.name.len() <= crate::native_tools::files::MAX_ROOT_NAME_LEN
+                && root
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+            if !name_ok {
+                return Err(ConfigError::InvalidFileRoot { field: "name" });
+            }
+            let path = PathBuf::from(&root.path);
+            if !path.is_absolute() || root.path.contains('\0') {
+                return Err(ConfigError::InvalidFileRoot { field: "path" });
+            }
+            if out.iter().any(|existing| existing.name == root.name) {
+                return Err(ConfigError::InvalidFileRoot { field: "name" });
+            }
+            out.push(crate::native_tools::files::RootDeclaration {
+                name: root.name.clone(),
+                path,
+                writable: root.mode == FileRootMode::ReadWrite,
+            });
+        }
+        Ok(out)
+    }
 }
 
 // `serde`'s `skip_serializing_if` calls the predicate with a reference, so the signature is not ours to change.
@@ -1195,5 +1278,71 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
             .expect("absent file must not fail");
         assert_eq!(config, Config::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod files_section_tests {
+    use super::{FileRootMode, FileRootSection, FilesSection};
+    use crate::config::ConfigError;
+
+    fn root(name: &str, path: &str, mode: FileRootMode) -> FileRootSection {
+        FileRootSection {
+            name: name.to_owned(),
+            path: path.to_owned(),
+            mode,
+        }
+    }
+
+    fn absolute() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
+    fn field(section: &FilesSection) -> &'static str {
+        match section.declarations() {
+            Err(ConfigError::InvalidFileRoot { field }) => field,
+            other => unreachable!("expected an invalid root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_roots_carry_their_mode() {
+        let section = FilesSection {
+            roots: vec![
+                root("notes", &absolute(), FileRootMode::ReadWrite),
+                root("docs-2", &absolute(), FileRootMode::Read),
+            ],
+        };
+        let declared = section.declarations().expect("valid");
+        assert!(declared[0].writable);
+        assert!(!declared[1].writable);
+    }
+
+    #[test]
+    fn unusable_entries_are_named_by_field() {
+        for bad in ["", "Upper", "has space", "../x", &"a".repeat(33)] {
+            let section = FilesSection {
+                roots: vec![root(bad, &absolute(), FileRootMode::Read)],
+            };
+            assert_eq!(field(&section), "name", "{bad:?}");
+        }
+        let relative = FilesSection {
+            roots: vec![root("notes", "relative/dir", FileRootMode::Read)],
+        };
+        assert_eq!(field(&relative), "path");
+        let duplicate = FilesSection {
+            roots: vec![
+                root("notes", &absolute(), FileRootMode::Read),
+                root("notes", &absolute(), FileRootMode::ReadWrite),
+            ],
+        };
+        assert_eq!(field(&duplicate), "name");
+    }
+
+    #[test]
+    fn mode_defaults_to_read_only() {
+        let parsed: FileRootSection =
+            toml::from_str("name = \"n\"\npath = \"/x\"").expect("parses");
+        assert_eq!(parsed.mode, FileRootMode::Read);
     }
 }

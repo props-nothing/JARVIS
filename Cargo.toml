@@ -63,6 +63,9 @@ rmcp = { version = "=3.5.0", default-features = false, features = [
 # `aws_lc_rs` is rustls's own default provider; `ring` is not enabled. Trust roots are the compiled-in
 # Mozilla set (`webpki-roots`), so there is no OS trust-store dependency. See
 # `docs/research/integrations/openai-compatible-model.md`, "TLS transport".
+# Capability-based filesystem access for the native file tools. Pinned exactly; no features. See
+# `docs/research/integrations/filesystem-capability.md`.
+cap-std = { version = "=4.0.3", default-features = false }
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["tls12", "aws_lc_rs"] }
 webpki-roots = { version = "=1.0.9" }

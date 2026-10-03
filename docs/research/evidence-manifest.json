@@ -87,6 +87,20 @@
       ]
     },
     {
+      "id": "filesystem-capability",
+      "todos": ["TLS-007"],
+      "evidence": "docs/research/integrations/filesystem-capability.md",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-10-03",
+      "revalidate_by": "2027-01-01",
+      "implementation_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/jarvis-infrastructure/Cargo.toml",
+        "crates/jarvis-infrastructure/src/native_tools/**"
+      ]
+    },    {
       "id": "json-schema-validation",
       "todos": ["TLS-003"],
       "evidence": "docs/research/integrations/json-schema-validation.md",

@@ -152,6 +152,28 @@ This is the one place authority is declared in configuration rather than in a du
 accordingly: it is a ceiling on *what may run unprompted*, visible in one line of the profile, and its widest
 setting still cannot do anything consequential without a person.
 
+### Native File Tools
+
+`files.list@1`, `files.read@1` and `files.write@1` are canonical native tools, so they pass the same validation,
+policy, approval, idempotency and audit pipeline as everything else. They are offered **only** when the profile
+declares at least one root:
+
+```toml
+[[tools.files.roots]]
+name = "notes"                  # lowercase slug, at most 32 characters; the model uses this name
+path = "C:\\Users\\me\\notes"    # absolute; must exist when the daemon starts
+mode = "read_write"             # or "read" (the default)
+```
+
+The model can name a root and a path relative to it, nothing else. A path is refused by shape in the domain
+(`..`, absolute, drive, NUL), and the filesystem containment is enforced structurally by `cap-std` directory
+handles opened once at startup, so a symlink or junction inside a root cannot lead out of it. Reads are bounded
+(128 KiB), writes are bounded (48 KiB), a listing is bounded (200 entries), a write never creates a directory and
+never overwrites unless `overwrite: true`, and a write into a read-only root is refused whatever was approved. Reads
+are `ReadOnly`/`Low` (unprompted at `balanced`); writes are `Write`/`Moderate` (ask at `balanced`, unprompted at
+`autonomous` or under a standing approval). The approval prompt carries the root, path and the start of the content.
+Evidence and the open verification items: [filesystem-capability](../research/integrations/filesystem-capability.md).
+
 ### Grants Are Configuration, Not Code
 
 **A grant is a durable row an operator writes, and this section exists because it was not always so.** For

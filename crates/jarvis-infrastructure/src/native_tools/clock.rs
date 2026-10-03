@@ -5,9 +5,11 @@
 //! itself against a double: it is read-only, low risk, needs no credential, no network, and no new
 //! dependency, and its result is a value a test can assert against the injected clock.
 //!
-//! ## Why this tool, and not a file read
+//! ## Why this tool came first, and not a file read
 //!
-//! It would be more impressive to ship `fs.read` first, and it would also be dishonest. The
+//! (The file tools have since shipped in the sibling `files` module, over `cap-std` directory handles.)
+//!
+//! It would have been more impressive to ship `fs.read` first, and it would also have been dishonest. The
 //! architecture requires a filesystem tool to open files through **open-relative, no-follow**
 //! primitives, because check-then-open has a TOCTOU race that `TLS-007` names explicitly — and those
 //! primitives are `unsafe` FFI this workspace forbids (`unsafe-code = "deny"`) or a `cap-std`-class

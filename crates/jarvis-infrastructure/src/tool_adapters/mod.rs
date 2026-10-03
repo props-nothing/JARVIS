@@ -124,7 +124,68 @@ pub(crate) fn offer_description(purpose: &str) -> String {
         .collect()
 }
 
+/// The most argument rows an approval prompt shows.
+const MAX_PREVIEW_ARGUMENTS: usize = 8;
+/// The longest argument value an approval prompt shows, in characters.
+const MAX_PREVIEW_VALUE_CHARS: usize = 160;
+/// The longest argument name an approval prompt shows, in characters.
+const MAX_PREVIEW_KEY_CHARS: usize = 40;
+
+/// Cleans untrusted text for a prompt row: control characters and runs of whitespace become one space and the
+/// result is cut at `limit` characters, marked with an ellipsis when it was cut.
+fn prompt_text(text: &str, limit: usize) -> String {
+    let cleaned = text
+        .split(|character: char| character.is_control() || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.chars().count() <= limit {
+        return cleaned;
+    }
+    let mut cut: String = cleaned.chars().take(limit).collect();
+    cut.push('…');
+    cut
+}
+
+/// Renders the top-level scalar arguments of a call as `(key, value)` rows for an approval prompt.
+///
+/// Only strings, numbers and booleans are shown, at most [`MAX_PREVIEW_ARGUMENTS`] of them, in key order. A
+/// nested object or array is skipped rather than flattened: the prompt is a summary a person reads in a
+/// glance, and the digest still binds the whole document. A document that is not a JSON object yields nothing.
+pub(crate) fn argument_rows(arguments: &ToolArguments) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(arguments.as_str()) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (key, value) in &map {
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Number(number) => number.to_string(),
+            serde_json::Value::Bool(flag) => flag.to_string(),
+            _ => continue,
+        };
+        let key = prompt_text(key, MAX_PREVIEW_KEY_CHARS);
+        let value = prompt_text(&text, MAX_PREVIEW_VALUE_CHARS);
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        rows.push((format!("arg.{key}"), value));
+        if rows.len() == MAX_PREVIEW_ARGUMENTS {
+            break;
+        }
+    }
+    rows
+}
+
 impl ToolCatalog for RegistryCatalog {
+    fn argument_preview(
+        &self,
+        _definition: &ToolDefinition,
+        arguments: &ToolArguments,
+    ) -> Vec<(String, String)> {
+        argument_rows(arguments)
+    }
+
     fn resolve(&self, _workspace: WorkspaceId, capability: &str) -> Option<ResolvedTool> {
         // The scope is **accepted and not yet a filter**, and saying so here is better than a
         // signature that omits it: a catalog that could not receive a workspace could never be
@@ -688,3 +749,6 @@ pub mod routing;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod preview_tests;

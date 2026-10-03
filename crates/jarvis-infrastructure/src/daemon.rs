@@ -90,6 +90,8 @@ pub struct DaemonConfig {
     /// narrow behaviour rather than silently widening what runs unprompted. The shipped daemon states it
     /// from the configuration, whose own default is `balanced`.
     autonomy: jarvis_domain::tool::policy::AutonomyLevel,
+    /// The file roots the profile declares, already validated. Empty means no file tool is offered.
+    file_roots: Vec<crate::native_tools::files::RootDeclaration>,
 }
 
 /// `Debug` is hand-written because the provider is a trait object: a derived implementation would
@@ -142,7 +144,24 @@ impl DaemonConfig {
             // without one — the native tools are the whole catalog in that case.
             mcp_servers: Vec::new(),
             autonomy: jarvis_domain::tool::policy::AutonomyLevel::Ask,
+            file_roots: Vec::new(),
         }
+    }
+
+    /// Supplies the file roots the profile declares.
+    #[must_use]
+    pub fn with_file_roots(
+        mut self,
+        roots: Vec<crate::native_tools::files::RootDeclaration>,
+    ) -> Self {
+        self.file_roots = roots;
+        self
+    }
+
+    /// Returns the declared file roots.
+    #[must_use]
+    pub fn file_roots(&self) -> &[crate::native_tools::files::RootDeclaration] {
+        &self.file_roots
     }
 
     /// Supplies the autonomy level the profile declares.
@@ -716,7 +735,10 @@ pub async fn start(
     // **One router, carrying whatever kinds the daemon can actually serve.** A profile with no `[mcp]` table
     // registers only `Native`, which is the common path — so the MCP kind appears only when a server composed,
     // and a router advertising a source it cannot serve is never built.
-    let executor = router_over(&clock, mcp.servers());
+    // The file roots are opened once, here, with the operator's own ambient authority; the tools hold only
+    // the directory capabilities from then on. A declared root that cannot be opened fails startup.
+    let file_roots = open_file_roots(config.file_roots())?;
+    let executor = router_over(&clock, mcp.servers(), file_roots.as_ref());
     // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_with` for why
     // composing it twice would let a grant written through one surface be invisible to the pipeline the
     // other resolves against.
@@ -728,14 +750,14 @@ pub async fn start(
     // the result here. What is true is narrower and worth stating: the *default* profile ships no refusals, so
     // every existing configuration loads unchanged, and the stored deny rules an operator writes through
     // `/api/v1/tool-grants/deny-rules` reach the evaluator independently from the same store handle.
-    let mcp_tools = mcp_catalog_tools(&mcp);
     let (tools, tool_grants) = tool_fabric_with(
         database.pool().clone(),
         config.reviewed_deny_rules().to_vec(),
         Arc::new(executor),
         clock,
-        mcp_tools,
+        mcp_catalog_tools(&mcp),
         config.autonomy(),
+        file_roots.as_ref(),
     )?;
     let ports = run_ports(
         Arc::clone(&repositories),
@@ -1116,6 +1138,7 @@ pub(crate) fn tool_fabric_with(
     clock: Arc<dyn jarvis_domain::clock::Clock>,
     extra_tools: Vec<jarvis_application::tool_call::ResolvedTool>,
     autonomy: jarvis_domain::tool::policy::AutonomyLevel,
+    files: Option<&crate::native_tools::files::FileRoots>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -1129,7 +1152,7 @@ pub(crate) fn tool_fabric_with(
     use jarvis_application::tool_call::ToolCallService;
     use jarvis_application::tool_grant_service::ToolGrantService;
 
-    let definitions = crate::native_tools::definitions().map_err(|_| {
+    let definitions = crate::native_tools::definitions_with(files).map_err(|_| {
         // A construction refusal from a reviewed definition is a packaging defect, reported as a
         // config fault so an operator knows to look at the build rather than at the request.
         StartupError::Config
@@ -1195,6 +1218,27 @@ pub(crate) fn tool_fabric_with(
     Ok((pipeline, surface))
 }
 
+/// Opens the declared file roots, or `None` when the profile declares none.
+///
+/// # Errors
+///
+/// Returns [`StartupError::Config`] when a declared directory cannot be opened or a name repeats: a file tool
+/// offered over a root that is not there would fail on every call, and a silently missing root is a fault an
+/// operator should see at startup rather than discover through a model's failed calls.
+fn open_file_roots(
+    declared: &[crate::native_tools::files::RootDeclaration],
+) -> Result<Option<crate::native_tools::files::FileRoots>, StartupError> {
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    crate::native_tools::files::FileRoots::open(declared)
+        .map(Some)
+        .map_err(|error| {
+            log::error!("a declared file root could not be opened: {error:?}");
+            StartupError::Config
+        })
+}
+
 /// Builds the executor the pipeline dispatches through: native, plus the MCP kind when servers composed.
 ///
 /// **One router whatever the profile declares.** With no `[mcp]` table this is the native-only router, which
@@ -1212,12 +1256,16 @@ pub(crate) fn tool_fabric_with(
 pub(crate) fn router_over(
     clock: &Arc<dyn jarvis_domain::clock::Clock>,
     servers: &[crate::mcp::composition::ComposedMcpServer],
+    files: Option<&crate::native_tools::files::FileRoots>,
 ) -> crate::tool_adapters::routing::RoutingExecutor {
     use crate::tool_adapters::routing::RoutingExecutor;
     use jarvis_domain::tool::identity::SourceKind;
 
-    let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> =
-        Arc::new(crate::native_tools::NativeExecutor::new(Arc::clone(clock)));
+    let mut native_executor = crate::native_tools::NativeExecutor::new(Arc::clone(clock));
+    if let Some(roots) = files {
+        native_executor = native_executor.with_files(roots.clone());
+    }
+    let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> = Arc::new(native_executor);
     if servers.is_empty() {
         return RoutingExecutor::new([(SourceKind::Native, native)]);
     }
@@ -1764,7 +1812,7 @@ mod tests {
         use jarvis_domain::tool::identity::SourceKind;
 
         let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
-        let routed = super::router_over(&clock, &[]).routed_kinds();
+        let routed = super::router_over(&clock, &[], None).routed_kinds();
         assert_eq!(
             routed,
             vec![SourceKind::Native],
@@ -1844,7 +1892,7 @@ mod tests {
         use jarvis_application::tool_call::ToolExecutor as _;
 
         let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
-        let router = super::router_over(&clock, &[]);
+        let router = super::router_over(&clock, &[], None);
         // The canonical definition the catalog offers, so the identity is the one a real dispatch carries
         // rather than a fixture that happens to satisfy the lookup.
         let definition = crate::native_tools::definitions()

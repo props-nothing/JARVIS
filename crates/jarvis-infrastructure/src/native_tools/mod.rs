@@ -24,6 +24,7 @@
 //! *different* tool and, with no arm for it, is refused rather than answered by `@1`.
 
 pub mod clock;
+pub mod files;
 
 use jarvis_application::tool_call::{
     ToolExecutionError, ToolExecutionFuture, ToolExecutionRequest, ToolExecutor,
@@ -89,10 +90,24 @@ impl Definition {
 /// Returns a construction refusal when a reviewed definition is inconsistent — a typo in a schema or
 /// a version whose major disagrees with its capability.
 pub fn definitions() -> Result<Vec<Definition>, jarvis_domain::error::DomainError> {
-    Ok(vec![Definition::build(
-        clock::definition,
-        clock::INPUT_SCHEMA,
-    )?])
+    definitions_with(None)
+}
+
+/// As [`definitions`], plus the file tools when roots are configured.
+///
+/// With `None` — the default profile — no filesystem capability is offered at all.
+///
+/// # Errors
+///
+/// Returns a construction refusal when a reviewed definition is inconsistent.
+pub fn definitions_with(
+    files: Option<&files::FileRoots>,
+) -> Result<Vec<Definition>, jarvis_domain::error::DomainError> {
+    let mut all = vec![Definition::build(clock::definition, clock::INPUT_SCHEMA)?];
+    if let Some(roots) = files {
+        all.extend(files::definitions(&roots.info())?);
+    }
+    Ok(all)
 }
 
 /// The catalog of native tools, ready for the tool-call service.
@@ -120,6 +135,8 @@ pub fn catalog() -> Result<Vec<ResolvedTool>, jarvis_domain::error::DomainError>
 #[derive(Clone)]
 pub struct NativeExecutor {
     clock: std::sync::Arc<dyn Clock>,
+    /// The opened file roots, when the profile declares any. `None` means a file capability is refused.
+    files: Option<files::FileRoots>,
 }
 
 impl std::fmt::Debug for NativeExecutor {
@@ -136,7 +153,14 @@ impl NativeExecutor {
     /// Builds an executor over `clock`.
     #[must_use]
     pub fn new(clock: std::sync::Arc<dyn Clock>) -> Self {
-        Self { clock }
+        Self { clock, files: None }
+    }
+
+    /// Returns this executor serving the file tools over `roots`.
+    #[must_use]
+    pub fn with_files(mut self, roots: files::FileRoots) -> Self {
+        self.files = Some(roots);
+        self
     }
 
     /// Returns whether this executor implements `identity`.
@@ -145,7 +169,8 @@ impl NativeExecutor {
     /// offers and this answers cannot disagree — the drift one-list-per-tool would permit.
     #[must_use]
     pub fn supports(identity: &ToolIdentity) -> bool {
-        identity.capability.to_string() == clock::CAPABILITY
+        let capability = identity.capability.to_string();
+        capability == clock::CAPABILITY || files::is_file_tool(&capability)
     }
 
     /// Returns the capability this executor refuses, for its own fail-closed assertion.
@@ -170,7 +195,26 @@ impl ToolExecutor for NativeExecutor {
             if cancel.is_cancelled() {
                 return Err(ToolExecutionError::Cancelled);
             }
-            match request.identity.capability.to_string().as_str() {
+            let capability = request.identity.capability.to_string();
+            if files::is_file_tool(&capability) {
+                // **Blocking filesystem work runs off the async threads**, and a file tool is refused when no
+                // root was composed — the catalog does not offer one then, so reaching here is a call to a
+                // capability this daemon never advertised.
+                let Some(roots) = self.files.clone() else {
+                    return Err(ToolExecutionError::Failed(ToolErrorClass::NotFound));
+                };
+                let arguments = request.arguments.as_str().to_owned();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    files::execute(&roots, &capability, &arguments)
+                })
+                .await;
+                return match outcome {
+                    Ok(Some(result)) => result,
+                    Ok(None) => Err(ToolExecutionError::Failed(ToolErrorClass::NotFound)),
+                    Err(_) => Err(ToolExecutionError::Failed(ToolErrorClass::ProviderError)),
+                };
+            }
+            match capability.as_str() {
                 clock::CAPABILITY => read_clock(self.clock.as_ref(), request.arguments),
                 // **A capability with no arm is refused, never answered.** An executor that returned
                 // an empty success for an unknown capability would make every catalog entry look

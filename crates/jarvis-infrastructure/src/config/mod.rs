@@ -92,6 +92,15 @@ pub enum ConfigError {
         /// The field that was rejected. The value is never included, because a name is operator text.
         field: &'static str,
     },
+    /// A declared file root is unusable.
+    ///
+    /// Its own variant for the reason `InvalidMcpServer` has one: an operator reading a deny-rule code about a
+    /// file root would go and look at the wrong table.
+    #[error("a declared file root names an unusable field")]
+    InvalidFileRoot {
+        /// The field that was rejected. The value is never included, because a path is operator text.
+        field: &'static str,
+    },
 }
 
 impl ConfigError {
@@ -110,6 +119,7 @@ impl ConfigError {
             Self::Write { .. } => "jarvis.config_write",
             Self::InvalidToolDenyRule { .. } => "jarvis.config_tool_deny_invalid",
             Self::InvalidMcpServer { .. } => "jarvis.config_mcp_invalid",
+            Self::InvalidFileRoot { .. } => "jarvis.config_file_root_invalid",
         }
     }
 
@@ -128,7 +138,8 @@ impl ConfigError {
             | Self::InvalidToolDenyRule { .. }
             // A declaration an operator wrote is wrong until they change it, so a retry reads the same
             // document and fails identically.
-            | Self::InvalidMcpServer { .. } => false,
+            | Self::InvalidMcpServer { .. }
+            | Self::InvalidFileRoot { .. } => false,
         }
     }
 }
