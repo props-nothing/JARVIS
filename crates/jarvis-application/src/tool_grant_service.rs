@@ -45,6 +45,80 @@ use crate::repository::tool_grant::{
 use crate::request_context::RequestContext;
 use crate::tool_call::ToolCatalog;
 
+/// The dimension on which a grant would widen the tool it names.
+///
+/// **A typed enum rather than a carried field name, and the difference is a defect this replaced.** The
+/// service used to hold `Widens { code: &'static str }` and put the *repository's* field name in it, so
+/// `code()` returned a bare `grant_scope` — which is not in one of JARVIS's owned namespaces, so
+/// `ErrorEnvelope::new` **replaced it with `jarvis.internal` at the emission boundary**. The four
+/// `tool.grant_*` widening codes this contract documents were therefore unreachable, and an operator who
+/// asked for too much risk was told the daemon had an internal error.
+///
+/// Nothing caught it, and the reason is worth stating: the scan that asserts every emitted code has a
+/// contract-table row reads **owned string literals**, and the value here was an owned literal read from
+/// a *different* crate's `what` field, arriving through a `String` parameter. A concatenated or
+/// passed-through code is structurally invisible to that scan, so the guard was never wrong — its subject
+/// was simply not a literal in the file it reads. Typing the dimension removes the possibility: no value
+/// outside this enum can be a widening, so no code outside the namespace can be emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantWidening {
+    /// A scope the tool does not declare.
+    Scope,
+    /// An effect the tool does not declare.
+    Effect,
+    /// A risk ceiling above the tool's own risk.
+    RiskCeiling,
+    /// A sensitivity ceiling above the tool's input sensitivity.
+    SensitivityCeiling,
+}
+
+impl GrantWidening {
+    /// Returns the stable, namespaced code a client branches on.
+    ///
+    /// Each is an **owned literal in this file**, so the code-table scan sees it and a row must exist —
+    /// which is what makes the four codes reachable *and* checked rather than merely documented.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Scope => "tool.grant_scope",
+            Self::Effect => "tool.grant_effect",
+            Self::RiskCeiling => "tool.grant_risk_ceiling",
+            Self::SensitivityCeiling => "tool.grant_sensitivity_ceiling",
+        }
+    }
+
+    /// Maps the repository's own field name onto a widening.
+    ///
+    /// Returns `None` for a name this service does not model, and the caller reports `Storage` rather than
+    /// inventing a code — the fail-closed direction, because a `what` the service cannot name is either a
+    /// store bug or a field added without a decision here, and neither should reach a client as a refusal
+    /// shape that says "you asked for too much".
+    ///
+    /// The names are the ones `NewToolGrant::narrowing` emits, and each is spelled here rather than derived
+    /// from the field with a prefix rule, so adding a widening dimension forces a decision in this match.
+    #[must_use]
+    pub fn from_field(field: &str) -> Option<Self> {
+        match field {
+            "grant_scope" => Some(Self::Scope),
+            "grant_effect" => Some(Self::Effect),
+            "grant_risk_ceiling" => Some(Self::RiskCeiling),
+            "grant_sensitivity_ceiling" => Some(Self::SensitivityCeiling),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for GrantWidening {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Scope => "the grant confers a scope the tool does not declare",
+            Self::Effect => "the grant permits an effect the tool does not declare",
+            Self::RiskCeiling => "the grant's risk ceiling is above the tool's own risk",
+            Self::SensitivityCeiling => "the grant's sensitivity ceiling is above the tool's input",
+        })
+    }
+}
+
 /// What a caller asks a grant to be.
 ///
 /// **A request rather than the stored type**, so the wire shape and the stored shape can differ where they
@@ -88,10 +162,10 @@ pub enum GrantServiceError {
     UnknownEffect,
     /// The requested scope is not a usable scope string.
     InvalidScope,
-    /// The grant would widen the tool, and the field that widened is named by the code.
+    /// The grant would widen the tool, and the dimension that widened is named by the variant.
     Widens {
-        /// The stable code naming the field that widened.
-        code: &'static str,
+        /// The dimension that widened.
+        widening: GrantWidening,
     },
     /// A version was named and no grant exists for that capability.
     NotFound,
@@ -124,8 +198,9 @@ impl GrantServiceError {
             Self::UnknownTool => "tool.grant_unknown_tool",
             Self::UnknownEffect => "tool.grant_unknown_effect",
             Self::InvalidScope => "tool.grant_invalid_scope",
-            // A widening carries the repository's own field name, so the two spellings cannot disagree.
-            Self::Widens { code } => code,
+            // Through the variant's own accessor, so the code and the dimension cannot disagree and every
+            // value is an owned literal this file carries.
+            Self::Widens { widening } => widening.code(),
             Self::NotFound => "tool.grant_not_found",
             Self::AlreadyExists => "tool.grant_exists",
             Self::VersionConflict { .. } => "tool.grant_version_conflict",
@@ -153,7 +228,10 @@ impl std::fmt::Display for GrantServiceError {
             Self::UnknownTool => "the named tool is not registered",
             Self::UnknownEffect => "the named effect is not one the contract defines",
             Self::InvalidScope => "a named scope is not a usable scope",
-            Self::Widens { code } => code,
+            // The dimension's own sentence rather than its code: this is the human summary, and the code is
+            // what a client branches on. Rendering the code here is what the old carried-field version did,
+            // which is how a bare `grant_scope` reached an operator's screen.
+            Self::Widens { widening } => return write!(formatter, "{widening}"),
             Self::NotFound => "no grant exists for that tool",
             Self::AlreadyExists => "a grant already exists for that tool",
             Self::VersionConflict { .. } => "the grant was modified concurrently",
@@ -183,7 +261,16 @@ impl From<RepositoryError> for GrantServiceError {
                 what: "deny_reason" | "deny_rule",
             } => Self::InvalidDenyRule,
             RepositoryError::Conflict { what } if what.starts_with("grant_") => {
-                Self::Widens { code: what }
+                // Through the typed mapping rather than by carrying the field name: see [`GrantWidening`]
+                // for the defect that made the four documented `tool.grant_*` codes unreachable.
+                match GrantWidening::from_field(what) {
+                    Some(widening) => Self::Widens { widening },
+                    // A `grant_*` field this service does not model. Reported as storage, because the honest
+                    // statement is "the store refused a write for a reason I cannot name" — and inventing a
+                    // refusal shape would tell an operator they asked for too much when nothing established
+                    // that they did.
+                    None => Self::Storage,
+                }
             }
             _ => Self::Storage,
         }

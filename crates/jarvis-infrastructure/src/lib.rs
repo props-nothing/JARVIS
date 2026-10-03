@@ -17,6 +17,7 @@ pub mod http;
 pub mod ids;
 pub mod install;
 pub mod lifecycle;
+pub mod mcp;
 pub mod model_providers;
 pub mod native_tools;
 pub mod paths;

@@ -240,6 +240,46 @@ projection that swapped the two would fail rather than pass by coincidence.
   with `left: Pending, right: Expired`. A response-only assertion would be satisfied by a surface that
   hid the row while leaving it `pending`, which is the state that makes a dead prompt reappear.
 
+## `tool-grant-cli-journey.mjs`
+
+Proves the `jarvis grants` command drives a **real** `jarvisd`. Every other harness here speaks HTTP
+directly, because it is testing a *surface*; this one runs the shipped `jarvis` binary, because the thing
+under test **is the client** — whether an operator can drive tool authorization from the product. `TLS-015`
+recorded that as absent ("no CLI commands for the surface yet"), and a harness that spoke HTTP would prove
+the routes work — which the other journeys already do — while leaving the command unexercised.
+
+Eight checks: `grants list` reaches the composed service rather than answering `service.not_ready`;
+`grants create` writes a grant and prints the stored row; `grants replace` **succeeds** and advances the
+version; a stale version is a conflict carrying `tool.grant_version_conflict`; `grants revoke` withdraws the
+row and keeps it for audit; `grants deny add` stores a refusal the listing shows with its reason;
+`grants deny remove` takes it away; and a run completes while a refusal is in force, so a refusal is an
+observation rather than a run fault.
+
+The CLI's own unit tests assert the *request builders* — the query string, each verb's body shape, the
+inverted `--workspace` flag. They cannot prove the daemon accepts those bytes, and this harness is what does.
+
+### What this harness found
+
+- **`PATCH` was unreachable, and no test of any kind had invoked `replace_tool_grant`.** The route reads
+  `expected_version` from the body and hands the body to a shared parse typed as `WriteToolGrantRequest` —
+  which carries `#[serde(deny_unknown_fields)]` and does not model the field. So the one body the route
+  *required* was the one body its own parse refused, and every replace answered `400 request.invalid`. It
+  survived because the route was asserted to **exist** (a compile-time guarantee) and each code it can emit
+  was asserted to be in the contract table, and both were true of a handler that could never succeed. This is
+  `TLS-018`'s lesson one layer out: a route's existence is not its reachability, and a command's is not
+  either.
+- **A widening refusal was reported as `jarvis.internal`.** The service carried the *repository's* field name
+  (`grant_scope`) into `Widens { code }`, and a bare `grant_scope` is in no owned namespace, so the envelope
+  constructor replaced it — the four `tool.grant_*` widening codes the contract documents could never be
+  sent, and an operator who asked for too much risk was told the daemon had an internal error. The code-table
+  scan reads **owned string literals**, and this value arrived as a `String` from another crate's `what`
+  field, so it was structurally invisible to the guard. `GrantWidening` is now a typed enum whose codes are
+  literals in the service.
+- **The refusal format is a code and an advice line, not the daemon's envelope.** A non-2xx from the
+  transport arrives as `ClientError::Rejected { status, code }` rather than as a body, so the CLI prints
+  `error: <code>` and discards `message`/`request_id`. The first version of this harness parsed JSON out of
+  stderr and saw `null`; reading the line is what the client actually emits.
+
 ## `provider-smoke.mjs`
 
 Proves Milestone 2's exit gate — *"a gated real-provider smoke test streams a response"* — and it is

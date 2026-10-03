@@ -434,6 +434,47 @@ pub async fn get_with_status(
     request(discovered, "GET", path, &request_headers, None).await
 }
 
+/// Sends an authenticated request with an **explicit method** and an optional JSON body.
+///
+/// **One method-agnostic sender rather than a wrapper per verb.** The CLI's surface already reaches
+/// `GET` and `POST` through the two helpers above; the tool-authorization routes add `PUT`, `PATCH`, and
+/// `DELETE`, and five near-identical wrappers would be five places the loopback check, the timeout, the
+/// header block, and the body framing could come to differ. The method is a parameter here and every
+/// other check is inherited from [`request`], which is the single implementation.
+///
+/// The method is **not** validated against a list. A caller naming a verb the daemon does not serve
+/// receives the daemon's own `405`-shaped refusal rather than a client-side guess at which verbs exist,
+/// and the client is not the authority on the routes — the server is.
+///
+/// # Errors
+///
+/// As [`post_authenticated`].
+pub async fn send_authenticated(
+    discovered: &Discovered,
+    credential: &str,
+    method: &str,
+    path: &str,
+    api_major: u32,
+    extra_headers: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), ClientError> {
+    // The body framing is decided by whether a body was supplied rather than by the method: a `GET`
+    // with no body and a `DELETE` with no body must produce the same headers, and a `PUT` with `""`
+    // is a body of zero bytes that must still carry `Content-Length: 0` rather than look absent.
+    let request_headers = match body {
+        Some(body) => format!(
+            "{}{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\n",
+            authenticated_headers(credential, api_major),
+            body.len()
+        ),
+        None => format!(
+            "{}{extra_headers}",
+            authenticated_headers(credential, api_major)
+        ),
+    };
+    request(discovered, method, path, &request_headers, body).await
+}
+
 /// Builds the headers for an authenticated request.
 ///
 /// Kept as a named function so the test can assert the credential is present here

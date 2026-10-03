@@ -4760,6 +4760,172 @@ Dependencies: Milestone 2 exit gate.
   - **Still not done:** the layer provenance above; `agent_runs.result_ref`/`error_ref` and
     `plan_summary_ref` (each needs a producer that does not exist).
 - [ ] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
+  - **Refresh half: DONE.** `docs/research/integrations/mcp.md` was re-derived from the **normative
+    changelog and deprecated registry** instead of the spec landing page, and the manifest entry was
+    moved to `last_verified 2026-10-03` / `revalidate_by 2027-04-03`. Eight statements in the
+    `2026-09-20` note were false, and each named a method or transport an adapter would otherwise have
+    been written against: the `initialize`/`notifications/initialized` handshake (**removed**; the
+    protocol is stateless and every request carries version and capabilities in `_meta`, SEP-2575);
+    `resources/subscribe` plus the HTTP GET stream (**replaced** by `subscriptions/listen`,
+    SEP-2575); Tasks as a core feature (**moved** to the `io.modelcontextprotocol/tasks` extension,
+    `tasks/result` → `tasks/get` polling, `tasks/list` removed, SEP-2663); Elicitation as a
+    server-initiated request (**replaced** by Multi Round-Trip Requests, SEP-2322); Sampling and
+    Elicitation as supported client features (**deprecated**, SEP-2577); no mention of caching
+    (`ttlMs`/`cacheScope`, SEP-2549) or the required `Mcp-Method`/`Mcp-Name` headers (SEP-2243); and
+    `ping`/`logging/setLevel` (**removed**, SEP-2575). The note also gained the error-code renumbering
+    (`HeaderMismatch` `-32001`→`-32020`, `MissingRequiredClientCapability` `-32003`→`-32021`,
+    `UnsupportedProtocolVersion` `-32004`→`-32022`, and resource-not-found `-32002`→`-32602`).
+  - **The dependency is now pinned from the published manifest, not from a README.** `rmcp 3.5.0`
+    (published 2026-09-28), license `Apache-2.0`, `rust-version 1.88`, edition 2024. The license
+    changed at `3.0.0` (MIT → Apache-2.0; `MIT/Apache-2.0` through `2.2.0`), so the terms are recorded
+    for the pinned version rather than inherited. `rmcp`'s default features are `base64`, `macros`,
+    `server`, so a client-only build must disable `server` explicitly.
+  - **Both open questions were answered at the SDK level rather than assumed.** The pinned version is
+    `3.5.0`; and the legacy HTTP+SSE transport is not reachable, because the `transport-sse-*` features
+    the crate had through `0.10.0` are gone from `3.x` — so a `2024-11-05` HTTP+SSE peer **cannot be
+    served by this SDK at all**, which is a stronger statement than the note's "initial non-goal".
+  - **Build-verified, so the gate is now open.** The one outstanding prerequisite
+    was discharged on 2026-10-03: a throwaway crate in the gitignored `.scratch/`
+    directory, declaring `rmcp = { version = "=3.5.0", default-features = false,
+    features = ["client","transport-io","transport-child-process",
+    "transport-streamable-http-client-reqwest","schemars"] }`, compiled `rmcp
+    v3.5.0` with the `server` feature **off**, and a signature naming each
+    transport type compiled too — which is the difference between "the type is
+    documented" and "the type exists behind the selected features".
+    `MCP-C002` is therefore `VERIFIED`, the note reads
+    `Implementation gate: PASSED`, and the manifest entry is now
+    `IMPLEMENTATION_READY` / `implementation_ready: true` (the validator enforces
+    those three moving together).
+  - **The build falsified four assumptions about the API**, each of which changes
+    the adapter's shape: `rmcp` needs a **Tokio runtime to construct a
+    transport** (calling `TokioChildProcess::new` outside one panics inside the
+    SDK at `transport/worker.rs:229` with "there is no reactor running");
+    `TokioChildProcess::new` takes a `tokio::process::Command`, **not**
+    `std::process::Command` (no `From` impl for `process_wrap`'s `CommandWrap`);
+    `AsyncRwTransport` is generic over **three** parameters (`Role`, `R`, `W`)
+    with `new_client(read, write)`; and **`chrono` is in the SDK's public model
+    surface** (`Annotated`), so the adapter must convert to `jiff` at its
+    boundary rather than let `jarvis-domain`'s clock type change.
+    Resolved transitives: `tokio 1.53.1`, `reqwest 0.13.5`, `process-wrap
+    10.0.1`, `schemars 1.2.2`, plus `sse-stream 0.2.6`.
+  - **Implementation half, first slice: DONE.** `crates/jarvis-infrastructure/src/mcp/` now holds
+    the **normalization layer** — MCP tool metadata to canonical `ToolDefinition` — with 18 tests.
+    It is pure and does no I/O, following the `openai_compatible` precedent that every
+    provider-shaped trap lives in the mapping, so the socket is a separate concern. `jarvis-domain`
+    is untouched: it still has no MCP or `rmcp` dependency, satisfying the architecture rule that
+    provider types are normalized at the adapter boundary.
+  - **Four untrusted-input rules, each with a test that can fail.** (1) A server's annotations can
+    propose but never permit: nothing here ever produces `ApprovalHint::Allow`, so a lying
+    `readOnlyHint` buys a `ReadOnly` label and still waits for an explicit decision. Falsified by
+    mutating `Ask` → `Allow` (3 tests die, including
+    `a_server_cannot_annotate_its_tool_out_of_an_approval_prompt`). (2) A tool name is **refused, not
+    transformed** — never lowercased, trimmed, or de-punctuated, because a repair that mapped two
+    distinct offered names onto one capability would defeat the canonical form. Falsified by mutating
+    `capability_for` to lowercase, which kills `an_unusable_tool_name_is_refused_rather_than_transformed`.
+    (3) A schema using a keyword this workspace does not implement is refused rather than weakened,
+    because dropping it would validate less than the server asked for while reporting success.
+    (4) Contradictory annotations (`readOnlyHint` **and** `openWorldHint`) are refused rather than
+    trimmed, since `Effect::ReadOnly` may not combine with another effect.
+  - **Two defects the build found, both of the "looks right, refuses everything" kind.**
+    `ToolCapability`'s **namespace is a single segment** — lowercase letters, digits, underscores —
+    while a *server name* is validated by a looser owner rule that permits hyphens and dots
+    (`brave-search`, `google.gmail`). Using the server name as the namespace therefore refused every
+    legitimately-named server; "fixing" it by replacing `-` with `_` would have been exactly the
+    silent transformation rule (2) forbids. The namespace is now a constant (`mcp`) and the server is
+    the `ToolSource` **owner**, so the server is not lost — two servers offering `read_file` produce
+    one capability but **two identities**, and `ToolIdentity::authorizes` requires all three
+    components, so a grant for one does not cover the other.
+  - **A variant that could never be constructed, removed.** `McpToolRejection::ToolNameTooLong` was
+    written for names too long to be a display name, but the segment rule is strictly narrower
+    (64 bytes of lowercase alphanumerics/underscores against the display rule's 128 bytes of anything
+    control-character-free), so the branch was **unreachable**. It is removed rather than left as a
+    guarantee that cannot fire, and replaced with two bounds that can: a description over
+    `MAX_MCP_PURPOSE_BYTES` and a listing past `MAX_MCP_TOOLS` are both refused individually, so an
+    operator sees how many tools were dropped instead of finding a silently shorter catalog.
+  - **`rmcp` is now a workspace dependency, added by review rather than by assumption.** Pinned
+    exactly at `=3.5.0`, `default-features = false`, with only `client`, `transport-io`, and
+    `transport-child-process`. **The Streamable HTTP transport is deliberately not enabled**: it
+    would add a TLS stack this workspace does not otherwise have (an inspection of `Cargo.lock` finds
+    no `rustls`, `native-tls`, `openssl`, or `ring`), and the `openai_compatible` adapter already
+    records the same posture by refusing non-loopback endpoints. A measured stdio-only build pulls in
+    **no HTTP client at all** — no `reqwest`, `hyper`, `tower-http`, or `rustls`. The `server` feature
+    is off because JARVIS is an MCP client here.
+  - **Second slice: outcomes and errors, `mcp/outcome.rs` (+18 tests, 36 total in the module).**
+    This normalizes what a server *returns* rather than what it *offers*, and it gives three reviewed
+    canonical types their **first production consumer** — `ToolResultBody`, `ContentBlock`, and
+    `ToolErrorClass` were previously reachable from tests alone, the same "reachable from tests alone"
+    gap `tool_schema` records about itself in `TLS-003`. The reason it matters is the retry decision:
+    `ToolErrorClass::retryable_for` is the one place that answers whether a repeat may duplicate an
+    effect.
+  - **The load-bearing distinction is `TransportSend` versus `TransportClosed`.** A send failure means
+    the request never left, so retrying cannot duplicate an effect (`Unavailable`, posture `Safe`); a
+    closed transport means it may have been delivered and executed, because `2026-07-28` removed SSE
+    resumability, so the outcome is **unsettled** and the class is `ProviderError` /
+    `OnlyIfIdempotent`. Collapsing them makes an at-most-once call look safely repeatable; the mutant
+    that collapses them is killed by
+    `a_closed_transport_is_unsettled_and_a_send_failure_is_not`.
+  - **A defect found by reading a constructor, not by a failing test.** `CallToolResult::success`
+    sets `is_error: Some(false)` (my first test asserted `is_none`), and reading that constructor is
+    what surfaced the larger gap: `tools/call` answers with `CallToolResponse`, which has **three**
+    variants — `Complete`, `InputRequired` (the MRTR pattern), and `Task`. Only one is a result.
+    `normalize_call_response` now dispatches on the kind and **refuses** the other two by name, so
+    "MRTR is not implemented yet" cannot look like "the call succeeded". The mutant that reads
+    `InputRequired` as a failure instead of refusing it is killed by
+    `an_incomplete_response_is_refused_rather_than_read_as_a_result`.
+  - **Non-text content is refused rather than coerced.** JARVIS has no artifact store, so there is
+    nothing honest to map a base64 image or blob to; inlining base64 into a text block would push an
+    unbounded, useless payload into a model's context, and fabricating an artifact id would invent a
+    reference that cannot be resolved. Each kind is refused **by name** (`image`, `audio`,
+    `blob_resource`, `resource_link`) so the limitation is visible. A text resource maps, because it
+    *is* its text; a resource *link* does not, because presenting a URI as the thing it points at is
+    the conflation the artifact indirection exists to prevent. `structuredContent` is mapped as a
+    JSON block ahead of the text blocks, since that is the field a `2026-07-28` server is directed to
+    use for a machine-readable result.
+  - **A server's prose never becomes a policy input.** MCP's `isError` carries no code, so a reported
+    failure is `ProviderError` and the message is deliberately not parsed; the same rule holds for a
+    JSON-RPC error whose message contradicts its code, where the code decides. Two tests assert
+    exactly that.
+  - **Three clippy `match_same_arms` reports, resolved by merging rather than by suppressing.** The
+    repeated pattern was a deliberately *named* arm beside a catch-all with the same body, e.g.
+    `TransportClosed => ProviderError` next to `_ => ProviderError`. Merging them means the rationale
+    comment now explains the arm that actually carries the behaviour, instead of a comment sitting on
+    a branch that is identical to its neighbour.
+  - **Third slice: process isolation, `mcp/process.rs` (+16 tests, 52 in the module).** This launches
+    a configured MCP server as a child process. Three structural decisions, each following an existing
+    workspace convention: **argv only, never a composed command string** (`service::exec`'s rule, which
+    is what makes an argument containing spaces or punctuation inert rather than injectable);
+    **`env_clear()` then explicit pairs**, so there is no path that passes an unlisted variable rather
+    than a path that happens not to; and **stderr piped, drained, and kept as a bounded tail**,
+    overriding `rmcp`'s own default of `Stdio::inherit()`, which would spray an untrusted server's
+    output across the daemon's stderr unbounded and unredacted.
+  - **The isolation test could not detect the failure it named, and the mutant proved it.** Its first
+    version asserted on `build_command(..).as_std().get_envs()` — which reports only the variables
+    *explicitly set on the command*, because inheritance happens later, inside the OS at spawn time.
+    Deleting `env_clear()` **survived**. Rewritten to have the child print its own environment, the
+    mutant now dies. This is the second time this round that a test's *premise* rather than its rule
+    was wrong, and only mutation found it.
+  - **A Windows finding the rewritten test then surfaced:** `cmd.exe` synthesises `COMSPEC`,
+    `PATHEXT`, and `PROMPT` for its own children whatever environment it is given. The assertion is
+    now narrow enough to name that measured set — and re-running the mutant afterwards confirmed the
+    looser assertion **still** detects a removed `env_clear`, which is the check that matters when an
+    assertion is relaxed.
+  - **A second SDK constraint, found by running rather than reading: a launched server must be
+    dropped inside a Tokio runtime.** `rmcp` kills its child from `Drop`, and `kill()` awaits a reap —
+    so dropping a transport outside a runtime panics inside the SDK at
+    `transport/child_process.rs:50` with "there is no reactor running". A daemon is async and so drops
+    servers in-runtime anyway; the hazard is a *synchronous* shutdown path or a test that builds a
+    server inside a runtime and drops it after `block_on` returns. `McpServerProcess::shutdown` now
+    gives shutdown a deliberate in-runtime path with a bounded wait.
+  - **What this module deliberately is *not*:** there is no sandbox. A child launched here inherits the
+    daemon's user, filesystem view, and network. It removes the ambient surface it *can* remove (the
+    environment) and bounds what the child can do to the daemon (output, lifetime, startup time); a
+    real platform sandbox is a separate reviewed capability, and claiming one here would make a real
+    gap invisible. The module doc says so rather than leaving it implied.
+  - **Still to do (`TLS-008` and sibling items):** the client that drives `server/discover` →
+    `tools/list` → `tools/call` over the transport, the MRTR round loop and Task polling, the
+    heartbeat/idle/shutdown supervision the launch half only prepares for, a reviewed TLS choice
+    before the remote half, the `Test Plan` items in `docs/research/integrations/mcp.md`, and
+    `TLS-009`/`TLS-010`.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
   the source layers a policy version was merged from, so the contract's `GET` requirement stops being
@@ -6606,13 +6772,33 @@ Dependencies: Milestone 2 exit gate.
     argued. `the_surface_refuses_a_body_that_names_its_own_workspace_or_operator` asserts the
     structural guarantee through the route: `deny_unknown_fields` makes a body carrying
     `workspace_id` or `granted_by` a **400** rather than a silently ignored key.
-  - **Not done, and named.** No CLI commands for the surface (its driver is the HTTP routes,
-    which a control plane and a UI both speak). The journey asserts refusals, not a *grant*
-    becoming newly effective: the reviewed default already grants every native read-only tool,
-    and `StoredGrants` replaces the defaults for a principal only when the store holds a grant
-    for them, so a narrowing grant cannot be seen as a new permission without first removing
-    the default. `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it`
-    in `tool_adapters::tests` covers that direction at the source.
+  - **The CLI half is now done** (this round). `jarvis grants list|show|create|replace|revoke` and
+    `jarvis grants deny list|add|remove` drive the surface from the product's own client, and
+    `tests/e2e/tool-grant-cli-journey.mjs` runs the shipped binary against a real `jarvisd`. **Two
+    defects fell out of writing it, and neither was visible from any existing test.**
+    - **⚠ `PATCH` was unreachable.** The route reads `expected_version` from the body and hands the body
+      to a shared parse typed as `WriteToolGrantRequest` — which carries `#[serde(deny_unknown_fields)]`
+      and does not model the field. So **the one body the route required was the one body its own parse
+      refused**, and every replace answered `400 request.invalid`. It survived because no test of any kind
+      invoked `replace_tool_grant`: the route was asserted to *exist* and each code it can emit was
+      asserted to be in the contract table, and both were true of a handler that could never succeed.
+      `the_replace_verb_can_actually_parse_its_own_body` is the detector now, and the fix strips the field
+      for a versioned verb rather than adding it to the create shape — adding it would make an absent
+      version parse as a create, which is the ambiguity the split routes exist to remove.
+    - **⚠ The four widening codes were unreachable.** `GrantServiceError::Widens { code }` carried the
+      *repository's* field name (`grant_scope`), which is in no owned namespace, so `ErrorEnvelope::new`
+      replaced it with `jarvis.internal` — an operator who asked for too much risk was told the daemon had
+      an internal error, and the four `tool.grant_*` widening codes the contract documents could never be
+      sent. The code-table scan reads **owned string literals**, and this value arrived as a `String` from
+      another crate's `what` field, so it was structurally invisible to the guard. `GrantWidening` is now a
+      typed enum whose codes are literals in the service.
+  - **Not done, and named.** The journey asserts refusals and the write verbs, not a *narrowing grant*
+    becoming newly effective: the reviewed default already grants every native read-only tool, and
+    `StoredGrants` replaces the defaults for a principal only when the store holds a grant for them, so a
+    narrowing grant cannot be seen as a new permission without first removing the default.
+    `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it` in `tool_adapters::tests`
+    covers that direction at the source. No control-plane **UI** exists; the CLI and the HTTP routes are
+    what one would drive.
 - [x] `TLS-019` Wire the reviewed deny rules in `tool_fabric_over` to configuration.
   **Done.** A `[[tools.deny]]` entry in the profile's `config.toml` is validated at startup and
   reaches the evaluator, beside the stored rules.

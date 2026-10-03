@@ -103,10 +103,10 @@
       "id": "mcp",
       "todos": ["TLS-008", "TLS-009", "TLS-010"],
       "evidence": "docs/research/integrations/mcp.md",
-      "state": "ARCHITECTURE_ONLY",
-      "implementation_ready": false,
-      "last_verified": "2026-09-20",
-      "revalidate_by": "2026-12-19",
+      "state": "IMPLEMENTATION_READY",
+      "implementation_ready": true,
+      "last_verified": "2026-10-03",
+      "revalidate_by": "2027-04-03",
       "implementation_paths": ["adapters/mcp/**", "crates/**/mcp/**", "crates/**/src/adapters/mcp/**", "tests/integration/mcp/**"]
     },
     {

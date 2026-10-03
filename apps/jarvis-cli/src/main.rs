@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use jarvis_infrastructure::auth::ClientCredentialPath;
 use jarvis_infrastructure::client::{
     ClientError, Discovered, discover, get_authenticated, get_with_status, post_authenticated,
-    read_credential, stream_response,
+    read_credential, send_authenticated, stream_response,
 };
 use jarvis_infrastructure::config::{Config, config_file_path, read_bounded};
 use jarvis_infrastructure::diagnostics::{
@@ -121,6 +121,18 @@ enum Command {
     Approvals {
         #[command(subcommand)]
         action: ApprovalsAction,
+    },
+    /// Inspect and configure what tools a principal may use.
+    ///
+    /// **The control-plane surface for tool authorization, and it exists because authority an operator
+    /// can only change with a database console is authority they cannot practically change.** The daemon
+    /// has served `/api/v1/tool-grants` since `TLS-015`; until this command there was no way to *reach* it
+    /// from the product's own client, which `TLS-015` recorded as "no CLI commands for the surface yet"
+    /// and the user asked for explicitly. `list` and `show` are read-only; every mutation is its own named
+    /// action, so a bare `jarvis grants` can never widen or withdraw authority.
+    Grants {
+        #[command(subcommand)]
+        action: GrantsAction,
     },
     /// Inspect the resolved configuration without printing secret values.
     Config,
@@ -276,6 +288,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Ask { text, conversation } => ask(paths, &text, conversation.as_deref()).await,
         Command::Runs { action } => runs(paths, action).await,
         Command::Approvals { action } => approvals(paths, action).await,
+        Command::Grants { action } => grants(paths, action).await,
         Command::Config => config(paths),
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
@@ -379,6 +392,147 @@ enum ApprovalsAction {
         /// Why it is being withdrawn.
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
+    },
+}
+
+/// Tool-authorization inspection and configuration a caller can request.
+///
+/// **Every mutation is its own named subcommand, and each mutation of a *grant* requires the version the
+/// caller read.** The version requirement is the approval rule applied to authority: `PUT` creates and is
+/// refused when a grant exists, `PATCH` replaces the version the caller read, and a replace that named no
+/// version would silently discard ceilings an operator configured and nobody asked to change. The daemon
+/// enforces both, and this surface must not paper over either — a client that supplied a version it
+/// invented would turn a conflict into a lost edit.
+///
+/// Three decisions are visible in the shape rather than in prose:
+///
+/// - **`principal` is required on a write and `granted_by` is not a flag at all.** A grant is *for*
+///   somebody, so the target is a legitimate argument; who configured it comes from the authenticated
+///   credential, and a flag for it would let a client attribute a widening to a principal who never wrote
+///   it. The daemon refuses such a body outright, so offering the flag would only produce a `400`.
+/// - **`workspace` is not a flag either**, for the same reason: it is resolved server-side from the
+///   credential. A local profile shares one workspace, so a client that could name another would be
+///   naming one it does not own.
+/// - **`deny` is a separate action group**, because a refusal and a grant are different objects with
+///   different lifecycles: a refusal narrows and is added or removed, while a grant confers and is
+///   versioned. Collapsing them into one verb would make "withdraw this authority" and "stop refusing
+///   this" look like the same operation.
+#[derive(Debug, Subcommand)]
+enum GrantsAction {
+    /// List the grants this client may see.
+    List {
+        /// The page size to request. The daemon clamps it to its own bound.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        /// Show only grants for one principal.
+        #[arg(long, value_name = "ID")]
+        principal: Option<String>,
+        /// Show only grants in force (`true`) or only withdrawn ones (`false`).
+        #[arg(long, value_name = "BOOL")]
+        active: Option<bool>,
+    },
+    /// Print one grant.
+    Show {
+        /// The grant identifier.
+        grant_id: String,
+    },
+    /// Grant a capability to a principal. **Refused if a grant already exists** — use `replace`.
+    Create {
+        /// The capability to grant, for example `clock.now@1`.
+        #[arg(long, value_name = "CAPABILITY")]
+        capability: String,
+        /// The principal the grant is for.
+        #[arg(long, value_name = "ID")]
+        principal: String,
+        /// An effect to permit. Repeatable.
+        #[arg(long = "effect", value_name = "EFFECT")]
+        effect: Vec<String>,
+        /// A scope to confer. Repeatable.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scope: Vec<String>,
+        /// The greatest risk to permit.
+        #[arg(long, value_name = "LEVEL")]
+        risk: String,
+        /// The most sensitive argument to permit.
+        #[arg(long, value_name = "LEVEL")]
+        sensitivity: String,
+        /// When the grant stops applying, an RFC 3339 instant. Absent means standing.
+        #[arg(long, value_name = "INSTANT")]
+        expires_at: Option<String>,
+    },
+    /// Replace an existing grant. **The version is required** so a stale edit is a conflict, not a loss.
+    Replace {
+        /// The capability to grant, for example `clock.now@1`.
+        #[arg(long, value_name = "CAPABILITY")]
+        capability: String,
+        /// The principal the grant is for.
+        #[arg(long, value_name = "ID")]
+        principal: String,
+        /// An effect to permit. Repeatable.
+        #[arg(long = "effect", value_name = "EFFECT")]
+        effect: Vec<String>,
+        /// A scope to confer. Repeatable.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scope: Vec<String>,
+        /// The greatest risk to permit.
+        #[arg(long, value_name = "LEVEL")]
+        risk: String,
+        /// The most sensitive argument to permit.
+        #[arg(long, value_name = "LEVEL")]
+        sensitivity: String,
+        /// When the grant stops applying, an RFC 3339 instant. Absent means standing.
+        #[arg(long, value_name = "INSTANT")]
+        expires_at: Option<String>,
+        /// The version `show` or `list` printed for the grant being replaced.
+        #[arg(long, value_name = "N")]
+        version: u32,
+    },
+    /// Withdraw a grant, keeping the row for audit.
+    Revoke {
+        /// The grant identifier.
+        grant_id: String,
+        /// The version `show` or `list` printed.
+        #[arg(long, value_name = "N")]
+        version: u32,
+    },
+    /// Inspect and add operator refusals.
+    Deny {
+        #[command(subcommand)]
+        action: DenyAction,
+    },
+}
+
+/// Operator-refusal inspection and change a caller can request.
+#[derive(Debug, Subcommand)]
+enum DenyAction {
+    /// List the refusals in force.
+    List {
+        /// The page size to request. The daemon clamps it to its own bound.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Refuse a capability or a set of effects.
+    Add {
+        /// The capability to refuse. Absent makes a rule constrained by its other dimensions alone.
+        #[arg(long, value_name = "CAPABILITY")]
+        capability: Option<String>,
+        /// A principal to refuse, or absent for every principal.
+        #[arg(long, value_name = "ID")]
+        principal: Option<String>,
+        /// An effect to refuse. Repeatable.
+        #[arg(long = "effect", value_name = "EFFECT")]
+        effect: Vec<String>,
+        /// The reason shown to a refused principal.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Scope the refusal to this workspace rather than applying it everywhere.
+        #[arg(long)]
+        workspace: bool,
+    },
+    /// Remove a refusal.
+    Remove {
+        /// The refusal identifier.
+        deny_rule_id: String,
     },
 }
 
@@ -1196,6 +1350,316 @@ fn print_daemon_response(result: Result<(u16, String), ClientError>) -> ExitCode
         }
         Err(error) => report_client_error(&error),
     }
+}
+
+/// The tool-authorization surface, reached over the local control API.
+///
+/// **The control plane for what a principal may use, and it is deliberately a thin client.** Every rule —
+/// that a grant may only narrow, that a capability must resolve, that a revoke keeps its row for audit, that
+/// a stale version is a conflict — is decided by the daemon, and this command performs the translation from
+/// flags to a request body and nothing else. A client-side check would be a second implementation of a rule
+/// the daemon already enforces, and the one that disagreed would be the one an operator trusted.
+async fn grants(paths: &ProfilePaths, action: GrantsAction) -> ExitCode {
+    let state = match daemon_client(paths) {
+        Ok(state) => state,
+        Err(error) => return report_client_error(&error),
+    };
+    match action {
+        // The read-only group first, and separated from the mutations rather than interleaved with them:
+        // `list` and `show` need no idempotency header and send no body, while every write does both — so
+        // a reader can see the whole read surface at once, and the two cannot be confused for one another.
+        GrantsAction::List {
+            limit,
+            principal,
+            active,
+        } => {
+            let path = grants_list_path(limit, principal.as_deref(), active);
+            print_daemon_response(
+                get_with_status(&state.discovered, &state.credential, &path, API_MAJOR, "").await,
+            )
+        }
+        GrantsAction::Show { grant_id } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/tool-grants/{grant_id}"),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        GrantsAction::Deny { action } => grant_deny(&state, action).await,
+        // The three mutating grant verbs, which share a body builder and differ by method and version.
+        mutating => grant_write(&state, mutating).await,
+    }
+}
+
+/// The mutating grant verbs: create, replace, and revoke.
+///
+/// **A function of its own because the three differ by method and by one field**, and keeping them beside
+/// each other is what makes "a create must not carry a version and a replace must" visible in one place.
+/// The read-only arms are unreachable here by construction — the caller routes them elsewhere — and that is
+/// deliberate rather than defensive: a `list` reaching this function would be a routing mistake, and the
+/// `unreachable` arm reports it as one instead of sending a `POST` a caller did not ask for.
+async fn grant_write(state: &ClientState, action: GrantsAction) -> ExitCode {
+    match action {
+        GrantsAction::Create {
+            capability,
+            principal,
+            effect,
+            scope,
+            risk,
+            sensitivity,
+            expires_at,
+        } => {
+            let body = grant_body(
+                &capability,
+                &principal,
+                &effect,
+                &scope,
+                &risk,
+                &sensitivity,
+                expires_at.as_deref(),
+                None,
+            );
+            print_daemon_response(
+                send_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    "PUT",
+                    "/api/v1/tool-grants",
+                    API_MAJOR,
+                    &idempotency_header(),
+                    Some(&body),
+                )
+                .await,
+            )
+        }
+        GrantsAction::Replace {
+            capability,
+            principal,
+            effect,
+            scope,
+            risk,
+            sensitivity,
+            expires_at,
+            version,
+        } => {
+            let body = grant_body(
+                &capability,
+                &principal,
+                &effect,
+                &scope,
+                &risk,
+                &sensitivity,
+                expires_at.as_deref(),
+                Some(version),
+            );
+            print_daemon_response(
+                send_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    "PATCH",
+                    "/api/v1/tool-grants",
+                    API_MAJOR,
+                    &idempotency_header(),
+                    Some(&body),
+                )
+                .await,
+            )
+        }
+        GrantsAction::Revoke { grant_id, version } => {
+            let body = serde_json::json!({ "expected_version": version }).to_string();
+            print_daemon_response(
+                send_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    "POST",
+                    &format!("/api/v1/tool-grants/{grant_id}/revoke"),
+                    API_MAJOR,
+                    &idempotency_header(),
+                    Some(&body),
+                )
+                .await,
+            )
+        }
+        // Unreachable, and reported rather than panicked: a routing mistake in the caller would send a
+        // `POST` a user did not ask for if this arm tried to do something, and a panic in a production
+        // binary is the hazard the workspace's own lint denies.
+        _ => {
+            eprintln!("error: request.invalid");
+            eprintln!("advice: this verb is not a mutation.");
+            ExitCode::from(EXIT_ATTENTION)
+        }
+    }
+}
+
+/// The operator-refusal group: list, add, and remove.
+///
+/// Separate from [`grant_write`] because a **refusal and a grant are different objects** with different
+/// lifecycles: a refusal narrows and is added or removed, while a grant confers and is versioned. The routes
+/// differ (`/tool-grants/deny-rules`) and so does the body — a refusal carries no version and no ceilings —
+/// so keeping the two groups apart is what stops one shape being sent to the other's path.
+async fn grant_deny(state: &ClientState, action: DenyAction) -> ExitCode {
+    match action {
+        DenyAction::List { limit } => {
+            let path = deny_rules_list_path(limit);
+            print_daemon_response(
+                get_with_status(&state.discovered, &state.credential, &path, API_MAJOR, "").await,
+            )
+        }
+        DenyAction::Add {
+            capability,
+            principal,
+            effect,
+            reason,
+            workspace,
+        } => {
+            let body = deny_rule_body(
+                capability.as_deref(),
+                principal.as_deref(),
+                &effect,
+                &reason,
+                workspace,
+            );
+            print_daemon_response(
+                send_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    "POST",
+                    "/api/v1/tool-grants/deny-rules",
+                    API_MAJOR,
+                    &idempotency_header(),
+                    Some(&body),
+                )
+                .await,
+            )
+        }
+        DenyAction::Remove { deny_rule_id } => print_daemon_response(
+            send_authenticated(
+                &state.discovered,
+                &state.credential,
+                "DELETE",
+                &format!("/api/v1/tool-grants/deny-rules/{deny_rule_id}"),
+                API_MAJOR,
+                "",
+                None,
+            )
+            .await,
+        ),
+    }
+}
+
+/// Builds the grants listing path from the client's own arguments.
+///
+/// Extracted as a pure function so the query string is testable without a daemon, and ordered
+/// (`limit`, `principal`, `active`) so it is deterministic. **Only the keys the daemon documents are
+/// emitted**, because it refuses an unrecognised one by name: a client that sent `active=false` as
+/// `active=0` would be told `active`, which names the field rather than the value an operator typed.
+fn grants_list_path(limit: Option<u32>, principal: Option<&str>, active: Option<bool>) -> String {
+    let mut query: Vec<String> = Vec::new();
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    if let Some(principal) = principal {
+        query.push(format!("principal={principal}"));
+    }
+    if let Some(active) = active {
+        query.push(format!("active={active}"));
+    }
+    join_query("/api/v1/tool-grants", &query)
+}
+
+/// Builds the deny-rules listing path.
+fn deny_rules_list_path(limit: Option<u32>) -> String {
+    let query: Vec<String> = limit
+        .map(|limit| vec![format!("limit={limit}")])
+        .unwrap_or_default();
+    join_query("/api/v1/tool-grants/deny-rules", &query)
+}
+
+/// Joins a base path and a query string, appending `?` only when there is a query.
+fn join_query(base: &str, query: &[String]) -> String {
+    if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", query.join("&"))
+    }
+}
+
+/// Builds the idempotency header block an authenticated write carries.
+///
+/// The daemon scopes an `Idempotency-Key` to the credential and the principal, so a retried write is
+/// recognised as the same logical write rather than applied twice. A key per invocation is right here:
+/// two separate `jarvis grants create` runs are two intents, while a retry of *one* run is what the key
+/// exists to collapse — and the client is where the run boundary is known.
+fn idempotency_header() -> String {
+    format!("Idempotency-Key: {}\r\n", idempotency_key())
+}
+
+/// Builds a grant create/replace body from the CLI's arguments.
+///
+/// `expected_version` is **absent for a create and present for a replace**, which is what makes the two
+/// verbs distinguishable at the daemon: a body that always carried a version would make a `PUT` replace,
+/// and one that never did would make a `PATCH` create. The parameter is an `Option` for that reason rather
+/// than a value with a sentinel.
+#[allow(clippy::too_many_arguments)]
+fn grant_body(
+    capability: &str,
+    principal: &str,
+    effects: &[String],
+    scopes: &[String],
+    risk: &str,
+    sensitivity: &str,
+    expires_at: Option<&str>,
+    expected_version: Option<u32>,
+) -> String {
+    let mut body = serde_json::json!({
+        "capability": capability,
+        "principal_id": principal,
+        "scopes": scopes,
+        "effects": effects,
+        "risk_ceiling": risk,
+        "sensitivity_ceiling": sensitivity,
+    });
+    // Absent rather than null, because the protocol shape uses `skip_serializing_if` for this field: a
+    // literal `null` would be an *unknown value* for a field the daemon reads as "no expiry", and the two
+    // spellings of one statement is how a client and a server come to disagree about which was meant.
+    if let Some(expires_at) = expires_at {
+        body["expires_at"] = serde_json::Value::String(expires_at.to_owned());
+    }
+    if let Some(version) = expected_version {
+        body["expected_version"] = serde_json::Value::from(version);
+    }
+    body.to_string()
+}
+
+/// Builds a deny-rule body from the CLI's arguments.
+///
+/// `workspace_wide` is always present, and it is `true` when `--workspace` was passed — the flag is
+/// inverted on purpose. The wire field asks "is this refusal scoped to the caller's workspace", the flag
+/// says "scope it to this workspace", and a client that passed the flag through as `workspace_wide` would
+/// make the narrow case the broad one: the refusal would apply to **every** workspace, which is the
+/// direction that over-refuses.
+fn deny_rule_body(
+    capability: Option<&str>,
+    principal: Option<&str>,
+    effects: &[String],
+    reason: &str,
+    scoped_to_workspace: bool,
+) -> String {
+    let mut body = serde_json::json!({
+        "effects": effects,
+        "reason": reason,
+        "workspace_wide": scoped_to_workspace,
+    });
+    if let Some(capability) = capability {
+        body["capability"] = serde_json::Value::String(capability.to_owned());
+    }
+    if let Some(principal) = principal {
+        body["principal_id"] = serde_json::Value::String(principal.to_owned());
+    }
+    body.to_string()
 }
 
 /// One parsed server-sent event.
@@ -2247,8 +2711,9 @@ mod tests {
     use super::{
         ApprovalsAction, AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command,
         FollowStep, InstallAction, RiskArg, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher,
-        SseFrame, SseParser, StatusBody, ask_body, event_stream_headers, follow_after, follow_run,
-        follow_step, idempotency_key, json_string, list_path, parse_status,
+        SseFrame, SseParser, StatusBody, ask_body, deny_rule_body, deny_rules_list_path,
+        event_stream_headers, follow_after, follow_run, follow_step, grant_body, grants_list_path,
+        idempotency_key, json_string, list_path, parse_status,
     };
     use clap::Parser as _;
     use jarvis_infrastructure::client::Discovered;
@@ -2746,6 +3211,7 @@ mod tests {
             (vec!["jarvis", "ask", "hello"], "ask"),
             (vec!["jarvis", "runs", "show", "abc"], "runs"),
             (vec!["jarvis", "approvals", "list"], "approvals"),
+            (vec!["jarvis", "grants", "list"], "grants"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -2761,6 +3227,7 @@ mod tests {
                 Command::Ask { .. } => "ask",
                 Command::Runs { .. } => "runs",
                 Command::Approvals { .. } => "approvals",
+                Command::Grants { .. } => "grants",
             };
             assert_eq!(actual, expected);
         }
@@ -3023,7 +3490,8 @@ mod tests {
                     | Command::Install { .. }
                     | Command::Ask { .. }
                     | Command::Runs { .. }
-                    | Command::Approvals { .. } => String::from("unexpected"),
+                    | Command::Approvals { .. }
+                    | Command::Grants { .. } => String::from("unexpected"),
                 }
             })
             .collect();
@@ -3483,6 +3951,264 @@ mod tests {
                 "changed my mind",
             ])
             .is_ok(),
+        );
+    }
+
+    #[test]
+    fn a_workspace_scoped_refusal_must_not_be_sent_as_the_broad_one() {
+        // **The flag is inverted, and inverting it wrongly is the over-refusing direction.** The wire field
+        // `workspace_wide` asks "does this refusal apply everywhere", while `--workspace` says "scope it to
+        // my workspace". A client that passed the flag straight through would turn the narrow case into the
+        // broad one, so a refusal an operator meant for one workspace would refuse the same capability in
+        // every workspace on the profile — and nobody would be told, because the rule would be stored
+        // exactly as written and simply match more than intended.
+        let scoped = deny_rule_body(Some("email.send@1"), None, &[], "not here", true);
+        let parsed: serde_json::Value = serde_json::from_str(&scoped).expect("valid JSON");
+        assert_eq!(
+            parsed["workspace_wide"],
+            serde_json::Value::Bool(true),
+            "`--workspace` must ask for a workspace-scoped refusal: {scoped}",
+        );
+
+        // The default (no flag) is the **profile-wide** refusal, which is what `workspace_wide: false` means.
+        // Asserted separately so a client that hardcoded `true` fails here rather than passing the case above.
+        let everywhere = deny_rule_body(Some("email.send@1"), None, &[], "never", false);
+        let parsed: serde_json::Value = serde_json::from_str(&everywhere).expect("valid JSON");
+        assert_eq!(
+            parsed["workspace_wide"],
+            serde_json::Value::Bool(false),
+            "without `--workspace` the refusal applies everywhere: {everywhere}",
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_body_omits_a_capability_and_principal_it_was_not_given() {
+        // **An absent field, not a `null`.** The protocol shape treats an absent `capability` as "this rule
+        // names no capability", which is the "refuse every destructive tool" form. A literal `null` is a
+        // different statement to a reader of the JSON, and the daemon refuses a body whose shape it cannot
+        // map — so a rule with no capability must carry no key at all.
+        let body = deny_rule_body(None, None, &["destructive".to_owned()], "never", false);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            parsed.get("capability").is_none(),
+            "an unset capability must be absent rather than null: {body}",
+        );
+        assert!(
+            parsed.get("principal_id").is_none(),
+            "an unset principal must be absent rather than null: {body}",
+        );
+        // And the values that were given are present, so the omission is a statement about the unset ones
+        // rather than about the builder dropping everything.
+        assert_eq!(
+            parsed["effects"],
+            serde_json::json!(["destructive"]),
+            "{body}",
+        );
+        assert_eq!(parsed["reason"], "never", "{body}");
+    }
+
+    #[test]
+    fn a_create_and_a_replace_body_differ_only_by_the_version() {
+        // **The single field that makes the two verbs distinguishable.** A create that carried a version
+        // would make `PUT` replace an existing grant — discarding ceilings nobody asked to change — and a
+        // replace that did not would make `PATCH` create one. So the bodies must be otherwise identical and
+        // differ exactly by `expected_version`, which is what this compares.
+        let create = grant_body(
+            "clock.now@1",
+            "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            &["read_only".to_owned()],
+            &[],
+            "low",
+            "public",
+            None,
+            None,
+        );
+        let replace = grant_body(
+            "clock.now@1",
+            "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            &["read_only".to_owned()],
+            &[],
+            "low",
+            "public",
+            None,
+            Some(7),
+        );
+
+        let create: serde_json::Value = serde_json::from_str(&create).expect("valid JSON");
+        let replace: serde_json::Value = serde_json::from_str(&replace).expect("valid JSON");
+        assert!(
+            create.get("expected_version").is_none(),
+            "a create must not name a version, or `PUT` would replace: {create}",
+        );
+        assert_eq!(
+            replace["expected_version"],
+            serde_json::Value::from(7u32),
+            "a replace must name the version the caller read: {replace}",
+        );
+        // Every other key is equal, so the difference is the version and nothing else.
+        let mut without_version = replace.clone();
+        without_version
+            .as_object_mut()
+            .expect("an object")
+            .remove("expected_version");
+        assert_eq!(
+            without_version, create,
+            "the two bodies must differ only by `expected_version`",
+        );
+    }
+
+    #[test]
+    fn a_grant_body_omits_an_expiry_it_was_not_given() {
+        // The same absent-versus-null rule as the deny body, and it has a second consequence here: the
+        // daemon reads an absent `expires_at` as a **standing** grant. A literal `null` would be a value it
+        // must interpret, and a client and a server disagreeing about which spelling means "never expires"
+        // is how a grant silently becomes one that lapses.
+        let standing = grant_body(
+            "clock.now@1",
+            "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            &[],
+            &[],
+            "low",
+            "public",
+            None,
+            None,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&standing).expect("valid JSON");
+        assert!(
+            parsed.get("expires_at").is_none(),
+            "a standing grant must carry no `expires_at`: {standing}",
+        );
+
+        // And a given instant is carried as a string, so the bound form is reachable and not merely absent
+        // by construction.
+        let expiring = grant_body(
+            "clock.now@1",
+            "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            &[],
+            &[],
+            "low",
+            "public",
+            Some("2026-10-02T12:00:00Z"),
+            None,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&expiring).expect("valid JSON");
+        assert_eq!(parsed["expires_at"], "2026-10-02T12:00:00Z", "{expiring}");
+    }
+
+    #[test]
+    fn the_grants_listing_path_emits_only_the_keys_the_daemon_documents() {
+        // The daemon refuses an unrecognised query key **by name**, and it also refuses an unusable value
+        // for a recognised one — so a client spelling `active` as `0` would be told `active`, which names
+        // the field rather than the value an operator typed. This asserts the three documented spellings and
+        // the ordering, which is what makes the path deterministic and testable.
+        assert_eq!(grants_list_path(None, None, None), "/api/v1/tool-grants");
+        assert_eq!(
+            grants_list_path(
+                Some(5),
+                Some("018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d"),
+                Some(true)
+            ),
+            "/api/v1/tool-grants?limit=5&principal=018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d&active=true",
+        );
+        // `false` is spelled as the word, not as `0`, because `0` is a value the daemon refuses and the
+        // refusal names the key — sending the operator to look at the wrong thing.
+        assert_eq!(
+            grants_list_path(None, None, Some(false)),
+            "/api/v1/tool-grants?active=false",
+        );
+        assert_eq!(
+            deny_rules_list_path(Some(2)),
+            "/api/v1/tool-grants/deny-rules?limit=2",
+        );
+        assert_eq!(deny_rules_list_path(None), "/api/v1/tool-grants/deny-rules",);
+    }
+
+    #[test]
+    fn every_grants_action_parses_and_the_read_only_ones_are_the_default_shape() {
+        // Every action the surface offers must parse, so a documented invocation cannot be a typo away from
+        // working. The read-only actions are additionally asserted to select **no mutation**, which is the
+        // property `runs` and `approvals` both record: a bare `jarvis grants` can never widen or withdraw
+        // authority.
+        for arguments in [
+            vec!["jarvis", "grants", "list"],
+            vec!["jarvis", "grants", "list", "--limit", "5"],
+            vec!["jarvis", "grants", "show", "abc"],
+            vec![
+                "jarvis",
+                "grants",
+                "create",
+                "--capability",
+                "clock.now@1",
+                "--principal",
+                "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+                "--effect",
+                "read_only",
+                "--risk",
+                "low",
+                "--sensitivity",
+                "public",
+            ],
+            vec![
+                "jarvis",
+                "grants",
+                "replace",
+                "--capability",
+                "clock.now@1",
+                "--principal",
+                "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+                "--risk",
+                "low",
+                "--sensitivity",
+                "public",
+                "--version",
+                "3",
+            ],
+            vec!["jarvis", "grants", "revoke", "abc", "--version", "3"],
+            vec!["jarvis", "grants", "deny", "list"],
+            vec![
+                "jarvis",
+                "grants",
+                "deny",
+                "add",
+                "--capability",
+                "email.send@1",
+                "--reason",
+                "never send unattended",
+            ],
+            vec![
+                "jarvis",
+                "grants",
+                "deny",
+                "remove",
+                "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&arguments).is_ok(),
+                "{arguments:?} must parse",
+            );
+        }
+
+        // A bare `grants` selects an action subcommand, so it cannot be a mutation by omission.
+        assert!(Cli::try_parse_from(["jarvis", "grants"]).is_err());
+        // And a replace without a version is a usage error rather than a silent create: the field is
+        // required by the flag definition, which is what keeps "replace" from meaning "create".
+        assert!(
+            Cli::try_parse_from([
+                "jarvis",
+                "grants",
+                "replace",
+                "--capability",
+                "clock.now@1",
+                "--principal",
+                "018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+                "--risk",
+                "low",
+                "--sensitivity",
+                "public",
+            ])
+            .is_err(),
+            "a replace must require the version it is replacing",
         );
     }
 }

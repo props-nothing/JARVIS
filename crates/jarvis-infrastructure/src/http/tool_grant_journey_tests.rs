@@ -639,4 +639,193 @@ mod tests {
             );
         }
     }
+
+    /// A create body for `capability`, conferring exactly what the reviewed definition declares.
+    ///
+    /// The grants in this test confer no scope and the read-only effect at the `low`/`public` ceilings, so
+    /// a body built here always **narrows** — a wider one would be refused for the wrong reason and the test
+    /// would pass while proving nothing about replace. `public` is the clock's own **input** class
+    /// (`DataClasses::new(Sensitivity::Public, Internal)`), which is what the ceiling is compared against;
+    /// naming `internal` would exceed the tool and be refused `tool.grant_sensitivity_ceiling`.
+    fn create_body(capability: &str, principal: &str) -> String {
+        format!(
+            r#"{{"capability":"{capability}","principal_id":"{principal}","scopes":[],"effects":["read_only"],"risk_ceiling":"low","sensitivity_ceiling":"public"}}"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_replace_verb_can_actually_parse_its_own_body() {
+        // **A defect the round that wrote the surface could not have caught, and the reason is structural.**
+        // `PATCH /api/v1/tool-grants` reads `expected_version` out of the body and hands the body on to
+        // `write_grant`, which parses it as `WriteToolGrantRequest` — a type carrying
+        // `#[serde(deny_unknown_fields)]` that does not model `expected_version`. So the one body the route
+        // requires is the one body its own parse refuses, and the verb was unreachable: every `PATCH`
+        // answered `request.invalid`.
+        //
+        // Nothing caught it because **no test of any kind invoked `replace_tool_grant`**. The route was
+        // asserted to *exist* (a compile-time guarantee) and every code it can emit was asserted to be in the
+        // contract table, and both were true — of a handler that could never succeed. The lesson is the one
+        // `TLS-018` recorded: a route's existence is not its reachability.
+        let provider = provider("journey-replace", CAPABILITY);
+        let (app, token) = journey("tool-grant-replace", Arc::clone(&provider)).await;
+
+        // Create a grant to replace, so the replace is about an existing row rather than about absence —
+        // an absent row would answer `tool.grant_not_found` and the test would pass against the defect.
+        let principal = another_principal();
+        let (status, created) = send(
+            &app,
+            "PUT",
+            "/api/v1/tool-grants",
+            &headers(&token),
+            &create_body(CAPABILITY, &principal),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let parsed: serde_json::Value = serde_json::from_str(&created).expect("valid JSON");
+        let version = parsed["version"].as_u64().expect("a version");
+        let grant_id = parsed["grant_id"].as_str().expect("a grant id").to_owned();
+
+        // Replace it, naming the version we read. This body is the one the route's own reader accepts.
+        let replace = format!(
+            r#"{{"capability":"{CAPABILITY}","principal_id":"{principal}","scopes":[],"effects":["read_only"],"risk_ceiling":"low","sensitivity_ceiling":"public","expected_version":{version}}}"#,
+        );
+        let (status, replaced) = send(
+            &app,
+            "PATCH",
+            "/api/v1/tool-grants",
+            &headers(&token),
+            &replace,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "`PATCH` must accept the body its own version reader requires: {replaced}",
+        );
+        let after: serde_json::Value = serde_json::from_str(&replaced).expect("valid JSON");
+        assert_eq!(
+            after["grant_id"].as_str(),
+            Some(grant_id.as_str()),
+            "the replace must act on the same grant rather than creating a second one",
+        );
+        assert!(
+            after["version"].as_u64().expect("a version") > version,
+            "a replace must advance the version, so a stale edit is a conflict rather than a loss",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_naming_a_stale_version_is_a_conflict_rather_than_a_silent_edit() {
+        // **The other half of the version rule, and the direction that loses an edit if it is wrong.** The
+        // version exists so an operator whose view is stale is told, not obeyed: a replace that ignored the
+        // version would discard ceilings somebody else configured and nobody asked to change. Asserted
+        // separately from the accepting case because "replace works" and "a stale replace is refused" are
+        // two different claims — a handler that never checked the version would satisfy the first alone.
+        let provider = provider("journey-stale-replace", CAPABILITY);
+        let (app, token) = journey("tool-grant-stale", Arc::clone(&provider)).await;
+
+        let principal = another_principal();
+        let (status, created) = send(
+            &app,
+            "PUT",
+            "/api/v1/tool-grants",
+            &headers(&token),
+            &create_body(CAPABILITY, &principal),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+
+        // A version this grant has never had. The daemon compares it against the stored one, so the
+        // request must be refused rather than applied.
+        let replace = format!(
+            r#"{{"capability":"{CAPABILITY}","principal_id":"{principal}","scopes":[],"effects":["read_only"],"risk_ceiling":"low","sensitivity_ceiling":"public","expected_version":9999}}"#,
+        );
+        let (status, refusal) = send(
+            &app,
+            "PATCH",
+            "/api/v1/tool-grants",
+            &headers(&token),
+            &replace,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a stale replace must be a conflict: {refusal}",
+        );
+        assert!(
+            refusal.contains("tool.grant_version_conflict"),
+            "the refusal must carry the contract's conflict code: {refusal}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoke_naming_a_stale_version_is_a_conflict_and_the_grant_survives() {
+        // **Revocation is the one operation where a wrong answer is a security outcome, so both halves are
+        // asserted.** A stale revoke that *applied* would withdraw authority an operator had just re-issued;
+        // a stale revoke that *silently succeeded without withdrawing* would leave authority an operator
+        // believes they removed. So the status is asserted **and** the grant is read back to prove it is
+        // still in force — a status alone cannot distinguish "refused" from "refused after applying".
+        let provider = provider("journey-stale-revoke", CAPABILITY);
+        let (app, token) = journey("tool-grant-stale-revoke", Arc::clone(&provider)).await;
+
+        let principal = another_principal();
+        let (status, created) = send(
+            &app,
+            "PUT",
+            "/api/v1/tool-grants",
+            &headers(&token),
+            &create_body(CAPABILITY, &principal),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let parsed: serde_json::Value = serde_json::from_str(&created).expect("valid JSON");
+        let grant_id = parsed["grant_id"].as_str().expect("a grant id").to_owned();
+        let version = parsed["version"].as_u64().expect("a version");
+
+        let stale = r#"{"expected_version":9999}"#.to_string();
+        let (status, refusal) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/tool-grants/{grant_id}/revoke"),
+            &headers(&token),
+            &stale,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+
+        // The grant is still active at the version that was actually current: the stale revoke changed
+        // nothing, which is the property the status alone does not establish.
+        let (status, read) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/tool-grants/{grant_id}"),
+            &headers(&token),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        let current: serde_json::Value = serde_json::from_str(&read).expect("valid JSON");
+        assert_eq!(current["active"], serde_json::Value::Bool(true), "{read}");
+        assert_eq!(
+            current["version"].as_u64(),
+            Some(version),
+            "a refused revoke must not advance the version: {read}",
+        );
+
+        // And the correct version does withdraw it, so the refusal above is attributable to the version
+        // rather than to a path that refuses every revoke.
+        let correct = format!(r#"{{"expected_version":{version}}}"#);
+        let (status, revoked) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/tool-grants/{grant_id}/revoke"),
+            &headers(&token),
+            &correct,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{revoked}");
+        let after: serde_json::Value = serde_json::from_str(&revoked).expect("valid JSON");
+        assert_eq!(after["active"], serde_json::Value::Bool(false), "{revoked}");
+    }
 }

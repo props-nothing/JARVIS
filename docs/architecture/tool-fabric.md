@@ -191,6 +191,65 @@ version-2 binary's `deny_unknown_fields` would report an unknown `[tools]` table
 the accurate diagnostic is "written by a newer JARVIS". A file with no `[tools]` table loads unchanged under
 versions 1, 2, and 3.
 
+### The Control Plane, and Why the Store Needed One
+
+**A grant store an operator can only change with a database console is one they cannot practically change.**
+The daemon served `/api/v1/tool-grants` from the round that built the store, but there was no way to reach it
+from the product's own client — recorded at the time as *"no CLI commands for the surface yet"*. That gap
+matters more here than the same gap would elsewhere: what the surface writes is **authority**, so an operator
+who cannot read it back cannot tell what their profile permits, and one who cannot revoke it cannot withdraw a
+widening they regret. The control plane is therefore `jarvis grants`:
+
+```text
+jarvis grants list      [--limit N] [--principal ID] [--active true|false]
+jarvis grants show      <grant_id>
+jarvis grants create    --capability C --principal ID [--effect E]... [--scope S]... \
+                        --risk LEVEL --sensitivity LEVEL [--expires-at INSTANT]
+jarvis grants replace   <the create flags> --version N
+jarvis grants revoke    <grant_id> --version N
+jarvis grants deny list [--limit N]
+jarvis grants deny add  [--capability C] [--principal ID] [--effect E]... --reason TEXT [--workspace]
+jarvis grants deny remove <deny_rule_id>
+```
+
+Four properties of the surface, each of which the shape enforces rather than documents:
+
+- **Every mutation is its own named verb, and the version is required for the two verbs that change an
+  existing grant.** `PUT` creates and is refused when a grant exists; `PATCH` replaces the version the caller
+  read; a revoke names the version too. A verb whose meaning depended on a field's presence would make an
+  accidental overwrite indistinguishable from an intended one, and a discarded ceiling is the thing nobody
+  asked to change.
+- **The body cannot name the operator or the workspace.** Both come from the authenticated credential. A body
+  field for either would let a client attribute a widening to a principal who never wrote it, or land a grant
+  in a workspace it did not authenticate for — and the daemon refuses such a body outright, so the CLI does not
+  offer the flags.
+- **`--workspace` on a refusal is inverted on purpose.** The wire field `workspace_wide` asks "does this apply
+  everywhere"; the flag says "scope it to my workspace". A client that passed the flag through would turn the
+  narrow case into the profile-wide one, so a refusal meant for one workspace would refuse the same capability
+  in every workspace — and nothing would report it, because the rule would be stored exactly as written and
+  simply match more than intended.
+- **The CLI holds no authorization rule.** Every decision — the narrowing check, the capability resolution, the
+  conflict, the audit row — belongs to the daemon. A client-side check would be a second implementation of a
+  rule the daemon already enforces, and the one that disagreed would be the one an operator trusted.
+
+**A defect this surface found, which nothing else could have.** `PATCH` read `expected_version` from the body
+and handed the body to a shared parse typed as `WriteToolGrantRequest` — a shape carrying
+`#[serde(deny_unknown_fields)]` that does not model the field. So **the one body the route required was the one
+body its own parse refused**, and every replace answered `400 request.invalid`. It survived because no test of
+any kind invoked the handler: the route was asserted to *exist* (a compile-time guarantee) and each code it can
+emit was asserted to be in the contract table, and both were true of a handler that could never succeed. The
+lesson is the one `TLS-018` recorded one layer in — **a route's existence is not its reachability** — extended
+to the client: a command's existence is not its either.
+
+**A second defect, in the error vocabulary.** A narrowing refusal carried the *repository's* field name
+(`grant_scope`) into the service's `Widens { code }`, and a bare `grant_scope` is in no owned namespace, so
+`ErrorEnvelope::new` replaced it with `jarvis.internal`. The four `tool.grant_*` widening codes this contract
+documents were therefore unreachable, and an operator who asked for too much risk was told the daemon had an
+internal error. The scan that asserts every emitted code has a table row reads **owned string literals**, and
+this value arrived as a `String` read from another crate's `what` field — structurally invisible to it, so the
+guard was never wrong; its subject was simply not a literal in the file it reads. `GrantWidening` is now a
+typed enum whose codes are literals in the service, which makes both the reachability and the scan structural.
+
 ## Approval Binding
 
 An approval request contains a safe preview and an action fingerprint over:

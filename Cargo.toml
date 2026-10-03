@@ -48,6 +48,17 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 thiserror = { version = "2.0.20" }
 toml = { version = "1.1.6", features = ["parse", "serde", "display"] }
 
+# The Model Context Protocol SDK. Pinned exactly, and **stdio only**: the Streamable HTTP transport
+# is deliberately not enabled because it would add a TLS stack this workspace does not otherwise
+# have (an inspection of `Cargo.lock` finds no `rustls`, `native-tls`, `openssl`, or `ring`). The
+# `server` feature is off because JARVIS is an MCP client here. See
+# `docs/research/integrations/mcp.md`, and `rmcp` is intentionally absent from `jarvis-domain`.
+rmcp = { version = "=3.5.0", default-features = false, features = [
+    "client",
+    "transport-io",
+    "transport-child-process",
+] }
+
 tokio = { version = "1.53.1", default-features = false, features = [
     "fs",
     "io-util",

@@ -216,6 +216,29 @@ struct ExpectedVersionBody {
     expected_version: u32,
 }
 
+/// Removes the `expected_version` field from a body whose verb carries the version separately.
+///
+/// **A structural edit rather than a textual one.** A body's text may contain the literal string
+/// `expected_version` inside a scope name, a reason, or any other value, and a string search would corrupt
+/// exactly the callers whose data happens to mention the word — removing a field is a statement about the
+/// document's *shape*, so it is performed on the parsed shape. The body is already bounded by the
+/// request-body middleware, so parsing it a second time costs nothing a caller can make unbounded.
+///
+/// Returns the input unchanged when it is not a JSON object, so the shared parse reports the malformed body
+/// as `request.invalid` **once**. A second refusal invented here for the same input would give one mistake
+/// two codes, and the caller would have no way to tell which one the daemon meant.
+fn strip_expected_version(body: &[u8]) -> Vec<u8> {
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return body.to_vec();
+    };
+    map.remove("expected_version");
+    // A `Value` that came from parsing always serializes, so the fallback is unreachable; returning the
+    // original keeps it fail-*closed* rather than fail-open, because the original still lacks nothing the
+    // shared parse needs to report.
+    serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_else(|_| body.to_vec())
+}
+
 /// Shared body handling for the two write verbs.
 async fn write_grant(
     state: Arc<ApiState>,
@@ -226,6 +249,24 @@ async fn write_grant(
 ) -> Response {
     let Some(service) = state.tool_grants.as_ref() else {
         return runs::not_ready(request_id);
+    };
+    // **The body is normalized for the verb before it is parsed, and this is the fix for a defect that made
+    // `PATCH` unreachable.** `replace_tool_grant` requires `expected_version` in the body — that is how the
+    // two verbs are kept from being interchangeable — but `WriteToolGrantRequest` carries
+    // `#[serde(deny_unknown_fields)]` and does not model the field, so the *only* body `PATCH` documents was
+    // the one its own parse refused with `request.invalid`. Every `PATCH` answered `400`, and nothing caught
+    // it because no test of any kind invoked this handler: the route was asserted to exist and its codes were
+    // asserted to be in the contract table, and both were true of a handler that could never succeed.
+    //
+    // Removed rather than added to the shared shape, because the shape is the **create** body: a
+    // `WriteToolGrantRequest` that modelled `expected_version` would make an absent version parse as a create
+    // and a supplied one silently change the verb, which is precisely the ambiguity the separate routes
+    // exist to remove. The version arrives through `expected_version` — a typed argument, not a body field —
+    // so stripping it here keeps the *verb* the only thing that decides, and the strip happens **after** the
+    // version was read, so a malformed integer was already refused by `replace_tool_grant`'s own reader.
+    let body: Bytes = match expected_version {
+        Some(_) => Bytes::from(strip_expected_version(&body)),
+        None => body,
     };
     let Ok(parsed) = serde_json::from_slice::<WriteToolGrantRequest>(&body) else {
         return invalid_body(request_id, "the body is not a well-formed grant request");
