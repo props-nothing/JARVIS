@@ -5155,7 +5155,7 @@ Dependencies: Milestone 2 exit gate.
     pipeline takes **one** `Arc<dyn ToolExecutor>` (`ToolCallService::new`), so the moment a second source of
     tools exists there is no way to dispatch to it: the slot is already held by native, and replacing it would
     stop native working. `RoutingExecutor` fills that one slot and routes by the tool's **source kind**.
-    Registered in `daemon::tool_fabric_over`, so the adapter half has its first production caller.
+    Registered in the daemon's tool fabric (**`daemon::router_over` since slice 16**, where the fabric was split so the executor could be supplied from outside), so the adapter half has its first production caller.
   - **The key is the source *kind*, not the capability namespace, and the difference is trust.** A namespace
     is a contract's rather than a transport's — the MCP adapter deliberately reuses one constant for every
     server — and it is *not* trusted the way a source is: by the time a call reaches an executor the identity
@@ -5253,11 +5253,38 @@ Dependencies: Milestone 2 exit gate.
     scrutinee: a real defect, because an arm matching everything means the binding was never used and the
     comment claiming it "records which identity it was asked for" was false. Same class as slices 10 and 13:
     **a mutation caught by the wrong test means the fixture, not the guard.**
-  - **Still to do (`TLS-008` and sibling items):** calling `compose_declared_servers` from `daemon::start` and
-    registering `ComposedMcpExecutor` under the `McpServer` kind in `RoutingExecutor` — the function is
-    complete and tested against spawned children, and nothing in `jarvisd` calls it; heartbeat/idle/shutdown
-    supervision; the `[mcp]` table in the operator docs; a reviewed TLS choice before the remote half; the
-    remaining `Test Plan` items; and `TLS-009`/`TLS-010`.
+  - **Slice 16: the daemon composes the declared servers, closing `TLS-008`'s implementation half.**
+    `daemon::start` now resolves the `[mcp]` declarations, spawns and registers each server, and builds the
+    executor the pipeline dispatches through from **one** router carrying whatever kinds the daemon can
+    actually serve. `jarvisd`'s composition root validates the declarations before the daemon is built, so a
+    broken name or environment key fails startup rather than surfacing as a server that "failed to start".
+  - **`tool_fabric_over` was deleted rather than kept, and that is the round's structural decision.** The
+    pipeline's executor slot is single, so MCP dispatch needs the router supplied *from outside* — which
+    split the old function in two: `router_over` chooses the kinds, `tool_fabric_with` builds everything that
+    does not depend on where a tool comes from. Clippy then reported the old function as never used, because
+    the daemon no longer calls it. Rather than silence it, the journey tests were moved onto the same two
+    functions — so there is now **one** wiring the daemon and the journeys share, and no second composition a
+    journey could pass while the daemon's own was broken.
+  - **The kind gate is asserted, and asserted through the production path.** `router_over(&clock, &[])` is
+    what a profile with no `[mcp]` table gets, and the test asserts it routes `Native` **only** — because a
+    router advertising `McpServer` with no server would be a source the daemon cannot serve. Falsified by
+    registering the MCP kind in the empty branch, which fails
+    `a_profile_with_no_mcp_server_routes_native_only`. The second half asserts the daemon's router actually
+    **resolves** a native tool the catalog offers, so a kind mismatch that would refuse every dispatch is
+    caught rather than showing up as `tool.not_found` for a listed tool.
+  - **`router_over` returns the concrete `RoutingExecutor` rather than a trait object**, which is what makes
+    `routed_kinds()` assertable. Returning `Arc<dyn ToolExecutor>` would hide the whole decision — the kinds
+    it registers — behind a trait that has no method to ask. A concrete return type for a value a test must
+    interrogate, and a trait object only where the caller genuinely does not care.
+  - **A per-server refusal is logged, not fatal.** One unreachable server must not deny the daemon its own
+    tools, so `compose_mcp_servers` reports each refusal at `warn` with its **stable code** (never the
+    message, which may carry operator text). A composition *error* is still `StartupError::Config`, which can
+    only mean the caller passed declarations that did not come from `McpSection::declarations`.
+  - **Still to do (`TLS-008` and sibling items):** heartbeat/idle/shutdown supervision for launched servers;
+    deregistration when a server is removed from configuration (the registry is built per start and dropped,
+    so a removal needs no release path *today* — it becomes needed when the registry is held); the `[mcp]`
+    table in the operator docs; a reviewed TLS choice before the remote half; the remaining `Test Plan`
+    items; and `TLS-009`/`TLS-010`.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
   the source layers a policy version was merged from, so the contract's `GET` requirement stops being
@@ -7051,13 +7078,14 @@ Dependencies: Milestone 2 exit gate.
     store at two instants, so a grant written between them would be seen while its matching deny rule
     was not.
   - **⚠ A value with no producer, found while closing the store.** `NativeReadOnlyGrants::with_deny_rules`
-    had **no caller**: `tool_fabric_over` took no rules, so the reviewed refusals a deployment ships were a
+    had **no caller**: the tool fabric took no rules, so the reviewed refusals a deployment ships were a
     struct field nothing populated and an operator could not refuse one of the daemon's own tools.
-    `tool_fabric_over` now takes them and passes them through, so the path from a reviewed refusal to the
+    The fabric then took them and passed them through, so the path from a reviewed refusal to the
     evaluator is composed and asserted (`a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal`,
-    `a_reviewed_rule_and_a_stored_rule_are_both_applied` in `tool_adapters::tests`). Its caller still
-    passes `Vec::new()` because no `[tools]` config section exists — which is `TLS-019` rather than a gap
-    in this slice, and is named there rather than left implicit.
+    `a_reviewed_rule_and_a_stored_rule_are_both_applied` in `tool_adapters::tests`). **`TLS-019` closed the
+    other end**: the caller now passes the profile's reviewed rules rather than `Vec::new()`.
+    (**The named function was `tool_fabric_over`, split into `router_over` + `tool_fabric_with` in slice 16** —
+    the parameter and its plumbing are what this entry is about, and both survive the split.)
   - 13 store tests + 10 adapter tests + 3 journey tests. 1679 workspace tests. All gates green
     (`fmt`, `clippy -D warnings`, `doc`, `test`, both docs gates). **DO NOT COMMIT.**
   - **Not done, and named.** No plugin process supervision, scoped launch environment, resource
@@ -7072,9 +7100,11 @@ Dependencies: Milestone 2 exit gate.
   that tries to name its own workspace or operator is refused. **Done, and the journey
   crosses the composition root — the layer every handler test is structurally blind to.**
   Evidence: `crates/jarvis-infrastructure/src/http/tool_grant_journey_tests.rs`, three tests
-  over a router composed by `daemon::tool_fabric_over` — the *same* function the daemon calls
-  at startup — so the pipeline the journey drives is the production composition rather than a
-  fixture's copy.
+  over a router the journey builds with `daemon::router_over` and the fabric from
+  `daemon::tool_fabric_with` — the *same* two functions `daemon::start` calls — so the pipeline
+  the journey drives is the production composition rather than a fixture's copy.
+  (**Slice 16** split the single `tool_fabric_over` these tests originally called; the tests were
+  moved onto the two functions rather than keeping a second composition to call.)
   - **The journey is asserted through `POST /api/v1/runs`, not through the source.**
     `a_deny_rule_written_through_the_surface_refuses_a_dispatch_and_removing_it_restores_it`
     runs four legs over one profile with the store as the **only** difference between them:
@@ -7131,7 +7161,9 @@ Dependencies: Milestone 2 exit gate.
     `a_stored_grant_replaces_the_default_posture_rather_than_adding_to_it` in `tool_adapters::tests`
     covers that direction at the source. No control-plane **UI** exists; the CLI and the HTTP routes are
     what one would drive.
-- [x] `TLS-019` Wire the reviewed deny rules in `tool_fabric_over` to configuration.
+- [x] `TLS-019` Wire the reviewed deny rules into configuration, so a profile's `[[tools.deny]]`
+  entries reach the tool fabric rather than a `Vec::new()` at the composition root. (The wiring now
+  lives in `daemon::tool_fabric_with`, which slice 16 split out of the single-function fabric.)
   **Done.** A `[[tools.deny]]` entry in the profile's `config.toml` is validated at startup and
   reaches the evaluator, beside the stored rules.
   Evidence: `ToolsSection` / `DenyRuleSection` / `ReviewedDenyRule`
@@ -7141,7 +7173,7 @@ Dependencies: Milestone 2 exit gate.
   that the proposed call is refused and **did not execute**.
   - **The value-with-no-producer is closed, and the finding was recorded before this existed.** The
     previous round found `NativeReadOnlyGrants::with_deny_rules` had **no caller** — so a deployment's
-    refusals were a struct field nothing populated. `tool_fabric_over` took the rules but its only caller
+    refusals were a struct field nothing populated. The tool fabric took the rules but its only caller
     passed `Vec::new()`, which is why this was named as its own TODO rather than counted as done.
   - **The asymmetry between grants and refusals is the design.** A *grant* is authority, so it lives only
     in the durable store: authority in a configuration file would be authority no surface can list, revoke,

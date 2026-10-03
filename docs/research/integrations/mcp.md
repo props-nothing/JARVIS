@@ -481,8 +481,8 @@ modules, and are now a single `JarvisClient`.
 `ToolCallService::new` holds a single `Arc<dyn ToolExecutor>`, and the composition passes native. That is a
 deliberate shape in the port — a *list* of executors would make dispatch order invisible — but it means a
 second source of tools has nowhere to go. `RoutingExecutor` fills the one slot and routes by the tool's
-**source kind**, and is registered in `daemon::tool_fabric_over`, which is the adapter's first production
-caller.
+**source kind**, and is registered in the daemon's tool fabric by `daemon::router_over`, which is the adapter's
+first production caller.
 
 **The key is the kind, not the capability namespace.** A namespace is a contract's rather than a transport's
 — this adapter deliberately reuses one constant for every server — and it is not trusted the way a source is:
@@ -572,6 +572,38 @@ it passed `declarations()` instead, at which point the mutant failed. And the re
 with one catch-all arm — clippy flagged it as replaceable by its scrutinee, which is a lint *and* a real
 defect: an arm matching everything means the binding was never used, so the comment claiming it "records which
 identity it was asked for" was false. **A mutation caught by the wrong test means the fixture, not the guard.**
+
+### The daemon composes them, and the old single-function fabric was split rather than kept
+
+`daemon::start` now resolves the profile's `[mcp]` declarations, spawns and registers each server, and builds
+the executor the pipeline dispatches through from **one** router carrying whatever kinds the daemon can serve.
+`jarvisd`'s composition root validates the declarations before the daemon is built, so a broken name or
+environment key fails startup rather than surfacing as a server that "failed to start" — and a **disabled**
+declaration is validated too, because it is a reviewed record that must stay correct.
+
+**The structural decision was deleting `tool_fabric_over` rather than keeping it.** The pipeline's executor
+slot is single, so MCP dispatch requires the router to be supplied *from outside* — which splits the old
+function in two: `router_over` chooses the kinds, `tool_fabric_with` builds everything that does not depend on
+where a tool comes from. Clippy then reported the old function as never used, because the daemon had stopped
+calling it. Silencing that would have left two compositions, so instead the journey tests were moved onto the
+same two functions: **one wiring the daemon and the journeys share**, and no second composition a journey
+could pass while the daemon's own was broken.
+
+Two smaller decisions worth recording:
+
+- **The kind gate is asserted through the production path.** `router_over(&clock, &[])` is what a profile with
+  no `[mcp]` table gets, and the test asserts it routes `Native` **only** — a router advertising `McpServer`
+  with no server would claim a source the daemon cannot serve. Falsified by registering the MCP kind in the
+  empty branch. A second test asserts the daemon's router actually *resolves* a native tool the catalog
+  offers, so a kind mismatch that would refuse every dispatch is caught here rather than appearing as
+  `tool.not_found` for a tool the catalog lists.
+- **`router_over` returns the concrete `RoutingExecutor`, not a trait object.** That is what makes
+  `routed_kinds()` assertable; `Arc<dyn ToolExecutor>` would hide the entire decision — which kinds are
+  registered — behind a trait with no method to ask. A concrete type for a value a test must interrogate, and
+  a trait object only where the caller genuinely does not care.
+
+A per-server failure is **logged, not fatal**: one unreachable server must not deny the daemon its own tools,
+so each refusal is reported at `warn` with its stable code — never the message, which may carry operator text.
 
 ## Version Matrix
 

@@ -72,6 +72,18 @@ pub struct DaemonConfig {
     /// that started with a broken refusal would run believing it had forbidden something it had not. Empty is
     /// the ordinary state — a profile with no `[tools]` table declares no reviewed refusal.
     reviewed_deny_rules: Vec<crate::config::ReviewedDenyRule>,
+    /// The MCP servers the profile's `[mcp]` table declares, already validated.
+    ///
+    /// **Carried as resolved declarations rather than as the section they came from**, for the reason
+    /// [`Self::reviewed_deny_rules`] records: a declaration whose name is unusable or whose environment key
+    /// cannot reach a process table is a *configuration* fault, and the reviewed form exists so it is caught
+    /// before anything serves. Empty is the ordinary state — a profile with no `[mcp]` table declares no
+    /// server, and that is a complete configuration rather than a placeholder.
+    ///
+    /// **Disabled declarations are carried too.** `compose_declared_servers` skips them, and a caller that
+    /// filtered here would move that rule into the composition root — where it is one edit away from being
+    /// dropped. The filtering belongs with the code that would otherwise launch the process.
+    mcp_servers: Vec<crate::config::mcp::McpServerDeclaration>,
 }
 
 /// `Debug` is hand-written because the provider is a trait object: a derived implementation would
@@ -94,6 +106,11 @@ impl std::fmt::Debug for DaemonConfig {
             // The count rather than the rules: a reason is operator text, and a diagnostic line needs to
             // say whether any reviewed refusal was configured, not reproduce the configuration file.
             .field("reviewed_refusals", &self.reviewed_deny_rules.len())
+            // Counted rather than listed, for the same reason: a server name is operator text and a
+            // diagnostic needs the count. Neither a program path nor an environment *reference* appears —
+            // the latter is safe by construction, but a `Debug` line that printed every locator would still
+            // be noise.
+            .field("mcp_servers", &self.mcp_servers.len())
             .finish_non_exhaustive()
     }
 }
@@ -115,6 +132,9 @@ impl DaemonConfig {
             // An empty list is the **ordinary** state, not a placeholder: a profile that declares no
             // `[[tools.deny]]` entry ships no reviewed refusal, and that is a complete configuration.
             reviewed_deny_rules: Vec::new(),
+            // Empty for the same reason: most profiles declare no MCP server, and the daemon is complete
+            // without one — the native tools are the whole catalog in that case.
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -150,6 +170,30 @@ impl DaemonConfig {
     #[must_use]
     pub fn reviewed_deny_rules(&self) -> &[crate::config::ReviewedDenyRule] {
         &self.reviewed_deny_rules
+    }
+
+    /// Supplies the MCP servers the profile declares.
+    ///
+    /// A builder rather than a `from_profile` argument, for the reason [`Self::with_reviewed_deny_rules`]
+    /// records: reading and validating the configuration file stays an explicit composition step. A caller
+    /// that forgets it gets **no** MCP server, which is the visible outcome — a profile that declares one and
+    /// a daemon that offers none is a composition step that did not run, rather than a silent misconfiguration.
+    #[must_use]
+    pub fn with_mcp_servers(
+        mut self,
+        servers: Vec<crate::config::mcp::McpServerDeclaration>,
+    ) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    /// Returns the MCP servers this profile declares.
+    ///
+    /// **Every declaration, including the disabled ones**, because the caller that filters would be a second
+    /// place the rule lives. See the field's own documentation.
+    #[must_use]
+    pub fn mcp_servers(&self) -> &[crate::config::mcp::McpServerDeclaration] {
+        &self.mcp_servers
     }
 
     /// Returns the discovery file path.
@@ -568,7 +612,21 @@ pub async fn start(
         .delivery_campaigns(DEFAULT_WORKSPACE)
         .await
         .unwrap_or_default();
-    // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_over` for why
+    // **The MCP servers are composed before the fabric, because the fabric's executor slot is single.**
+    // Composing them after would mean building a pipeline over a router that cannot reach a server's tools,
+    // and rebuilding it would be a second composition — the defect the split of the old single-function fabric
+    // exists to prevent. So the registry, the dispatcher, and the router are built here and handed in.
+    //
+    // The clock is built here rather than inside `tool_fabric_with` because the router needs the native
+    // executor, which needs a clock, and constructing two would give the native tools and the ledger
+    // different sources of time.
+    let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
+    let mcp = compose_mcp_servers(config.mcp_servers()).await?;
+    // **One router, carrying whatever kinds the daemon can actually serve.** A profile with no `[mcp]` table
+    // registers only `Native`, which is the common path — so the MCP kind appears only when a server composed,
+    // and a router advertising a source it cannot serve is never built.
+    let executor = router_over(&clock, mcp.servers());
+    // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_with` for why
     // composing it twice would let a grant written through one surface be invisible to the pipeline the
     // other resolves against.
     //
@@ -579,9 +637,11 @@ pub async fn start(
     // the result here. What is true is narrower and worth stating: the *default* profile ships no refusals, so
     // every existing configuration loads unchanged, and the stored deny rules an operator writes through
     // `/api/v1/tool-grants/deny-rules` reach the evaluator independently from the same store handle.
-    let (tools, tool_grants) = tool_fabric_over(
+    let (tools, tool_grants) = tool_fabric_with(
         database.pool().clone(),
         config.reviewed_deny_rules().to_vec(),
+        Arc::new(executor),
+        clock,
     )?;
     let ports = run_ports(
         Arc::clone(&repositories),
@@ -675,7 +735,7 @@ pub async fn start(
     let approvals = approval_service_over(&database);
 
     // **The tool pipeline and its authorization surface, over one catalog.** Both are composed by
-    // `tool_fabric_over`, and both are attached: a pipeline without the surface could not be configured
+    // `tool_fabric_with`, and both are attached: a pipeline without the surface could not be configured
     // by a client, and a surface without the pipeline would write grants nothing reads. Returns the pair
     // because neither is meaningful alone — which is the whole reason the grant store exists.
 
@@ -825,9 +885,18 @@ fn run_ports(
 /// assembling its own pipeline — would be a second composition, and a journey that exercised a copy would
 /// pass while the daemon's own wiring was broken. That is the same defect the daemon's other composition
 /// helpers record: the composition root is the layer a handler test is structurally blind to.
-pub(crate) fn tool_fabric_over(
+/// Builds the governed tool pipeline over the daemon's catalog, stores, and a **supplied** executor.
+///
+/// `executor` is passed in rather than composed here, and that is what makes MCP dispatch possible: the
+/// pipeline's executor slot is single, so the daemon supplies a router carrying both the native
+/// implementation and whatever MCP servers it composed. This function's remaining job is everything that
+/// does not depend on where a tool comes from — the catalog, the grants, the validator, the ledger, the
+/// approvals.
+pub(crate) fn tool_fabric_with(
     pool: sqlx::SqlitePool,
     deny_rules: Vec<crate::config::ReviewedDenyRule>,
+    executor: Arc<dyn jarvis_application::tool_call::ToolExecutor>,
+    clock: Arc<dyn jarvis_domain::clock::Clock>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -841,7 +910,6 @@ pub(crate) fn tool_fabric_over(
     use jarvis_application::tool_call::ToolCallService;
     use jarvis_application::tool_grant_service::ToolGrantService;
 
-    let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
     let definitions = crate::native_tools::definitions().map_err(|_| {
         // A construction refusal from a reviewed definition is a packaging defect, reported as a
         // config fault so an operator knows to look at the build rather than at the request.
@@ -878,22 +946,6 @@ pub(crate) fn tool_fabric_over(
         crate::storage::tool_grant_repository::SqliteToolGrantRepository::new(pool.clone()),
     );
     let grants = StoredGrants::new(Arc::clone(&store), defaults, &tools);
-    // **The pipeline gets a router, not the native executor directly.** The port takes one executor, so a
-    // second source of tools — an MCP server today, a connector or runtime later — has no way to be reached
-    // through a slot that already holds native. Registering native *by kind* keeps the pipeline's shape and
-    // makes the choice a value: a call whose source kind is not routed is `NotFound` rather than silently
-    // served by the wrong implementation. See `tool_adapters::routing`.
-    //
-    // Only `Native` is registered, because it is the only kind the daemon can currently implement: the MCP
-    // adapter's executor needs a live session and a server declaration, and neither exists in configuration
-    // yet. Stating that here rather than registering a placeholder is deliberate — a router with a kind that
-    // cannot answer would refuse calls the daemon appears to support.
-    let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> =
-        Arc::new(crate::native_tools::NativeExecutor::new(Arc::clone(&clock)));
-    let executor = crate::tool_adapters::routing::RoutingExecutor::new([(
-        jarvis_domain::tool::identity::SourceKind::Native,
-        native,
-    )]);
     let ledger = crate::storage::tool_call_repository::SqliteToolCallRepository::new(pool.clone());
     let approvals = crate::storage::approval_repository::SqliteApprovalRepository::new(pool);
     let pipeline = Arc::new(ToolCallService::new(
@@ -901,7 +953,12 @@ pub(crate) fn tool_fabric_over(
         Arc::new(grants),
         Arc::new(SchemaValidator::new()),
         Arc::new(FingerprintHasher::new()),
-        Arc::new(executor),
+        // **The supplied executor, which is a router.** The port takes one executor, so a second source of
+        // tools — an MCP server today, a connector or runtime later — cannot be reached through a slot that
+        // holds only native. Registering by *kind* keeps the pipeline's shape and makes the choice a value: a
+        // call whose source kind is not routed is `NotFound` rather than served by the wrong implementation.
+        // See `tool_adapters::routing`.
+        executor,
         Arc::new(ledger),
         Arc::new(approvals),
         clock,
@@ -911,6 +968,93 @@ pub(crate) fn tool_fabric_over(
     // being kept in step.
     let surface = Arc::new(ToolGrantService::new(store, catalog));
     Ok((pipeline, surface))
+}
+
+/// Builds the executor the pipeline dispatches through: native, plus the MCP kind when servers composed.
+///
+/// **One router whatever the profile declares.** With no `[mcp]` table this is the native-only router, which
+/// is the common path — so the `McpServer` kind appears only when a server actually composed. Registering the
+/// kind for an empty composition would be a router advertising a source it cannot serve.
+///
+/// The composition's servers are folded into **one** executor for the whole kind, because
+/// [`crate::tool_adapters::routing::RoutingExecutor`] holds at most one per kind and every MCP server shares
+/// `SourceKind::McpServer`. See [`crate::mcp::composition::ComposedMcpExecutor`] for why that fan-out is keyed
+/// by identity.
+///
+/// `pub(crate)` because the journey tests compose the **same** fabric the daemon does: rebuilding the router
+/// there would exercise a copy, and a defect in the daemon's own wiring would leave the journey green — which
+/// is the layer that needs proving.
+pub(crate) fn router_over(
+    clock: &Arc<dyn jarvis_domain::clock::Clock>,
+    servers: &[crate::mcp::composition::ComposedMcpServer],
+) -> crate::tool_adapters::routing::RoutingExecutor {
+    use crate::tool_adapters::routing::RoutingExecutor;
+    use jarvis_domain::tool::identity::SourceKind;
+
+    let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> =
+        Arc::new(crate::native_tools::NativeExecutor::new(Arc::clone(clock)));
+    if servers.is_empty() {
+        return RoutingExecutor::new([(SourceKind::Native, native)]);
+    }
+    // The composition is folded into **one** executor for the whole kind, because a router holds at most one
+    // per kind and every MCP server shares `SourceKind::McpServer`. See
+    // [`crate::mcp::composition::ComposedMcpExecutor`] for why that fan-out is keyed by identity.
+    let dispatcher: Arc<dyn jarvis_application::tool_call::ToolExecutor> = Arc::new(
+        crate::mcp::composition::ComposedMcpExecutor::over_servers(servers),
+    );
+    // The native executor is used in **both** branches, so it is built once above rather than inline in
+    // each: a second construction would give the two branches different executors for one kind.
+    RoutingExecutor::new([
+        (SourceKind::Native, native),
+        (SourceKind::McpServer, dispatcher),
+    ])
+}
+
+/// Composes the profile's declared MCP servers, resolving their secrets through the environment.
+///
+/// # Errors
+///
+/// Returns [`StartupError::Config`] when a *declaration* is unusable, which `jarvisd`'s composition root has
+/// already validated — reaching this would mean the caller passed declarations that did not come from
+/// `McpSection::declarations`, so it is a packaging fault like a refused native definition. Every per-server
+/// failure (a missing secret, a launch fault, an incompatible peer, an all-refused catalog) is **reported and
+/// skipped** rather than failing startup, so one misconfigured server does not take down the others.
+///
+/// A refused server is logged at `warn` with its stable code, because a daemon that started with fewer servers
+/// than the profile declares is a fact an operator has to be able to see — and the alternative, failing
+/// startup, would make an unreachable server a denial of service on the daemon's own tools.
+async fn compose_mcp_servers(
+    declared: &[crate::config::mcp::McpServerDeclaration],
+) -> Result<crate::mcp::composition::McpComposition, StartupError> {
+    use crate::config::secret::EnvSecretResolver;
+
+    if declared.is_empty() {
+        return Ok(crate::mcp::composition::McpComposition::default());
+    }
+    // The registry is **the daemon's own**, so registrations accumulate across servers and the registry's
+    // first-wins source claim refuses a second server that declares the first's owner. It is not the
+    // pipeline's catalog (a capability-keyed snapshot); it is what the admission and publish checks read.
+    // Held here for the composition and then dropped, because a live registry would be a second mutable
+    // authority beside the catalog the pipeline dispatches through — and the daemon has no deregistration path
+    // yet, so an operator removal would leave a stale claim nothing could release.
+    let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
+    let composition = crate::mcp::composition::compose_declared_servers(
+        &mut registry,
+        declared,
+        &EnvSecretResolver::new(),
+    )
+    .await
+    .map_err(|_| StartupError::Config)?;
+    for (server, refusal) in composition.refused() {
+        // The **code**, never the refusal's message: a message may carry operator text, and the code is what
+        // an operator greps for in the note's error table.
+        log::warn!(
+            "mcp server refused at startup: server={server} code={} permanent={}",
+            refusal.code(),
+            refusal.is_permanent()
+        );
+    }
+    Ok(composition)
 }
 
 /// Settles the tool calls left stranded by the previous shutdown.
@@ -1001,6 +1145,7 @@ pub fn api_state(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{DaemonConfig, format_base_url, start};
@@ -1347,5 +1492,73 @@ mod tests {
 
     fn daemon_discovery_path(root: &std::path::Path) -> std::path::PathBuf {
         config(root).discovery_path()
+    }
+
+    /// The router a profile with no `[mcp]` table gets, asserted by **the kind it routes**.
+    ///
+    /// **This is the production path, not a copy of it.** `start` builds the executor through
+    /// [`super::router_over`] with whatever composed, so a daemon with no MCP server gets exactly this value.
+    /// Asserting the kind is what makes the wiring checkable: an executor registered under the wrong
+    /// `SourceKind` would dispatch nothing, and the pipeline tests would still pass because they exercise the
+    /// *pipeline* rather than the route into it.
+    #[test]
+    fn a_profile_with_no_mcp_server_routes_native_only() {
+        use jarvis_domain::tool::identity::SourceKind;
+
+        let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
+        let routed = super::router_over(&clock, &[]).routed_kinds();
+        assert_eq!(
+            routed,
+            vec![SourceKind::Native],
+            "a profile with no `[mcp]` table must route only the daemon's own tools"
+        );
+        assert!(
+            !routed.contains(&SourceKind::McpServer),
+            "registering the MCP kind with no server would advertise a source the daemon cannot serve"
+        );
+    }
+
+    /// The router is the executor `start` hands the pipeline, and it answers for a native identity.
+    ///
+    /// The second half of the wiring: the *daemon's* router must actually resolve the tools the catalog
+    /// offers. A router whose kind did not match would produce a daemon that starts, reports ready, and
+    /// refuses every tool call — the failure mode that reads as `tool.not_found` for a tool the catalog lists.
+    #[tokio::test]
+    async fn the_daemons_router_resolves_a_native_tool_the_catalog_offers() {
+        use jarvis_application::tool_call::ToolExecutor as _;
+
+        let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
+        let router = super::router_over(&clock, &[]);
+        // The canonical definition the catalog offers, so the identity is the one a real dispatch carries
+        // rather than a fixture that happens to satisfy the lookup.
+        let definition = crate::native_tools::definitions()
+            .expect("the reviewed definitions are consistent")
+            .into_iter()
+            .next()
+            .expect("the daemon offers at least one native tool")
+            .definition;
+
+        let arguments = jarvis_domain::tool::call::ToolArguments::new("{}")
+            .expect("the fixture arguments are usable");
+        let cancel = jarvis_application::cancellation::CancellationScope::new();
+        let request = jarvis_application::tool_call::ToolExecutionRequest {
+            identity: &definition.identity,
+            display_name: &definition.display_name,
+            arguments: &arguments,
+            started_at: jarvis_domain::time::UtcTimestamp::parse("2026-10-03T00:00:00Z")
+                .expect("the fixture instant is valid"),
+            timeout_ms: definition.execution.timeout_ms,
+        };
+        // **Routed, not necessarily successful.** The clock tool has an arm for its own capability, and this
+        // asserts the *route* by checking the refusal is not the unrouted one — an unmatched kind would answer
+        // `NotFound` before the tool ran.
+        let outcome = router.execute(request, &cancel).await;
+        if let Err(error) = &outcome {
+            assert_ne!(
+                error.error_class(),
+                jarvis_domain::tool::error_class::ToolErrorClass::NotFound,
+                "the daemon's own router must reach the native tool rather than refuse it as unrouted"
+            );
+        }
     }
 }

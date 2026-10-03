@@ -493,9 +493,19 @@ impl ComposedMcpExecutor {
     /// safety, but the intent is the same.
     #[must_use]
     pub fn over(composition: &McpComposition) -> Self {
+        Self::over_servers(composition.servers())
+    }
+
+    /// Builds a dispatcher over an explicit slice of composed servers.
+    ///
+    /// Exposed beside [`Self::over`] because the **daemon holds its composition and needs the dispatcher at
+    /// the same time**: the sessions must outlive the router that dispatches to them, so consuming the
+    /// composition would drop the very sessions the dispatcher is holding. Both entry points build the same
+    /// value; this one does not require the composition to be moved.
+    #[must_use]
+    pub fn over_servers(servers: &[ComposedMcpServer]) -> Self {
         Self {
-            servers: composition
-                .servers()
+            servers: servers
                 .iter()
                 .map(|server| (Arc::clone(server.executor()), server.admitted().to_vec()))
                 .collect(),

@@ -192,9 +192,17 @@ fn compose_provider(
         .tools
         .reviewed_rules()
         .map_err(|error| error.code())?;
+    // **The MCP declarations are validated here too, and carried whether or not they are enabled.** A name
+    // that is not a usable identity, a program that cannot reach a process table, or an environment key with a
+    // `=` in it is a *configuration* fault, so it fails startup rather than surfacing later as a server that
+    // "failed to start". Disabled declarations are validated as well, because a disabled server is a reviewed
+    // record that must stay correct — the composition skips it, so a broken one would sit in the file doing
+    // nothing while its author believed it was merely switched off.
+    let mcp_servers = layered.mcp.declarations().map_err(|error| error.code())?;
     Ok(config
         .with_provider(provider)
-        .with_reviewed_deny_rules(reviewed))
+        .with_reviewed_deny_rules(reviewed)
+        .with_mcp_servers(mcp_servers))
 }
 
 /// Serves the local surface until a shutdown signal arrives, then drains.

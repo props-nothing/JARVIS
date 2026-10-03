@@ -268,11 +268,11 @@ mod tests {
 
     /// A fresh provider and the router over one in-memory profile, with the daemon's **real** tool fabric.
     ///
-    /// The pipeline comes from `daemon::tool_fabric_over` — the same function the daemon calls at startup —
-    /// and the surface is handed the store handle that same function built. Rebuilding either here would be
-    /// a second composition, and the journey would exercise the copy: a defect in the daemon's own wiring
-    /// would leave this file green, which is precisely the layer that needs proving. It is the reason
-    /// `tool_fabric_over` is crate-visible.
+    /// The pipeline comes from `daemon::tool_fabric_with` over the router `daemon::router_over` builds — the
+    /// same two functions `daemon::start` calls — and the surface is handed the store handle that function
+    /// built. Rebuilding either here would be a second composition, and the journey would exercise the copy:
+    /// a defect in the daemon's own wiring would leave this file green, which is precisely the layer that
+    /// needs proving. It is the reason both functions are crate-visible.
     async fn journey(tag: &str, provider: Arc<ProposeThenAnswer>) -> (axum::Router, String) {
         journey_with(tag, provider, Vec::new()).await
     }
@@ -300,8 +300,21 @@ mod tests {
 
         let database = Database::open_in_memory().await.expect("in-memory opens");
         migrate::run(database.pool()).await.expect("migrates");
-        let (tools, grants) = crate::daemon::tool_fabric_over(database.pool().clone(), reviewed)
-            .expect("the reviewed definitions are consistent");
+        // **The daemon's own wiring, reached through its own functions.** The router comes from
+        // `daemon::router_over` with no MCP servers, which is exactly what a daemon with no `[mcp]` table
+        // builds, and the fabric from `daemon::tool_fabric_with` — so this journey cannot pass while the
+        // daemon's real composition is broken, which is the layer `tool_fabric_with` is crate-visible for. An
+        // earlier version composed the fabric with one function and left the router inside it; the two are now
+        // the caller's choice, so the MCP case is the same code path with one more kind registered.
+        let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
+        let executor = crate::daemon::router_over(&clock, &[]);
+        let (tools, grants) = crate::daemon::tool_fabric_with(
+            database.pool().clone(),
+            reviewed,
+            Arc::new(executor),
+            clock,
+        )
+        .expect("the reviewed definitions are consistent");
         let repositories = Arc::new(crate::storage::repositories::SqliteRepositories::new(
             database.pool().clone(),
         ));
@@ -553,7 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_reviewed_refusal_from_the_profile_configuration_refuses_a_dispatch() {
-        // **`TLS-019`, and the last mile of the value-with-no-producer finding.** `tool_fabric_over` accepted
+        // **`TLS-019`, and the last mile of the value-with-no-producer finding.** The fabric's reviewed-rule
+        // parameter accepted
         // the reviewed refusals but its only caller passed an empty list, so a deployment's reviewable
         // refusals had no way to reach the evaluator. The value now comes from the `[[tools.deny]]`
         // configuration table, and this test closes the same loop the four-leg test closes for the *store*:

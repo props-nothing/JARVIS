@@ -2,8 +2,8 @@
 //!
 //! # Why a router is required rather than a convenience
 //!
-//! `ToolCallService::new` takes **one** `Arc<dyn ToolExecutor>`, and the composition in
-//! `daemon::tool_fabric_over` passes the native executor. So the moment a second source of tools exists —
+//! `ToolCallService::new` takes **one** `Arc<dyn ToolExecutor>`, and the daemon's composition passes the
+//! native executor. So the moment a second source of tools exists —
 //! an MCP server, a connector, a runtime — there is no way to dispatch to it: the pipeline's single slot is
 //! already taken, and replacing it would stop the native tools working.
 //!

@@ -337,7 +337,7 @@ async fn a_rule_naming_only_effects_is_passed_through_unchanged() {
 #[tokio::test]
 async fn a_reviewed_deny_rule_reaches_the_source_and_stays_a_refusal() {
     // **The gap this test closes was a value with no producer.** `NativeReadOnlyGrants::with_deny_rules`
-    // existed with no production caller — `tool_fabric_over` never passed any — so an operator had no way to
+    // existed with no production caller — the daemon's fabric never passed any — so an operator had no way to
     // refuse one of the daemon's own tools, and the reviewed refusals were a struct field nothing populated.
     //
     // Two assertions, because the failure has two directions. The rule must **arrive** (a refusal that does
