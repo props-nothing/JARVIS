@@ -40,6 +40,7 @@ use crate::auth::ClientRegistry;
 use crate::auth::credential::CredentialError;
 
 pub mod approval;
+pub mod memory;
 pub mod policy;
 pub mod runs;
 pub mod tool_grant;
@@ -156,6 +157,11 @@ pub struct ApiState {
     /// a database console. Optional for the same reason the three above are, and routable without it so a
     /// client receives `service.not_ready` rather than the unknown-route refusal.
     pub tool_grants: Option<Arc<jarvis_application::tool_grant_service::ToolGrantService>>,
+    /// The memory surface's service, absent when no storage is configured.
+    ///
+    /// Optional and routable without it for the same reason the four above are: a client receives
+    /// `service.not_ready` rather than the unknown-route refusal.
+    pub memories: Option<Arc<jarvis_application::memory_service::MemoryService>>,
     /// The candidate inventory an effective-route probe evaluates.
     ///
     /// Absent when no provider is configured, because a probe with no candidates would report
@@ -384,6 +390,7 @@ impl ApiState {
             policies: None,
             approvals: None,
             tool_grants: None,
+            memories: None,
             inventory: None,
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -462,6 +469,16 @@ impl ApiState {
         self
     }
 
+    /// Attaches the memory surface's service.
+    #[must_use]
+    pub fn with_memories(
+        mut self,
+        memories: Arc<jarvis_application::memory_service::MemoryService>,
+    ) -> Self {
+        self.memories = Some(memories);
+        self
+    }
+
     /// Overrides how a run's execution is scheduled.
     #[must_use]
     pub fn with_spawner(mut self, spawner: Arc<dyn RunSpawner>) -> Self {
@@ -525,7 +542,7 @@ pub fn authority_of(address: SocketAddr) -> String {
 /// would still be served — which is why the list is asserted against the router rather than
 /// trusted, and why adding a route without adding its capability is a test failure rather than a
 /// silent omission a client would discover by probing.
-pub const SYSTEM_CAPABILITIES: [&str; 7] = [
+pub const SYSTEM_CAPABILITIES: [&str; 9] = [
     "system.status",
     "runs.create",
     "runs.read",
@@ -533,6 +550,8 @@ pub const SYSTEM_CAPABILITIES: [&str; 7] = [
     "runs.events",
     "policy.read",
     "policy.write",
+    "memory.read",
+    "memory.write",
 ];
 
 /// The `{"status":"live"}` body.
@@ -761,6 +780,20 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route(
             "/api/v1/tool-grants/{grant_id}/revoke",
             authenticated(post(tool_grant::revoke_tool_grant)),
+        )
+        // **The memory surface.** `search` is declared before `{memory_id}` so the literal segment is not
+        // captured as an identifier, the same ordering the deny-rule routes above rely on.
+        .route(
+            "/api/v1/memories",
+            authenticated(post(memory::remember).get(memory::list_memories)),
+        )
+        .route(
+            "/api/v1/memories/search",
+            authenticated(get(memory::search_memories)),
+        )
+        .route(
+            "/api/v1/memories/{memory_id}",
+            authenticated(get(memory::read_memory).delete(memory::forget_memory)),
         )
         .fallback(unknown_route)
         .layer(middleware::from_fn(reject_browser_origin))
@@ -2648,6 +2681,12 @@ pub(crate) mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
             )
             .with_runs(service)
+            .with_memories(Arc::new(jarvis_application::memory_service::MemoryService::new(
+                Arc::new(crate::storage::memory_repository::SqliteMemoryRepository::new(
+                    database.pool().clone(),
+                )),
+                Arc::new(crate::ids::UuidV7Generator::new()),
+            )))
             .with_spawner(Arc::new(TokioSpawner))
             // A **short** interval, because a keepalive is only observable by waiting: with the
             // production fifteen seconds the test would take fifteen seconds to prove one comment.
@@ -3099,6 +3138,8 @@ pub(crate) mod tests {
             ("runs.events", "/api/v1/runs/{run_id}/events"),
             ("policy.read", "/api/v1/model-data-policy"),
             ("policy.write", "/api/v1/model-data-policy"),
+            ("memory.read", "/api/v1/memories"),
+            ("memory.write", "/api/v1/memories"),
         ];
         for (capability, route) in served {
             assert!(
@@ -3114,6 +3155,218 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(temp_dir("capabilities"));
     }
 
+    /// Authenticated headers for a request that carries no idempotency key (the memory surface is
+    /// naturally idempotent: an exact duplicate is a no-op).
+    fn memory_headers(token: &str) -> Vec<(&str, String)> {
+        vec![
+            ("authorization", format!("Bearer {token}")),
+            ("jarvis-api-version", "1".to_owned()),
+            ("content-type", "application/json".to_owned()),
+        ]
+    }
+
+    fn json(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).expect("a JSON body")
+    }
+
+    #[tokio::test]
+    async fn a_memory_is_remembered_found_read_and_forgotten_through_the_api() {
+        let (app, token) = runs_fixture("memory-journey").await;
+        let headers = memory_headers(&token);
+
+        // Remember: created, with provenance the client did not supply.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/memories",
+            &headers,
+            r#"{"text":"Client proposals should be concise"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created = json(&body);
+        assert_eq!(created["created"], true);
+        assert_eq!(created["memory"]["class"], "preference");
+        assert_eq!(created["memory"]["sensitivity"], "internal");
+        assert_eq!(created["memory"]["source_kind"], "user_request");
+        let id = created["memory"]["memory_id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+        assert!(
+            created["memory"]["source_principal_id"]
+                .as_str()
+                .is_some_and(|v| v.len() == 36)
+        );
+
+        // The same claim again, spelled differently: no second memory, and the answer says so.
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/memories",
+            &headers,
+            r#"{"text":"  client proposals SHOULD be   concise "}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let again = json(&body);
+        assert_eq!(again["created"], false);
+        assert_eq!(again["memory"]["memory_id"], id.as_str());
+
+        // Listed once, found by a lexical query, and read by identity.
+        let (status, body) = send(&app, "GET", "/api/v1/memories", &headers, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            json(&body)["memories"].as_array().map(Vec::len),
+            Some(1),
+            "{body}"
+        );
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/memories/search?q=concise%20proposals",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let found = json(&body);
+        assert_eq!(
+            found["hits"][0]["memory"]["memory_id"],
+            id.as_str(),
+            "{body}"
+        );
+        assert_eq!(found["hits"][0]["relevance"], 1000);
+        let (status, _) = send(&app, "GET", &format!("/api/v1/memories/{id}"), &headers, "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Forgotten: gone from read, list, and search, and a second forget reads as missing.
+        let (status, body) = send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/memories/{id}"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            send(&app, "GET", &format!("/api/v1/memories/{id}"), &headers, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains(r#""code":"resource.not_found""#), "{body}");
+        let (_, body) = send(&app, "GET", "/api/v1/memories", &headers, "").await;
+        assert_eq!(json(&body)["memories"].as_array().map(Vec::len), Some(0));
+        let (_, body) = send(
+            &app,
+            "GET",
+            "/api/v1/memories/search?q=concise",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(json(&body)["hits"].as_array().map(Vec::len), Some(0));
+        let (status, _) = send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/memories/{id}"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(temp_dir("memory-journey"));
+    }
+
+    #[tokio::test]
+    async fn a_memory_request_the_surface_cannot_honour_is_refused_with_the_shared_envelope() {
+        let (app, token) = runs_fixture("memory-refusals").await;
+        let headers = memory_headers(&token);
+        for (label, body) in [
+            ("empty text", r#"{"text":"   "}"#),
+            ("unknown class", r#"{"text":"x y","class":"episodic"}"#),
+            (
+                "unknown sensitivity",
+                r#"{"text":"x y","sensitivity":"cosmic"}"#,
+            ),
+            // A model-invented provenance or scope has no field to land in.
+            ("a source", r#"{"text":"x y","source":"model"}"#),
+            (
+                "a workspace",
+                r#"{"text":"x y","workspace_id":"018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d"}"#,
+            ),
+            ("not json", "remember this"),
+        ] {
+            let (status, response) = send(&app, "POST", "/api/v1/memories", &headers, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {response}");
+            assert!(
+                response.contains(r#""code":"request.invalid""#),
+                "{label}: {response}"
+            );
+        }
+        for (label, path) in [
+            ("a search with no query", "/api/v1/memories/search"),
+            ("a blank query", "/api/v1/memories/search?q=%20%20"),
+            ("an unknown filter", "/api/v1/memories?kind=preference"),
+            ("a malformed limit", "/api/v1/memories?limit=many"),
+            ("q on the listing", "/api/v1/memories?q=anything"),
+        ] {
+            let (status, response) = send(&app, "GET", path, &headers, "").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {response}");
+            assert!(
+                response.contains(r#""code":"request.invalid""#),
+                "{label}: {response}"
+            );
+        }
+        // A malformed identifier and an absent one are the same answer, so identifiers cannot be probed.
+        let (malformed, malformed_body) =
+            send(&app, "GET", "/api/v1/memories/not-an-id", &headers, "").await;
+        let (absent, absent_body) = send(
+            &app,
+            "GET",
+            "/api/v1/memories/018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(
+            (malformed, absent),
+            (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            json(&malformed_body)["error"]["code"],
+            json(&absent_body)["error"]["code"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir("memory-refusals"));
+    }
+
+    #[tokio::test]
+    async fn the_memory_routes_require_authentication() {
+        let (app, _token) = runs_fixture("memory-auth").await;
+        for (method, path) in [
+            ("POST", "/api/v1/memories"),
+            ("GET", "/api/v1/memories"),
+            ("GET", "/api/v1/memories/search?q=x"),
+            (
+                "GET",
+                "/api/v1/memories/018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            ),
+            (
+                "DELETE",
+                "/api/v1/memories/018f2b3c-4d5e-7a6b-8c9d-0e1f2a3b4c5d",
+            ),
+        ] {
+            let (status, body) = send(
+                &app,
+                method,
+                path,
+                &[("jarvis-api-version", "1".to_owned())],
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir("memory-auth"));
+    }
     #[tokio::test]
     async fn a_create_returns_the_contracts_accepted_shape() {
         let (app, token) = runs_fixture("runs-create").await;

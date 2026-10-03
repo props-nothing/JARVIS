@@ -1,7 +1,7 @@
 # JARVIS Roadmap
 
 Status: ACCEPTED
-Last updated: 2026-10-01
+Last updated: 2026-10-03
 Current milestone: Milestone 2 - Native Brain (started; `BRN-001`, `BRN-002`, `BRN-004`, `BRN-005`, and `BRN-006` done, `BRN-007`'s run resource surface, CLI chat path, **live SSE follow**, **CLI streaming renderer**, **conversation continuation**, and **per-principal idempotency scoping** done with the run list outstanding, `BRN-008`'s run controller, startup recovery, time/token/cost/context budgets, pre-acceptance retry, and cancellation/disconnect partially done with fallback and turn/byte/concurrency budgets outstanding, `BRN-010`'s policy rules, route selector, versioned policy store, policy service, the three policy endpoints, and the create-run policy reference with its context ceiling done with the exception lifecycle outstanding, `BRN-012` done, `BRN-011` done, `BRN-003`'s OpenAI-compatible adapter implemented, composed into the daemon, verified against a real Ollama model end to end, and translating tool calls with a cloud endpoint still needing its own reviewed TLS dependency, `BRN-009`'s gated provider smoke test done with the deterministic suites still to be gathered under that TODO. Milestone 2's exit gate — "a gated real-provider smoke test streams a response" — is now **met**; Milestone 1 is complete apart from `OWN-001` through `OWN-005`, which are owner-gated)
 
 Milestone 0 exit status: DONE. Evidence is recorded in `TODO.md` and validated
@@ -24,6 +24,25 @@ export (`TLS-008`/`TLS-009`/`TLS-010`) and the plugin/runtime route
 (`TLS-011`/`TLS-014`/`TLS-015`) do not exist, so "a denied model request cannot
 bypass policy through native, MCP, or runtime routes" is proven for the native
 route only, and `TLS-012` stays `[~]` for exactly that reason.
+
+Update 2026-10-03: the MCP **client** is no longer absent. `TLS-008` has a stdio client
+(`jarvis_infrastructure::mcp`: normalization, outcome classification, process supervision, executor,
+registration) pinned to `rmcp =3.5.0`, with its evidence gate `IMPLEMENTATION_READY`. It remains
+`[~]`: Streamable HTTP waits on a reviewed TLS dependency, a hung-but-open server is not detected
+(a server that *dies* is now restarted or quarantined by `mcp::supervisor`), and `TLS-009` (server export),
+`TLS-010` (conformance), and
+the plugin route (`TLS-011`/`TLS-014`) are still open, so the exit gate is unmet.
+
+Update 2026-10-03 (Memory): Milestone 4 has **started** with a vertical slice rather than a scaffold.
+A user can remember a preference through `/api/v1/memories` or `jarvis memory`, a matching run sends it to
+the model (proven from the wire request of a real daemon), it survives a restart, and forgetting removes it.
+`MEM-001`..`MEM-003` are `[~]`; correction, export, disable, the other memory classes, embeddings,
+entities, and the context ledger are not started. Milestone 4's exit gate is unmet.
+
+Update 2026-10-03 (Brain): the OpenAI-compatible adapter can now reach a named cloud host over TLS
+(`tls = true`, config schema 4; `rustls` + `aws-lc-rs`, compiled-in `webpki-roots`), with evidence in
+`docs/research/integrations/openai-compatible-model.md`. No live cloud call has been made; that needs a
+provider account and spend approval.
 
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or

@@ -423,6 +423,8 @@ pub struct RunService {
     /// Held for the service's lifetime, which is what makes a subscription's `Closed` case
     /// unreachable in the daemon: a follower's publisher outlives the follower.
     live: crate::live_events::RunStreamNotifier,
+    /// The store runs recall memories from, when one is composed.
+    memories: Option<Arc<dyn crate::repository::memory::MemoryRepository>>,
 }
 
 impl std::fmt::Debug for RunService {
@@ -491,7 +493,21 @@ impl RunService {
             ports,
             cancellations,
             live: crate::live_events::RunStreamNotifier::new(),
+            memories: None,
         }
+    }
+
+    /// Attaches the memory store runs recall from.
+    ///
+    /// A builder rather than a field of [`RunPorts`], because recall is optional and every existing
+    /// composition builds `RunPorts` as a complete literal.
+    #[must_use]
+    pub fn with_memories(
+        mut self,
+        memories: Arc<dyn crate::repository::memory::MemoryRepository>,
+    ) -> Self {
+        self.memories = Some(memories);
+        self
     }
 
     /// Subscribes a follower to run-stream wake-ups.
@@ -527,8 +543,12 @@ impl RunService {
         // The tool pipeline is attached **here** rather than read inside the controller, so a
         // controller built from ports without one cannot execute a tool at all — the composition is
         // the enablement, and there is no runtime path that turns it on.
-        match self.ports.tools.as_ref() {
+        let controller = match self.ports.tools.as_ref() {
             Some(tools) => controller.with_tools(Arc::clone(tools)),
+            None => controller,
+        };
+        match self.memories.as_ref() {
+            Some(memories) => controller.with_memories(Arc::clone(memories)),
             None => controller,
         }
     }

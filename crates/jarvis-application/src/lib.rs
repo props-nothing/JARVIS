@@ -8,6 +8,7 @@ pub mod approval_service;
 pub mod cancellation;
 pub mod context_assembly;
 pub mod live_events;
+pub mod memory_service;
 pub mod model;
 pub mod policy_service;
 pub mod recovery;

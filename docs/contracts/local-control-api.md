@@ -144,6 +144,11 @@ POST /api/v1/runs/{run_id}/cancel
 GET  /api/v1/model-data-policy
 PUT  /api/v1/model-data-policy
 GET  /api/v1/model-data-policy/effective
+POST /api/v1/memories
+GET  /api/v1/memories
+GET  /api/v1/memories/search?q={text}
+GET  /api/v1/memories/{memory_id}
+DELETE /api/v1/memories/{memory_id}
 ```
 
 The three policy routes are served **on this same surface, under the same authentication, version
@@ -201,7 +206,9 @@ through authenticated status/doctor paths.
     "runs.cancel",
     "runs.events",
     "policy.read",
-    "policy.write"
+    "policy.write",
+    "memory.read",
+    "memory.write"
   ],
   "mcp": {
     "servers": [
@@ -613,6 +620,35 @@ Both fields are optional and each is omitted when unset, because "no ceiling" an
 are different facts — `0` would read as "any answer breaches", which nobody configured. The values
 come from the run's own stored budget, the same one `RunBudget::exceeded_by` reads, so a client cannot
 be shown a limit the daemon did not enforce.
+
+## Memory Resources
+
+Added with `MEM-001`/`MEM-002`/`MEM-003`. The surface stores **only explicit user requests**
+(`docs/architecture/memory-context.md`: "the initial implementation stores only explicit user requests
+such as 'remember that...'"), and the shapes make that structural rather than a policy.
+
+- `POST /api/v1/memories` takes `{"text": "...", "class": "preference", "sensitivity": "internal"}`;
+  `class` (`preference` or `semantic`) and `sensitivity` are optional. Unknown fields are rejected, so a
+  `source`, `confidence`, or `workspace_id` has no field to land in: the workspace and the principal come
+  from the authenticated context, and the source is always `user_request`. A new memory answers `201`; an
+  exact duplicate (same text after lowercasing and collapsing whitespace, in the same workspace) answers
+  `200` with the existing memory and `"created": false`, which also makes a retried request safe without
+  an `Idempotency-Key`.
+- `GET /api/v1/memories?limit=` lists the workspace's newest memories with `has_more`.
+- `GET /api/v1/memories/search?q=&limit=` ranks the workspace's memories by lexical relevance — the
+  fraction of the query's tokens found, ties broken by recency then identity — and reports
+  `scan_bounded` when the workspace holds more memories than one search considers (1,000), so "nothing
+  matched" is distinguishable from "nothing matched in the newest 1,000".
+- `GET /api/v1/memories/{memory_id}` reads one memory with its provenance.
+- `DELETE /api/v1/memories/{memory_id}` **hard-deletes** it: the text is removed, not tombstoned.
+
+A memory in another workspace, an absent one, and a malformed identifier are all `404 resource.not_found`,
+so identifiers cannot be probed. A refused body or query is `400 request.invalid`; an unknown query
+parameter is refused by name. No memory-specific error code exists: refusals use the shared codes above.
+
+**Not done, and named:** correction and supersession lineage, export, a per-workspace disable switch,
+the other memory classes, confirmation of inferred memories, semantic and entity retrieval, and the
+context-manifest ledger for recalled memories.
 
 ## Common Error Envelope
 

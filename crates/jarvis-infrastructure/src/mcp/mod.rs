@@ -66,6 +66,7 @@ pub mod invocation;
 pub mod outcome;
 pub mod process;
 pub mod registration;
+pub mod supervisor;
 
 #[cfg(test)]
 #[path = "tests.rs"]

@@ -445,3 +445,189 @@ fn the_manifest_records_the_ceiling_it_ran_under() {
     assert_eq!(assembled.manifest.budget_tokens, 512);
     assert_eq!(assembled.used_tokens, assembled.manifest.used_tokens);
 }
+
+// ---- Recalled memories ------------------------------------------------------------------------------------
+
+use crate::repository::memory::MemoryHit;
+use jarvis_domain::ids::{MemoryId, PrincipalId};
+use jarvis_domain::memory::{Memory, MemoryClass, MemorySource, MemoryText};
+
+fn hit(id_value: u128, text: &str, sensitivity: Sensitivity, relevance: u32) -> MemoryHit {
+    MemoryHit {
+        memory: Memory {
+            id: MemoryId::from_uuid(uuid::Uuid::from_u128(id_value)),
+            workspace: jarvis_domain::ids::WorkspaceId::from_uuid(uuid::Uuid::from_u128(9)),
+            class: MemoryClass::Preference,
+            text: MemoryText::new(text).expect("valid"),
+            sensitivity,
+            source: MemorySource::UserRequest {
+                principal: PrincipalId::from_uuid(uuid::Uuid::from_u128(7)),
+            },
+            created_at: at("2026-09-01T00:00:00Z"),
+            updated_at: at("2026-09-01T00:00:00Z"),
+        },
+        relevance,
+    }
+}
+
+fn assemble_with(
+    transcript: &[StoredMessage],
+    memories: &[MemoryHit],
+    ceiling_tokens: u64,
+    data_policy_ceiling: Sensitivity,
+) -> super::AssembledInput {
+    super::assemble_with_memories(
+        transcript,
+        memories,
+        "draft the proposal",
+        None,
+        ceiling_tokens,
+        data_policy_ceiling,
+        now(),
+    )
+    .expect("assembles")
+}
+
+#[test]
+fn a_recalled_memory_is_placed_before_the_conversation_and_the_objective_stays_last() {
+    let transcript = [message(1, "an earlier turn", Role::User, "internal")];
+    let assembled = assemble_with(
+        &transcript,
+        &[hit(
+            50,
+            "keep proposals concise",
+            Sensitivity::Internal,
+            1_000,
+        )],
+        1_000,
+        Sensitivity::Restricted,
+    );
+    let kinds: Vec<_> = assembled.items.iter().map(RetainedItem::kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            RetainedKind::Memory,
+            RetainedKind::Message,
+            RetainedKind::Objective
+        ]
+    );
+    // The manifest names the memory by identity, never by content.
+    let memory_item = assembled
+        .manifest
+        .included
+        .iter()
+        .find(|item| item.source == CandidateSource::Memory)
+        .expect("the memory is in the manifest");
+    assert_eq!(
+        memory_item.reference,
+        super::memory_reference(MemoryId::from_uuid(uuid::Uuid::from_u128(50)))
+    );
+    assert!(!memory_item.reference.contains("concise"));
+    assert!(assembled.manifest.is_consistent());
+}
+
+#[test]
+fn a_memory_above_the_data_policy_ceiling_is_refused_before_ranking_and_never_sent() {
+    // ACC-035: "excluded sensitive content never reaches the provider request". A restricted memory under a
+    // confidential ceiling must be counted as a sensitivity exclusion and absent from the items.
+    let assembled = assemble_with(
+        &[],
+        &[
+            hit(50, "my locker code is 4821", Sensitivity::Restricted, 1_000),
+            hit(51, "keep proposals concise", Sensitivity::Internal, 500),
+        ],
+        1_000,
+        Sensitivity::Confidential,
+    );
+    let sent: Vec<&str> = assembled.items.iter().map(RetainedItem::text).collect();
+    assert!(!sent.iter().any(|text| text.contains("4821")), "{sent:?}");
+    assert!(sent.contains(&"keep proposals concise"), "{sent:?}");
+    assert_eq!(
+        assembled
+            .manifest
+            .exclusions
+            .count(ExclusionReason::Sensitivity),
+        1
+    );
+}
+
+#[test]
+fn memories_cannot_crowd_the_conversation_out_of_a_tight_budget() {
+    // A budget that holds the objective and one more item. The conversation turn is in a higher priority band
+    // than any memory, so it wins the slot even though the memory scores far higher on relevance.
+    let transcript = [message(
+        1,
+        "a turn that matters to the answer",
+        Role::User,
+        "internal",
+    )];
+    let assembled = assemble_with(
+        &transcript,
+        &[hit(
+            50,
+            "a highly relevant but lower priority memory",
+            Sensitivity::Internal,
+            1_000,
+        )],
+        // Objective (5 tokens) plus the turn (9 tokens), and no room for the 11-token memory.
+        15,
+        Sensitivity::Restricted,
+    );
+    let kinds: Vec<_> = assembled.items.iter().map(RetainedItem::kind).collect();
+    assert_eq!(
+        kinds,
+        vec![RetainedKind::Message, RetainedKind::Objective],
+        "{kinds:?}"
+    );
+    assert!(
+        assembled
+            .manifest
+            .exclusions
+            .count(ExclusionReason::OverBudget)
+            >= 1
+    );
+}
+
+#[test]
+fn a_recalled_memory_is_labelled_as_the_users_own_earlier_words() {
+    let assembled = assemble_with(
+        &[],
+        &[hit(
+            50,
+            "keep proposals concise",
+            Sensitivity::Internal,
+            1_000,
+        )],
+        1_000,
+        Sensitivity::Restricted,
+    );
+    let memory = assembled
+        .items
+        .iter()
+        .find(|item| item.kind() == RetainedKind::Memory)
+        .expect("recalled");
+    let InputItem::Message { role, blocks } = memory.to_input_item() else {
+        unreachable!("a memory renders as a message");
+    };
+    assert_eq!(
+        role,
+        Role::User,
+        "never the system slot the architecture reserves for policy"
+    );
+    let ContentBlock::Text { text } = &blocks[0] else {
+        unreachable!("a memory renders as text");
+    };
+    assert!(
+        text.starts_with("[remembered earlier by the user, in their own words]\n"),
+        "{text}"
+    );
+    assert!(text.ends_with("keep proposals concise"), "{text}");
+}
+
+#[test]
+fn no_memories_assembles_exactly_as_before() {
+    let transcript = [message(1, "an earlier turn", Role::User, "internal")];
+    let without = assemble_permissive(&transcript, "draft the proposal", 1_000).expect("assembles");
+    let with_none = assemble_with(&transcript, &[], 1_000, Sensitivity::Restricted);
+    assert_eq!(without, with_none);
+}

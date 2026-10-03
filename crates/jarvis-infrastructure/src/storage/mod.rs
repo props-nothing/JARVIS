@@ -28,6 +28,7 @@ pub mod approval_repository;
 pub mod backup;
 pub mod connection;
 pub mod error;
+pub mod memory_repository;
 pub mod migrate;
 pub mod repositories;
 pub mod schema;

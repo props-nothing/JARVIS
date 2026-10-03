@@ -3,8 +3,8 @@
 Status: ACCEPTED
 Review scope: OpenAI Chat Completions wire contract, streaming SSE shape, auth, errors, limits, retention, and the transport decision for the first provider adapter
 Owner: Model gateway
-Last verified: 2026-09-27
-Revalidate by: 2027-03-26
+Last verified: 2026-10-03
+Revalidate by: 2027-04-03
 Implementation gate: PASSED
 ## Decision Summary
 
@@ -28,9 +28,11 @@ Implementation gate: PASSED
 - Reference deployment for the gated smoke test: an OpenAI-compatible server the
   operator configures by base URL, reached over **plaintext HTTP/1.1 on
   loopback** (`EndpointClass::Local`).
-- Explicitly unsupported in this slice: any `https://` endpoint, the Responses
-  API, Chat Completions non-streaming collection, multi-choice (`n > 1`),
-  multimodal content parts, audio, logprobs, and provider-hosted tools.
+- Explicitly unsupported: the Responses API, Chat Completions non-streaming
+  collection, multi-choice (`n > 1`), multimodal content parts, audio, logprobs, and
+  provider-hosted tools. An `https://` endpoint is supported **only** through the
+  TLS transport recorded under "TLS transport" below (named host, `tls = true`);
+  plaintext to a non-loopback host remains refused.
 - Kill switch: the adapter is a configured provider entry. Removing it, or
   removing its base URL, leaves the daemon with no provider for that model, which
   `select_route` already reports as `model.provider_no_route`; it is not a
@@ -253,8 +255,10 @@ the official guide explicitly warns that different conditions share a status.
   a trace. Provider-supplied `error.message` text is treated as untrusted and is
   bounded before it is stored or shown; it is not a JARVIS error code.
 - Sandbox or network policy: deny-by-default except the configured provider host.
-  `https` is explicitly not implemented in this slice, so there is no TLS
-  configuration to get wrong and no certificate-validation bypass to add later.
+  A plaintext endpoint must be loopback. A TLS endpoint must be a DNS name whose
+  certificate verifies against the compiled-in trust roots, and a failed handshake
+  writes nothing, so the credential is never sent to an unverified peer (see "TLS
+  transport"). There is no certificate-validation bypass and no option to add one.
 - Abuse cases: a hostile endpoint that streams unbounded text (the adapter must bound
   total and per-frame bytes and the delta count); a hostile endpoint that never
   sends a terminal (the deadline must fire); a hostile endpoint that reports
@@ -288,7 +292,91 @@ this is a decision with a reason rather than a convenience:
 Choosing plaintext-loopback-first is therefore the honest boundary: it delivers a
 real streamed provider call without smuggling an unreviewed TLS stack into the
 adapter, and it keeps the cloud path as a *later, separately evidenced* step rather
-than an implicit one.
+than an implicit one. That later step is the next section.
+
+## TLS transport
+
+Added 2026-10-03 under `BRN-003`. Implementation gate for this section: **PASSED** for
+the exact versions below.
+
+- Purpose: reach cloud OpenAI-compatible endpoints (for example
+  `https://api.openai.com/v1`) without sending a credential in the clear.
+- JARVIS boundary: `OpenAiCompatibleProvider::new_tls` /
+  `new_tls_with_roots` in the same adapter. The hand-rolled HTTP/1.1 exchange is
+  unchanged and runs over a plaintext or a TLS stream through one function
+  (`converse`), so framing, status mapping and credential handling cannot diverge.
+  No `rustls` type crosses into `jarvis-domain` or `jarvis-application`.
+- Selected stack (exact pins in the workspace `Cargo.toml`):
+  `rustls =0.23.45` (`std`, `tls12`, `aws_lc_rs`; `default-features = false`),
+  `tokio-rustls =0.26.6` (`tls12`, `aws_lc_rs`), `webpki-roots =1.0.9`, and, for tests
+  only, `rcgen =0.14.10` (`pem`, `aws_lc_rs`). Resolved in `Cargo.lock`:
+  `rustls-webpki 0.103.15`, `rustls-pki-types 1.15.1`, `aws-lc-rs 1.18.1`,
+  `aws-lc-sys 0.45.0`. `ring` is not enabled; `cargo tree -i ring` finds nothing
+  (a `ring` entry exists in the lockfile only as an unselected optional of `rcgen`).
+- Why this stack: `aws-lc-rs` is rustls's own default provider and `rustls` is the
+  TLS library the MCP SDK ecosystem and `tokio-rustls` standardize on. It builds on
+  this repository's Windows x86_64 toolchain with no extra tools (verified by a clean
+  `cargo build`, 2026-10-03); the upstream build guide lists a C compiler as required
+  and CMake/Go as FIPS-only, with prebuilt NASM objects used when NASM is absent.
+- Trust roots: **`webpki-roots`**, the compiled-in Mozilla/CCADB set, chosen over
+  `rustls-platform-verifier` (the rustls team's recommendation for applications that
+  cannot be recompiled) because it adds no OS-specific dependency tree, is the same on
+  every tier-1 target, and lets a test inject a root. **Trade-off, recorded rather than
+  hidden:** a revoked or newly added root takes effect only on a rebuilt release, and
+  there is no revocation checking. The revalidation date below is the control, and
+  moving to the platform verifier is a replacement behind `new_tls_with_roots`, which is
+  already the single seam for trust.
+- License review: `rustls` `Apache-2.0 OR ISC OR MIT`; `tokio-rustls`
+  `MIT OR Apache-2.0`; `rustls-webpki` `ISC`; `aws-lc-rs` `ISC AND (Apache-2.0 OR ISC)`;
+  `aws-lc-sys` a conjunction of permissive licenses (ISC, Apache-2.0, MIT, BSD-3-Clause)
+  covering vendored C; `webpki-roots` **`CDLA-Permissive-2.0`** (a data license; attribution
+  must be carried in release notices, which `OWN-001` already owns); `rcgen`
+  `MIT OR Apache-2.0` (dev-only). No copyleft anywhere. Until `OWN-001` selects the project
+  license this is recorded as permissive-compatible, not as approved for publication.
+- Advisories checked (RustSec, 2026-10-03): `RUSTSEC-2026-0285` is fixed at exactly
+  `rustls 0.23.45`, which is why the pin is `=0.23.45` and must not be lowered; the
+  `rustls-webpki` advisories through `RUSTSEC-2026-0104` are fixed by `0.103.15`. No
+  advisory exists for `aws-lc-rs`, `rustls-pki-types`, `webpki-roots`, or `rcgen`.
+- Behaviour decisions:
+  - **Verification is by name.** The host must be a DNS name; an address is refused
+    (`model.adapter_tls_host_invalid`). The name is both the certificate subject
+    check and the SNI value.
+  - **Protocols:** TLS 1.2 and 1.3 (rustls safe defaults), ALPN offers only
+    `http/1.1`, because that is the only protocol the hand-rolled client speaks.
+  - **Explicit provider and versions**, so no process-wide default crypto provider is
+    consulted or installed.
+  - **A failed handshake sends nothing.** The request, and so the credential, is written
+    only after the handshake verifies. The failure is reported as
+    `model.provider_unavailable`; which check failed is deliberately not forwarded from
+    an untrusted peer.
+  - **Truncation is not completion.** rustls surfaces a TCP close with no `close_notify`
+    as `UnexpectedEof`; the reader maps any read error to a failure, so a cut stream
+    ends `call.failed` rather than `call.completed`.
+  - **Flush after write**, because a TLS stream buffers writes.
+  - **`EndpointClass::ApprovedCloud`**, so a local-only data policy refuses the provider
+    and the model data policy's residency and retention rules apply to it.
+  - The `Host` header omits `:443` for a TLS endpoint on 443, as clients do.
+- Not done, and named: no client certificates; no HTTP/2; no proxy support; no custom CA
+  file in configuration (the seam exists as `new_tls_with_roots` but no config key feeds
+  it); no certificate pinning; no revocation checking; no `private_network` class for a
+  TLS endpoint on an operator network (every TLS endpoint is `ApprovedCloud`, the more
+  restrictive class); no live test against a real cloud endpoint, because that needs a
+  provider account and spend approval.
+- Official sources (accessed 2026-10-03): rustls crate documentation and
+  `Reader::read` close semantics (docs.rs/rustls); `tokio-rustls` 0.26.6 source and
+  `examples/client.rs` / `examples/server.rs` (github.com/rustls/tokio-rustls);
+  `rustls-platform-verifier` and `webpki-roots` READMEs (github.com/rustls); AWS-LC-RS
+  user guide requirements pages (aws.github.io/aws-lc-rs/requirements); crates.io metadata
+  for each crate's version, license and dependencies; RustSec advisory database;
+  OpenAI `llms.txt` at `https://developers.openai.com/llms.txt` (the earlier
+  `platform.openai.com/llms.txt` now 404s), whose API overview documents bearer
+  authentication and `https://api.openai.com/v1` and states streaming is plain SSE over
+  HTTP, so nothing TLS-specific beyond standard SNI is required.
+- Verification: `crates/jarvis-infrastructure/tests/openai_compatible_tls.rs` runs a real
+  `tokio-rustls` server over a per-test `rcgen` authority. Each negative case differs from
+  the passing case by exactly one variable: an empty trust store, a certificate for another
+  name, or a close without `close_notify`. They assert the server saw **no request bytes**
+  in the two rejection cases, and that SNI and ALPN are what this section says.
 
 ## Normalization Map
 
@@ -327,7 +415,12 @@ Do not expose provider SDK types in JARVIS domain contracts.
 | `OC-C007` | `finish_reason` has more values than the five named | DOCUMENTED | The page renders the type as five literals followed by "or 2 more" | A capture shows only the five named values and the docs stop saying "or more" |
 | `OC-C008` | A `429` can mean a filled budget, an exhausted balance, or a ramp-rate limit, and only the last is retryable | DOCUMENTED | Error-codes and rate-limits guides; `Retry-After` "does not mean that quota, billing, or other errors that require user action can be resolved by retrying" | A `429` with `credit_balance_exhausted` succeeds on retry |
 | `OC-C009` | A request must not be automatically replayed after stream output was consumed | DOCUMENTED | Rate-limits guide, "For streaming requests… don't automatically replay a request after consuming output" | Replaying a post-output failure produces a coherent, non-duplicated result |
-| `OC-C010` | The workspace has no TLS implementation, so a cloud endpoint needs a new reviewed dependency | VERIFIED (lockfile inspection, 2026-09-27) | `Cargo.lock` contains no `rustls`, `native-tls`, `openssl`, `ring`, `webpki`, or `hyper-rustls` | A TLS crate appears in the lockfile without a dependency evidence change |
+| `OC-C010` | The workspace has no TLS implementation, so a cloud endpoint needs a new reviewed dependency | VERIFIED (lockfile inspection, 2026-09-27); **SUPERSEDED 2026-10-03** by `OC-C011`..`OC-C015` — the dependency is now reviewed and present | `Cargo.lock` contained no `rustls`, `native-tls`, `openssl`, `ring`, `webpki`, or `hyper-rustls` before this change | A TLS crate appears in the lockfile without a dependency evidence change |
+| `OC-C011` | A certificate whose root is not in the trust store is rejected and the request, with its credential, is never written | VERIFIED by test (2026-10-03) | `a_certificate_whose_root_is_not_trusted_is_rejected_and_no_credential_is_sent`: server saw no completed handshake and zero request bytes | The same test passing with the server observing request bytes, or the handshake completing |
+| `OC-C012` | A chain that verifies but names a different host is rejected | VERIFIED by test (2026-10-03) | `a_trusted_chain_for_a_different_name_is_rejected` | The adapter completing a call against a certificate not valid for the dialled name |
+| `OC-C013` | A certificate from an injected root is accepted, SNI is the verified name, ALPN is `http/1.1`, and the credential is a header only | VERIFIED by test (2026-10-03) | `a_certificate_from_an_injected_root_is_accepted_and_the_answer_streams` | The server observing another SNI, no ALPN, or the credential in the request line |
+| `OC-C014` | A TCP close without `close_notify` mid-body ends `call.failed`, never `call.completed` | VERIFIED by test (2026-10-03); **the test cannot isolate `close_notify` from the unfinished chunk**, so it proves truncation is a failure, not that a clean-looking body without `close_notify` is | `a_connection_dropped_without_close_notify_mid_body_is_a_failure_not_a_completion` | A truncated TLS stream completing |
+| `OC-C015` | `rustls 0.23.45` and `aws-lc-rs` build with no extra tools on Windows x86_64, and `rustls-webpki` resolves to `0.103.15` | VERIFIED (clean `cargo build`, `Cargo.lock`, 2026-10-03); macOS and Linux targets **UNVERIFIED** here and owned by native CI (`FND-010`) | `Cargo.lock`; the build | A tier-1 target failing to build `aws-lc-sys` in native CI |
 
 ## Test Plan
 
@@ -571,8 +664,15 @@ contain. Capture, then reconcile the table against the bytes.
   shows raw thinking (planning text about what the user wants), which is never persistable. If some
   server used the same field for a summary the user is meant to read, the adapter would be discarding
   something permitted — and the counter is what would make that visible rather than silent.
-- When the cloud path is enabled, which TLS stack is reviewed, and does the
-  adapter then need to distinguish residency domains from ordinary hostnames?
+- **Answered 2026-10-03:** the reviewed TLS stack is `rustls` with `aws-lc-rs` over
+  `tokio-rustls`, with compiled-in `webpki-roots` (see "TLS transport").
+- Still open: does the adapter need to distinguish residency domains from ordinary
+  hostnames (the provider documents per-region domains)? Today every TLS endpoint is
+  `ApprovedCloud` and the operator names the host.
+- Still open: should the trust roots come from the platform verifier, so a revoked CA takes
+  effect without a release? The seam is `new_tls_with_roots`.
+- Still open: a gated live test against a real cloud endpoint, which needs a provider
+  account and explicit spend approval.
 
 ## Change Log
 
@@ -585,3 +685,4 @@ contain. Capture, then reconcile the table against the bytes.
 | 2026-09-27 | **Tool calls are translated, reversing a decision that was wrong in the dangerous direction.** The Security Analysis above claimed "tool calls appear as `tool.call.*` events and remain subject to the canonical tool pipeline" while `translate.rs` recognized `tool_calls` and emitted nothing — so the note described behaviour the adapter did not have, and the omission produced a **silent success** rather than a refusal: the controller's typed `run.tools_not_implemented` terminal was reachable only through the scripted provider, so a real model that asked to call a tool yielded a stream with no delta and no tool event and the run could reach `completed` with an empty answer. Now emits `tool.call.added`, `tool.call.arguments.delta`, and `tool.call.completed` (the last carrying the accumulated arguments, because a fragment is not parseable JSON), keyed by the protocol's `index` because later fragments carry neither the id nor the name. Emitting is not a grant: the events are proposals the deterministic layer judges | Five translator tests, falsified by restoring the silent drop; the controller's existing tool-intent tests; the adapter's own code against its security section |
 | 2026-09-27 | **A raw capture of one real stream, taken while answering the open `[DONE]` question — and it closed that question while finding a field the documented schema does not have.** The capture ends `data: [DONE]\n\n` (**so the sentinel exists**, `OC-C004`'s `[DONE]` half moves from UNVERIFIED to OBSERVED) and carries `finish_reason: "stop"` before it, so the adapter's refusal to depend on the sentinel is vindicated. It also carries **`delta.reasoning` on the majority of its frames** — the raw model-internal thinking text, **absent from the Chat Completions documented field set** the mapping table above was built from. The adapter already discarded it, and that is exactly the defect: a field no code names is indistinguishable from a field the translator forgot, and the two have opposite remedies. It is now **counted** and explicitly never translated, with the code stating why it is *not* mapped onto `reasoning.summary.delta` (which carries a user-visible summary the contract permits). Falsified by removing the increment, which fails both new tests | The live capture; `model_internal_reasoning_is_counted_and_never_becomes_output` and `the_shape_of_a_captured_stream_from_a_real_endpoint_is_handled`, the latter built from the captured frames; `Cargo.lock` still has no TLS crate |
 | 2026-09-30 | **The output ceiling is now forwarded to the provider, under the parameter that bounds what JARVIS measures.** `RequestSchema` listed only `model`, `messages`, `stream`, and `stream_options`, and `max_output_tokens` never reached the wire while `RunBudget::exceeded_by` was documented as making the ceiling "a bound rather than a number carried in a request" — so the check was unreachable from a real run and a defaulted ceiling would have **discarded a working answer** without ever asking the provider to be shorter. The reference settles the parameter: `max_completion_tokens` is "an upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens", while `max_tokens` "is now deprecated in favor of `max_completion_tokens`, and is **not compatible with o-series models**" — so the older name would refuse exactly the reasoning models that need the bound. Because it *includes* reasoning tokens it bounds the same quantity this adapter maps from `completion_tokens` onto `Usage::output_tokens`, which is what `exceeded_by` compares against; a visible-text-only bound would fail an answer the provider considered within limit. The parameter is omitted when the run states no ceiling | `the_runs_output_ceiling_is_forwarded_under_the_parameter_that_bounds_what_is_measured` (asserts the current name, the absence of the deprecated one, that the value is the run own, and that an unset ceiling sends nothing); the live endpoint capture; `llms.txt` root and API/reference indexes, then `/api/reference/resources/chat.md` |
+| 2026-10-03 | **TLS transport added.** The adapter reaches a named host over TLS (`new_tls`, config `tls = true`, schema 3 → 4). Stack: `rustls =0.23.45` + `aws-lc-rs`, `tokio-rustls =0.26.6`, `webpki-roots =1.0.9`; `rcgen =0.14.10` dev-only. The loopback-only refusal now applies to **plaintext** only. Claims `OC-C011`..`OC-C015` added; `OC-C010` superseded | rustls/tokio-rustls/webpki-roots/rcgen crate docs and crates.io metadata, AWS-LC-RS requirements pages, RustSec (`RUSTSEC-2026-0285` fixed at 0.23.45), OpenAI `llms.txt` and API overview; `tests/openai_compatible_tls.rs`; `Cargo.lock` |

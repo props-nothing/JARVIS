@@ -22,6 +22,7 @@ pub mod clock;
 pub mod context;
 pub mod error;
 pub mod ids;
+pub mod memory;
 pub mod model;
 pub mod plugin;
 pub mod run;

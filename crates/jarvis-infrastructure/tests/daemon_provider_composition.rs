@@ -380,6 +380,7 @@ async fn a_configuration_the_adapter_refuses_stops_the_daemon_from_being_wired_t
         id: "local.fake".to_owned(),
         host: "api.example.com".to_owned(),
         port: 443,
+        tls: false,
         base_path: None,
         models: vec!["fake-model".to_owned()],
         model_names: std::collections::BTreeMap::new(),

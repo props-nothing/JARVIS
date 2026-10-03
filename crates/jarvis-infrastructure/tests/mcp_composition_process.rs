@@ -584,7 +584,7 @@ async fn a_lifecycle_probe_records_each_servers_health() {
     let sessions: Vec<_> = composition
         .servers()
         .iter()
-        .map(|server| Arc::clone(server.session()))
+        .map(jarvis_infrastructure::mcp::composition::ComposedMcpServer::session)
         .collect();
     let _ = composition.shutdown().await;
     for session in &sessions {

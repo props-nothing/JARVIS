@@ -135,12 +135,6 @@ impl McpCompositionRefusal {
 pub struct ComposedMcpServer {
     /// The declared name, which is the trusted identity its tools carry.
     server: ServerConfigId,
-    /// The live session, kept so the executor's own `Arc` is not the only reference and a caller can shut it
-    /// down deliberately.
-    ///
-    /// **Held rather than dropped**, because dropping the last `Arc<RunningService>` kills the child: the
-    /// session must outlive the composition for the executor to be usable.
-    session: Arc<rmcp::service::RunningService<rmcp::RoleClient, super::client::JarvisClient>>,
     /// The executor for this server's tools.
     executor: Arc<McpToolExecutor>,
     /// What registration did, including the refusals an operator should see.
@@ -230,11 +224,14 @@ impl ComposedMcpServer {
     }
 
     /// Returns the live session.
+    ///
+    /// Read from the executor, which is the single owner: a supervisor may replace the session after the
+    /// child dies, so a copy held here would go stale and be the one that gets read.
     #[must_use]
     pub fn session(
         &self,
-    ) -> &Arc<rmcp::service::RunningService<rmcp::RoleClient, super::client::JarvisClient>> {
-        &self.session
+    ) -> Arc<rmcp::service::RunningService<rmcp::RoleClient, super::client::JarvisClient>> {
+        self.executor.session()
     }
 }
 
@@ -304,7 +301,8 @@ impl McpComposition {
             // `cancellation_token()` hands back a token that *owns a clone of the signal*, which is the one
             // non-consuming way to stop the worker — and stopping the worker closes the transport, which is what
             // kills the child.
-            let token = server.session.cancellation_token();
+            let session = server.executor.session();
+            let token = session.cancellation_token();
             // The executor goes first, so a dispatch cannot be admitted after the cancel is signalled.
             drop(server.executor);
             token.cancel();
@@ -313,7 +311,7 @@ impl McpComposition {
             // running. `is_closed` is the service's own answer to "has the worker finished", polled to a bound
             // rather than waited on indefinitely: a server that will not stop must not hold the drain open past
             // its grace window, and the fact is reported instead.
-            if !wait_until_closed(&server.session).await {
+            if !wait_until_closed(&session).await {
                 unclean.push(name);
             }
         }
@@ -338,11 +336,10 @@ impl McpComposition {
     /// quarantine acts on all three.
     ///
     /// **It reports; it does not act, and that limit is the honest part.** Calling this does not prune, stop,
-    /// or quarantine anything, and it cannot see a child that dies a moment later. There is no supervisor yet,
-    /// so the two places a death is currently observable are a drain (`daemon::stop_mcp_servers` reads this to
-    /// report which servers were already gone) and the single-server form a dispatch path can consult
-    /// ([`McpToolExecutor::is_closed`]). A pass that *acts* on a closed row — quarantine, deregistration,
-    /// re-launch — is the supervisor this does not claim to be.
+    /// or quarantine anything, and it cannot see a child that dies a moment later. Acting on a closed
+    /// row — restart or quarantine — is [`super::supervisor::McpSupervisor`]'s job, which reads the
+    /// single-server form ([`McpToolExecutor::is_closed`]); a drain also reads this to report which servers
+    /// were already gone.
     #[must_use]
     pub fn health(&self) -> Vec<McpServerHealth> {
         self.composed
@@ -351,10 +348,10 @@ impl McpComposition {
                 name: server.server.as_str().to_owned(),
                 tools: server.admitted.len(),
                 version: server
-                    .session
+                    .session()
                     .peer_info()
                     .map(|info| info.protocol_version.to_string()),
-                closed: server.session.is_closed(),
+                closed: server.executor.is_closed(),
                 refused: server.refusals().len(),
             })
             .collect()
@@ -467,14 +464,9 @@ pub fn compose_discovered(
         .map_or(super::DEFAULT_MCP_TIMEOUT_MS, |(definition, _)| {
             definition.execution.timeout_ms
         });
-    let executor = Arc::new(McpToolExecutor::new(
-        Arc::clone(&session),
-        admitted.clone(),
-        timeout_ms,
-    ));
+    let executor = Arc::new(McpToolExecutor::new(session, admitted.clone(), timeout_ms));
     Ok(ComposedMcpServer {
         server,
-        session,
         executor,
         report,
         normalized_refusals,
@@ -486,8 +478,8 @@ pub fn compose_discovered(
 ///
 /// **A real delay, not a yield**, and short because it is bounded work on the startup path: the daemon is
 /// still coming up, and a server that needs longer than this to become startable is one an operator should
-/// hear about rather than wait on. The purpose is not to outlast a long outage — that is the supervisor this
-/// module still does not have — but to stop a *transient* failure (a child that lost a race with its own
+/// hear about rather than wait on. The purpose is not to outlast a long outage — that is
+/// [`super::supervisor`], which restarts a server that dies after a successful start — but to stop a *transient* failure (a child that lost a race with its own
 /// socket, a machine briefly out of file descriptors) from costing the whole session.
 const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 

@@ -88,6 +88,13 @@ use crate::request_context::RequestContext;
 /// exists precisely because a transcript cannot be sent whole.
 pub const MAX_TRANSCRIPT_MESSAGES: u32 = 200;
 
+/// The most memories one run recalls.
+///
+/// Small on purpose: recall competes for the same context budget as the conversation, every memory costs
+/// tokens whether or not it helps, and the ranking is lexical, so the tail of a long result list is mostly
+/// noise.
+pub const MEMORY_RECALL_LIMIT: u32 = 5;
+
 /// The context ceiling applied to a run that was created without one.
 ///
 /// A default rather than no ceiling, for the same reason a run gets a default deadline:
@@ -1054,6 +1061,12 @@ pub struct RunController {
     /// and making the port optional is what lets every existing controller test keep asserting the
     /// refusal without constructing a full tool stack.
     tools: Option<Arc<crate::tool_call::ToolCallService>>,
+    /// Where memories the user asked JARVIS to remember are recalled from.
+    ///
+    /// `None` is the ordinary state for a controller built without a memory store, and means a run is
+    /// assembled from the conversation alone. Recall is read-only, scoped to the run's own workspace by the
+    /// port, and bounded by [`MEMORY_RECALL_LIMIT`].
+    memories: Option<Arc<dyn crate::repository::memory::MemoryRepository>>,
 }
 
 impl fmt::Debug for RunController {
@@ -1094,7 +1107,18 @@ impl RunController {
             // controller that ran tools without a policy stage would be the one bypass `TLS-012`
             // exists to make impossible.
             tools: None,
+            memories: None,
         }
+    }
+
+    /// Attaches the memory store runs recall from.
+    #[must_use]
+    pub fn with_memories(
+        mut self,
+        memories: Arc<dyn crate::repository::memory::MemoryRepository>,
+    ) -> Self {
+        self.memories = Some(memories);
+        self
     }
 
     /// Shares a tool-call service, so this run's tool intents are governed.
@@ -1446,12 +1470,26 @@ impl RunController {
             .await
             .map_err(ControllerError::Repository)?;
 
+        // Recall is **best effort**: a memory store that cannot answer leaves the run to be answered
+        // from the conversation alone rather than failing it. Adding context can only help the answer, so
+        // there is nothing a failed recall could have leaked — and a run that refused to start because an
+        // optional store was unreachable would turn a convenience into an outage.
+        let recalled = match self.memories.as_ref() {
+            Some(store) => store
+                .search(run.workspace, objective, MEMORY_RECALL_LIMIT)
+                .await
+                .map(|search| search.hits)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
         // The prompt is assembled under the run's own context ceiling rather than sent as
         // every message read. This is also where the architecture's "untrusted retrieved
         // content is clearly delimited" rule becomes real: the transcript is content JARVIS
         // did not author, and `RetainedItem::to_input_item` is what delimits it.
-        let assembled = match context_assembly::assemble(
+        let assembled = match context_assembly::assemble_with_memories(
             &transcript,
+            &recalled,
             objective,
             // The objective is also a stored message, so the assembler drops that one by identity
             // and keeps the objective candidate below. Without this the model received the question

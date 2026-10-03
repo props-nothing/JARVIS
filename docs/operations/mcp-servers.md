@@ -17,12 +17,20 @@ become canonical JARVIS tools: they pass the same validation, policy, approval,
 idempotency, and audit pipeline as a native tool, and the model may propose a call
 against one but never authorize it.
 
-The limit: **nothing supervises a server that dies after a successful startup.**
-`GET /api/v1/system/status` reports it (`closed: true`), a dispatch to it is
-refused before the wire, and a *startup* failure is re-attempted once — but no
-pass prunes, quarantines, or re-launches a server that started and later went
-away. A dead server stays dead until the daemon restarts. That is named as a gap
-in the evidence note and is not something this runbook can work around.
+A server that dies after a successful startup is **restarted by a supervisor**,
+under a bound. Every 5 seconds the daemon looks for a closed server and
+relaunches it from its declaration (secrets are resolved again at that moment).
+Attempts back off from 1 s, doubling to 60 s, and after 5 consecutive attempts the
+server is **quarantined** until the daemon restarts. The count is forgotten only
+once a restarted server has stayed up for 60 s, so a server that dies straight
+after every start cannot reset its own budget.
+
+Two limits remain. A restarted server is accepted only if it offers **exactly**
+the tools it did before; one that comes back with a different catalog is
+quarantined rather than substituted, because the grants and approvals were
+written against the old one. And liveness is the session's own `closed` state:
+a server that is still open but hung is not detected. A *call* that raced a death
+is still reported unsettled, and is never retried automatically.
 
 ## Symptoms and safe diagnostics
 
@@ -45,7 +53,7 @@ Three readings, and they mean different things:
 
 | Reading | Meaning | Correction |
 | --- | --- | --- |
-| `closed=true` on a row | The child is gone — it died, or its transport ended | Restart the daemon; there is no re-launch yet |
+| `closed=true` on a row | The child is gone — it died, or its transport ended | Wait one supervision pass; if it stays closed see "A server died during operation" |
 | `refused=N` on a row | The server offered more tools than it contributed | Read the per-tool lines below; the server is *running* |
 | A row in `mcp refused` | The server never composed | Its `code` names the correction |
 
@@ -63,7 +71,10 @@ jarvisd | grep 'mcp'
 | `mcp server refused at startup: server=… code=… permanent=…` | The server did not compose. `permanent=false` means the composition **already re-attempted it once** and it failed the same way |
 | `mcp tool refused at startup: server=… tool=… code=…` | A tool the server offered is not callable. The server itself is fine |
 | `mcp server registered: server=… added=… unchanged=… refused=…` | `debug` level. The counts, for "did this server end up with the tools it listed" |
-| `mcp server was already closed before the drain` | The daemon noticed a dead server **while shutting down** — too late to act on. This is the supervision gap above |
+| `mcp server was already closed before the drain` | A server was closed at shutdown — quarantined, or between restart attempts |
+| `mcp server restarted: server=… attempt=…` | The supervisor relaunched a dead server; its tools are callable again |
+| `mcp server restart failed: server=… code=… attempt=… retry_in_ms=…` | A restart attempt failed in a way a later one might fix |
+| `mcp server quarantined until the daemon restarts: server=… code=…` | Given up on. `mcp.restart_budget_exhausted`: it kept dying. `mcp.restart_identity_changed`: it came back with different tools — review them before restarting. Other codes are permanent launch or catalog faults |
 | `mcp server startup failed transiently, retrying` | A transient failure is being re-attempted. One retry, 250 ms apart |
 
 A **configuration** fault fails startup instead of appearing here, and reports
@@ -142,8 +153,9 @@ server is fine and one of its tools is not.
 
 ### A server died during operation
 
-`jarvis status` reports `closed=true`. There is no re-launch: **restart the
-daemon.** The daemon's drain stops every remaining server inside the runtime and
+`jarvis status` reports `closed=true`. The supervisor relaunches it within a few
+seconds; a `restarted` log line confirms it. If the row stays closed, look for a
+`quarantined` line, fix the cause, and **restart the daemon.** The daemon's drain stops every remaining server inside the runtime and
 reports any it could not confirm stopped (`mcp server did not stop cleanly`), so a
 restart is a clean stop rather than an orphaned child.
 

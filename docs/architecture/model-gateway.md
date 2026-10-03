@@ -463,13 +463,14 @@ fixture is fed to the parser *past* the layer that was broken.
 
 Two boundaries are enforced at construction rather than documented and trusted:
 
-- **The transport is loopback-only.** There is no TLS implementation in the
-  dependency graph as of 2026-09-27, so a remote endpoint would send the credential
-  in the clear. A **non-loopback host is refused** — parsed as an address rather
-  than prefix-matched, so a name that merely begins with `127.0.0.1` cannot pass.
-  This is why the class is called "loopback" and not "local or remote": a cloud
-  endpoint is a separate change that brings its own transport dependency, and that
-  dependency has its own evidence obligation.
+- **Plaintext is loopback-only; anything else is TLS.** The plaintext constructor refuses a
+  **non-loopback host** — parsed as an address rather than prefix-matched, so a name that
+  merely begins with `127.0.0.1` cannot pass. A named host is reached only through the TLS
+  constructor (`tls = true`), added 2026-10-03 with its own evidence (`rustls` + `aws-lc-rs`
+  over `tokio-rustls`, compiled-in `webpki-roots`; see the evidence note's "TLS transport").
+  The certificate is verified against the **name**, an address is refused for TLS, and a
+  failed handshake writes nothing, so the credential never reaches an unverified peer. A TLS
+  endpoint is classed `ApprovedCloud`, so a local-only data policy refuses it.
 - **The credential is a header, never part of a URL.** The key is a private field
   with no accessor other than the one that writes the request header, so it cannot
   be interpolated into an endpoint string, which is the shape that makes a key a
@@ -519,7 +520,9 @@ not one a version-1 binary can read: that binary's unknown-field rejection would
 no provider table loads unchanged under both, so an existing profile is not rewritten
 merely because the binary was upgraded.
 
-**The schema has since moved to version 3** for the `[tools]` table that ships reviewed tool
+**The schema has since moved to version 4** for the optional `tls` flag on `[model.provider]`, by the
+same rule (a version-3 binary would report an unknown `tls` key as a parse failure), and **to version 3**
+earlier for the `[tools]` table that ships reviewed tool
 refusals — a different subsystem's table, moved by the same rule for the same reason. See
 [tool-fabric.md](tool-fabric.md)'s *Refusals Can Also Be Reviewed Configuration* for what the table
 means; the version arithmetic is recorded here because this section owns the configuration schema's

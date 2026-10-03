@@ -41,14 +41,19 @@ pub use jarvis_application::repository::tool_grant::MAX_GRANT_NOTE_BYTES;
 /// parse failure rather than as "written by a newer JARVIS". A file with no `[tools]` table
 /// loads unchanged under 1, 2, and 3 — so this bump rewrites nothing that did not use the
 /// new capability.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Version 4 added the optional `tls` flag on `[model.provider]`, which selects TLS to a named host. The
+/// version moved for the same reason: a version-3 binary's `deny_unknown_fields` would report an
+/// unknown `tls` key as a parse failure rather than as "written by a newer JARVIS". A file without the
+/// key loads unchanged under 1 through 4.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The schema versions this binary can read.
 ///
 /// All three are accepted. Version 1 remains readable because the only difference is an
 /// optional table, so refusing it would lock an operator out of their own profile for no
 /// security benefit — and the same is true of version 2.
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3];
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4];
 
 /// Log verbosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +117,7 @@ impl Default for StorageSection {
 ///
 /// This is **operator configuration for reaching an endpoint**, and it deliberately does not
 /// validate the host. Whether an endpoint is admissible is a property of the *adapter* — the
-/// openai-compatible adapter refuses a non-loopback host because this build has no TLS — and
+/// openai-compatible adapter refuses a non-loopback host unless `tls` is set — and
 /// duplicating that predicate here would be a second implementation of one rule that could
 /// disagree with the first. An invalid value therefore fails at startup with the adapter's own
 /// code, from the one place that owns the decision.
@@ -128,6 +133,14 @@ pub struct ProviderSection {
     pub host: String,
     /// The endpoint port.
     pub port: u16,
+    /// Whether the endpoint is reached over TLS.
+    ///
+    /// `false` (the default, and omitted when false) is the loopback plaintext path. `true` means `host`
+    /// is a DNS name whose certificate is verified against the compiled-in trust roots, and the endpoint
+    /// is classed as an approved cloud endpoint for the model data policy. Not validated here, for the
+    /// reason the host is not: the adapter owns the rule and its error code.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls: bool,
     /// The prefix the completion route is mounted under, when the server uses one.
     ///
     /// Absent means `/chat/completions` at the origin. Present means the route is mounted under a
@@ -645,7 +658,7 @@ mod tests {
     /// reviewed-refusal shape rather than a document that happens not to use it — the same reason `VALID`
     /// already names a provider-adjacent model policy rather than a minimal one.
     const VALID: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [runtime]
 log_level = "debug"
@@ -707,7 +720,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
 
     #[test]
     fn a_minimal_document_uses_documented_defaults() {
-        let config = Config::from_toml("schema_version = 3").expect("minimal document must parse");
+        let config = Config::from_toml("schema_version = 4").expect("minimal document must parse");
         assert_eq!(config, Config::default());
         assert_eq!(config.runtime.log_level, LogLevel::Info);
         assert_eq!(config.storage.kind, StorageKind::Sqlite);
@@ -926,7 +939,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
         assert_eq!(missing_field.code(), "jarvis.config_missing_version");
 
         for future in [
-            "schema_version = 4",
+            "schema_version = 5",
             "schema_version = 0",
             "schema_version = 999",
         ] {
@@ -939,7 +952,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
         }
 
         // All supported versions are accepted, so each upgrade path is real rather than only documented.
-        // `3` must not appear in the rejecting list above.
+        // `4` must not appear in the rejecting list above.
 
         // A negative or non-integer version is not silently accepted.
         assert!(Config::from_toml("schema_version = -1").is_err());
@@ -950,7 +963,7 @@ api_key_ref = "env:JARVIS_MODEL_KEY"
     fn an_unsupported_version_is_not_rewritten() {
         let dir = temp_dir("no-rewrite");
         let path = config_file_path(&dir);
-        let original = "schema_version = 4\n[runtime]\nlog_level = \"info\"\n";
+        let original = "schema_version = 5\n[runtime]\nlog_level = \"info\"\n";
         std::fs::write(&path, original).expect("write fixture");
 
         // Loading fails, so there is nothing to save and the file is untouched.

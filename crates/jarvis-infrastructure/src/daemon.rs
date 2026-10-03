@@ -319,6 +319,9 @@ pub struct RunningDaemon {
     /// `approvals` records: the composition root is where a missing service is invisible to a handler test
     /// and visible to every real client.
     tool_grants: Arc<jarvis_application::tool_grant_service::ToolGrantService>,
+    /// The memory surface's use cases, over the same pool as every other store, so a memory written through
+    /// the API is the one a later run recalls.
+    memories: Arc<jarvis_application::memory_service::MemoryService>,
     recovery: RecoverySummary,
     /// What the tool-call recovery pass settled.
     ///
@@ -341,6 +344,8 @@ pub struct RunningDaemon {
     /// loop — and the `Option` makes a second stop a no-op, which matters because the drain can be entered
     /// twice (a serve error, then a normal drain).
     mcp_servers: Arc<tokio::sync::Mutex<Option<crate::mcp::composition::McpComposition>>>,
+    /// The declarations the servers were launched from, kept so the supervisor can relaunch a dead one.
+    mcp_declarations: Vec<crate::config::mcp::McpServerDeclaration>,
     guard: InstanceGuard,
 }
 
@@ -431,6 +436,7 @@ impl RunningDaemon {
             .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory))
             .with_approvals(Arc::clone(&self.approvals))
             .with_tool_grants(Arc::clone(&self.tool_grants))
+            .with_memories(Arc::clone(&self.memories))
             // **The composition the drain takes from is the one the status reads**, deliberately the same
             // `Arc`. A second holder would report a composition the drain could have already stopped, and
             // `McpHealthSource::rows` returning `None` after the take is what makes "the daemon is shutting
@@ -469,6 +475,23 @@ impl RunningDaemon {
         // The MCP servers are taken **before** the move for the same reason, and the clone is of the `Arc`
         // rather than of the composition: the sessions must be stopped through the one value that owns them.
         let mcp_servers = Arc::clone(&self.mcp_servers);
+        // **The supervisor is started with the serving loop and stopped before the drain takes the servers.**
+        // It restarts a child that died after a successful start; see `crate::mcp::supervisor` for what a
+        // restart may change (the session) and may not (the set of tools it can call). Started only when a
+        // server was declared, so the common profile spawns no task.
+        let mcp_stop = Arc::new(tokio::sync::Notify::new());
+        if !self.mcp_declarations.is_empty() {
+            tokio::spawn(crate::mcp::supervisor::supervise_composition(
+                Arc::clone(&self.mcp_servers),
+                crate::mcp::supervisor::McpSupervisor::new(
+                    self.mcp_declarations.clone(),
+                    crate::mcp::supervisor::McpRestartPolicy::default(),
+                ),
+                Arc::new(crate::config::secret::EnvSecretResolver::new()),
+                MCP_SUPERVISION_INTERVAL,
+                Arc::clone(&mcp_stop),
+            ));
+        }
 
         // Readiness was set before `start` returned, so the surface is ready the
         // moment it accepts a connection. Graceful shutdown stops new admission
@@ -478,6 +501,7 @@ impl RunningDaemon {
         if serving.await.is_err() {
             // A serve error is not a successful drain.
             let _ = drain.begin();
+            mcp_stop.notify_one();
             stop_mcp_servers(&mcp_servers).await;
             return false;
         }
@@ -485,6 +509,7 @@ impl RunningDaemon {
         // Stop admitting and unpublish after connections have drained, so no
         // client discovers a daemon that is already stopping.
         if drain.begin().is_err() {
+            mcp_stop.notify_one();
             stop_mcp_servers(&mcp_servers).await;
             return false;
         }
@@ -493,6 +518,7 @@ impl RunningDaemon {
         // this process, so exiting without asking them to stop orphans them — and for a supervised server an
         // orphan is the state a supervisor cannot distinguish from a crash loop. Stopping them here also means
         // the grace window below bounds *their* shutdown as well as the application's.
+        mcp_stop.notify_one();
         stop_mcp_servers(&mcp_servers).await;
 
         // The bound covers remaining application work after connection drain, so
@@ -745,10 +771,13 @@ pub async fn start(
         crate::time::SystemClock::new().now().ok(),
     ));
 
-    let runs = Arc::new(RunService::new(
-        ports,
-        Arc::new(RunCancellationRegistry::new()),
-    ));
+    // One memory service for the API and for run recall, so a memory written through the API is the one
+    // the next run recalls: two stores would let a client remember something no run could ever see.
+    let memories = memory_service_over(&database);
+    let runs = Arc::new(
+        RunService::new(ports, Arc::new(RunCancellationRegistry::new()))
+            .with_memories(Arc::clone(memories.store())),
+    );
 
     // The policy surface reads the same pool the run service writes, so the rules a route is
     // evaluated against are the ones this daemon stores. `repositories` here is the *same* value
@@ -781,12 +810,29 @@ pub async fn start(
         inventory,
         approvals,
         tool_grants,
+        memories,
         recovery,
         tool_recovery: tool_report,
         mcp_servers: Arc::new(tokio::sync::Mutex::new(Some(mcp))),
+        mcp_declarations: config.mcp_servers().to_vec(),
         guard,
     })
 }
+
+/// Builds the memory service over the daemon's own pool.
+fn memory_service_over(
+    database: &crate::storage::Database,
+) -> Arc<jarvis_application::memory_service::MemoryService> {
+    Arc::new(jarvis_application::memory_service::MemoryService::new(
+        Arc::new(
+            crate::storage::memory_repository::SqliteMemoryRepository::new(database.pool().clone()),
+        ),
+        Arc::new(crate::ids::UuidV7Generator::new()),
+    ))
+}
+
+/// How often the supervisor looks for a server whose child has died.
+const MCP_SUPERVISION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Stops every launched MCP server, taking the composition out of the holder.
 ///
@@ -808,8 +854,8 @@ async fn stop_mcp_servers(
         return;
     };
     // **The health probe gets its first production caller here, and reporting what it finds is the point.**
-    // A server whose child died during the session is still in the composition — nothing prunes it, because
-    // there is no supervisor yet — so without reading the sessions the drain would log "stopped 3 mcp
+    // A server whose child died during the session is still in the composition — the supervisor restarts it
+    // when it can and quarantines it when it cannot, so a server can still be closed here — and without reading the sessions the drain would log "stopped 3 mcp
     // server(s)" for children that were already gone. The count is corrected rather than left as a fact about
     // the declaration, and the servers that went away are named, because an operator seeing this line is the
     // only place the death is currently visible: no heartbeat notices it and no dispatch is refused for it

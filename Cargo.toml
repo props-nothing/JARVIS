@@ -59,6 +59,15 @@ rmcp = { version = "=3.5.0", default-features = false, features = [
     "transport-child-process",
 ] }
 
+# TLS for cloud model endpoints. Pinned exactly; `rustls` must stay >= 0.23.45 (RUSTSEC-2026-0285).
+# `aws_lc_rs` is rustls's own default provider; `ring` is not enabled. Trust roots are the compiled-in
+# Mozilla set (`webpki-roots`), so there is no OS trust-store dependency. See
+# `docs/research/integrations/openai-compatible-model.md`, "TLS transport".
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["tls12", "aws_lc_rs"] }
+webpki-roots = { version = "=1.0.9" }
+rcgen = { version = "=0.14.10", default-features = false, features = ["pem", "aws_lc_rs"] }
+
 tokio = { version = "1.53.1", default-features = false, features = [
     "fs",
     "io-util",

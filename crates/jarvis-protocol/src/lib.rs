@@ -11,6 +11,7 @@
 pub mod approval;
 pub mod discovery;
 pub mod error;
+pub mod memory;
 pub mod policy;
 pub mod run;
 pub mod tool_grant;
@@ -21,6 +22,9 @@ pub use approval::{
 };
 pub use discovery::{DISCOVERY_SCHEMA_VERSION, DiscoveryFile, DiscoveryReject};
 pub use error::{CODE_NAMESPACES, ErrorEnvelope, ErrorResponse, INTERNAL_CODE, is_owned_code};
+pub use memory::{
+    MemoryHitView, MemoryListView, MemorySearchView, MemoryView, RememberRequest, RememberedView,
+};
 pub use policy::{
     ActivePolicyResponse, DataPolicyView, EffectivePolicyResponse, EffectiveRouteView,
     PolicyRulesView, PutPolicyRequest, PutPolicyResponse, RejectedCandidateView, SourceLayerView,

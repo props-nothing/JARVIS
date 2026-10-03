@@ -20,6 +20,7 @@ getrandom.workspace = true
 jiff.workspace = true
 log.workspace = true
 rmcp.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -27,12 +28,15 @@ sqlx.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 toml.workspace = true
 tower-http.workspace = true
 uuid.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+rcgen.workspace = true
 serde_json.workspace = true
 tower.workspace = true
 # The `server` feature is enabled **for tests only**, so an end-to-end test can run a fixture MCP server

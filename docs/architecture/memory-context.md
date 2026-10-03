@@ -183,6 +183,57 @@ delimiting of untrusted content that the source-priority section requires is exp
 by `CandidateSource::is_untrusted` but consumed by nothing yet, since no prompt is
 assembled before `BRN-007`.
 
+### Implemented evidence: the first memory slice (`MEM-001`, `MEM-002`, `MEM-003`)
+
+Added 2026-10-03. What exists is exactly what "the initial implementation stores only explicit user requests"
+describes, and the types make the restriction structural rather than a policy:
+
+- `jarvis_domain::memory` — `MemoryId`, `MemoryText` (trimmed, bounded to 2,048 bytes, no control characters,
+  with a normalized dedupe key), `MemoryClass` (`preference` and `semantic` only), `Memory`, and
+  `MemorySource`, which has **one** variant, `UserRequest { principal }`. There is no inferred or extracted
+  source, so a model-proposed claim has no way to become a memory through this type.
+- `000013_memories.sql` — one table, `workspace_id` on every row, a unique `(workspace_id, dedupe_key)` index,
+  and `CHECK` constraints on the class and the source kind, so even a buggy writer cannot store a source this
+  build does not define. Schema version 13.
+- `SqliteMemoryRepository` — `workspace_id` is in every statement, so a foreign memory is absent rather than
+  forbidden; an exact duplicate is one `INSERT ... ON CONFLICT DO NOTHING` whose result decides, not a prior
+  read; forgetting is a **hard delete**, so the text is removed rather than tombstoned.
+- Retrieval is **lexical and deterministic**: `lexical_relevance` is the fraction of the query's distinct tokens
+  found (exact, or a shared prefix of at least four characters), computed in Rust over the newest 1,000
+  memories of the workspace, ordered by relevance, then recency, then identity. A search reports
+  `scan_bounded` when more memories existed than it considered.
+- `MemoryService` and `/api/v1/memories` (see the local control API contract) — remember, list, search, read,
+  and forget. The workspace and principal come from the authenticated context, never the body.
+- **Recall.** `RunController::build_context` searches the run's workspace with the objective (at most five
+  hits) and offers each hit to `context_assembly::assemble_with_memories`. A recalled memory competes under the
+  same budget and the same **sensitivity ceiling before ranking** as every other candidate: a memory labelled
+  above the run's data-policy ceiling is counted as a `sensitivity` exclusion and never reaches the provider.
+  Memories sit in the domain's memory band, below the conversation, so they cannot crowd out the turns an
+  answer is about. They render ahead of the conversation, with the objective last, labelled "remembered
+  earlier by the user, in their own words" — deliberately **not** the "untrusted data" wording other memory
+  sources would get, because the only writer is the user and that wording would stop the model honouring the
+  preference. When automatic extraction arrives, that label must key off the memory's source. Recall is best
+  effort: an unreachable store leaves the run to be answered from the conversation alone.
+- `jarvis memory remember|list|search|show|forget` is a thin client over the same API.
+
+Evidence: 7 domain tests; 9 repository tests against a real database, including identical text in two
+workspaces never crossing, the ranking order, a hard delete that removes the text, corruption reported as
+corruption, and the database refusing a source or class this build does not write; 3 API journey tests; 5
+assembly tests; and `tests/memory_recall.rs`, which starts a **real daemon**, remembers through the API, asks
+two questions against a fake OpenAI-compatible server, and asserts from the **wire request** that the matching
+question carried the memory (before the question, labelled) and the unrelated one did not — then restarts the
+daemon and recalls it again, then forgets it and shows a third daemon no longer sends it. Falsified by making
+recall search for an empty query (the journey fails) and by removing the workspace filter from the newest-first
+query (the isolation test fails).
+
+**Not done, and named:** correction and supersession lineage, export, a per-workspace disable switch
+(`ACC-031`'s "disable memory"), the other five memory classes and their lifecycle rules (`MEM-010`), embeddings
+and hybrid ranking (`MEM-004`/`MEM-005`), entity resolution (`MEM-006`), a persisted context manifest or ledger
+for recalled memories (`MEM-008` — the manifest is built per run but not stored), validity windows and expiry,
+inferred or sensitive-claim confirmation, and a full-text index (the search scans the newest 1,000 rows).
+`ACC-030` is evidenced for a preference remembered through the API; `ACC-032` at the store and recall level;
+`ACC-031`, `ACC-033`, `ACC-034`, `ACC-035`, and `ACC-036` are not.
+
 ## Context Source Priority
 
 Typical order:

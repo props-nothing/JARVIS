@@ -22,6 +22,7 @@
 
 pub mod approval;
 pub mod conversation;
+pub mod memory;
 pub mod model_call;
 pub mod policy;
 pub mod run;

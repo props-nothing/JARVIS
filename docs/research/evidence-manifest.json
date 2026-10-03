@@ -43,8 +43,8 @@
       "evidence": "docs/research/integrations/openai-compatible-model.md",
       "state": "IMPLEMENTATION_READY",
       "implementation_ready": true,
-      "last_verified": "2026-09-27",
-      "revalidate_by": "2027-03-26",
+      "last_verified": "2026-10-03",
+      "revalidate_by": "2027-04-03",
       "implementation_paths": ["adapters/models/openai-compatible/**", "crates/**/src/adapters/models/openai-compatible/**", "crates/**/src/providers/openai-compatible/**", "crates/**/src/model_providers/**", "crates/**/src/model_providers/openai-compatible/**", "crates/**/src/model_providers/openai_compatible/**", "tests/integration/openai-compatible/**", "tests/integration/openai_compatible/**"]
     },
     {

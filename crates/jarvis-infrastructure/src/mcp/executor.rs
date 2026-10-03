@@ -76,7 +76,11 @@ use super::outcome::classify_service_error;
 /// dropped inside a runtime** — its transport kills the child from `Drop`.
 pub struct McpToolExecutor {
     /// The session, which owns both the senders and the MRTR loop.
-    session: Arc<RunningService<RoleClient, JarvisClient>>,
+    ///
+    /// Behind a lock because a supervisor may **replace** it after the child dies ([`Self::replace_session`]).
+    /// A call clones the `Arc` once and uses that clone for its whole exchange, so a replacement never changes
+    /// the session a call in flight is talking to.
+    session: std::sync::RwLock<Arc<RunningService<RoleClient, JarvisClient>>>,
     /// The identities this executor may call, from the catalog the session produced.
     ///
     /// A **set of identities**, not the catalog itself: the call path needs membership, and holding the
@@ -117,7 +121,7 @@ impl McpToolExecutor {
         default_timeout_ms: u64,
     ) -> Self {
         Self {
-            session,
+            session: std::sync::RwLock::new(session),
             callable: Arc::new(callable.into_iter().collect()),
             default_timeout_ms,
         }
@@ -144,7 +148,48 @@ impl McpToolExecutor {
     /// signal is a second answer to one question, and the stale one is the one that gets read.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.session.is_closed()
+        self.session().is_closed()
+    }
+
+    /// Returns whether `identities` are exactly the identities this executor may call.
+    ///
+    /// The check a supervisor makes before substituting a restarted server: a replacement offering more,
+    /// fewer, or different tools is not the server the grants were written against.
+    #[must_use]
+    pub fn offers_exactly(&self, identities: &[ToolIdentity]) -> bool {
+        let offered: std::collections::BTreeSet<&ToolIdentity> = identities.iter().collect();
+        offered.len() == self.callable.len() && self.callable.iter().all(|i| offered.contains(i))
+    }
+
+    /// Returns the current session.
+    ///
+    /// A clone of the `Arc`, so a caller holds the session it read even if a supervisor replaces it a moment
+    /// later. A poisoned lock is read through: the guarded value is an `Arc` that is only ever replaced whole,
+    /// so a panic elsewhere cannot leave it half-written.
+    #[must_use]
+    pub fn session(&self) -> Arc<RunningService<RoleClient, JarvisClient>> {
+        Arc::clone(
+            &self
+                .session
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Replaces the session with a freshly launched one and returns the previous session.
+    ///
+    /// The caller is responsible for having verified that the new session offers **exactly** the identities
+    /// this executor may call — an executor whose session offers different tools than its `callable` set
+    /// describes would authorize one catalog and dispatch to another.
+    pub fn replace_session(
+        &self,
+        session: Arc<RunningService<RoleClient, JarvisClient>>,
+    ) -> Arc<RunningService<RoleClient, JarvisClient>> {
+        let mut guard = self
+            .session
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *guard, session)
     }
 
     /// Sends one `tools/call` and normalizes what comes back.
@@ -199,9 +244,9 @@ impl McpToolExecutor {
             Err(refusal) => return Err(class_of_refusal(&refusal)),
         };
 
-        let call = self
-            .session
-            .call_tool_with_mrtr_max_rounds(params, MAX_MRTR_ROUNDS);
+        // One read of the session for the whole exchange; see the field for why.
+        let session = self.session();
+        let call = session.call_tool_with_mrtr_max_rounds(params, MAX_MRTR_ROUNDS);
         // **The bound is the caller's.** `ToolExecutionRequest::timeout_ms` is documented as "the tool's
         // declared timeout", and it is what the pipeline reviewed the tool with — so measuring the call
         // against anything else would enforce a bound nobody chose. `0` falls back to the server's declared

@@ -747,6 +747,12 @@ confirmation_state, valid_from, valid_until,
 created_at, updated_at, last_accessed_at, archived_at, deleted_at
 ```
 
+**Implemented subset (migration `000013_memories.sql`, schema version 13):** `id`, `workspace_id`,
+`memory_class`, `canonical_text`, `dedupe_key`, `sensitivity`, `source_kind`, `source_principal_id`,
+`created_at`, `updated_at`. `memory_class` is constrained to `preference`/`semantic` and `source_kind` to
+`user_request`; `(workspace_id, dedupe_key)` is unique. The remaining columns above are the conceptual target
+and are added by the migration that gives them a writer and a reader, not before. Forgetting deletes the row.
+
 ### `memory_sources`
 
 ```text

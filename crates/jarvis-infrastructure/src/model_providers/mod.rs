@@ -131,9 +131,18 @@ fn compose_adapter(
     for name in &section.models {
         model_ids.push(ModelId::parse(name).map_err(|_| ProviderResolutionError::InvalidModelId)?);
     }
-    let adapter =
+    let adapter = if section.tls {
+        OpenAiCompatibleProvider::new_tls(
+            provider_id,
+            &section.host,
+            section.port,
+            api_key,
+            model_ids,
+        )
+    } else {
         OpenAiCompatibleProvider::new(provider_id, &section.host, section.port, api_key, model_ids)
-            .map_err(ProviderResolutionError::Adapter)?;
+    }
+    .map_err(ProviderResolutionError::Adapter)?;
     // The base path is applied through the adapter's own validator rather than checked here, so
     // there is one implementation of "is this a safe path" and one error code for a bad one — the
     // same reasoning that keeps the host rule in the adapter.
@@ -340,6 +349,48 @@ models = ["qwen2.5-7b-instruct"]
             )
         );
         assert_eq!(error.code(), "model.adapter_endpoint_not_loopback");
+    }
+
+    #[test]
+    fn a_tls_table_composes_an_approved_cloud_endpoint() {
+        // The same document with `tls = true` and a name: the adapter's TLS constructor, classed as a
+        // cloud endpoint so a local-only data policy refuses it.
+        let document = PROVIDER
+            .replace("schema_version = 2", "schema_version = 4")
+            .replace(
+                "host = \"127.0.0.1\"",
+                "host = \"api.example.com\"\ntls = true",
+            )
+            .replace("port = 8080", "port = 443");
+        let config = Config::from_toml(&document).expect("parses");
+        assert!(config.model.provider.as_ref().expect("provider").tls);
+        let secrets = MapSecretResolver::new();
+        secrets.insert("JARVIS_MODEL_KEY", "sk-test");
+        let provider = resolve(&config, &secrets).expect("composes");
+        assert_eq!(provider.endpoint_class(), EndpointClass::ApprovedCloud);
+    }
+
+    #[test]
+    fn tls_with_an_address_is_refused_by_the_adapter_s_own_rule() {
+        let document = PROVIDER
+            .replace("schema_version = 2", "schema_version = 4")
+            .replace("port = 8080", "port = 8080\ntls = true");
+        let config = Config::from_toml(&document).expect("parses");
+        let secrets = MapSecretResolver::new();
+        secrets.insert("JARVIS_MODEL_KEY", "sk-test");
+        let error = resolve(&config, &secrets).err().expect("refused");
+        assert_eq!(error.code(), "model.adapter_tls_host_invalid");
+    }
+
+    #[test]
+    fn a_document_without_the_tls_key_stays_plaintext_and_does_not_write_it_back() {
+        let config = Config::from_toml(PROVIDER).expect("provider document");
+        assert!(!config.model.provider.as_ref().expect("provider").tls);
+        let rendered = toml::to_string(&config).expect("serializes");
+        assert!(
+            !rendered.contains("tls"),
+            "an unset flag must not be rewritten into the file: {rendered}"
+        );
     }
 
     #[test]

@@ -6,17 +6,18 @@
 //!
 //! # What this adapter is, and what it deliberately is not
 //!
-//! It speaks **HTTP/1.1 over a loopback, plaintext connection** to an operator-configured
-//! OpenAI-compatible endpoint serving the Chat Completions streaming contract. The transport is
+//! It speaks **HTTP/1.1** to an operator-configured OpenAI-compatible endpoint serving the Chat
+//! Completions streaming contract: in plaintext to a **loopback** address ([`OpenAiCompatibleProvider::new`]),
+//! or over **TLS** to a named host ([`OpenAiCompatibleProvider::new_tls`], added 2026-10-03 under the
+//! evidence note's "TLS transport" section). A non-loopback endpoint without TLS is still refused. The transport is
 //! hand-rolled rather than a general client, for the reason the Foundation note already records for
 //! the loopback client: one known peer does not justify a full client stack, and a hand-rolled path
 //! makes it *structurally* hard to send a credential somewhere unintended. The stronger reason here
-//! is measured rather than argued — an inspection of `Cargo.lock` on 2026-09-27 found **no TLS
-//! implementation in this workspace at all** (`rustls`, `native-tls`, `openssl`, `ring`, `webpki`,
-//! and `hyper-rustls` are all absent), so reaching an `https://` endpoint would require a new
-//! reviewed dependency. That is its own evidence obligation under `AGENTS.md`, not a side effect of
-//! this item, so the adapter **refuses a non-loopback endpoint** rather than silently pretending to
-//! support a cloud provider it cannot secure.
+//! is measured rather than argued. Until 2026-10-03 the workspace had **no TLS implementation at
+//! all**, so the adapter refused a non-loopback endpoint rather than pretend to support a cloud
+//! provider it could not secure. TLS is now `rustls` (the `aws-lc-rs` provider) over `tokio-rustls`
+//! with the compiled-in `webpki-roots` trust set, and the hand-rolled HTTP/1.1 path is unchanged
+//! beneath it: the same reader runs over a plaintext or a TLS stream.
 //!
 //! # Three layers, deliberately separate
 //!
@@ -46,6 +47,7 @@ use jarvis_domain::model::identity::{EndpointClass, ModelId, ModelRef, ProviderI
 use jarvis_domain::model::stream::{
     ContentBlock, InputItem, ModelCallRequest, ModelStreamEvent, ModelStreamEventKind, Role,
 };
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
@@ -150,6 +152,19 @@ pub struct OpenAiCompatibleProvider {
     /// `CallLimits`, and this is the transport's last-resort limit so a stalled peer cannot hold a
     /// connection open indefinitely even if the request carried no deadline.
     timeout: std::time::Duration,
+    /// The TLS peer, when the endpoint is reached over TLS; `None` is the loopback plaintext path.
+    tls: Option<TlsPeer>,
+}
+
+/// What a TLS exchange needs beyond the host and port: the verified name and the trust configuration.
+///
+/// Cheap to clone (`TlsConnector` shares an `Arc<ClientConfig>`), so each exchange owns a copy rather
+/// than borrowing the provider.
+#[derive(Clone)]
+struct TlsPeer {
+    connector: tokio_rustls::TlsConnector,
+    /// The name the certificate is verified against and sent as SNI. A DNS name, never an address.
+    server_name: ServerName<'static>,
 }
 
 impl std::fmt::Debug for OpenAiCompatibleProvider {
@@ -165,6 +180,7 @@ impl std::fmt::Debug for OpenAiCompatibleProvider {
             .field("models", &self.models.len())
             .field("endpoint", &format_args!("{}:{}", self.host, self.port))
             .field("endpoint_class", &self.endpoint_class)
+            .field("tls", &self.tls.is_some())
             // Named so the presence of a credential is visible without its value, which is what a
             // diagnostic needs: "was one configured" rather than "what is it".
             .field("api_key", &"[redacted]")
@@ -175,12 +191,11 @@ impl std::fmt::Debug for OpenAiCompatibleProvider {
 /// Why an endpoint configuration was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
-    /// The host is not a loopback address.
+    /// The host is not a loopback address, and TLS was not requested.
     ///
-    /// Refused rather than accepted and later failed, because this build has no TLS implementation:
-    /// a remote host would be reached in plaintext, and sending a provider credential over an
-    /// unencrypted network is worse than refusing to start. The evidence note records the measurement
-    /// behind this.
+    /// Refused rather than accepted and later failed: a remote host would be reached in plaintext,
+    /// and sending a provider credential over an unencrypted network is worse than refusing to
+    /// start. A remote host is reached with [`OpenAiCompatibleProvider::new_tls`].
     NotLoopback,
     /// The credential is empty or not a plausible bearer token.
     InvalidCredential,
@@ -204,6 +219,13 @@ pub enum ConfigError {
     /// had been — the same reasoning that makes an unserved routed model a refusal rather than a
     /// silent substitution.
     InvalidModelName,
+    /// A TLS endpoint was given as an address or as a name that is not a valid DNS name.
+    ///
+    /// Refused because certificate verification here is by **name**: an address has no name to verify,
+    /// and a loopback address is served by the plaintext constructor.
+    InvalidTlsHost,
+    /// The TLS client could not be configured (no usable protocol version or crypto provider).
+    TlsSetup,
 }
 
 impl ConfigError {
@@ -217,6 +239,8 @@ impl ConfigError {
             Self::UrlShaped => "model.adapter_endpoint_url_shaped",
             Self::InvalidPath => "model.adapter_path_invalid",
             Self::InvalidModelName => "model.adapter_model_name_invalid",
+            Self::InvalidTlsHost => "model.adapter_tls_host_invalid",
+            Self::TlsSetup => "model.adapter_tls_setup_failed",
         }
     }
 }
@@ -251,7 +275,7 @@ impl OpenAiCompatibleProvider {
         if host.is_empty() {
             return Err(ConfigError::UrlShaped);
         }
-        // Loopback only, and checked by parsing rather than by prefix, because `127.0.0.1.evil` and
+        // Loopback only (a named host is reached with `new_tls`), and checked by parsing rather than by prefix, because `127.0.0.1.evil` and
         // `localhost.attacker` both start with something that looks local. A name is refused outright
         // so no string that could resolve through DNS or a hosts file reaches the socket.
         let loopback = match host.parse::<std::net::IpAddr>() {
@@ -289,7 +313,85 @@ impl OpenAiCompatibleProvider {
             timeout: std::time::Duration::from_secs(120),
             base_path: String::new(),
             wire_names: std::collections::BTreeMap::new(),
+            tls: None,
         })
+    }
+
+    /// Builds an adapter over a **TLS** endpoint, trusting the compiled-in Mozilla root set.
+    ///
+    /// The host must be a DNS name; the certificate is verified against it and it is sent as SNI.
+    /// The endpoint class is [`EndpointClass::ApprovedCloud`], so a local-only data policy refuses it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], plus [`ConfigError::InvalidTlsHost`] for an address or an invalid name and
+    /// [`ConfigError::TlsSetup`] if the TLS client cannot be configured.
+    pub fn new_tls(
+        provider_id: ProviderId,
+        host: &str,
+        port: u16,
+        api_key: &str,
+        model_ids: Vec<ModelId>,
+    ) -> Result<Self, ConfigError> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::new_tls_with_roots(provider_id, host, port, api_key, model_ids, roots)
+    }
+
+    /// As [`Self::new_tls`], trusting exactly `roots`.
+    ///
+    /// The seam for a private certificate authority and for tests, which must show a certificate is
+    /// rejected when its root is absent and accepted when it is injected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new_tls`].
+    pub fn new_tls_with_roots(
+        provider_id: ProviderId,
+        host: &str,
+        port: u16,
+        api_key: &str,
+        model_ids: Vec<ModelId>,
+        roots: rustls::RootCertStore,
+    ) -> Result<Self, ConfigError> {
+        if host.contains("://")
+            || host.contains('/')
+            || host.contains('?')
+            || host.contains('#')
+            || host.contains('@')
+        {
+            return Err(ConfigError::UrlShaped);
+        }
+        let host = host.trim();
+        if host.is_empty() {
+            return Err(ConfigError::UrlShaped);
+        }
+        // Parsed by the TLS library, which is the authority on what a valid DNS name is. An address is
+        // refused: it has no name to verify a certificate against.
+        let Ok(server_name @ ServerName::DnsName(_)) = ServerName::try_from(host.to_owned()) else {
+            return Err(ConfigError::InvalidTlsHost);
+        };
+        // Build through the loopback constructor with a placeholder host so the credential, model,
+        // and URL-shape rules have one implementation, then replace the endpoint.
+        let mut provider = Self::new(provider_id, "127.0.0.1", port, api_key, model_ids)?;
+        // Explicit crypto provider and protocol versions, so no process-wide default is consulted or
+        // installed: this adapter must not depend on, or change, how another component configured TLS.
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| ConfigError::TlsSetup)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        // HTTP/1.1 is the only protocol this hand-rolled client speaks.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        provider.host = host.to_ascii_lowercase();
+        provider.endpoint_class = EndpointClass::ApprovedCloud;
+        provider.tls = Some(TlsPeer {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            server_name,
+        });
+        Ok(provider)
     }
 
     /// Supplies the provider-side names for models whose JARVIS id differs from the API's name.
@@ -561,9 +663,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     fn endpoint_class(&self) -> EndpointClass {
-        // Loopback by construction — `new` refuses anything else — so this is a fact about the
-        // adapter rather than a configuration reading. A `Local` class is what makes a `LocalOnly`
-        // policy admit this provider and a cloud-only policy refuse it.
+        // Fixed at construction: `Local` for the loopback constructor, `ApprovedCloud` for TLS. A
+        // `Local` class is what makes a `LocalOnly` policy admit this provider and a cloud-only
+        // policy refuse it.
         self.endpoint_class
     }
 
@@ -587,6 +689,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 // only copy and no reference to it outlives this call.
                 credential: self.api_key.expose_for_header().to_owned(),
                 timeout: self.timeout,
+                tls: self.tls.clone(),
             };
             let call_id = request.call_id;
             let ids: Arc<dyn IdGenerator> = Arc::new(crate::ids::UuidV7Generator::new());
@@ -621,6 +724,7 @@ struct ExchangePlan {
     body: String,
     credential: String,
     timeout: std::time::Duration,
+    tls: Option<TlsPeer>,
 }
 
 /// Opens the connection and feeds the body's frames to `sender`.
@@ -665,46 +769,24 @@ async fn exchange(
     stamper: &mut jarvis_application::model::FrameStamper<'_>,
 ) -> Result<(), ProviderError> {
     let attempt = async {
-        let mut stream = tokio::net::TcpStream::connect((plan.host.as_str(), plan.port))
+        let tcp = tokio::net::TcpStream::connect((plan.host.as_str(), plan.port))
             .await
             .map_err(|_| ProviderError::Unavailable)?;
-
-        // The request is assembled by hand for the reason the evidence note records: one known local
-        // peer does not justify a general client stack, and a hand-built request makes it structurally
-        // hard to send the credential anywhere but this peer. The credential is a **header value**,
-        // never a URL component, so it cannot appear in a URL-shaped log line.
-        let request = format!(
-            "POST {path} HTTP/1.1\r\n\
-             Host: {host}:{port}\r\n\
-             Authorization: Bearer {credential}\r\n\
-             Content-Type: application/json\r\n\
-             Accept: text/event-stream\r\n\
-             Content-Length: {length}\r\n\
-             Connection: close\r\n\r\n{body}",
-            path = plan.path,
-            host = plan.host,
-            port = plan.port,
-            credential = plan.credential,
-            length = plan.body.len(),
-            body = plan.body,
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|_| ProviderError::Unavailable)?;
-
-        let mut reader = ResponseReader::new(stream);
-        let head = reader.read_head().await?;
-        if !(200..300).contains(&head.status) {
-            // The error body is read so the mapping can use the documented type/code pair, and the
-            // code is what distinguishes a retryable rate limit from an exhausted balance. The body
-            // text itself never becomes a JARVIS code.
-            let body = reader.read_error_body().await.unwrap_or_default();
-            return Err(map_status(head.status, &body));
+        match &plan.tls {
+            None => converse(tcp, plan, sender, stamper).await,
+            Some(peer) => {
+                // Verification is by name against the configured trust roots; a failed handshake sends
+                // nothing, so the credential is never written to an unverified peer. It is `Unavailable`
+                // rather than a new class because the port has no certificate-specific error and the
+                // detail (which check failed) is deliberately not forwarded from an untrusted peer.
+                let tls = peer
+                    .connector
+                    .connect(peer.server_name.clone(), tcp)
+                    .await
+                    .map_err(|_| ProviderError::Unavailable)?;
+                converse(tls, plan, sender, stamper).await
+            }
         }
-
-        let mut translator = ChunkTranslator::new();
-        pump_body(&mut reader, sender, stamper, &mut translator).await
     };
 
     // The adapter's outer bound. The run controller's deadline is tighter and is the real budget; this
@@ -712,6 +794,71 @@ async fn exchange(
     tokio::time::timeout(plan.timeout, attempt)
         .await
         .map_err(|_| ProviderError::Timeout)?
+}
+
+/// The `Host` header value: the port is omitted for a TLS endpoint on 443, as clients do.
+fn host_header(plan: &ExchangePlan) -> String {
+    if plan.tls.is_some() && plan.port == 443 {
+        plan.host.clone()
+    } else {
+        format!("{}:{}", plan.host, plan.port)
+    }
+}
+
+/// Sends the request and pumps the response over an established stream, plaintext or TLS.
+///
+/// One implementation for both transports, so the framing, the status mapping, and the credential
+/// handling cannot diverge between them.
+async fn converse<S>(
+    mut stream: S,
+    plan: &ExchangePlan,
+    sender: &mpsc::Sender<ModelStreamEvent>,
+    stamper: &mut jarvis_application::model::FrameStamper<'_>,
+) -> Result<(), ProviderError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // The request is assembled by hand for the reason the evidence note records: one known local
+    // peer does not justify a general client stack, and a hand-built request makes it structurally
+    // hard to send the credential anywhere but this peer. The credential is a **header value**,
+    // never a URL component, so it cannot appear in a URL-shaped log line.
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+             Host: {host_header}\r\n\
+             Authorization: Bearer {credential}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: text/event-stream\r\n\
+             Content-Length: {length}\r\n\
+             Connection: close\r\n\r\n{body}",
+        path = plan.path,
+        host_header = host_header(plan),
+        credential = plan.credential,
+        length = plan.body.len(),
+        body = plan.body,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| ProviderError::Unavailable)?;
+    // A TLS stream buffers writes like a `BufWriter`: without a flush the request may never reach the
+    // socket and the exchange would wait for a response to a request the peer has not seen.
+    stream
+        .flush()
+        .await
+        .map_err(|_| ProviderError::Unavailable)?;
+
+    let mut reader = ResponseReader::new(stream);
+    let head = reader.read_head().await?;
+    if !(200..300).contains(&head.status) {
+        // The error body is read so the mapping can use the documented type/code pair, and the
+        // code is what distinguishes a retryable rate limit from an exhausted balance. The body
+        // text itself never becomes a JARVIS code.
+        let body = reader.read_error_body().await.unwrap_or_default();
+        return Err(map_status(head.status, &body));
+    }
+
+    let mut translator = ChunkTranslator::new();
+    pump_body(&mut reader, sender, stamper, &mut translator).await
 }
 
 /// The parsed response head.

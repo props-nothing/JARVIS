@@ -679,6 +679,13 @@ Foundation TODO remains incomplete.
   per-model capability inventory that `BRN-011` and `NFR-VOI-002` need is not
   collected.
 - [~] `BRN-003` Research and implement one OpenAI-compatible provider adapter.
+  **TLS added 2026-10-03:** the adapter now reaches a named host over TLS (`tls = true`, schema 4;
+  `rustls =0.23.45` + `aws-lc-rs`, `tokio-rustls =0.26.6`, `webpki-roots =1.0.9`). Evidence: the "TLS
+  transport" section of `docs/research/integrations/openai-compatible-model.md` (claims
+  `OC-C011`..`OC-C015`) and `tests/openai_compatible_tls.rs` (6 tests against a real TLS server; the
+  rejection cases assert the server saw zero request bytes). **Not done:** a live test against a real
+  cloud endpoint (needs a provider account and spend approval), a custom CA key in configuration,
+  platform-verifier trust roots, macOS/Linux proof of the `aws-lc-sys` build (native CI, `FND-010`).
   Evidence: **all three halves now exist** — the research gate, the adapter, and a **verified real
   provider run**.
   `crates/jarvis-infrastructure/src/model_providers/openai_compatible/` holds it in three layers,
@@ -4759,7 +4766,19 @@ Dependencies: Milestone 2 exit gate.
     two `jarvis-domain` doc comments whose claims were false.
   - **Still not done:** the layer provenance above; `agent_runs.result_ref`/`error_ref` and
     `plan_summary_ref` (each needs a producer that does not exist).
-- [ ] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
+- [~] `TLS-008` Refresh MCP evidence; implement stdio and Streamable HTTP client.
+  **PARTIAL (marker corrected 2026-10-03; it read `[ ]` after thirty slices of landed stdio work).**
+  Done: evidence refresh, normalization, outcome classification, process supervision, executor, and
+  **post-start supervision (2026-10-03)**: `jarvis_infrastructure::mcp::supervisor` restarts a closed
+  server under a bounded, backed-off budget and swaps the session behind the same executor only when the
+  restarted server offers exactly the identities it did (otherwise it is quarantined). Evidence:
+  `tests/mcp_supervisor_process.rs` (4 tests against real children) plus 4 unit tests; falsified by making
+  `McpToolExecutor::offers_exactly` always true, which fails the quarantine test. A restart that finishes
+  after the drain took the composition is undone so no child is orphaned. The `[[mcp.servers]]` operator
+  runbook exists (`docs/operations/mcp-servers.md`) and now documents the supervisor.
+  Outstanding: Streamable HTTP (a reviewed TLS stack now exists for the model adapter, but `rmcp`'s
+  `reqwest` transport brings its own TLS selection, so enabling it is still its own review), hung-but-open child detection
+  (heartbeat), and the remaining test plan.
   - **Refresh half: DONE.** `docs/research/integrations/mcp.md` was re-derived from the **normative
     changelog and deprecated registry** instead of the spec landing page, and the manifest entry was
     moved to `last_verified 2026-10-03` / `revalidate_by 2027-04-03`. Eight statements in the
@@ -7729,9 +7748,23 @@ Dependencies: Milestone 2 exit gate.
 
 Dependencies: Milestone 3 exit gate.
 
-- [ ] `MEM-001` Define typed memory and provenance schema.
-- [ ] `MEM-002` Implement user-confirmed preference memory lifecycle.
-- [ ] `MEM-003` Implement lexical retrieval and deterministic ranking baseline.
+- [~] `MEM-001` Define typed memory and provenance schema. **PARTIAL (2026-10-03).** Done:
+  `jarvis_domain::memory` (typed id, validated text, two classes, a single `UserRequest` source),
+  `000013_memories.sql` (workspace-scoped, `CHECK`-constrained class and source, unique dedupe key),
+  `SqliteMemoryRepository`. Not done: confidence, importance, validity windows, supersession/lineage
+  columns, the other five classes. Evidence: `docs/architecture/memory-context.md` "Implemented evidence: the
+  first memory slice"; 7 domain and 9 repository tests, including a database refusing an undefined source.
+- [~] `MEM-002` Implement user-confirmed preference memory lifecycle. **PARTIAL (2026-10-03).** Done: an
+  explicit request writes a memory (`POST /api/v1/memories`, `jarvis memory remember`); an exact duplicate is
+  an idempotent no-op; a hard-delete forget; read/list/search. Not done: correction, supersession, export,
+  per-workspace disable, confirmation of inferred or sensitive claims. Evidence: 3 API tests and
+  `tests/memory_recall.rs` (remember, restart, forget through a real daemon).
+- [~] `MEM-003` Implement lexical retrieval and deterministic ranking baseline. **PARTIAL (2026-10-03).** Done:
+  `lexical_relevance` (pure, deterministic) over the newest 1,000 memories with a total order, reported
+  `scan_bounded`, and **recall into runs**: the objective is searched, at most five hits compete under the
+  run's budget and sensitivity ceiling, and the matching question carries the memory on the wire while an
+  unrelated one does not. Not done: a full-text index, the versioned score breakdown `ACC-036` requires, and a
+  persisted context ledger (`MEM-008`).
 - [ ] `MEM-011` Implement the procedural memory lifecycle and the learned-skill
   record: a learned procedure is a durable memory carrying the provenance every
   memory class carries plus the canonical identities and schema fingerprints of the

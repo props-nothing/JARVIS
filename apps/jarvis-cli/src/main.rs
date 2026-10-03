@@ -134,6 +134,15 @@ enum Command {
         #[command(subcommand)]
         action: GrantsAction,
     },
+    /// Remember, recall, and forget durable memories.
+    ///
+    /// A thin client over `/api/v1/memories`: the daemon decides what is storable, so this command only
+    /// turns flags into a request. `list`, `search`, and `show` are read-only; `remember` and `forget`
+    /// change durable state and are their own named actions, so a bare `jarvis memory` changes nothing.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Read the workspace's model data policy, or put a new version in force.
     ///
     /// **The control plane for the policy the daemon already enforces, and it exists for the same reason
@@ -302,6 +311,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Approvals { action } => approvals(paths, action).await,
         Command::Grants { action } => grants(paths, action).await,
         Command::Policy { action } => policy(paths, action).await,
+        Command::Memory { action } => memory(paths, action).await,
         Command::Config => config(paths),
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
@@ -1778,6 +1788,151 @@ async fn grant_deny(state: &ClientState, action: DenyAction) -> ExitCode {
     }
 }
 
+/// What the `memory` command can do.
+#[derive(Debug, Subcommand)]
+enum MemoryAction {
+    /// Store something JARVIS should remember, in your own words.
+    Remember {
+        /// What to remember.
+        text: String,
+        /// `preference` (how you want things done) or `semantic` (a fact about your world).
+        #[arg(long, default_value = "preference")]
+        class: String,
+        /// `public`, `internal`, `confidential`, or `restricted`.
+        #[arg(long, default_value = "internal")]
+        sensitivity: String,
+    },
+    /// List the newest memories.
+    List {
+        /// The most memories to return.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Find memories by words, most relevant first.
+    Search {
+        /// What to look for.
+        query: String,
+        /// The most memories to return.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show one memory with its provenance.
+    Show {
+        /// The memory identifier.
+        memory_id: String,
+    },
+    /// Permanently delete a memory.
+    Forget {
+        /// The memory identifier.
+        memory_id: String,
+    },
+}
+
+/// Runs a memory action against the daemon.
+async fn memory(paths: &ProfilePaths, action: MemoryAction) -> ExitCode {
+    let state = match daemon_client(paths) {
+        Ok(state) => state,
+        Err(error) => return report_client_error(&error),
+    };
+    match action {
+        MemoryAction::Remember {
+            text,
+            class,
+            sensitivity,
+        } => print_daemon_response(
+            send_authenticated(
+                &state.discovered,
+                &state.credential,
+                "POST",
+                "/api/v1/memories",
+                API_MAJOR,
+                // No idempotency header: an exact duplicate is a no-op at the daemon, so a retry is safe.
+                "",
+                Some(&memory_body(&text, &class, &sensitivity)),
+            )
+            .await,
+        ),
+        MemoryAction::List { limit } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &memory_list_path(limit),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        MemoryAction::Search { query, limit } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &memory_search_path(&query, limit),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        MemoryAction::Show { memory_id } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &format!("/api/v1/memories/{memory_id}"),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        MemoryAction::Forget { memory_id } => print_daemon_response(
+            send_authenticated(
+                &state.discovered,
+                &state.credential,
+                "DELETE",
+                &format!("/api/v1/memories/{memory_id}"),
+                API_MAJOR,
+                "",
+                None,
+            )
+            .await,
+        ),
+    }
+}
+
+/// Builds the remember body. The workspace, principal, and source are the daemon's to decide, so none is sent.
+fn memory_body(text: &str, class: &str, sensitivity: &str) -> String {
+    serde_json::json!({ "text": text, "class": class, "sensitivity": sensitivity }).to_string()
+}
+
+/// Builds the memory listing path.
+fn memory_list_path(limit: Option<u32>) -> String {
+    let query: Vec<String> = limit
+        .map(|limit| vec![format!("limit={limit}")])
+        .unwrap_or_default();
+    join_query("/api/v1/memories", &query)
+}
+
+/// Builds the memory search path, percent-encoding the query so spaces, `&`, and `#` cannot change its meaning.
+fn memory_search_path(query: &str, limit: Option<u32>) -> String {
+    let mut parts = vec![format!("q={}", percent_encode(query))];
+    if let Some(limit) = limit {
+        parts.push(format!("limit={limit}"));
+    }
+    join_query("/api/v1/memories/search", &parts)
+}
+
+/// Percent-encodes every byte outside the RFC 3986 unreserved set.
+fn percent_encode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 /// Builds the grants listing path from the client's own arguments.
 ///
 /// Extracted as a pure function so the query string is testable without a daemon, and ordered
@@ -2998,13 +3153,14 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::MemoryAction;
     use super::{
         ApprovalsAction, AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command,
         FollowStep, InstallAction, PolicyAction, RiskArg, STREAM_ATTEMPTS, SequenceCheck,
         SequenceWatcher, SseFrame, SseParser, StatusBody, ask_body, deny_rule_body,
         deny_rules_list_path, effective_policy_path, event_stream_headers, follow_after,
         follow_run, follow_step, grant_body, grants_list_path, idempotency_key, json_string,
-        list_path, parse_status, policy_body,
+        list_path, memory_body, memory_list_path, memory_search_path, parse_status, policy_body,
     };
     use clap::Parser as _;
     use jarvis_infrastructure::client::Discovered;
@@ -3551,6 +3707,55 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_memory_command_changes_nothing_and_the_defaults_are_the_documented_ones() {
+        assert!(Cli::try_parse_from(["jarvis", "memory"]).is_err());
+        let cli =
+            Cli::try_parse_from(["jarvis", "memory", "remember", "be concise"]).expect("parses");
+        let Command::Memory {
+            action:
+                MemoryAction::Remember {
+                    text,
+                    class,
+                    sensitivity,
+                },
+        } = cli.command
+        else {
+            unreachable!("expected a remember action");
+        };
+        assert_eq!(
+            (text.as_str(), class.as_str(), sensitivity.as_str()),
+            ("be concise", "preference", "internal")
+        );
+    }
+
+    #[test]
+    fn the_remember_body_names_nothing_the_daemon_decides() {
+        // No workspace, principal, source, or confidence: those are the daemon's, and a client-supplied one
+        // would be refused by the daemon's unknown-field rule.
+        let body: serde_json::Value =
+            serde_json::from_str(&memory_body("be concise", "semantic", "public")).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({"text": "be concise", "class": "semantic", "sensitivity": "public"})
+        );
+    }
+
+    #[test]
+    fn the_search_path_encodes_the_query_so_it_cannot_change_the_request() {
+        assert_eq!(
+            memory_search_path("client proposals", Some(5)),
+            "/api/v1/memories/search?q=client%20proposals&limit=5"
+        );
+        // A query carrying `&`, `#`, `=` and a non-ASCII letter stays one value.
+        assert_eq!(
+            memory_search_path("a&b#c=d é", None),
+            "/api/v1/memories/search?q=a%26b%23c%3Dd%20%C3%A9"
+        );
+        assert_eq!(memory_list_path(None), "/api/v1/memories");
+        assert_eq!(memory_list_path(Some(3)), "/api/v1/memories?limit=3");
+    }
+
+    #[test]
     fn the_event_stream_request_states_the_media_type_the_contract_requires() {
         // The contract requires `Accept: text/event-stream` on the events route, and this client is
         // the reference implementation of that surface. It sent **no** `Accept` header at all until
@@ -3613,6 +3818,7 @@ mod tests {
             (vec!["jarvis", "runs", "show", "abc"], "runs"),
             (vec!["jarvis", "approvals", "list"], "approvals"),
             (vec!["jarvis", "grants", "list"], "grants"),
+            (vec!["jarvis", "memory", "list"], "memory"),
         ] {
             let cli = Cli::try_parse_from(&arguments).expect("documented command parses");
             let actual = match cli.command {
@@ -3630,6 +3836,7 @@ mod tests {
                 Command::Approvals { .. } => "approvals",
                 Command::Grants { .. } => "grants",
                 Command::Policy { .. } => "policy",
+                Command::Memory { .. } => "memory",
             };
             assert_eq!(actual, expected);
         }
@@ -3894,7 +4101,8 @@ mod tests {
                     | Command::Runs { .. }
                     | Command::Approvals { .. }
                     | Command::Grants { .. }
-                    | Command::Policy { .. } => String::from("unexpected"),
+                    | Command::Policy { .. }
+                    | Command::Memory { .. } => String::from("unexpected"),
                 }
             })
             .collect();

@@ -259,6 +259,15 @@ identifier!(
      authority an operator had refused."
 );
 
+identifier!(
+    MemoryId,
+    "memory",
+    "Identifies one durable memory. A memory is corrected, forgotten, and cited by the context \
+     manifest, so it needs an identity that survives edits to its text — naming it by its content \
+     would make a correction a different memory and break the provenance of everything that \
+     referenced the original."
+);
+
 /// Generates identifiers for domain records.
 ///
 /// The port is injected so production code uses real `UUIDv7` values while tests
