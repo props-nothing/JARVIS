@@ -593,6 +593,7 @@ async fn a_decision_records_the_principal_and_channel_from_the_context_not_the_r
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -629,6 +630,7 @@ async fn a_decision_on_a_channel_the_request_excludes_is_refused_by_name() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -658,6 +660,7 @@ async fn a_guest_cannot_decide_and_is_refused_before_the_record_is_read() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -686,6 +689,7 @@ async fn a_critical_action_cannot_be_decided_by_an_ordinary_session() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -723,6 +727,7 @@ async fn a_critical_action_is_decided_by_a_stepped_up_session_and_the_level_is_r
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -754,6 +759,7 @@ async fn a_high_risk_action_is_decidable_by_an_ordinary_session() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -781,6 +787,7 @@ async fn a_channel_refusal_outranks_an_assurance_refusal() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -811,6 +818,7 @@ async fn a_lapsed_request_is_expired_and_recorded_so_it_leaves_the_listing() {
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             later(),
         )
@@ -1026,6 +1034,7 @@ async fn a_reviewed_action_that_is_not_the_approved_one_is_refused_before_the_ve
                 expected_version: ApprovalVersion::new(99),
                 fingerprint: &other_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -1056,6 +1065,7 @@ async fn a_repeat_of_the_same_decision_is_idempotent_while_a_differing_one_confl
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -1073,6 +1083,7 @@ async fn a_repeat_of_the_same_decision_is_idempotent_while_a_differing_one_confl
                 expected_version: ApprovalVersion::FIRST,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -1096,6 +1107,7 @@ async fn a_repeat_of_the_same_decision_is_idempotent_while_a_differing_one_confl
                 expected_version: ApprovalVersion::new(2),
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -1175,6 +1187,7 @@ async fn a_spent_one_shot_reports_already_consumed_rather_than_a_generic_conflic
                 expected_version: version,
                 fingerprint: &approved_digest(),
                 note: None,
+                remember: false,
             },
             now(),
         )
@@ -1381,4 +1394,123 @@ fn the_channels_a_request_may_come_from_map_onto_approval_channels_without_a_cat
         7,
         "every `RequestChannel` variant must appear, or a new one inherits a mapping untested",
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// "Always allow this": remembered approvals.
+// ---------------------------------------------------------------------------------------
+
+/// A fixture whose approval is a reversible write of moderate risk, the shape "remember" is for.
+async fn rememberable_fixture(
+    risk: Risk,
+    effects: Vec<Effect>,
+) -> (ApprovalService, Arc<InMemoryRepositories>, DurableApproval) {
+    let repositories = Arc::new(InMemoryRepositories::new());
+    let mut approval = pending();
+    approval.risk = risk;
+    approval.effects = effects;
+    repositories
+        .request(&approval)
+        .await
+        .expect("the fixture approval is inserted");
+    let service = ApprovalService::new(Arc::clone(&repositories) as Arc<dyn ApprovalRepository>);
+    (service, repositories, approval)
+}
+
+fn remember_command(decision: Decision) -> DecisionCommand<'static> {
+    static DIGEST: jarvis_domain::tool::canonical::ActionDigest =
+        jarvis_domain::tool::canonical::ActionDigest::from_bytes([11; 32]);
+    DecisionCommand {
+        decision,
+        expected_version: ApprovalVersion::FIRST,
+        fingerprint: &DIGEST,
+        note: None,
+        remember: true,
+    }
+}
+
+#[tokio::test]
+async fn a_remembered_approval_becomes_standing_with_a_longer_deadline() {
+    let (service, repositories, approval) =
+        rememberable_fixture(Risk::Moderate, vec![Effect::Write]).await;
+    let decided = service
+        .decide(
+            &context(RequestChannel::Cli),
+            approval.id,
+            remember_command(Decision::Approve),
+            now(),
+        )
+        .await
+        .expect("a moderate write can be remembered");
+    assert_eq!(decided.approval.scope, ApprovalScopeKind::Standing);
+    assert!(
+        decided.approval.expires_at > later(),
+        "the standing window outlasts the prompt window"
+    );
+
+    let stored = repositories
+        .load(workspace(), approval.id)
+        .await
+        .expect("loads");
+    assert_eq!(
+        stored.scope,
+        ApprovalScopeKind::Standing,
+        "the scope is persisted, not only returned"
+    );
+    assert_eq!(stored.expires_at, decided.approval.expires_at);
+    assert_eq!(stored.state(), ApprovalState::Approved);
+}
+
+#[tokio::test]
+async fn an_action_that_must_always_ask_cannot_be_remembered() {
+    for (risk, effects) in [
+        (Risk::High, vec![Effect::Write]),
+        (Risk::Low, vec![Effect::ExternalCommunication]),
+        (Risk::Moderate, vec![Effect::Write, Effect::Destructive]),
+        (Risk::Low, vec![Effect::CodeExecution]),
+        (Risk::Low, vec![Effect::Financial]),
+    ] {
+        let (service, repositories, approval) = rememberable_fixture(risk, effects.clone()).await;
+        let error = service
+            .decide(
+                &context(RequestChannel::Cli),
+                approval.id,
+                remember_command(Decision::Approve),
+                now(),
+            )
+            .await
+            .expect_err("not rememberable");
+        assert_eq!(
+            error.code(),
+            "approval.standing_not_allowed",
+            "{risk:?} {effects:?}"
+        );
+        // Refused rather than quietly downgraded: nothing was decided.
+        let stored = repositories
+            .load(workspace(), approval.id)
+            .await
+            .expect("loads");
+        assert_eq!(
+            stored.state(),
+            ApprovalState::Pending,
+            "{risk:?} {effects:?}"
+        );
+        assert_eq!(stored.scope, ApprovalScopeKind::OneShot);
+    }
+}
+
+#[tokio::test]
+async fn remembering_a_rejection_is_refused_rather_than_ignored() {
+    let (service, _repositories, approval) =
+        rememberable_fixture(Risk::Low, vec![Effect::ReadOnly]).await;
+    let error = service
+        .decide(
+            &context(RequestChannel::Cli),
+            approval.id,
+            remember_command(Decision::Reject),
+            now(),
+        )
+        .await
+        .expect_err("a rejection has nothing to remember");
+    assert_eq!(error.code(), "approval.standing_not_allowed");
 }

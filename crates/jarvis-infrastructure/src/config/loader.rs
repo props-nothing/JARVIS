@@ -320,6 +320,23 @@ pub struct ToolsSection {
     /// fail-open direction, so shipping refusals in configuration is the safe half to make declarative.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<DenyRuleSection>,
+    /// How much JARVIS may do without asking: `ask`, `balanced` (the default) or `autonomous`.
+    ///
+    /// **The operator's posture, and the one declarative statement of authority in this table.** It is the
+    /// answer to "how often should this interrupt me". `balanced` runs read-only, low-risk tools from any
+    /// configured source without a prompt or a hand-written grant; `autonomous` also runs reversible local
+    /// writes of at most moderate risk; `ask` is the original behaviour, where only the daemon's own reads
+    /// are covered. **No level ever skips a prompt for external communication, destruction, code execution,
+    /// money, privilege or physical effects, or for anything of high risk**, and a deny rule or a grant
+    /// constraint still wins. A model or a tool cannot change it; only this file can.
+    #[serde(default, skip_serializing_if = "is_default_autonomy")]
+    pub autonomy: jarvis_domain::tool::policy::AutonomyLevel,
+}
+
+// `serde`'s `skip_serializing_if` calls the predicate with a reference, so the signature is not ours to change.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_autonomy(level: &jarvis_domain::tool::policy::AutonomyLevel) -> bool {
+    *level == jarvis_domain::tool::policy::AutonomyLevel::default()
 }
 
 impl ToolsSection {

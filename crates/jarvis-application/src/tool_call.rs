@@ -80,8 +80,8 @@ use jarvis_domain::tool::ledger::{
     ToolCallVersion,
 };
 use jarvis_domain::tool::policy::{
-    ApprovalRecord, DenyRule, Grant, PolicyInputs, PolicyOutcome, PolicyReason, PolicyRequest,
-    evaluate,
+    ApprovalRecord, AutonomyLevel, DenyRule, Grant, PolicyInputs, PolicyOutcome, PolicyReason,
+    PolicyRequest, evaluate_at,
 };
 
 use crate::cancellation::CancellationScope;
@@ -634,6 +634,9 @@ pub struct ToolCallService {
     ledger: Arc<dyn ToolCallRepository>,
     approvals: Arc<dyn ApprovalRepository>,
     clock: Arc<dyn Clock>,
+    /// How much may run without a prompt. [`AutonomyLevel::Ask`] until a composition states otherwise,
+    /// which is the original behaviour: a service built without a level asks exactly as before.
+    autonomy: AutonomyLevel,
 }
 
 impl fmt::Debug for ToolCallService {
@@ -669,7 +672,18 @@ impl ToolCallService {
             ledger,
             approvals,
             clock,
+            autonomy: AutonomyLevel::Ask,
         }
+    }
+
+    /// Returns this service deciding under `autonomy`.
+    ///
+    /// A builder rather than a constructor argument, so every existing composition keeps `Ask` unless it
+    /// opts in, and the level is visibly a separate decision from the ports.
+    #[must_use]
+    pub fn with_autonomy(mut self, autonomy: AutonomyLevel) -> Self {
+        self.autonomy = autonomy;
+        self
     }
 
     /// Returns the canonical names of the tools this service can dispatch.
@@ -1178,7 +1192,7 @@ impl ToolCallService {
         let effects: BTreeSet<Effect> = definition.effects.iter().copied().collect();
         let scopes: BTreeSet<jarvis_domain::tool::classification::Scope> =
             definition.required_scopes.iter().cloned().collect();
-        let decision = evaluate(
+        let decision = evaluate_at(
             &PolicyRequest {
                 identity: &definition.identity,
                 principal,
@@ -1198,6 +1212,7 @@ impl ToolCallService {
                 approvals: &approvals,
                 deny_rules: &deny_rules,
             },
+            self.autonomy,
         );
 
         match decision.outcome {
@@ -1261,13 +1276,25 @@ impl ToolCallService {
         now: UtcTimestamp,
     ) -> Result<Decision, ToolServiceError> {
         let (workspace, principal) = scope;
-        // The same four conditions policy matched on, so this picks the approval policy relied on.
-        let Some(matched) = approved.iter().find(|approval| {
+        // The same conditions policy matched on, so this picks the approval policy relied on. A standing
+        // approval is preferred: it is not spent by a use, so relying on it costs the user nothing, while
+        // spending a one-shot that happened to match too would.
+        let covers = |approval: &&DurableApproval| {
             approval.workspace == workspace
                 && approval.requesting_principal == principal
-                && approval.action_digest == digest
                 && now < approval.expires_at
-        }) else {
+        };
+        let Some(matched) = approved
+            .iter()
+            .filter(covers)
+            .find(|approval| !approval.scope.is_consumed_on_use())
+            .or_else(|| {
+                approved
+                    .iter()
+                    .filter(covers)
+                    .find(|approval| approval.action_digest == digest)
+            })
+        else {
             return Ok(Decision::Permitted);
         };
         if !matched.scope.is_consumed_on_use() {
@@ -1482,7 +1509,7 @@ impl ToolCallService {
 
 /// Renders an approved approval as the record policy matches against.
 ///
-/// `consumed` is always false: an approval that was spent is no longer `Approved`, so reaching this
+/// A standing approval is matched on the tool rather than the action (`standing`). `consumed` is always false: an approval that was spent is no longer `Approved`, so reaching this
 /// function already means it has not been.
 fn record_of(approval: &DurableApproval) -> ApprovalRecord {
     ApprovalRecord {
@@ -1491,6 +1518,7 @@ fn record_of(approval: &DurableApproval) -> ApprovalRecord {
         workspace: approval.workspace,
         action_digest: approval.action_digest,
         expires_at: approval.expires_at,
+        standing: !approval.scope.is_consumed_on_use(),
         consumed: false,
     }
 }

@@ -231,7 +231,9 @@ impl ApprovalState {
         // Spelled as one table rather than an early return plus a list, so absorbing is a property of
         // the data rather than a branch that can be silently deleted.
         //
-        // Seven edges, and `Rejected` is reachable **only** from `Pending`. That is the one boundary a
+        // **`Approved -> Cancelled` is the revocation edge**: a permission the user granted — above all a
+        // standing one — must be withdrawable, and the service already documented cancelling an approved,
+        // unspent request while the table refused it. Eight edges, and `Rejected` is reachable **only** from `Pending`. That is the one boundary a
         // grouped pattern must not blur: `Approved` reaches the three outcomes describing a *granted*
         // approval ending (spent, invalidated, lapsed) but not `Rejected`, because a rejection is a
         // decision that was never taken once an approval was given. Grouping the two sources with one
@@ -243,7 +245,7 @@ impl ApprovalState {
                 Self::Approved | Self::Rejected | Self::Expired | Self::Cancelled
             ) | (
                 Self::Approved,
-                Self::Consumed | Self::Invalidated | Self::Expired
+                Self::Consumed | Self::Invalidated | Self::Expired | Self::Cancelled
             )
         )
     }

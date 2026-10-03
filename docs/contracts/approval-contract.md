@@ -74,11 +74,12 @@ when the exact tool call is reserved. Reuse or changed fingerprint fails.
   "decision": "approve",
   "expected_version": 3,
   "action_fingerprint": "sha256:...",
-  "comment": null
+  "comment": null,
+  "remember": false
 }
 ```
 
-The server derives deciding principal, device/session, authentication assurance,
+`remember` is optional and means "always allow this" — see [Standing approvals](#standing-approvals-always-allow). The server derives deciding principal, device/session, authentication assurance,
 and time. A client cannot assert them in the body.
 
 ## Approval API
@@ -87,6 +88,7 @@ Authenticated product clients use:
 
 ```text
 GET  /api/v1/approvals
+GET  /api/v1/approvals/standing
 GET  /api/v1/approvals/{approval_id}
 POST /api/v1/approvals/{approval_id}/decide
 POST /api/v1/approvals/{approval_id}/cancel
@@ -171,6 +173,27 @@ second is refused at construction.
 An approved one-shot action is still revalidated at reservation/invocation and
 consumed atomically with the exact tool-call reservation. Approval never grants
 general tool access.
+
+### Standing approvals ("always allow")
+
+An agent that asks about every call to a tool the user trusts is not usable, so a decision may be
+remembered. `"remember": true` on an **approve** turns the approval into a *standing* one: it covers any later
+call to the same tool identity by the same principal in the same workspace — not just the reviewed action — and
+is **not spent by use**. It is the one place an approval is a pattern rather than an exact action, and it is
+bounded so it cannot become a blank cheque:
+
+- **Only for what a person can sensibly pre-authorize.** Effects limited to `read_only` and `write`, risk at most
+  `moderate`, recorded on the approval when it was raised and never taken from the request. Anything that
+  communicates externally, destroys, executes code, moves money, escalates privilege or acts physically — and
+  anything of `high` or `critical` risk — always asks. A request to remember one is refused with
+  `approval.standing_not_allowed` and **nothing is decided**: quietly downgrading to a one-time approval would
+  let a user who asked for "always" find out by being prompted again. `remember` on a rejection is refused too.
+- **Expiring.** Seven days from the decision (`STANDING_APPROVAL_WINDOW_MS`), after which it authorizes nothing.
+- **Still inside the grant.** Policy matches a standing approval only after deny rules, the grant and its effect,
+  risk and sensitivity ceilings have been satisfied; it can raise an `ask` to an `allow` and nothing more.
+- **Visible and revocable.** `GET /api/v1/approvals/standing` lists the permissions in force (each row carries the
+  `approval_id` and `version` that `cancel` needs), and cancelling an approved approval — the `approved ->
+  cancelled` edge — withdraws it before the next policy check.
 
 ### Cancel and Revoke
 

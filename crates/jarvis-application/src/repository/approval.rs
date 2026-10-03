@@ -285,6 +285,24 @@ pub trait ApprovalRepository: Send + Sync {
         limit: u32,
     ) -> RepositoryFuture<'_, Vec<DurableApproval>>;
 
+    /// Returns the standing approvals in force in `workspace` at `now`, soonest deadline first, at most
+    /// `limit`.
+    ///
+    /// **The view that makes "always allow" revocable.** A standing approval is a permission that outlives
+    /// its prompt, so the person who granted it has to be able to find it again; without a listing the only
+    /// way to revoke one is to remember its identifier. "In force" means approved, standing, and not past its
+    /// deadline — a lapsed one authorizes nothing and is not offered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Query`](super::RepositoryError::Query) when the store cannot be read.
+    fn standing(
+        &self,
+        workspace: WorkspaceId,
+        now: UtcTimestamp,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<DurableApproval>>;
+
     /// Returns an approval's transition trail, oldest first.
     ///
     /// **This read exists because the decision's note is stored in the transition and had no reader.**

@@ -202,6 +202,7 @@ fn compose_provider(
     Ok(config
         .with_provider(provider)
         .with_reviewed_deny_rules(reviewed)
+        .with_autonomy(layered.tools.autonomy)
         .with_mcp_servers(mcp_servers))
 }
 

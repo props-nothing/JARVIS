@@ -731,6 +731,10 @@ pub fn router(state: Arc<ApiState>) -> Router {
         // `service.not_ready` when no storage is configured.
         .route("/api/v1/approvals", authenticated(get(approval::list_approvals)))
         .route(
+            "/api/v1/approvals/standing",
+            authenticated(get(approval::list_standing_approvals)),
+        )
+        .route(
             "/api/v1/approvals/{approval_id}",
             authenticated(get(approval::read_approval)),
         )

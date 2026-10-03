@@ -63,6 +63,20 @@ impl UtcTimestamp {
         self.0
     }
 
+    /// Returns the instant `millis` milliseconds after this one, or `None` when that leaves the
+    /// representable range.
+    ///
+    /// One place for "add a duration to an instant", so a caller never does its own arithmetic on a
+    /// timestamp (which could overflow or round differently from another caller's).
+    #[must_use]
+    pub fn plus_millis(&self, millis: u64) -> Option<Self> {
+        let millis = i64::try_from(millis).ok()?;
+        self.0
+            .checked_add(jiff::SignedDuration::from_millis(millis))
+            .ok()
+            .map(Self)
+    }
+
     /// Parses an RFC 3339 / ISO 8601 instant and normalizes it to UTC.
     ///
     /// # Errors

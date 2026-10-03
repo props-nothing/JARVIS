@@ -19,7 +19,8 @@ use super::identity::{
     SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
 };
 use super::policy::{
-    ApprovalRecord, DenyRule, Grant, PolicyInputs, PolicyReason, PolicyRequest, evaluate,
+    ApprovalRecord, AutonomyLevel, DenyRule, Grant, PolicyInputs, PolicyReason, PolicyRequest,
+    evaluate, evaluate_at,
 };
 use crate::ids::{PrincipalId, WorkspaceId};
 use crate::model::policy::Sensitivity;
@@ -669,6 +670,7 @@ fn approval_for(
         workspace: workspace(1),
         action_digest,
         expires_at: instant(expires_at),
+        standing: false,
         consumed: false,
     }
 }
@@ -1199,4 +1201,190 @@ fn a_denial_caused_by_a_lapsed_approval_names_the_approval_rather_than_permissio
         Some(ToolErrorClass::ApprovalExpired),
         "an expired approval must not be reported as a permission problem",
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Autonomy levels and standing approvals.
+// ---------------------------------------------------------------------------------------
+
+/// Evaluates `request` for the read tool's grant under `autonomy`.
+fn under(
+    autonomy: AutonomyLevel,
+    request: &PolicyRequest<'_>,
+    grants: &[Grant],
+    approvals: &[ApprovalRecord],
+    deny_rules: &[DenyRule],
+) -> super::policy::PolicyDecision {
+    evaluate_at(
+        request,
+        &PolicyInputs {
+            now: now(),
+            grants,
+            approvals,
+            deny_rules,
+        },
+        autonomy,
+    )
+}
+
+#[test]
+fn each_level_allows_exactly_what_it_says_and_nothing_consequential() {
+    let read = effects(&[Effect::ReadOnly]);
+    let write = effects(&[Effect::Write]);
+    for (level, expect_read, expect_write) in [
+        (AutonomyLevel::Ask, false, false),
+        (AutonomyLevel::Balanced, true, false),
+        (AutonomyLevel::Autonomous, true, true),
+    ] {
+        assert_eq!(
+            level.auto_allows(&read, Risk::Low),
+            expect_read,
+            "{level:?} read"
+        );
+        assert_eq!(
+            level.auto_allows(&write, Risk::Moderate),
+            expect_write,
+            "{level:?} write"
+        );
+        // **No level ever allows the consequential effects, or high risk, without asking.**
+        for effect in [
+            Effect::ExternalCommunication,
+            Effect::Destructive,
+            Effect::CodeExecution,
+            Effect::Financial,
+            Effect::Privileged,
+            Effect::Physical,
+        ] {
+            assert!(
+                !level.auto_allows(&effects(&[effect]), Risk::Low),
+                "{level:?} {effect:?}"
+            );
+            assert!(
+                !level.auto_allows(&effects(&[Effect::Write, effect]), Risk::Low),
+                "{level:?} write+{effect:?}"
+            );
+        }
+        assert!(
+            !level.auto_allows(&write, Risk::High),
+            "{level:?} high risk"
+        );
+        assert!(
+            !level.auto_allows(&read, Risk::Critical),
+            "{level:?} critical read"
+        );
+        assert!(
+            !level.auto_allows(&BTreeSet::new(), Risk::Low),
+            "{level:?} no effects"
+        );
+    }
+}
+
+#[test]
+fn autonomy_allows_an_action_a_tool_would_otherwise_ask_about_but_only_through_a_grant() {
+    let identity = read_identity();
+    let tool_effects = effects(&[Effect::Write]);
+    let required = scopes(&["fs.read"]);
+    let grants = vec![grant_for(&identity)];
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    request.risk = Risk::Moderate;
+
+    let asked = under(AutonomyLevel::Balanced, &request, &grants, &[], &[]);
+    assert!(
+        asked.needs_approval(),
+        "balanced does not allow writes: {asked:?}"
+    );
+
+    let allowed = under(AutonomyLevel::Autonomous, &request, &grants, &[], &[]);
+    assert!(allowed.is_allowed(), "{allowed:?}");
+    assert_eq!(allowed.reason(), Some(PolicyReason::AutonomyAllowed));
+
+    // **A level is not a grant**: with no grant the call is still refused.
+    let refused = under(AutonomyLevel::Autonomous, &request, &[], &[], &[]);
+    assert!(refused.is_denied(), "{refused:?}");
+}
+
+#[test]
+fn a_deny_rule_and_a_tool_declared_deny_beat_every_autonomy_level() {
+    let identity = read_identity();
+    let tool_effects = effects(&[Effect::Write]);
+    let required = scopes(&["fs.read"]);
+    let grants = vec![grant_for(&identity)];
+    let mut request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    request.risk = Risk::Moderate;
+
+    let rule = DenyRule {
+        identity: Some(identity.clone()),
+        principal: None,
+        workspace: None,
+        effects: BTreeSet::new(),
+    };
+    let refused = under(AutonomyLevel::Autonomous, &request, &grants, &[], &[rule]);
+    assert!(refused.is_denied(), "{refused:?}");
+
+    request.default_approval = ApprovalHint::Deny;
+    let declared = under(AutonomyLevel::Autonomous, &request, &grants, &[], &[]);
+    assert!(
+        declared.is_denied(),
+        "a tool that declares deny stays denied: {declared:?}"
+    );
+}
+
+#[test]
+fn a_standing_approval_covers_any_action_of_the_tool_and_is_never_spent() {
+    let identity = read_identity();
+    let tool_effects = effects(&[Effect::Write]);
+    let required = scopes(&["fs.read"]);
+    let grants = vec![grant_for(&identity)];
+    let mut standing = approval_for(&identity, digest(9), "2026-09-27T12:10:00Z");
+    standing.standing = true;
+    let approvals = vec![standing];
+
+    // A different action than the one the approval was raised for.
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
+    let decision = under(AutonomyLevel::Ask, &request, &grants, &approvals, &[]);
+    assert!(decision.is_allowed(), "{decision:?}");
+    assert_eq!(decision.reason(), Some(PolicyReason::ApprovalMatched));
+
+    // The same record without `standing` is exact-action only.
+    let mut exact = approval_for(&identity, digest(9), "2026-09-27T12:10:00Z");
+    exact.standing = false;
+    let refused = under(AutonomyLevel::Ask, &request, &grants, &[exact], &[]);
+    assert!(refused.needs_approval(), "{refused:?}");
+}
+
+#[test]
+fn a_standing_approval_still_expires_and_never_overrides_a_deny_rule_or_another_tool() {
+    let identity = read_identity();
+    let other = tool_identity("fs.write@1", "acme.files", 2);
+    let tool_effects = effects(&[Effect::Write]);
+    let required = scopes(&["fs.read"]);
+    let grants = vec![grant_for(&identity)];
+    let request = permissive_request(&identity, &tool_effects, &required, digest(1));
+
+    let mut lapsed = approval_for(&identity, digest(9), "2026-09-27T11:00:00Z");
+    lapsed.standing = true;
+    let decision = under(AutonomyLevel::Ask, &request, &grants, &[lapsed], &[]);
+    assert!(
+        decision.needs_approval(),
+        "a lapsed standing approval allows nothing: {decision:?}"
+    );
+
+    let mut elsewhere = approval_for(&other, digest(9), "2026-09-27T12:10:00Z");
+    elsewhere.standing = true;
+    let decision = under(AutonomyLevel::Ask, &request, &grants, &[elsewhere], &[]);
+    assert!(
+        decision.needs_approval(),
+        "an approval of another tool allows nothing: {decision:?}"
+    );
+
+    let mut live = approval_for(&identity, digest(9), "2026-09-27T12:10:00Z");
+    live.standing = true;
+    let rule = DenyRule {
+        identity: Some(identity.clone()),
+        principal: None,
+        workspace: None,
+        effects: BTreeSet::new(),
+    };
+    let decision = under(AutonomyLevel::Ask, &request, &grants, &[live], &[rule]);
+    assert!(decision.is_denied(), "{decision:?}");
 }

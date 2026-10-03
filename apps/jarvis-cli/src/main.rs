@@ -393,7 +393,22 @@ enum ApprovalsAction {
         /// The version the caller believes is current.
         #[arg(long, value_name = "N")]
         version: u64,
+        /// Also allow every later call to this tool, for seven days ("always allow").
+        ///
+        /// Honoured only for reads and reversible writes of at most moderate risk; anything else is refused
+        /// by the daemon and stays a one-time approval. Revoke it with `approvals cancel`; find it with
+        /// `approvals standing`.
+        #[arg(long)]
+        remember: bool,
     },
+    /// Walk through what is waiting on you and decide each item: yes, no, always, or skip.
+    ///
+    /// Prints each action's summary, risk, effects and preview and reads your answer from the terminal, so
+    /// the decision is bound to the action you just read without copying a fingerprint by hand. Needs an
+    /// interactive terminal; scripts keep using `approve` and `reject`.
+    Review,
+    /// List the "always allow" permissions in force, so one can be revoked.
+    Standing,
     /// Reject an approval.
     Reject {
         /// The approval identifier.
@@ -1380,12 +1395,34 @@ async fn approvals(paths: &ProfilePaths, action: ApprovalsAction) -> ExitCode {
             approval_id,
             fingerprint,
             version,
-        } => decide(&state, &approval_id, "approve", &fingerprint, version).await,
+            remember,
+        } => {
+            decide(
+                &state,
+                &approval_id,
+                "approve",
+                &fingerprint,
+                version,
+                remember,
+            )
+            .await
+        }
         ApprovalsAction::Reject {
             approval_id,
             fingerprint,
             version,
-        } => decide(&state, &approval_id, "reject", &fingerprint, version).await,
+        } => decide(&state, &approval_id, "reject", &fingerprint, version, false).await,
+        ApprovalsAction::Standing => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                "/api/v1/approvals/standing",
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        ApprovalsAction::Review => review(&state).await,
         ApprovalsAction::Cancel {
             approval_id,
             version,
@@ -1414,6 +1451,114 @@ async fn approvals(paths: &ProfilePaths, action: ApprovalsAction) -> ExitCode {
     }
 }
 
+/// What the person answered for one approval in [`review`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewAnswer {
+    Approve,
+    Always,
+    Reject,
+    Skip,
+    Quit,
+}
+
+/// Parses one line of input at the review prompt.
+///
+/// **Anything unrecognised is a skip, never an approval.** A stray keypress, an empty line or a typo must
+/// not authorize an action, so the only inputs that approve are the explicit ones.
+fn parse_review_answer(line: &str) -> ReviewAnswer {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ReviewAnswer::Approve,
+        "a" | "always" => ReviewAnswer::Always,
+        "n" | "no" | "r" | "reject" => ReviewAnswer::Reject,
+        "q" | "quit" => ReviewAnswer::Quit,
+        _ => ReviewAnswer::Skip,
+    }
+}
+
+/// Interactive review of the pending approvals.
+///
+/// A thin client like the rest of this file: the daemon's own list is the queue, its own `decide` is the
+/// decision, and what is shown is what it returned. The fingerprint and version sent are the ones **read in
+/// the same listing the person is looking at**, so the decision binds to the action they saw rather than to
+/// whatever is pending a moment later; if the action changed in between, the daemon refuses with
+/// `approval.fingerprint_mismatch` and nothing is decided.
+async fn review(state: &ClientState) -> ExitCode {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "error: `approvals review` needs an interactive terminal; use `approvals approve` or `approvals reject` in scripts"
+        );
+        return ExitCode::from(EXIT_ATTENTION);
+    }
+    let listed = match get_with_status(
+        &state.discovered,
+        &state.credential,
+        "/api/v1/approvals",
+        API_MAJOR,
+        "",
+    )
+    .await
+    {
+        Ok((status, body)) if (200..300).contains(&status) => body,
+        Ok((_, body)) => {
+            eprintln!("error: {body}");
+            return ExitCode::from(EXIT_ATTENTION);
+        }
+        Err(error) => return report_client_error(&error),
+    };
+    let Ok(list) = serde_json::from_str::<jarvis_protocol::ApprovalListView>(&listed) else {
+        eprintln!("error: the daemon returned a listing this client could not read");
+        return ExitCode::from(EXIT_ATTENTION);
+    };
+    if list.approvals.is_empty() {
+        println!("nothing is waiting on you");
+        return ExitCode::SUCCESS;
+    }
+    let total = list.approvals.len();
+    let mut decided = 0_usize;
+    let stdin = std::io::stdin();
+    for (index, approval) in list.approvals.iter().enumerate() {
+        println!("\n[{}/{total}] {}", index + 1, approval.summary);
+        println!(
+            "  tool {}  risk {}  effects {}  expires {}",
+            approval.tool_id,
+            approval.risk,
+            approval.effects.join(","),
+            approval.expires_at
+        );
+        for row in &approval.preview {
+            println!("  {}: {}", row.key, row.value);
+        }
+        print!("  approve? [y]es / [a]lways / [n]o / [s]kip / [q]uit: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let (verb, remember) = match parse_review_answer(&line) {
+            ReviewAnswer::Quit => break,
+            ReviewAnswer::Skip => continue,
+            ReviewAnswer::Approve => ("approve", false),
+            ReviewAnswer::Always => ("approve", true),
+            ReviewAnswer::Reject => ("reject", false),
+        };
+        let code = decide(
+            state,
+            &approval.approval_id,
+            verb,
+            &approval.action_fingerprint,
+            approval.version,
+            remember,
+        )
+        .await;
+        if code == ExitCode::SUCCESS {
+            decided += 1;
+        }
+    }
+    println!("\n{decided} decided, {} left", total - decided);
+    ExitCode::SUCCESS
+}
+
 /// Sends a decision and prints the daemon's answer.
 ///
 /// A separate function because `approve` and `reject` differ by one verb, and writing the request
@@ -1425,12 +1570,16 @@ async fn decide(
     decision: &str,
     fingerprint: &str,
     version: u64,
+    remember: bool,
 ) -> ExitCode {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "decision": decision,
         "expected_version": version,
         "action_fingerprint": fingerprint,
     });
+    if remember {
+        body["remember"] = serde_json::Value::Bool(true);
+    }
     let headers = format!("Idempotency-Key: {}\r\n", idempotency_key());
     print_daemon_response(
         post_authenticated(

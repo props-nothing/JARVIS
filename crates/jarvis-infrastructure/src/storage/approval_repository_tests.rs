@@ -1713,6 +1713,8 @@ async fn shape_row(database: &Database, id: ApprovalId, state: &str, version: i6
     .expect("the row is shaped");
 }
 
+// A table of cases: it is long because it lists every state, not because it does much.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn every_reachable_state_the_machine_can_walk_to_reconstructs_with_its_own_version() {
     // **The path table's other five arms.** The round-trip tests above reach `approved` and `consumed`,
@@ -1757,6 +1759,21 @@ async fn every_reachable_state_the_machine_can_walk_to_reconstructs_with_its_own
             decided: false,
             expected: ApprovalState::Cancelled,
             expected_version: 2,
+        },
+        // A granted approval that is later revoked or lapses carries its decider and one more version.
+        Case {
+            state: "cancelled",
+            version: 3,
+            decided: true,
+            expected: ApprovalState::Cancelled,
+            expected_version: 3,
+        },
+        Case {
+            state: "expired",
+            version: 3,
+            decided: true,
+            expected: ApprovalState::Expired,
+            expected_version: 3,
         },
         Case {
             state: "consumed",
@@ -1824,4 +1841,108 @@ async fn every_reachable_state_the_machine_can_walk_to_reconstructs_with_its_own
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_revoked_standing_approval_round_trips_and_leaves_the_standing_listing() {
+    // **Revocation is `approved -> cancelled`, and the row must stay readable afterwards.** The reader
+    // used to treat every cancellation as one step from `PENDING`, so a revoked permission read as corrupt
+    // and failed every later policy read of that principal's decisions.
+    let (_database, approvals) = repository().await;
+    let mut requested = approval();
+    requested.scope = ApprovalScopeKind::Standing;
+    requested.expires_at = UtcTimestamp::parse("2026-10-08T12:00:00Z").expect("valid");
+    approvals.request(&requested).await.expect("inserted");
+    let first = approve(&mut requested, ApprovalChannel::Cli);
+    approvals
+        .apply_transition(
+            workspace(),
+            &first,
+            ApprovalVersion::FIRST,
+            &decide(ApprovalChannel::Cli),
+            &requested,
+        )
+        .await
+        .expect("approved");
+    let in_force = approvals
+        .standing(workspace(), now(), 10)
+        .await
+        .expect("lists");
+    assert_eq!(
+        in_force.len(),
+        1,
+        "an approved standing approval is in force"
+    );
+    assert_eq!(in_force[0].scope, ApprovalScopeKind::Standing);
+
+    let actor = ApprovalActor::Cancelled {
+        by: principal(),
+        reason: None,
+    };
+    let revoked = requested
+        .apply(
+            ApprovalState::Cancelled,
+            ApprovalVersion::new(2),
+            actor.clone(),
+            now(),
+        )
+        .expect("a granted approval can be withdrawn");
+    approvals
+        .apply_transition(
+            workspace(),
+            &revoked,
+            ApprovalVersion::new(2),
+            &actor,
+            &requested,
+        )
+        .await
+        .expect("the revocation is stored");
+
+    let loaded = approvals
+        .load(workspace(), requested.id)
+        .await
+        .expect("a revoked approval still loads");
+    assert_eq!(loaded.state(), ApprovalState::Cancelled);
+    assert_eq!(loaded.version(), ApprovalVersion::new(3));
+    assert!(
+        approvals
+            .standing(workspace(), now(), 10)
+            .await
+            .expect("lists")
+            .is_empty(),
+        "a revoked permission is not in force"
+    );
+    // And it does not poison the principal's decided list, which policy reads on every call.
+    approvals
+        .decided_by(workspace(), principal(), 10)
+        .await
+        .expect("the decided list reads a revoked row");
+}
+
+#[tokio::test]
+async fn a_lapsed_standing_approval_is_not_in_force() {
+    let (_database, approvals) = repository().await;
+    let mut requested = approval();
+    requested.scope = ApprovalScopeKind::Standing;
+    requested.expires_at = UtcTimestamp::parse("2026-09-27T12:30:00Z").expect("valid");
+    approvals.request(&requested).await.expect("inserted");
+    let first = approve(&mut requested, ApprovalChannel::Cli);
+    approvals
+        .apply_transition(
+            workspace(),
+            &first,
+            ApprovalVersion::FIRST,
+            &decide(ApprovalChannel::Cli),
+            &requested,
+        )
+        .await
+        .expect("approved");
+    let later = UtcTimestamp::parse("2026-09-27T13:00:00Z").expect("valid");
+    assert!(
+        approvals
+            .standing(workspace(), later, 10)
+            .await
+            .expect("lists")
+            .is_empty()
+    );
 }

@@ -347,6 +347,33 @@ pub async fn read_approval(
     }
 }
 
+/// Handles `GET /api/v1/approvals/standing`: the "always allow" permissions in force.
+///
+/// A permission that outlives its prompt has to be findable, or it cannot be revoked; each row carries
+/// the `approval_id` and `version` that `POST .../cancel` needs to withdraw it.
+pub async fn list_standing_approvals(
+    State(state): State<Arc<ApiState>>,
+    client: AuthenticatedClient,
+    RequestIdOf(request_id): RequestIdOf,
+) -> Response {
+    let request_id = request_id.as_deref();
+    let Some(service) = state.approvals.as_ref() else {
+        return runs::not_ready(request_id);
+    };
+    let context = context_for(&client, request_id);
+    let at = clock_now();
+    match service.standing(&context, MAX_APPROVAL_PAGE, at).await {
+        Ok(rows) => runs::json_response(
+            request_id,
+            StatusCode::OK,
+            &serde_json::json!({
+                "approvals": rows.iter().map(|row| view_of(row, at)).collect::<Vec<_>>(),
+            }),
+        ),
+        Err(error) => approval_error_response(request_id, &error),
+    }
+}
+
 /// Handles `POST /api/v1/approvals/{approval_id}/decide`.
 pub async fn decide_approval(
     State(state): State<Arc<ApiState>>,
@@ -444,6 +471,7 @@ pub async fn decide_approval(
                 expected_version: expected,
                 fingerprint: &fingerprint,
                 note: note.as_ref(),
+                remember: request.remember.unwrap_or(false),
             },
             clock_now(),
         )

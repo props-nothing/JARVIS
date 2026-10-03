@@ -84,6 +84,12 @@ pub struct DaemonConfig {
     /// filtered here would move that rule into the composition root — where it is one edit away from being
     /// dropped. The filtering belongs with the code that would otherwise launch the process.
     mcp_servers: Vec<crate::config::mcp::McpServerDeclaration>,
+    /// How much may run without a prompt, from the profile's `[tools] autonomy`.
+    ///
+    /// **`Ask` until a caller states otherwise**, so a composition that forgets this keeps the original,
+    /// narrow behaviour rather than silently widening what runs unprompted. The shipped daemon states it
+    /// from the configuration, whose own default is `balanced`.
+    autonomy: jarvis_domain::tool::policy::AutonomyLevel,
 }
 
 /// `Debug` is hand-written because the provider is a trait object: a derived implementation would
@@ -135,7 +141,21 @@ impl DaemonConfig {
             // Empty for the same reason: most profiles declare no MCP server, and the daemon is complete
             // without one — the native tools are the whole catalog in that case.
             mcp_servers: Vec::new(),
+            autonomy: jarvis_domain::tool::policy::AutonomyLevel::Ask,
         }
+    }
+
+    /// Supplies the autonomy level the profile declares.
+    #[must_use]
+    pub fn with_autonomy(mut self, autonomy: jarvis_domain::tool::policy::AutonomyLevel) -> Self {
+        self.autonomy = autonomy;
+        self
+    }
+
+    /// Returns the autonomy level in force.
+    #[must_use]
+    pub fn autonomy(&self) -> jarvis_domain::tool::policy::AutonomyLevel {
+        self.autonomy
     }
 
     /// Supplies the composed model provider.
@@ -715,6 +735,7 @@ pub async fn start(
         Arc::new(executor),
         clock,
         mcp_tools,
+        config.autonomy(),
     )?;
     let ports = run_ports(
         Arc::clone(&repositories),
@@ -1094,6 +1115,7 @@ pub(crate) fn tool_fabric_with(
     executor: Arc<dyn jarvis_application::tool_call::ToolExecutor>,
     clock: Arc<dyn jarvis_domain::clock::Clock>,
     extra_tools: Vec<jarvis_application::tool_call::ResolvedTool>,
+    autonomy: jarvis_domain::tool::policy::AutonomyLevel,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -1136,7 +1158,9 @@ pub(crate) fn tool_fabric_with(
     // to refuse one of the daemon's own tools: the refusals a deployment ships were compiled into a struct
     // field that nothing populated. They now come from the `[[tools.deny]]` configuration table, validated
     // before this point, and they reach the evaluator beside the stored ones.
-    let defaults = NativeReadOnlyGrants::new(tools.clone()).with_deny_rules(deny_rules);
+    let defaults = NativeReadOnlyGrants::new(tools.clone())
+        .with_deny_rules(deny_rules)
+        .with_autonomy(autonomy);
     // **One store handle, shared by the source and the surface.** The source reads it on every dispatch
     // and the surface writes it from a client, so a second handle would let the two disagree about what
     // is configured — the same argument the catalog's single list records.
@@ -1146,21 +1170,24 @@ pub(crate) fn tool_fabric_with(
     let grants = StoredGrants::new(Arc::clone(&store), defaults, &tools);
     let ledger = crate::storage::tool_call_repository::SqliteToolCallRepository::new(pool.clone());
     let approvals = crate::storage::approval_repository::SqliteApprovalRepository::new(pool);
-    let pipeline = Arc::new(ToolCallService::new(
-        Arc::clone(&catalog) as Arc<dyn jarvis_application::tool_call::ToolCatalog>,
-        Arc::new(grants),
-        Arc::new(SchemaValidator::new()),
-        Arc::new(FingerprintHasher::new()),
-        // **The supplied executor, which is a router.** The port takes one executor, so a second source of
-        // tools — an MCP server today, a connector or runtime later — cannot be reached through a slot that
-        // holds only native. Registering by *kind* keeps the pipeline's shape and makes the choice a value: a
-        // call whose source kind is not routed is `NotFound` rather than served by the wrong implementation.
-        // See `tool_adapters::routing`.
-        executor,
-        Arc::new(ledger),
-        Arc::new(approvals),
-        clock,
-    ));
+    let pipeline = Arc::new(
+        ToolCallService::new(
+            Arc::clone(&catalog) as Arc<dyn jarvis_application::tool_call::ToolCatalog>,
+            Arc::new(grants),
+            Arc::new(SchemaValidator::new()),
+            Arc::new(FingerprintHasher::new()),
+            // **The supplied executor, which is a router.** The port takes one executor, so a second source of
+            // tools — an MCP server today, a connector or runtime later — cannot be reached through a slot that
+            // holds only native. Registering by *kind* keeps the pipeline's shape and makes the choice a value: a
+            // call whose source kind is not routed is `NotFound` rather than served by the wrong implementation.
+            // See `tool_adapters::routing`.
+            executor,
+            Arc::new(ledger),
+            Arc::new(approvals),
+            clock,
+        )
+        .with_autonomy(autonomy),
+    );
     // The surface resolves against **the catalog the pipeline dispatches through**, which is what makes
     // "a grant names a tool that can actually run" a property of the composition rather than of two lists
     // being kept in step.

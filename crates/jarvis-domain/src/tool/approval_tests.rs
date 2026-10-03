@@ -148,6 +148,8 @@ fn the_transition_table_permits_exactly_the_contracts_edges() {
         (ApprovalState::Approved, ApprovalState::Consumed),
         (ApprovalState::Approved, ApprovalState::Invalidated),
         (ApprovalState::Approved, ApprovalState::Expired),
+        // The revocation edge: a granted permission, above all a standing one, can be withdrawn.
+        (ApprovalState::Approved, ApprovalState::Cancelled),
     ];
     let all = [
         ApprovalState::Pending,

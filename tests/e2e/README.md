@@ -385,6 +385,27 @@ run **continues**: the tool runs in the MCP child and the model answers with the
 produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
 a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
 
+## `autonomy-journey.mjs`
+
+Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a recording fake model, on
+three fresh profiles — and **no grant is ever written**. `balanced` (the default): the first call reaches a prompt
+rather than a refusal, `approve --remember` runs it, a later call with other arguments runs **without asking**,
+`approvals standing` lists the permission and `approvals cancel` revokes it, after which the tool asks again.
+`autonomous`: the same reversible write runs with no prompt at all. `ask`: the original behaviour, where the model
+is told `tool.permission_denied`.
+
+```bash
+node tests/e2e/autonomy-journey.mjs target/debug
+```
+
+### What this harness found
+
+Revoking a standing permission **made every later policy read fail**: the approval reader reconstructed a
+cancellation as one step from `pending`, so an `approved -> cancelled` row read as corrupt (`storage.row_corrupted`)
+and the next run failed. The state machine also refused the revocation edge outright although the service and the
+contract both described it. Both are fixed and covered; the first only a real daemon with a real database found.
+Making the standing flag always false in the pipeline fails the journey at the second run.
+
 ## `approval-resume.mjs`
 
 Deterministic (no model, no network): a real `jarvisd`, the real CLI, and the MCP fixture child process, with a

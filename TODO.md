@@ -7153,7 +7153,24 @@ Dependencies: Milestone 2 exit gate.
   prompt of a cancelled run stayed `pending`). Evidence: seven controller/service tests, a real-SQL exclusion test,
   and the kill-and-restart scenario in `tests/e2e/approval-resume.mjs`, falsified by breaking the exclusion.
   **Still open:** approvals decided by a principal other than the requester are not seen by policy; the sweep is
-  bounded to 200 records. **Provider-safe tool names (2026-10-03):** the OpenAI-compatible adapter now sends
+  bounded to 200 records. **Autonomy and "always allow" (2026-10-03).** A product review found JARVIS interrupting far too often: an MCP
+  tool needed a hand-written operator grant *and* a prompt on every call, and an answered prompt was spent. Now
+  `[tools] autonomy = ask | balanced (default) | autonomous` decides what runs unprompted (one rule,
+  `AutonomyLevel::auto_allows`, read by policy and by the grant source): reads at `balanced`, plus reversible
+  moderate-risk writes at `autonomous`, and **never** external communication, destruction, code execution, money,
+  privilege, physical effects or high/critical risk. Balanced and above cover the configured servers' tools
+  implicitly, so a first call reaches a prompt instead of `tool.permission_denied`. `approve --remember` (or `a`
+  in `jarvis approvals review`, an interactive walk of the queue) makes the approval *standing*: matched on the
+  tool, unspent, seven days, reads and reversible writes only (`approval.standing_not_allowed` otherwise), listed
+  at `GET /api/v1/approvals/standing`, revoked by cancelling. Fixed on the way: the state machine refused the
+  `approved -> cancelled` revocation edge the contract described, and the approval reader read an
+  approved-then-ended row as corrupt (`storage.row_corrupted`, found by the new journey). Evidence: domain tests
+  (every level over every effect; deny rules and tool-declared deny beat every level; standing matches the tool
+  not the action and still expires), service tests (eligibility), pipeline tests, a real-SQL revocation round trip,
+  and `tests/e2e/autonomy-journey.mjs` (three fresh profiles, no grant ever written; falsified by making the
+  standing flag always false). **Still open:** the review is a terminal prompt, so approving by voice or from a
+  phone is the next surface; no per-tool autonomy overrides; the level needs a restart to change.
+  **Provider-safe tool names (2026-10-03):** the OpenAI-compatible adapter now sends
   `mcp.read_file@1` as `mcp_read_file_1` and resolves the model's answer back to the canonical name, per request
   (`tool_names.rs`; claim `OC-C016`, constraint verified against OpenAI's official OpenAPI document). Every e2e
   journey and `mcp-live` against a real model pass on the sanitized names.

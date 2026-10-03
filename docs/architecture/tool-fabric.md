@@ -125,6 +125,33 @@ Inputs include:
 Outputs are `ALLOW`, `ASK`, or `DENY` with machine reason codes, human summary,
 constraints, expiry, and audit metadata. The model cannot modify the decision.
 
+### Autonomy: How Often JARVIS Interrupts
+
+A tool that needs an operator grant **and** a prompt for every call is a tool that does not get used, and an
+agent nobody lets act is not an agent. Interruption is therefore a **declared posture**, not an accident of how
+many layers a request passes through: `[tools] autonomy` is `ask`, `balanced` (the default) or `autonomous`, and it
+is decided by deterministic Rust (`AutonomyLevel::auto_allows`, one definition read by both policy and the grant
+source), never by a model, a tool, or its annotations.
+
+- **It widens exactly one thing**: which actions are allowed *without a prompt* once deny rules, the grant and its
+  effect/risk/sensitivity ceilings have been satisfied. It never overrides a deny rule, a tool that declares
+  itself `deny`, or a grant constraint.
+- **`balanced`** runs read-only, low-risk actions; **`autonomous`** also runs reversible local writes of at most
+  moderate risk. Neither ever skips a prompt for external communication, destruction, code execution, money,
+  privilege or physical effects, or for high/critical risk — those always ask.
+- **Coverage replaces the second layer, not the first.** At `balanced` and above the tools the operator's own
+  configuration offers are covered implicitly, each bounded by what it declares, so the first call reaches a
+  *prompt* rather than a `tool.permission_denied`. The prompt is then the permission. A stored grant still
+  switches its principal to explicit configuration (below), and `ask` keeps the original strictness.
+- **A prompt can be answered once, for good.** "Always allow" (`remember` on an approve) makes the approval
+  *standing*: matched on the tool, not the action, unspent by use, seven days, only for reads and reversible writes,
+  listed at `GET /api/v1/approvals/standing`, and revoked by cancelling it. See the
+  [approval contract](../contracts/approval-contract.md#standing-approvals-always-allow).
+
+This is the one place authority is declared in configuration rather than in a durable row, and it is bounded
+accordingly: it is a ceiling on *what may run unprompted*, visible in one line of the profile, and its widest
+setting still cannot do anything consequential without a person.
+
 ### Grants Are Configuration, Not Code
 
 **A grant is a durable row an operator writes, and this section exists because it was not always so.** For

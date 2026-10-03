@@ -219,6 +219,13 @@ pub struct DecideApprovalRequest {
     /// `idempotency.conflict`" rule has a value to compare rather than nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Approve **this and every later call to the tool** until the approval's own deadline (`true`), or
+    /// only this action (absent or `false`).
+    ///
+    /// Honoured for an approve of a read or a reversible write of at most moderate risk; refused with
+    /// `approval.standing_not_allowed` for anything else and for a reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember: Option<bool>,
 }
 
 /// A cancellation body.

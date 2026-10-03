@@ -278,6 +278,18 @@ impl Fixture {
         validator_refuses: bool,
         executor_failure: Option<ToolExecutionError>,
     ) -> Self {
+        Self::build_with(tools, grants, validator_refuses, executor_failure, true)
+    }
+
+    /// As `Self::build`, optionally without the executor's single-row ledger observation, which a test
+    /// that makes several calls cannot satisfy.
+    fn build_with(
+        tools: Vec<ResolvedTool>,
+        grants: Vec<Grant>,
+        validator_refuses: bool,
+        executor_failure: Option<ToolExecutionError>,
+        observe_ledger: bool,
+    ) -> Self {
         let repository = Arc::new(InMemoryRepositories::new());
         let catalog = Arc::new(Catalog::new(tools));
         let catalog_resolutions = Arc::clone(&catalog.resolved);
@@ -302,7 +314,7 @@ impl Fixture {
                 observed_states: Arc::clone(&observed_states),
                 // The executor reads the *durable* row through a dedicated accessor the double
                 // exposes for exactly this observation.
-                ledger: Some(Arc::clone(&ledger_port)),
+                ledger: observe_ledger.then(|| Arc::clone(&ledger_port)),
             }),
             Arc::clone(&repository) as Arc<dyn ToolCallRepository>,
             Arc::clone(&repository) as Arc<dyn ApprovalRepository>,
@@ -1060,4 +1072,187 @@ async fn resuming_twice_does_not_run_the_call_twice() {
             .expect("resumes");
     }
     assert_eq!(fixture.executions_count(), 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// Autonomy and standing approvals through the whole pipeline.
+// ---------------------------------------------------------------------------------------
+
+fn resolved_write_tool() -> ResolvedTool {
+    ResolvedTool {
+        definition: definition(
+            "notes.write@1",
+            vec![Effect::Write],
+            Risk::Moderate,
+            ApprovalHint::Ask,
+            READ_SCHEMA,
+        ),
+        input_schema: Some(READ_SCHEMA.to_owned()),
+    }
+}
+
+fn grant_for_write(tool: &ResolvedTool) -> Grant {
+    Grant {
+        identity: tool.definition.identity.clone(),
+        workspace: workspace(),
+        principal: principal(),
+        scopes: tool.definition.required_scopes.iter().cloned().collect(),
+        effects: [Effect::Write].into_iter().collect(),
+        risk_ceiling: Risk::Moderate,
+        sensitivity_ceiling: tool.definition.data_classes.input,
+        expires_at: None,
+    }
+}
+
+fn write_fixture(level: jarvis_domain::tool::policy::AutonomyLevel) -> Fixture {
+    let tool = resolved_write_tool();
+    let mut fixture = Fixture::build_with(
+        vec![tool.clone()],
+        vec![grant_for_write(&tool)],
+        false,
+        None,
+        false,
+    );
+    fixture.service = fixture.service.with_autonomy(level);
+    fixture
+}
+
+async fn invoke_write(fixture: &Fixture, key: &str, arguments: &str) -> ToolCallOutcome {
+    fixture
+        .service
+        .invoke(
+            &context(),
+            run(),
+            &intent("notes.write@1", arguments),
+            key,
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("the pipeline reaches an outcome")
+}
+
+#[tokio::test]
+async fn a_moderate_write_asks_unless_the_operator_chose_autonomous() {
+    use jarvis_domain::tool::policy::AutonomyLevel;
+    for level in [AutonomyLevel::Ask, AutonomyLevel::Balanced] {
+        let fixture = write_fixture(level);
+        let outcome = invoke_write(&fixture, "call-1", r#"{"path":"/a"}"#).await;
+        assert!(
+            matches!(outcome, ToolCallOutcome::WaitingApproval { .. }),
+            "{level:?}: {outcome:?}"
+        );
+        assert_eq!(fixture.executions_count(), 0);
+    }
+    let fixture = write_fixture(AutonomyLevel::Autonomous);
+    let outcome = invoke_write(&fixture, "call-1", r#"{"path":"/a"}"#).await;
+    assert!(
+        matches!(outcome, ToolCallOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fixture.executions_count(),
+        1,
+        "autonomous runs a moderate write without a prompt"
+    );
+}
+
+#[tokio::test]
+async fn autonomy_never_runs_a_consequential_tool_without_asking() {
+    use jarvis_domain::tool::policy::AutonomyLevel;
+    let tool = resolved_send_tool();
+    let mut fixture = Fixture::build(vec![tool.clone()], vec![grant_for_send(&tool)], false, None);
+    fixture.service = fixture.service.with_autonomy(AutonomyLevel::Autonomous);
+    let outcome = fixture
+        .service
+        .invoke(
+            &context(),
+            run(),
+            &intent("email.send@1", r#"{"path":"/tmp"}"#),
+            "call-1",
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        matches!(outcome, ToolCallOutcome::WaitingApproval { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(fixture.executions_count(), 0);
+}
+
+#[tokio::test]
+async fn a_standing_approval_lets_later_calls_with_other_arguments_run_unprompted_and_is_not_spent()
+{
+    use jarvis_domain::tool::approval::{ApprovalScopeKind, ApprovalState};
+    use jarvis_domain::tool::policy::AutonomyLevel;
+    let fixture = write_fixture(AutonomyLevel::Balanced);
+    let ToolCallOutcome::WaitingApproval { approval } =
+        invoke_write(&fixture, "call-1", r#"{"path":"/a"}"#).await
+    else {
+        unreachable!("balanced asks about a write");
+    };
+
+    // The user answers "always": the record becomes standing, with a deadline past the prompt window.
+    let mut stored = ApprovalRepository::load(fixture.repository.as_ref(), workspace(), approval)
+        .await
+        .expect("loads");
+    stored.scope = ApprovalScopeKind::Standing;
+    stored.expires_at = UtcTimestamp::parse("2026-10-08T12:00:00Z").expect("valid");
+    let version = stored.version();
+    let transition = stored
+        .apply(
+            ApprovalState::Approved,
+            version,
+            jarvis_domain::tool::approval::ApprovalActor::Decided {
+                principal: principal(),
+                channel: jarvis_domain::tool::approval::ApprovalChannel::Cli,
+                assurance: jarvis_domain::model::exception::RequiredAssurance::Standard,
+                note: None,
+            },
+            now(),
+        )
+        .expect("decides");
+    ApprovalRepository::apply_transition(
+        fixture.repository.as_ref(),
+        workspace(),
+        &transition,
+        version,
+        &transition.actor,
+        &stored,
+    )
+    .await
+    .expect("stores");
+    let first = fixture
+        .service
+        .resume(
+            &context(),
+            run(),
+            &stored,
+            &intent("notes.write@1", r#"{"path":"/a"}"#),
+            &CancellationScope::new(),
+        )
+        .await
+        .expect("resumes");
+    assert!(
+        matches!(first, ToolCallOutcome::Completed { .. }),
+        "{first:?}"
+    );
+
+    // A different action, under a new key, runs without being asked — twice.
+    for (key, path) in [("call-2", "/b"), ("call-3", "/c")] {
+        let outcome = invoke_write(&fixture, key, &format!(r#"{{"path":"{path}"}}"#)).await;
+        assert!(
+            matches!(outcome, ToolCallOutcome::Completed { .. }),
+            "{key}: {outcome:?}"
+        );
+    }
+    assert_eq!(fixture.executions_count(), 3);
+    let after = ApprovalRepository::load(fixture.repository.as_ref(), workspace(), approval)
+        .await
+        .expect("loads");
+    assert_eq!(
+        after.state(),
+        ApprovalState::Approved,
+        "a standing approval is not spent by a use"
+    );
 }

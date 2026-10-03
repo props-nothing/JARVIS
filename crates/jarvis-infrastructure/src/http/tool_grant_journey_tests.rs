@@ -314,6 +314,7 @@ mod tests {
             Arc::new(executor),
             clock,
             Vec::new(),
+            jarvis_domain::tool::policy::AutonomyLevel::Ask,
         )
         .expect("the reviewed definitions are consistent");
         let repositories = Arc::new(crate::storage::repositories::SqliteRepositories::new(

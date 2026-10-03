@@ -260,6 +260,9 @@ pub struct NativeReadOnlyGrants {
     /// loses a restriction. The capability is kept beside the rule and expanded into the identities that
     /// currently offer it when the source is read.
     deny_rules: Vec<ReviewedDenyRule>,
+    /// The operator's autonomy level, which decides how much beyond the daemon's own reads is covered
+    /// implicitly. [`AutonomyLevel::Ask`] until stated, which is the narrow original behaviour.
+    autonomy: jarvis_domain::tool::policy::AutonomyLevel,
 }
 
 impl NativeReadOnlyGrants {
@@ -273,9 +276,34 @@ impl NativeReadOnlyGrants {
         Self {
             tools,
             deny_rules: Vec::new(),
+            autonomy: jarvis_domain::tool::policy::AutonomyLevel::Ask,
         }
     }
 
+    /// Returns this source covering tools according to `autonomy`.
+    ///
+    /// **At `balanced` and `autonomous` the tools the operator's own configuration offers are covered
+    /// implicitly, bounded by what each declares.** Requiring a hand-written grant *and* a prompt for the
+    /// same tool was two layers of friction for one decision: the grant allowlisted a tool the operator had
+    /// already chosen to run by configuring its server, and the prompt then asked about every call anyway.
+    /// The grant here is the tool's own declared effects and risk, so it confers nothing a prompt would not
+    /// still gate — a write still asks at `balanced`, a read runs, and what [`AutonomyLevel::auto_allows`](jarvis_domain::tool::policy::AutonomyLevel::auto_allows)
+    /// permits runs without asking. Nothing consequential is ever skipped, a deny rule still wins, and the
+    /// first stored grant for a principal still replaces all of this with explicit configuration. At `ask`
+    /// only the daemon's own reads are covered and every other tool needs an explicit grant.
+    #[must_use]
+    pub fn with_autonomy(mut self, autonomy: jarvis_domain::tool::policy::AutonomyLevel) -> Self {
+        self.autonomy = autonomy;
+        self
+    }
+
+    /// Returns whether this source grants `definition`: the original native read-only rule, or any tool
+    /// when the autonomy level is not `ask`.
+    #[must_use]
+    pub fn covers(&self, definition: &ToolDefinition) -> bool {
+        Self::qualifies(definition)
+            || self.autonomy != jarvis_domain::tool::policy::AutonomyLevel::Ask
+    }
     /// Returns this source with the operator's deny rules attached.
     ///
     /// Takes [`ReviewedDenyRule`]s — the validated configuration form — rather than bare `DenyRule`s, so a
@@ -288,7 +316,9 @@ impl NativeReadOnlyGrants {
         self
     }
 
-    /// Returns whether a definition is one this source grants.
+    /// Returns whether a definition is one the daemon's own reviewed rule grants: native, exactly
+    /// read-only, and low risk. The autonomy level widens what is covered beyond this
+    /// ([`Self::covers`]); this is the floor that holds at every level, including `ask`.
     ///
     /// One predicate with one home, so the constructor's doc and the filter cannot disagree — the rule
     /// is stated once and read by the filter rather than paraphrased in each.
@@ -307,7 +337,7 @@ impl NativeReadOnlyGrants {
     pub fn granted_count(&self) -> usize {
         self.tools
             .iter()
-            .filter(|tool| Self::qualifies(&tool.definition))
+            .filter(|tool| self.covers(&tool.definition))
             .count()
     }
 }
@@ -321,7 +351,7 @@ impl ToolGrantSource for NativeReadOnlyGrants {
         let grants: Vec<Grant> = self
             .tools
             .iter()
-            .filter(|tool| Self::qualifies(&tool.definition))
+            .filter(|tool| self.covers(&tool.definition))
             .map(|tool| Grant {
                 identity: tool.definition.identity.clone(),
                 workspace,
@@ -333,10 +363,8 @@ impl ToolGrantSource for NativeReadOnlyGrants {
                 // request's effects and risk against these on every call, so a definition replaced
                 // after this grant was built is refused by the ceiling even though the identity
                 // matched — which is the one property a per-definition grant would otherwise lose.
-                effects: [jarvis_domain::tool::classification::Effect::ReadOnly]
-                    .into_iter()
-                    .collect(),
-                risk_ceiling: jarvis_domain::tool::classification::Risk::Low,
+                effects: tool.definition.effects.iter().copied().collect(),
+                risk_ceiling: tool.definition.risk,
                 sensitivity_ceiling: tool.definition.data_classes.input,
                 // No expiry, because a standing grant for a read-only tool is exactly the case the
                 // domain's own `Grant::expires_at` doc names as legitimate.

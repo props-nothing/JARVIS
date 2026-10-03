@@ -52,6 +52,14 @@ a decided approval (a rejected one included) was never usable or spent. A run pa
 waiting for ever. Tool names are sent in the form strict providers accept (OpenAI's function-name rule), mapped
 back to the canonical names on the way in.
 
+Update 2026-10-03 (Autonomy): JARVIS no longer asks about everything. `[tools] autonomy` (`ask`/`balanced`/`autonomous`,
+default `balanced`) decides what runs unprompted — reads, and at `autonomous` reversible local writes; external
+communication, destruction, code execution, money and privilege **always** ask — and "always allow" turns an answered
+prompt into a seven-day, revocable permission (`jarvis approvals review`, `approve --remember`, `approvals standing`).
+The remaining gaps against the four hallmarks of a real Jarvis are voice (and so hands-free approval), a visual
+presence, and supervised sub-agents; all three are client work over the same daemon, and approvals already have the
+durable, restart-safe, channel-scoped shape a voice or HUD surface needs.
+
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or
 create an unverified parallel implementation.

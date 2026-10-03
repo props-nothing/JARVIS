@@ -92,7 +92,22 @@ pub struct DecisionCommand<'a> {
     /// **Present because the wire carried a `comment` whose doc claimed it was stored and nothing stored
     /// it.** An absent note is `None` and distinct from an empty one, which `DecisionNote::new` refuses.
     pub note: Option<&'a DecisionNote>,
+    /// Whether an approval should stand for **every later call to the tool**, not just this action.
+    ///
+    /// "Always allow this" is what keeps an agent usable: without it a tool the user trusts prompts on
+    /// every call. It is honoured only for an approve, only for the narrow effects a person can sensibly
+    /// pre-authorize (reading and reversible writes, at most moderate risk), and it expires
+    /// ([`STANDING_APPROVAL_WINDOW_MS`]); anything else is refused with `approval.standing_not_allowed`
+    /// rather than quietly downgraded to a one-shot, because a user who asked for "always" and got "once"
+    /// would find out by being prompted again.
+    pub remember: bool,
 }
+
+/// How long a remembered approval stays in force: seven days.
+///
+/// A bound rather than for ever, for the reason a prompt window is one: a standing permission the user may
+/// not remember granting is the thing to avoid, and revoking it is `jarvis approvals cancel`.
+pub const STANDING_APPROVAL_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Why an approval operation could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +324,35 @@ impl ApprovalService {
             .await)
     }
 
+    /// Lists the standing approvals in force: what the user said "always allow" to and has not revoked.
+    ///
+    /// Read-only and scoped to the caller's workspace. A caller whose channel could not have decided one
+    /// of them is not shown it, for the reason a listing of pending prompts filters by channel: showing a
+    /// surface a permission it cannot act on discloses another surface's work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalServiceError::Unauthenticated`] for a guest and
+    /// [`ApprovalServiceError::Storage`] when the store cannot be read.
+    pub async fn standing(
+        &self,
+        context: &RequestContext,
+        limit: u32,
+        at: UtcTimestamp,
+    ) -> Result<Vec<DurableApproval>, ApprovalServiceError> {
+        let _ = assurance_of(context.assurance)?;
+        let channel = approval_channel_of(context.channel);
+        let rows = self
+            .approvals
+            .standing(context.workspace_id, at, limit)
+            .await
+            .map_err(ApprovalServiceError::Storage)?;
+        Ok(rows
+            .into_iter()
+            .filter(|approval| approval.allowed_channels.permits(channel))
+            .collect())
+    }
+
     /// Reads one approval, scoped to the caller's workspace.
     ///
     /// A record whose `allowed_channels` exclude the caller's channel is
@@ -379,6 +423,7 @@ impl ApprovalService {
             expected_version,
             fingerprint,
             note,
+            remember,
         } = command;
         let _ = assurance_of(context.assurance)?;
         let mut stored = self.load(context, approval).await?;
@@ -404,6 +449,14 @@ impl ApprovalService {
         }
 
         let target = decision.state();
+        let remembered = remember && target == ApprovalState::Approved;
+        if remember && !remembered {
+            // "Remember" attached to a rejection means nothing; refused rather than ignored so a client
+            // that built the request wrongly learns it.
+            return Err(ApprovalServiceError::Invalid {
+                code: "approval.standing_not_allowed",
+            });
+        }
         // **A repeat of the same decision is idempotence, and it is checked BEFORE the version.**
         // The contract requires that "same-key/same-request retry returns the original decision", and
         // a same-request retry carries the `expected_version` from the *original* body — so a version
@@ -421,6 +474,9 @@ impl ApprovalService {
                 expected: expected_version.get(),
                 actual: stored.version().get(),
             });
+        }
+        if remembered {
+            stored = standing_from(stored, at)?;
         }
         let actor = ApprovalActor::Decided {
             principal: context.principal_id,
@@ -703,6 +759,38 @@ impl ApprovalService {
             )
             .await;
     }
+}
+
+/// Turns a pending approval into a standing one, or refuses.
+///
+/// Eligibility is the **action's own classification**, recorded on the approval when it was raised and not
+/// anything the caller states: only reads and reversible writes, at most moderate risk. A tool that
+/// communicates externally, destroys, executes code, moves money, escalates privilege or acts physically
+/// always asks, because "always" is exactly the wrong answer to those.
+fn standing_from(
+    mut approval: DurableApproval,
+    at: UtcTimestamp,
+) -> Result<DurableApproval, ApprovalServiceError> {
+    use jarvis_domain::tool::classification::{Effect, Risk};
+    let eligible = approval.risk <= Risk::Moderate
+        && !approval.effects.is_empty()
+        && approval
+            .effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::ReadOnly | Effect::Write));
+    if !eligible {
+        return Err(ApprovalServiceError::Invalid {
+            code: "approval.standing_not_allowed",
+        });
+    }
+    let expires_at =
+        at.plus_millis(STANDING_APPROVAL_WINDOW_MS)
+            .ok_or(ApprovalServiceError::Invalid {
+                code: "approval.standing_not_allowed",
+            })?;
+    approval.scope = jarvis_domain::tool::approval::ApprovalScopeKind::Standing;
+    approval.expires_at = expires_at;
+    Ok(approval)
 }
 
 /// An approval after a decision or cancellation, and whether this call performed it.

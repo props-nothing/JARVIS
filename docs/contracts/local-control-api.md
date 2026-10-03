@@ -702,6 +702,7 @@ Minimum codes:
 | 403 | `model.policy_unsatisfied` | no |
 | 403 | `jarvis.context_candidates_unbounded` | no |
 | 404 | `resource.not_found` | no |
+| 400 | `approval.standing_not_allowed` | no |
 | 404 | `approval.not_found` | no |
 | 404 | `model.policy_not_found` | no |
 | 404 | `tool.grant_not_found` | no |

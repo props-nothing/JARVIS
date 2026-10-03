@@ -83,25 +83,40 @@ that is not a usable token, too many arguments or variables, an environment key
 with a `=` in it, or a duplicated name. Fix the profile; the daemon refuses to
 start with a declaration it cannot honour.
 
-## Using a server's tools: discovery is not permission
+## Using a server's tools: how often JARVIS asks
 
 A composed server's tools join the daemon's tool catalog, so the model is **offered** them with their real
-description and argument schema. Offering is all that happens: a call is refused `tool.permission_denied` until
-an operator writes a grant for it, and then every call still waits for a human approval, because an MCP server's
-annotations can propose but never permit.
+description and argument schema. Whether a call then runs, asks, or is refused is the operator's **autonomy
+level**, set in `config.toml` (`[tools] autonomy = "ask" | "balanced" | "autonomous"`, default `balanced`):
+
+| level | a read-only tool | a reversible write (moderate risk) | anything consequential |
+|---|---|---|---|
+| `ask` | needs a hand-written grant, then runs only if the tool declares `allow` | needs a grant, then asks every call | needs a grant, then asks |
+| `balanced` | runs | **asks** (and can be remembered) | asks |
+| `autonomous` | runs | **runs** | asks |
+
+"Consequential" is external communication, destruction, code execution, money, privilege, physical effects, or
+anything of high or critical risk: **no level skips a prompt for these**, a deny rule always wins, and neither a
+model nor a server can change the level. At `balanced` and `autonomous` no `jarvis grants create` is needed — the
+servers you configured are trusted to *propose*, and the prompt (or the level) is the permission. The first grant
+you do write for a principal switches that principal to explicit configuration, replacing these defaults.
+
+An MCP tool with no annotations is recorded as `write` at `moderate` risk (the absence of a read-only claim is not
+a claim of safety), so at `balanced` its calls ask. Answer once, and stop being asked:
 
 ```bash
-# An MCP tool with no annotations is recorded as `write` at `moderate` risk (the absence of a read-only claim is
-# not a claim of safety). A grant may only narrow, so it names exactly that.
-jarvis grants create --capability mcp.read_file@1 --principal <your-principal-id> \
-  --effect write --risk moderate --sensitivity internal
-jarvis approvals list          # a model's call to the tool appears here
-jarvis approvals approve <id> --fingerprint <fp> --version <n>
+jarvis approvals review                      # walk the queue: yes / always / no / skip
+jarvis approvals approve <id> --fingerprint <fp> --version <n> --remember   # scripted equivalent
+jarvis approvals standing                    # the "always allow" permissions in force
+jarvis approvals cancel <id> --version <n>   # revoke one
 ```
 
+"Always" lasts seven days, covers any later call to that tool, and is refused for anything consequential. Under
+`ask` the original flow still applies: `jarvis grants create --capability mcp.read_file@1 --principal <id> --effect
+write --risk moderate --sensitivity internal`, then an approval per call.
 A decided approval **continues the run**: approved, the tool runs in the server and the model answers from its
 result; rejected or withdrawn, the model is told the call was refused and the tool never runs. An approval is
-spent by the call it authorizes, so the same action asks again. A run waiting on an approval survives a daemon restart and continues when the approval is decided
+spent by the call it authorizes unless it was remembered, so the same action asks again. A run waiting on an approval survives a daemon restart and continues when the approval is decided
 (`docs/architecture/agent-runtime.md`, "Resuming after an approval"). One more limit to know: a
 client cannot ask the daemon for its own principal id today; for the enrolled `owner`
 client it is the first sixteen bytes of the SHA-256 of `owner`, written as a UUID. A secret reference in a server's

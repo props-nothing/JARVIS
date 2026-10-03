@@ -114,6 +114,86 @@ pub enum PolicyReason {
     DefaultDeny,
     /// The tool is low risk and read-only, so policy allows it without a prompt.
     LowRiskReadOnly,
+    /// The operator's autonomy level allows an action of this effect and risk without a prompt.
+    AutonomyAllowed,
+}
+
+/// How much JARVIS may do without asking, as the operator declared it.
+///
+/// **A posture the operator sets, never something a model or a tool can influence.** It is the answer to
+/// "how often should this interrupt me", and the answer has to be deterministic and reviewable: the same
+/// level and the same action always decide the same way. It widens exactly one thing — which actions are
+/// allowed *without a prompt* when a grant already covers them — and it never overrides a deny rule, a
+/// grant constraint, a tool that declares itself `Deny`, or an approval requirement for anything
+/// consequential.
+///
+/// | level | allowed without a prompt |
+/// |---|---|
+/// | `ask` | only what a tool declares `Allow` and is read-only and low risk (the original behaviour) |
+/// | `balanced` | read-only, low-risk actions from any source the operator configured |
+/// | `autonomous` | the above, plus reversible local writes of at most moderate risk |
+///
+/// What no level allows unprompted: external communication, destruction, code execution, money, privilege,
+/// physical effects, or anything of high or critical risk. Those always ask.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyLevel {
+    /// Ask about everything that is not a declared low-risk read.
+    Ask,
+    /// Read-only, low-risk actions run; everything else asks. The default.
+    #[default]
+    Balanced,
+    /// Reversible local writes of at most moderate risk also run.
+    Autonomous,
+}
+
+impl AutonomyLevel {
+    /// Returns whether an action with these effects and this risk needs no prompt at this level.
+    ///
+    /// The **single definition** of the rule: policy uses it to skip the prompt and the grant source uses
+    /// it to decide which tools are covered implicitly, so the two cannot disagree about what a level
+    /// means.
+    #[must_use]
+    pub fn auto_allows(self, effects: &BTreeSet<Effect>, risk: Risk) -> bool {
+        if effects.is_empty() {
+            return false;
+        }
+        match self {
+            Self::Ask => false,
+            Self::Balanced => {
+                effects.iter().all(|effect| *effect == Effect::ReadOnly) && risk <= Risk::Low
+            }
+            Self::Autonomous => {
+                effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::ReadOnly | Effect::Write))
+                    && risk <= Risk::Moderate
+            }
+        }
+    }
+
+    /// Returns the spelling configuration and the wire use.
+    #[must_use]
+    pub const fn as_contract_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Balanced => "balanced",
+            Self::Autonomous => "autonomous",
+        }
+    }
+
+    /// Parses the spelling [`Self::as_contract_str`] produces.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ask" => Some(Self::Ask),
+            "balanced" => Some(Self::Balanced),
+            "autonomous" => Some(Self::Autonomous),
+            _ => None,
+        }
+    }
 }
 
 /// One grant: what a principal is allowed to do with one tool in one workspace.
@@ -224,6 +304,12 @@ pub struct ApprovalRecord {
     pub action_digest: super::canonical::ActionDigest,
     /// When the approval stops being valid.
     pub expires_at: UtcTimestamp,
+    /// Whether the approval covers **any call to the tool** rather than one exact action.
+    ///
+    /// A standing approval ("always allow this") is matched on identity, principal and workspace and not
+    /// on the action digest, and is never spent by a use. It is still bounded by the grant's own effect
+    /// and risk ceilings and by its expiry, and a deny rule still wins over it.
+    pub standing: bool,
     /// Whether it has already been spent.
     ///
     /// A one-shot approval is consumed when its call is reserved, so a record that is still present
@@ -551,7 +637,8 @@ fn resolve_approval(
         // The fingerprint is checked **before** expiry and consumption. An approval for a different
         // action is not "an approval that lapsed": reporting expiry for it would tell a user to
         // re-approve, and re-approving the action they already approved would still not match.
-        if approval.action_digest != request.action_digest {
+        // A standing approval names the tool rather than one action, so it has no digest to compare.
+        if !approval.standing && approval.action_digest != request.action_digest {
             most_specific.get_or_insert(PolicyReason::ApprovalFingerprintMismatch);
             continue;
         }
@@ -588,6 +675,21 @@ fn resolve_approval(
 ///    asking — so nothing is allowed by falling through.
 #[must_use]
 pub fn evaluate(request: &PolicyRequest<'_>, inputs: &PolicyInputs<'_>) -> PolicyDecision {
+    evaluate_at(request, inputs, AutonomyLevel::Ask)
+}
+
+/// Evaluates policy under an autonomy level.
+///
+/// [`evaluate`] is this with [`AutonomyLevel::Ask`], which is the original behaviour, so a caller that has
+/// no level to state keeps exactly what it had. The level only widens step 6: an action it
+/// [auto-allows](AutonomyLevel::auto_allows) is permitted without a prompt **when the tool does not declare
+/// itself `Deny`**, and only after the deny rules, the grant and its constraints have all been satisfied.
+#[must_use]
+pub fn evaluate_at(
+    request: &PolicyRequest<'_>,
+    inputs: &PolicyInputs<'_>,
+    autonomy: AutonomyLevel,
+) -> PolicyDecision {
     let now = inputs.now;
 
     // Step 1: deny rules first, and their refusal is final. Returning here rather than accumulating
@@ -646,6 +748,16 @@ pub fn evaluate(request: &PolicyRequest<'_>, inputs: &PolicyInputs<'_>) -> Polic
     };
 
     // Step 6: the tool's declared default.
+    if request.default_approval != super::classification::ApprovalHint::Deny
+        && autonomy.auto_allows(request.effects, request.risk)
+    {
+        return PolicyDecision {
+            outcome: PolicyOutcome::Allow,
+            reasons: vec![PolicyReason::AutonomyAllowed],
+            grant: Some(grant_ref),
+            final_outcome: false,
+        };
+    }
     finalize_default(request, grant_ref, approval_mismatch)
 }
 

@@ -1908,6 +1908,33 @@ impl crate::repository::approval::ApprovalRepository for InMemoryRepositories {
         })
     }
 
+    fn standing(
+        &self,
+        workspace: WorkspaceId,
+        now: UtcTimestamp,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<DurableApproval>> {
+        Box::pin(async move {
+            self.with(|store| {
+                let mut found: Vec<DurableApproval> = store
+                    .approvals
+                    .values()
+                    .filter(|stored| {
+                        stored.workspace == workspace
+                            && stored.state() == ApprovalState::Approved
+                            && !stored.scope.is_consumed_on_use()
+                            && now < stored.expires_at
+                    })
+                    .cloned()
+                    .collect();
+                // The adapter's `ORDER BY expires_at ASC, id ASC`.
+                found.sort_by_key(|stored| (stored.expires_at, stored.id.to_string()));
+                found.truncate(limit.min(MAX_PENDING_PAGE) as usize);
+                Ok(found)
+            })
+        })
+    }
+
     fn transitions(
         &self,
         workspace: WorkspaceId,

@@ -22,6 +22,7 @@
 //! **And the deny rules are a union that cannot be lost.** A refusal can only narrow, so an unreachable store
 //! must not be able to drop one — which is why `deny_rules` is asserted separately from the grants.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use jarvis_application::repository::tool_grant::ToolGrantRepository;
@@ -591,4 +592,125 @@ fn a_description_written_by_a_server_is_bounded_and_stripped_before_it_reaches_a
         cleaned.chars().count()
     );
     assert!(cleaned.starts_with("Reads files."));
+}
+
+// ---------------------------------------------------------------------------------------
+// Autonomy levels decide which tools are covered without a hand-written grant.
+// ---------------------------------------------------------------------------------------
+
+/// An MCP-sourced definition with the given effects and risk.
+fn mcp_definition(capability: &str, effects: Vec<Effect>, risk: Risk) -> ToolDefinition {
+    let source = ToolSource::new(
+        SourceKind::McpServer,
+        "acme.files",
+        ToolVersion::parse("1.0.0").expect("valid"),
+    )
+    .expect("valid source");
+    ToolDefinition::new(
+        ToolIdentity {
+            capability: ToolCapability::parse(capability).expect("valid capability"),
+            source,
+            schema_fingerprint: SchemaFingerprint::from_bytes([0x22; 32]),
+        },
+        "Server tool",
+        "A tool an MCP server offers.",
+        effects,
+        risk,
+        Vec::<Scope>::new(),
+        ApprovalHint::Ask,
+        Idempotency::None,
+        DataClasses::new(Sensitivity::Internal, Sensitivity::Internal).expect("valid classes"),
+        ExecutionDefaults::new(5_000, 1).expect("valid defaults"),
+    )
+    .expect("the definition is consistent")
+}
+
+fn granted_capabilities(
+    level: jarvis_domain::tool::policy::AutonomyLevel,
+    definitions: &[ToolDefinition],
+) -> Vec<String> {
+    let tools: Vec<ResolvedTool> = definitions
+        .iter()
+        .map(|definition| ResolvedTool {
+            definition: definition.clone(),
+            input_schema: None,
+        })
+        .collect();
+    let source = NativeReadOnlyGrants::new(tools).with_autonomy(level);
+    let read = futures_lite_block_on(source.read(principal(), workspace()));
+    read.grants
+        .iter()
+        .map(|grant| grant.identity.capability.to_string())
+        .collect()
+}
+
+/// Drives the source's immediately-ready future without a runtime.
+fn futures_lite_block_on<T>(
+    future: impl Future<Output = Result<T, jarvis_application::repository::RepositoryError>>,
+) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime")
+        .block_on(future)
+        .expect("the reviewed source does not fail")
+}
+
+#[test]
+fn ask_needs_a_hand_written_grant_for_a_server_tool_and_the_other_levels_cover_it() {
+    use jarvis_domain::tool::policy::AutonomyLevel::{Ask, Autonomous, Balanced};
+    let definitions = [
+        mcp_definition("srv.read@1", vec![Effect::ReadOnly], Risk::Low),
+        mcp_definition("srv.write@1", vec![Effect::Write], Risk::Moderate),
+        mcp_definition(
+            "srv.send@1",
+            vec![Effect::Write, Effect::ExternalCommunication],
+            Risk::High,
+        ),
+    ];
+    assert_eq!(
+        granted_capabilities(Ask, &definitions),
+        Vec::<String>::new(),
+        "ask covers no server tool"
+    );
+    for level in [Balanced, Autonomous] {
+        assert_eq!(
+            granted_capabilities(level, &definitions),
+            ["srv.read@1", "srv.write@1", "srv.send@1"],
+            "{level:?}: covered, so the first call reaches a prompt instead of a refusal"
+        );
+    }
+}
+
+#[test]
+fn an_implicit_grant_confers_exactly_what_the_tool_declares_and_no_more() {
+    use jarvis_domain::tool::policy::AutonomyLevel::Balanced;
+    let definition = mcp_definition(
+        "srv.send@1",
+        vec![Effect::Write, Effect::ExternalCommunication],
+        Risk::High,
+    );
+    let tools = vec![ResolvedTool {
+        definition: definition.clone(),
+        input_schema: None,
+    }];
+    let source = NativeReadOnlyGrants::new(tools).with_autonomy(Balanced);
+    let grants = futures_lite_block_on(source.read(principal(), workspace())).grants;
+    assert_eq!(grants.len(), 1);
+    assert_eq!(
+        grants[0].effects,
+        definition.effects.iter().copied().collect()
+    );
+    assert_eq!(grants[0].risk_ceiling, Risk::High);
+}
+#[test]
+fn the_daemons_own_reads_stay_covered_at_every_level() {
+    use jarvis_domain::tool::policy::AutonomyLevel::{Ask, Autonomous, Balanced};
+    let native = [read_definition("clock.now@1")];
+    for level in [Ask, Balanced, Autonomous] {
+        assert_eq!(
+            granted_capabilities(level, &native),
+            ["clock.now@1"],
+            "{level:?}"
+        );
+    }
 }

@@ -84,6 +84,14 @@ const DECIDED_SQL: &str = concat!(
     " FROM approvals WHERE workspace_id = ? AND decided_by = ? ORDER BY decided_at DESC, id ASC LIMIT ?"
 );
 
+/// The `SELECT` for [`ApprovalRepository::standing`]: approved, standing, and not yet lapsed.
+const STANDING_SQL: &str = concat!(
+    "SELECT ",
+    approval_columns!(),
+    " FROM approvals WHERE workspace_id = ? AND state = 'approved' AND scope = 'standing' \
+     AND expires_at > ? ORDER BY expires_at ASC, id ASC LIMIT ?"
+);
+
 /// The `SELECT` for [`ApprovalRepository::transitions`], oldest first.
 ///
 /// **The order is `(occurred_at, id)` and the identifier is load-bearing.** A trail is read forwards, and
@@ -269,7 +277,7 @@ impl ApprovalRepository for SqliteApprovalRepository {
             // statement is refused rather than overwriting a decision.
             let updated = sqlx::query(
                 "UPDATE approvals SET state = ?, version = ?, decided_by = ?, decided_via = ?, \
-                 decided_assurance = ?, decided_at = ?, updated_at = ? \
+                 decided_assurance = ?, decided_at = ?, updated_at = ?, scope = ?, expires_at = ? \
                  WHERE workspace_id = ? AND id = ? AND version = ?",
             )
             .bind(approval.state().as_contract_str())
@@ -292,6 +300,11 @@ impl ApprovalRepository for SqliteApprovalRepository {
                     .pipe_decided_at(approval.is_decided()),
             )
             .bind(transition.occurred_at.to_string())
+            // The scope and the deadline travel with a decision because a remembered approval changes
+            // both: it becomes standing and its deadline moves from the prompt window to the standing one.
+            // Writing them from the record on every transition keeps the row equal to the value.
+            .bind(approval.scope.as_contract_str())
+            .bind(approval.expires_at.to_string())
             .bind(workspace.to_string())
             .bind(approval.id.to_string())
             .bind(
@@ -470,6 +483,27 @@ impl ApprovalRepository for SqliteApprovalRepository {
             let rows = sqlx::query(DECIDED_SQL)
                 .bind(workspace.to_string())
                 .bind(principal.to_string())
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| RepositoryError::Query)?;
+            rows.iter().map(stored_approval).collect()
+        })
+    }
+
+    fn standing(
+        &self,
+        workspace: WorkspaceId,
+        now: UtcTimestamp,
+        limit: u32,
+    ) -> RepositoryFuture<'_, Vec<DurableApproval>> {
+        Box::pin(async move {
+            let limit = limit.min(MAX_PENDING_PAGE);
+            // ISO-8601 UTC text compares in time order, which is what the deadline column relies on
+            // everywhere else it is compared.
+            let rows = sqlx::query(STANDING_SQL)
+                .bind(workspace.to_string())
+                .bind(now.to_string())
                 .bind(i64::from(limit))
                 .fetch_all(&self.pool)
                 .await
@@ -761,18 +795,33 @@ fn reach(
     // `apply` needs it mutably.
     let expires_at = approval.expires_at;
 
-    let path: &[ApprovalState] = match state {
-        ApprovalState::Pending => &[],
-        // Every decision and lifecycle state is reachable in one step except the two that describe a
-        // **granted** approval ending: a consumed or invalidated approval must have been approved first,
-        // which is what makes an unreachable stored state detectable rather than assigned.
+    // **A lapse or a cancellation after an approval is a two-step path, and a row's own decider says
+    // which.** `Expired` and `Cancelled` are reachable from `Pending` *and* from `Approved`; a row that
+    // carries a decider was approved first, so reading it as one step produced a version one short and
+    // reported a perfectly good record as corrupt — which, with revocable standing approvals, made one
+    // revoked permission fail every later policy read.
+    let after_grant = stored.decided_by.is_some()
+        && matches!(state, ApprovalState::Expired | ApprovalState::Cancelled);
+    let path: Vec<ApprovalState> = match state {
+        ApprovalState::Pending => Vec::new(),
         ApprovalState::Approved
         | ApprovalState::Rejected
         | ApprovalState::Expired
-        | ApprovalState::Cancelled => &[state],
-        ApprovalState::Consumed | ApprovalState::Invalidated => &[ApprovalState::Approved, state],
+        | ApprovalState::Cancelled
+            if !after_grant =>
+        {
+            vec![state]
+        }
+        // The states that describe a **granted** approval ending: it must have been approved first, which
+        // is also what makes an unreachable stored state detectable rather than assigned.
+        ApprovalState::Approved
+        | ApprovalState::Rejected
+        | ApprovalState::Expired
+        | ApprovalState::Cancelled
+        | ApprovalState::Consumed
+        | ApprovalState::Invalidated => vec![ApprovalState::Approved, state],
     };
-    for step in path {
+    for step in &path {
         let version = approval.version();
         // **The instant comes from the row, per step, and the first version used the approval's own
         // `expires_at`.** That value is the deadline, not the moment of a decision, so a stored
