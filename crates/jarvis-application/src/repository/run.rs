@@ -923,6 +923,50 @@ pub trait RunRepository: Send + Sync {
     ///
     /// Returns [`RepositoryError::Corrupted`] for a stored state this build cannot interpret.
     fn active_runs(&self, workspace: WorkspaceId) -> RepositoryFuture<'_, ActiveRuns>;
+
+    /// Reads the workspace-wide activity feed after `after`, oldest first.
+    ///
+    /// The feed is every run's **public** activity events in the workspace, in the order they were stored, each
+    /// with a `cursor` that is the position in that order. `after: None` asks only for the current position and
+    /// returns no events, which is how a live tail starts "from now"; `Some(0)` replays from the start.
+    /// Streamed output text is left out unless `include_deltas`, because one answer is hundreds of events and a
+    /// dashboard wants the transitions, not the tokens.
+    ///
+    /// **Writers are serialized**, so storage order is commit order and a reader that has seen a cursor has seen
+    /// everything before it. The position handed back is read *before* the page, so an event committed between
+    /// the two is delivered next time rather than skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Corrupted`] for a stored row this build cannot interpret.
+    fn activity_after(
+        &self,
+        workspace: WorkspaceId,
+        after: Option<u64>,
+        limit: u32,
+        include_deltas: bool,
+    ) -> RepositoryFuture<'_, ActivityPage>;
+}
+
+/// The most feed events one read returns.
+pub const MAX_ACTIVITY_PAGE: u32 = 200;
+
+/// One event of the workspace feed, with its position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedEvent {
+    /// The position in the workspace's storage order; resume with it.
+    pub cursor: u64,
+    /// The event itself.
+    pub event: StoredActivityEvent,
+}
+
+/// A page of the workspace activity feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityPage {
+    /// The events, oldest first.
+    pub events: Vec<FeedEvent>,
+    /// Where to read next: everything at or before it has been considered.
+    pub next_cursor: u64,
 }
 
 /// The most active runs one listing returns.

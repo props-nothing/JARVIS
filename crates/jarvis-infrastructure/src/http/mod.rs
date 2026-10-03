@@ -39,6 +39,7 @@ use serde::Serialize;
 use crate::auth::ClientRegistry;
 use crate::auth::credential::CredentialError;
 
+pub mod activity;
 pub mod approval;
 pub mod memory;
 pub mod policy;
@@ -732,6 +733,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/health/ready", get(readiness_handler))
         .route("/api/v1/system/status", authenticated(get(system_status)))
         .merge(run_routes(&authenticated))
+        .route("/api/v1/activity", authenticated(get(activity::activity_feed)))
         // The policy routes follow the same shape as the run routes: always routable, and
         // answering `service.not_ready` when no storage is configured, so a client receives a
         // parseable envelope rather than the generic unknown-route refusal.

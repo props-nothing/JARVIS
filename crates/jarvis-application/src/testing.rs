@@ -49,9 +49,10 @@ use crate::repository::model_call::{
     StoredModelCall,
 };
 use crate::repository::run::{
-    ActiveRuns, IdempotencyClaim, MAX_ACTIVE_RUNS, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS,
-    NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage, RunEventPage, RunRepository,
-    RunResumeState, StoredActivityEvent, StoredRun, validate_idempotency_key,
+    ActiveRuns, ActivityPage, FeedEvent, IdempotencyClaim, MAX_ACTIVE_RUNS, MAX_ACTIVITY_PAGE,
+    MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord, NewRun,
+    RecoveryPage, RunEventPage, RunRepository, RunResumeState, StoredActivityEvent, StoredRun,
+    validate_idempotency_key,
 };
 use crate::repository::tool_call::{EffectingScan, ToolCallRepository};
 use crate::repository::{RepositoryError, RepositoryFuture};
@@ -846,6 +847,76 @@ impl RunRepository for InMemoryRepositories {
                 Ok(RecoveryPage {
                     runs: incomplete,
                     bounded,
+                })
+            })
+        })
+    }
+
+    fn activity_after(
+        &self,
+        workspace: WorkspaceId,
+        after: Option<u64>,
+        limit: u32,
+        include_deltas: bool,
+    ) -> RepositoryFuture<'_, ActivityPage> {
+        Box::pin(async move {
+            self.with(|store| {
+                // The cursor is the 1-based position in the append-only event list, the double's storage order.
+                let in_workspace = |event: &NewActivityEvent| {
+                    store
+                        .runs
+                        .get(&event.run_id)
+                        .is_some_and(|row| row.workspace_id == workspace)
+                };
+                let max = store
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| in_workspace(event))
+                    .map(|(index, _)| index as u64 + 1)
+                    .max()
+                    .unwrap_or(0);
+                let Some(after) = after else {
+                    return Ok(ActivityPage {
+                        events: Vec::new(),
+                        next_cursor: max,
+                    });
+                };
+                let bounded = limit.clamp(1, MAX_ACTIVITY_PAGE) as usize;
+                let events: Vec<FeedEvent> = store
+                    .events
+                    .iter()
+                    .enumerate()
+                    .map(|(index, event)| (index as u64 + 1, event))
+                    .filter(|(cursor, event)| {
+                        *cursor > after
+                            && in_workspace(event)
+                            && event.visibility == crate::repository::run::EventVisibility::Public
+                            && (include_deltas
+                                || event.event_type != crate::live_events::OUTPUT_TEXT_DELTA_EVENT)
+                    })
+                    .take(bounded)
+                    .map(|(cursor, event)| FeedEvent {
+                        cursor,
+                        event: StoredActivityEvent {
+                            id: event_id_for(event.run_id, event.sequence),
+                            run_id: event.run_id,
+                            sequence: event.sequence,
+                            event_type: event.event_type.clone(),
+                            payload_json: event.payload_json.clone(),
+                            visibility: event.visibility,
+                            occurred_at: event.occurred_at,
+                        },
+                    })
+                    .collect();
+                let next_cursor = if events.len() >= bounded {
+                    events.last().map_or(after, |last| last.cursor)
+                } else {
+                    max.max(after)
+                };
+                Ok(ActivityPage {
+                    events,
+                    next_cursor,
                 })
             })
         })

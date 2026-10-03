@@ -739,6 +739,22 @@ fn render_page(
 fn render_event(
     event: &jarvis_application::repository::run::StoredActivityEvent,
 ) -> Result<String, ()> {
+    render_event_with_id(event, &event.id.to_string())
+}
+
+/// Renders one stored event as an SSE frame whose `id:` is `sse_id`.
+///
+/// A run's own stream resumes by the event's identifier; the workspace feed resumes by its cursor, so the frame
+/// body is the same and only the SSE `id:` differs. One function renders both, so the two cannot spell a frame
+/// differently.
+///
+/// # Errors
+///
+/// Returns `Err(())` when the frame cannot be serialized.
+pub(super) fn render_event_with_id(
+    event: &jarvis_application::repository::run::StoredActivityEvent,
+    sse_id: &str,
+) -> Result<String, ()> {
     // A stored payload is already-redacted public detail, so it is passed through unchanged. A
     // missing or unparseable payload becomes `null` rather than an invented object, because a client
     // can detect `null` and cannot detect a plausible-looking substitute.
@@ -757,7 +773,7 @@ fn render_event(
     };
     let data = serde_json::to_string(&frame).map_err(|_| ())?;
     Ok(SseEvent {
-        id: frame.event_id,
+        id: sse_id.to_owned(),
         event_type: event.event_type.clone(),
         data,
     }
@@ -837,7 +853,7 @@ pub(crate) const FOLLOW_CHANNEL_DEPTH: usize = 32;
 /// how long one frame takes to reach one follower — rather than how long a page took to render. A
 /// batch of frames from one read must each clear it in turn, which is the same statement made for
 /// every frame rather than an average over the batch.
-async fn send_bounded(
+pub(super) async fn send_bounded(
     sender: &tokio::sync::mpsc::Sender<Bytes>,
     piece: String,
     timeout: Duration,
@@ -862,13 +878,13 @@ async fn send_bounded(
 /// lock to decide, and `watch::Receiver::borrow_and_update` is a synchronous read of the latest
 /// value. It is written once, by the only task that can decide an overrun happened.
 #[derive(Clone)]
-struct OverrunSignal {
+pub(super) struct OverrunSignal {
     sender: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl OverrunSignal {
     /// Creates a signal that has nothing to report yet.
-    fn new() -> (Self, tokio::sync::watch::Receiver<Option<String>>) {
+    pub(super) fn new() -> (Self, tokio::sync::watch::Receiver<Option<String>>) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         (Self { sender }, receiver)
     }
@@ -878,7 +894,7 @@ impl OverrunSignal {
     /// `send_replace` rather than `send`, because the value is read by the body and an unobserved send
     /// would be dropped: this is a piece of *state* ("this stream ended in an overrun"), not an event,
     /// and a receiver that reads it a moment later must still find it.
-    fn record_overrun(&self) {
+    pub(super) fn record_overrun(&self) {
         self.sender
             .send_replace(Some(jarvis_protocol::run::stream_overrun_frame()));
     }
@@ -1025,7 +1041,7 @@ fn follow_stream(
 /// means the client reads every frame the daemon did manage to hand over and *then* learns why the
 /// stream stopped, which is what makes the reconnect instruction actionable: it says where to resume
 /// from, and the position it names is the last frame the client actually received.
-struct ReceiverStream {
+pub(super) struct ReceiverStream {
     receiver: tokio::sync::mpsc::Receiver<Bytes>,
     signal: tokio::sync::watch::Receiver<Option<String>>,
     /// Whether the overrun frame has been handed over.
@@ -1036,6 +1052,20 @@ struct ReceiverStream {
     /// polled again after every `Ready`, the body would have emitted the overrun frame for ever
     /// instead of ending. The frame is one-shot by contract, so the one-shot-ness is tracked here.
     overrun_delivered: bool,
+}
+
+impl ReceiverStream {
+    /// Wraps a follow task's channel and its overrun signal as a response body.
+    pub(super) const fn new(
+        receiver: tokio::sync::mpsc::Receiver<Bytes>,
+        signal: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Self {
+        Self {
+            receiver,
+            signal,
+            overrun_delivered: false,
+        }
+    }
 }
 
 impl futures_core::Stream for ReceiverStream {
@@ -1089,7 +1119,7 @@ impl futures_core::Stream for ReceiverStream {
 /// table has no `406` and inventing a status/code pair is a protocol change. `request.invalid` is
 /// what this surface already uses for a malformed request header (a missing idempotency key, an
 /// over-long cancel reason), so this stays inside the published envelope.
-fn accepts_event_stream(headers: &HeaderMap) -> bool {
+pub(super) fn accepts_event_stream(headers: &HeaderMap) -> bool {
     let Some(value) = headers.get(header::ACCEPT) else {
         return true;
     };
@@ -1256,7 +1286,10 @@ pub(crate) fn service_error_response_for_test(error: &RunServiceError) -> Respon
 }
 
 /// Maps a service error to its contract status and envelope.
-fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> Response {
+pub(super) fn service_error_response(
+    request_id: Option<&str>,
+    error: &RunServiceError,
+) -> Response {
     let status = match error {
         RunServiceError::Invalid { .. } => StatusCode::BAD_REQUEST,
         // A named policy that does not exist is a 404 like any other absent resource, and it is
@@ -1300,7 +1333,7 @@ fn service_error_response(request_id: Option<&str>, error: &RunServiceError) -> 
 }
 
 /// The refusal for a caller's invalid request.
-fn invalid_request(request_id: Option<&str>, message: &str) -> Response {
+pub(super) fn invalid_request(request_id: Option<&str>, message: &str) -> Response {
     error_response_for(
         request_id,
         StatusCode::BAD_REQUEST,
@@ -1352,7 +1385,7 @@ pub(crate) fn not_ready(request_id: Option<&str>) -> Response {
 /// "internal failures return a request ID and generic message while preserving structured
 /// diagnostics in redacted local logs". A client reporting this has no other handle to quote, and
 /// the identifier is also returned as a response header so it can be read without parsing the body.
-fn internal_failure(request_id: Option<&str>) -> Response {
+pub(super) fn internal_failure(request_id: Option<&str>) -> Response {
     error_response_for(
         request_id,
         StatusCode::INTERNAL_SERVER_ERROR,

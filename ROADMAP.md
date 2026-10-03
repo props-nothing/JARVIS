@@ -71,6 +71,22 @@ approval, and `jarvis runs stop-all` (`POST /api/v1/runs/stop-all`) is the kill 
 cancels parked ones and withdraws their approvals, needs no idempotency key, is safe to repeat, and is not a latch. A
 HUD or a voice command ("Jarvis, stop everything") is now a client over one call.
 
+Review 2026-10-03 (the four hallmarks of a real Jarvis). Measured against the TODO (107 done, 20 partial, 86 open) and the
+evidence manifest, JARVIS is a strong **agent core without a face or a voice yet**:
+
+| Hallmark | Built and proven on a real daemon | Missing | Next step |
+| --- | --- | --- | --- |
+| Voice | Nothing. Voice, telephony and LiveKit evidence are `ARCHITECTURE_ONLY`; `VOI-001`..`VOI-014` are open | Everything: wake word, spoken answers, barge-in | `VOI-002` evidence refresh, then `VOI-003` (authenticated Responses SSE endpoint), the first piece any voice provider needs |
+| Hands-free | Durable, restart-safe, channel-scoped approvals; standing "always allow"; autonomy levels; kill switch | A channel a person can answer without hands (`VOI-010`), and approvals decided by a principal other than the requester | Voice or push approval channel over `approvals review`, after voice transport exists |
+| Visual presence | Per-run SSE event streams; `runs list`; approvals API; **workspace-wide live activity feed** (`GET /api/v1/activity`, `jarvis runs watch`, added 2026-10-03) | Any UI (Tauri is `ARCHITECTURE_ONLY`) | A thin loopback dashboard over the feed, then the desktop client |
+| Oversight | Approvals, kill switch, run listing, supervised MCP servers, bounded budgets and deadlines | Sub-agents, parent/child runs, background workers, scheduler (`AUT-002`..`AUT-005`), external runtimes (Milestone 7) | A native supervised sub-agent tool: a child run with a parent link, a depth and budget ceiling, authority no wider than its parent, cancelled with it |
+
+Recommended order: (1) the workspace-wide activity stream (**done 2026-10-03**), because the HUD, the voice client and a
+notification surface all consume it; (2) the supervised native sub-agent, the largest gain in capability with no external dependency;
+(3) the scheduler and proactive rules so JARVIS acts without being asked; (4) voice, once (1) exists and the evidence is
+refreshed; (5) the desktop client. Connectors (`CON-*`) wait for a first vertical (`CON-005`) and are what make the agent
+useful beyond files, so they should start no later than step (3).
+
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or
 create an unverified parallel implementation.

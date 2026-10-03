@@ -140,6 +140,7 @@ GET  /api/v1/system/status
 POST /api/v1/runs
 GET  /api/v1/runs
 POST /api/v1/runs/stop-all
+GET  /api/v1/activity
 GET  /api/v1/runs/{run_id}
 GET  /api/v1/runs/{run_id}/events
 POST /api/v1/runs/{run_id}/cancel
@@ -478,6 +479,28 @@ default `kill_switch`) and **no `Idempotency-Key` is required**: the command is 
 stops whatever is still active — and a control reached for in a hurry must not be refused for a missing header. It
 is a stop, not a latch: a run created afterwards is accepted. When `bounded` is true more than 100 runs were active
 and a second call reaches the rest.
+
+### The Workspace Activity Feed
+
+`GET /api/v1/activity` is **one server-sent-event stream of every run's public events in the caller's workspace**,
+for a heads-up display, a voice client or a notifier that must see what JARVIS is doing without knowing a run
+identifier. It requires `Accept: text/event-stream`, the same authentication and envelope as every route, and it is
+built from the same durable rows as a run's own stream, so the two cannot disagree.
+
+- **Frames are run events**, rendered by the same function as the per-run stream (`run.received`,
+  `run.approval_requested`, `run.completed`, …), so a client that reads a run stream reads this one. The frame body is
+  the run event frame; the SSE `id:` is the **cursor**, the event's position in the workspace's storage order.
+- **Resume by cursor.** `Last-Event-ID` (or `?after=N`; the header wins) resumes after that cursor, re-reading from the
+  store, so a client that disconnected receives exactly the frames it missed and none it had. **With no position the
+  feed starts from now**: a display reads `GET /api/v1/runs` for current state and then tails. `?after=0` replays
+  everything retained. A malformed cursor or an unknown parameter is `400 request.invalid`, never ignored.
+- **Streamed output text is opt-in** (`?deltas=true`), because one answer is hundreds of events and a display wants the
+  transitions. Operator-only events are never delivered, and the workspace is a predicate of the query.
+- **Backpressure is a disconnect, not a gap.** A consumer that stops reading is sent the `stream.overrun` frame and
+  closed, like a run stream; reconnecting with the last cursor loses nothing. Keepalives are SSE comments.
+- Storage order is commit order because writers are serialized, so a client that has seen a cursor has seen everything
+  before it; the daemon reads its position before the page, so an event committed in between is delivered next time.
+  Latency is bounded by a 250 ms poll of one indexed range query, because no workspace-wide wake-up channel exists yet.
 
 ## Run Event Stream
 

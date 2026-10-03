@@ -335,6 +335,21 @@ async fn run(cli: Cli) -> ExitCode {
 enum RunsAction {
     /// List what JARVIS is doing right now: the runs that have not finished, including any waiting on an approval.
     List,
+    /// Follow everything JARVIS is doing, across all runs, as it happens.
+    ///
+    /// Prints the daemon's own frames (the `id:` of each is a cursor). With no option it starts from now; use
+    /// `--from-start` to replay what is retained, or `--after CURSOR` to resume where an earlier watch stopped.
+    Watch {
+        /// Replay everything retained before following.
+        #[arg(long, conflicts_with = "after")]
+        from_start: bool,
+        /// Resume after this cursor (the `id:` of the last frame seen).
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<u64>,
+        /// Include streamed output text, which is hundreds of frames per answer.
+        #[arg(long)]
+        deltas: bool,
+    },
     /// **The kill switch**: ask every active run to stop and withdraw the approvals they are waiting on.
     ///
     /// Safe to repeat; it stops whatever is still active. Tool calls already in flight are cancelled where the
@@ -1185,6 +1200,44 @@ fn follow_after(
     }
 }
 
+/// Follows the workspace activity feed until the connection ends, printing each frame as it arrived.
+///
+/// The frames are printed verbatim, like `runs events`, so the output is what the daemon sent and a consumer can
+/// parse it; the `id:` line of each is the cursor to give `--after` to resume.
+async fn watch_activity(state: &ClientState, after: Option<u64>, deltas: bool) -> ExitCode {
+    let mut path = String::from("/api/v1/activity");
+    let mut query = Vec::new();
+    if let Some(cursor) = after {
+        query.push(format!("after={cursor}"));
+    }
+    if deltas {
+        query.push("deltas=true".to_owned());
+    }
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
+    let mut parser = SseParser::new();
+    let result = stream_response(
+        &state.discovered,
+        &state.credential,
+        &path,
+        API_MAJOR,
+        &event_stream_headers(None),
+        |piece| {
+            for frame in parser.push(piece) {
+                print!("{}", frame.render());
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            true
+        },
+    )
+    .await;
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => report_client_error(&error),
+    }
+}
 /// Calls a run-collection endpoint (`GET` without a body, `POST` with one) and prints the daemon's own answer.
 ///
 /// The daemon's response is printed rather than a re-derived summary, so the client cannot disagree with the
@@ -1245,6 +1298,11 @@ async fn runs(paths: &ProfilePaths, action: RunsAction) -> ExitCode {
             println!("{body}");
             ExitCode::SUCCESS
         }
+        RunsAction::Watch {
+            from_start,
+            after,
+            deltas,
+        } => watch_activity(&state, if from_start { Some(0) } else { after }, deltas).await,
         RunsAction::List => print_run_call(&state, "/api/v1/runs", None).await,
         RunsAction::StopAll { reason } => {
             let body = reason.map_or_else(
@@ -4016,6 +4074,12 @@ mod tests {
             (vec!["jarvis", "ask", "hello"], "ask"),
             (vec!["jarvis", "runs", "show", "abc"], "runs"),
             (vec!["jarvis", "runs", "list"], "runs"),
+            (vec!["jarvis", "runs", "watch"], "runs"),
+            (
+                vec!["jarvis", "runs", "watch", "--from-start", "--deltas"],
+                "runs",
+            ),
+            (vec!["jarvis", "runs", "watch", "--after", "12"], "runs"),
             (vec!["jarvis", "runs", "stop-all"], "runs"),
             (
                 vec!["jarvis", "runs", "stop-all", "--reason", "leaving"],

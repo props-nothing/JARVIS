@@ -2182,3 +2182,111 @@ async fn an_active_run_this_process_has_no_task_for_is_reported_not_hidden() {
     assert_eq!(summary.unsignalled, 1);
     assert_eq!(summary.signalled, 0);
 }
+
+#[tokio::test]
+async fn the_feed_interleaves_every_runs_events_in_order_and_resumes_from_a_cursor() {
+    let fixture = fixture();
+    let first = create(&fixture, "one", "key-1").await;
+    let second = create(&fixture, "two", "key-2").await;
+    fixture.spawner.run_all().await;
+
+    let page = fixture
+        .service
+        .activity(&context(), Some(0), false)
+        .await
+        .expect("reads");
+    let runs: std::collections::HashSet<_> = page.events.iter().map(|e| e.event.run_id).collect();
+    assert!(runs.contains(&first.run_id) && runs.contains(&second.run_id));
+    assert!(
+        page.events
+            .windows(2)
+            .all(|pair| pair[0].cursor < pair[1].cursor),
+        "the feed is strictly ordered by cursor",
+    );
+    assert!(
+        page.events
+            .iter()
+            .any(|e| e.event.event_type == "run.completed"),
+        "transitions are in the feed",
+    );
+    assert_eq!(page.next_cursor, page.events.last().expect("events").cursor);
+
+    // Resuming from the position it returned yields nothing new, and a later run is picked up.
+    let none = fixture
+        .service
+        .activity(&context(), Some(page.next_cursor), false)
+        .await
+        .expect("reads");
+    assert!(none.events.is_empty());
+    assert_eq!(none.next_cursor, page.next_cursor);
+
+    let third = create(&fixture, "three", "key-3").await;
+    let more = fixture
+        .service
+        .activity(&context(), Some(page.next_cursor), false)
+        .await
+        .expect("reads");
+    assert!(!more.events.is_empty());
+    assert!(more.events.iter().all(|e| e.event.run_id == third.run_id));
+    assert!(more.events.iter().all(|e| e.cursor > page.next_cursor));
+}
+
+#[tokio::test]
+async fn a_live_tail_starts_from_now_and_streamed_text_is_opt_in() {
+    let fixture = fixture();
+    create(&fixture, "one", "key-1").await;
+    fixture.spawner.run_all().await;
+
+    let now = fixture
+        .service
+        .activity(&context(), None, false)
+        .await
+        .expect("reads");
+    assert!(
+        now.events.is_empty(),
+        "asking for the position returns no history"
+    );
+    let all = fixture
+        .service
+        .activity(&context(), Some(0), true)
+        .await
+        .expect("reads");
+    assert_eq!(now.next_cursor, all.events.last().expect("events").cursor);
+
+    let without = fixture
+        .service
+        .activity(&context(), Some(0), false)
+        .await
+        .expect("reads");
+    assert!(
+        without
+            .events
+            .iter()
+            .all(|e| e.event.event_type != crate::live_events::OUTPUT_TEXT_DELTA_EVENT),
+        "streamed output text is left out by default",
+    );
+    assert!(
+        all.events.len() >= without.events.len(),
+        "opting in only adds events",
+    );
+}
+
+#[tokio::test]
+async fn the_feed_never_shows_another_workspaces_events() {
+    let fixture = fixture();
+    create(&fixture, "one", "key-1").await;
+    fixture.spawner.run_all().await;
+    let foreign = api_request_context(
+        WorkspaceId::from_uuid(id(99)),
+        principal(),
+        RequestId::from_uuid(id(5)),
+        CorrelationId::from_uuid(id(6)),
+    );
+    let page = fixture
+        .service
+        .activity(&foreign, Some(0), true)
+        .await
+        .expect("reads");
+    assert!(page.events.is_empty());
+    assert_eq!(page.next_cursor, 0);
+}

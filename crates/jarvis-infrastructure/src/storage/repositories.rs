@@ -32,10 +32,10 @@ use jarvis_application::repository::model_call::{
     ModelCallOutcome, ModelCallRepository, ModelDeliverySamples, NewModelCall, StoredModelCall,
 };
 use jarvis_application::repository::run::{
-    ActiveRuns, EventVisibility, IdempotencyClaim, IncompleteRun, MAX_ACTIVE_RUNS, MAX_EVENT_PAGE,
-    MAX_INCOMPLETE_RUNS, NewActivityEvent, NewIdempotencyRecord, NewRun, RecoveryPage,
-    RunEventPage, RunRepository, RunResumeState, RunRuntime, RunWrite, StoredActivityEvent,
-    StoredRun, validate_idempotency_key,
+    ActiveRuns, ActivityPage, EventVisibility, FeedEvent, IdempotencyClaim, IncompleteRun,
+    MAX_ACTIVE_RUNS, MAX_ACTIVITY_PAGE, MAX_EVENT_PAGE, MAX_INCOMPLETE_RUNS, NewActivityEvent,
+    NewIdempotencyRecord, NewRun, RecoveryPage, RunEventPage, RunRepository, RunResumeState,
+    RunRuntime, RunWrite, StoredActivityEvent, StoredRun, validate_idempotency_key,
 };
 use jarvis_application::repository::{RepositoryError, RepositoryFuture};
 use jarvis_domain::ids::{
@@ -1151,6 +1151,83 @@ impl RunRepository for SqliteRepositories {
             Ok(RecoveryPage {
                 runs: incomplete,
                 bounded,
+            })
+        })
+    }
+
+    fn activity_after(
+        &self,
+        workspace: WorkspaceId,
+        after: Option<u64>,
+        limit: u32,
+        include_deltas: bool,
+    ) -> RepositoryFuture<'_, ActivityPage> {
+        Box::pin(async move {
+            // The position is read before the page, and the page is bounded by it, so an event committed in
+            // between belongs to the next read. Writers are serialized, so `rowid` order is commit order.
+            let max: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(rowid), 0) FROM run_activity_events WHERE workspace_id = ?",
+            )
+            .bind(workspace.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            let max =
+                u64::try_from(max).map_err(|_| RepositoryError::Corrupted { column: "rowid" })?;
+            let Some(after) = after else {
+                return Ok(ActivityPage {
+                    events: Vec::new(),
+                    next_cursor: max,
+                });
+            };
+            let bounded = limit.clamp(1, MAX_ACTIVITY_PAGE);
+            let rows = sqlx::query(
+                "SELECT rowid AS cursor, id, run_id, sequence, event_type, payload_json, visibility, \
+                        occurred_at \
+                 FROM run_activity_events \
+                 WHERE workspace_id = ? AND visibility = 'public' AND rowid > ? AND rowid <= ? \
+                   AND (? OR event_type <> 'run.output_text.delta') \
+                 ORDER BY rowid ASC LIMIT ?",
+            )
+            .bind(workspace.to_string())
+            .bind(i64::try_from(after).map_err(|_| RepositoryError::Corrupted { column: "rowid" })?)
+            .bind(i64::try_from(max).map_err(|_| RepositoryError::Corrupted { column: "rowid" })?)
+            .bind(include_deltas)
+            .bind(i64::from(bounded))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RepositoryError::Query)?;
+            let mut events = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let cursor = u64::try_from(int(row, "cursor")?)
+                    .map_err(|_| RepositoryError::Corrupted { column: "rowid" })?;
+                let sequence = u64::try_from(int(row, "sequence")?)
+                    .map_err(|_| RepositoryError::Corrupted { column: "sequence" })?;
+                events.push(FeedEvent {
+                    cursor,
+                    event: StoredActivityEvent {
+                        id: RunActivityEventId::parse(&text(row, "id")?)
+                            .map_err(|_| RepositoryError::Corrupted { column: "event_id" })?,
+                        run_id: RunId::parse(&text(row, "run_id")?)
+                            .map_err(|_| RepositoryError::Corrupted { column: "run_id" })?,
+                        sequence,
+                        event_type: text(row, "event_type")?,
+                        payload_json: opt_text(row, "payload_json")?,
+                        visibility: EventVisibility::parse(&text(row, "visibility")?)?,
+                        occurred_at: parse_time(&text(row, "occurred_at")?, "occurred_at")?,
+                    },
+                });
+            }
+            // A full page stops short of `max`, so the position is the last row; a short page has seen
+            // everything up to `max`, including the delta rows it filtered out.
+            let next_cursor = if rows.len() >= bounded as usize {
+                events.last().map_or(after, |last| last.cursor)
+            } else {
+                max.max(after)
+            };
+            Ok(ActivityPage {
+                events,
+                next_cursor,
             })
         })
     }

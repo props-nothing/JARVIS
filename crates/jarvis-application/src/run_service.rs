@@ -1256,6 +1256,32 @@ impl RunService {
             .await?)
     }
 
+    /// Reads the workspace-wide activity feed after `after` (see [`RunRepository::activity_after`]).
+    ///
+    /// The feed is what a heads-up display, a voice client or a notifier follows to see **everything JARVIS is
+    /// doing** without knowing a run identifier. It is scoped to the caller's workspace in the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunServiceError::Storage`] when the read fails.
+    pub async fn activity(
+        &self,
+        context: &RequestContext,
+        after: Option<u64>,
+        include_deltas: bool,
+    ) -> Result<crate::repository::run::ActivityPage, RunServiceError> {
+        Ok(self
+            .ports
+            .runs
+            .activity_after(
+                context.workspace_id,
+                after,
+                crate::repository::run::MAX_ACTIVITY_PAGE,
+                include_deltas,
+            )
+            .await?)
+    }
+
     /// Reads the sequence a retained public event carries, by identifier.
     ///
     /// Exists so a resume position is resolved against the **stream** rather than against one page

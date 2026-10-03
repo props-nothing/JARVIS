@@ -385,6 +385,20 @@ run **continues**: the tool runs in the MCP child and the model answers with the
 produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
 a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
 
+## `activity-feed.mjs`
+
+Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a fake model. Opens
+`GET /api/v1/activity` and checks that a feed with no position **starts from now** (an earlier run is not replayed); that
+two runs started together, one **parked on an approval**, appear in one stream with strictly increasing cursors and the
+parked run's `run.approval_requested`; that approving surfaces the rest of that run in the same stream; that streamed
+output text is absent unless `?deltas=true`; that a reconnect with `Last-Event-ID` delivers **exactly the frames that
+were missed**; that `?after=0` replays retained history; and that an unauthenticated request is refused and a malformed
+cursor is `400`. Making the cursor comparison inclusive fails five checks; dropping the delta filter fails one.
+
+```bash
+node tests/e2e/activity-feed.mjs target/debug
+```
+
 ## `kill-switch.mjs`
 
 Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a fake model, on one profile.
