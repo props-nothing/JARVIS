@@ -44,6 +44,9 @@ const FIXTURE_ENV: &str = "JARVIS_MCP_FIXTURE";
 /// The standard fixture: one usable tool, target version preferred.
 const FIXTURE_STANDARD: &str = "standard";
 
+/// The fixture whose tool answers with the child's own working directory.
+const FIXTURE_CWD: &str = "cwd";
+
 /// The text the fixture returns from a call, mirrored from the example.
 const FIXTURE_CALL_TEXT: &str = "fixture result for read_file";
 
@@ -94,8 +97,91 @@ fn declaration_for(server: &str, program: &std::path::Path, _fixture: &str) -> M
             SecretReference::Env(format!("JARVIS_FIXTURE_{}", server.to_uppercase())),
         )]),
         enabled: true,
+        // No directory by default: a child inherits the daemon's, which is the honest default the field's
+        // documentation records. The test below sets one explicitly.
+        working_directory: None,
         startup_timeout_ms: DEFAULT_MCP_STARTUP_TIMEOUT_MS,
     }
+}
+
+/// A declaration whose child runs in `directory`, for the working-directory test.
+fn declaration_working_in(
+    server: &str,
+    program: &std::path::Path,
+    directory: &std::path::Path,
+) -> McpServerSection {
+    let mut declaration = declaration_for(server, program, FIXTURE_CWD);
+    declaration.working_directory = Some(directory.to_string_lossy().into_owned());
+    declaration
+}
+
+#[tokio::test]
+async fn a_declared_working_directory_is_the_one_a_spawned_child_actually_runs_in() {
+    // **The only way to prove a launch directory was applied.** A specification field can be asserted and a
+    // built command can be inspected, but neither shows that `current_dir` reached the operating system — and
+    // "the value was threaded through" is a different claim from "the child ran there". The fixture's `cwd`
+    // tool answers with `std::env::current_dir()`, so the text is where the process *is*.
+    //
+    // The gap this closes is half of an `AGENTS.md` requirement: "isolate process environment variables and
+    // working directories". The environment was already cleared explicitly; the directory was whatever the
+    // daemon happened to be started in, because `McpLaunchSpec::working_dir` was validated, applied by
+    // `build_command`, and set by nobody.
+    let Some(program) =
+        program_or_skip("a_declared_working_directory_is_the_one_a_spawned_child_actually_runs_in")
+    else {
+        return;
+    };
+    // A directory this test creates, so the assertion is about a path that exists and whose name nothing else
+    // in the tree uses — a shared temp root would let a child that ignored the setting look correct.
+    let directory = std::env::temp_dir().join("jarvis-mcp-cwd-test");
+    std::fs::create_dir_all(&directory).expect("the fixture directory must be creatable");
+
+    let section = McpSection {
+        servers: vec![declaration_working_in("acme-files", &program, &directory)],
+    };
+    let declarations = section.enabled_declarations().expect("valid");
+    let secrets = resolver_for(&[("acme-files", FIXTURE_CWD)]);
+    let mut registry = ToolRegistry::new();
+    let composition = compose_declared_servers(&mut registry, &declarations, &secrets)
+        .await
+        .expect("valid");
+    assert!(composition.is_clean(), "{:?}", composition.refused());
+
+    let server = &composition.servers()[0];
+    let identity = &server.admitted()[0];
+    let dispatcher = ComposedMcpExecutor::over(&composition);
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "where_am_i",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        timeout_ms: CALL_TIMEOUT_MS,
+    };
+    let result = dispatcher
+        .execute(request, &cancel)
+        .await
+        .expect("the cwd fixture's tool must run");
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            jarvis_domain::tool::call::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    // **Asserted by the directory's own name rather than by a resolved-path comparison**, because Windows
+    // reports a canonicalized form whose prefix differs from `temp_dir()`'s spelling — and a test that failed
+    // for that reason would be reporting the platform rather than the defect. The name is unique to this test,
+    // so a child that inherited some other directory cannot contain it.
+    assert!(
+        text.contains("jarvis-mcp-cwd-test"),
+        "the child must run in the declared directory, but it reported {text:?}"
+    );
+
+    let _ = composition.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// A resolver holding the fixture selector for each declared server name.

@@ -391,11 +391,11 @@ pub fn launch_spec_for(
         program: declaration.program.clone(),
         args: declaration.args.clone(),
         env,
-        // **`None`: the child inherits no working directory from this adapter.** `McpLaunchSpec` documents
-        // `None` as "the daemon's", which is why it is worth stating that the configuration does not set one:
-        // a server that needs a directory should receive it as an argument, and inventing one here would put
-        // an unreviewed path in the process table.
-        working_dir: None,
+        // **The operator's directory when one was declared, and the daemon's when not.** `McpLaunchSpec::validate`
+        // checks the value (a usable UTF-8 token), so an unusable one is refused before a process exists, and
+        // `build_command` applies it. `None` still means "inherit the daemon's working directory" — a real
+        // exposure, now one an operator can close by declaring `working_directory`.
+        working_dir: declaration.working_dir.clone(),
         startup_timeout_ms: declaration.startup_timeout_ms,
     };
     spec.validate()

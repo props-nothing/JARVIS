@@ -35,6 +35,7 @@ fn base_server() -> McpServerSection {
             SecretReference::Env("JARVIS_ACME_TOKEN".to_owned()),
         )]),
         enabled: true,
+        working_directory: None,
         startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
     }
 }
@@ -72,6 +73,56 @@ fn a_complete_declaration_is_accepted() {
     assert_eq!(
         declaration.env.get("ACME_TOKEN"),
         Some(&SecretReference::Env("JARVIS_ACME_TOKEN".to_owned()))
+    );
+    // Absent by default, and that absence is the honest default rather than a good one: the child inherits
+    // the daemon's working directory. Asserted so "no directory" is a decision the fixture records rather
+    // than something a later reader assumes was an oversight.
+    assert_eq!(declaration.working_dir, None);
+}
+
+#[test]
+fn a_declared_working_directory_reaches_the_launch_specification() {
+    // **The field existed on `McpLaunchSpec` and had no way in.** The launcher validates a directory and
+    // applies it to the child's process, but the composition passed `None` unconditionally because the
+    // declaration had no such field — so `AGENTS.md`'s "isolate process environment variables and working
+    // directories" was half achieved: the environment was cleared explicitly and the directory was whatever
+    // the daemon happened to be started in. This is the write half; `mcp_composition_process` asserts the
+    // value reaches a real child.
+    let mut server = base_server();
+    server.working_directory = Some("/srv/mcp-work".to_owned());
+    let declarations = section(vec![server])
+        .declarations()
+        .expect("a declared directory must be accepted");
+    assert_eq!(
+        declarations[0].working_dir,
+        Some(std::path::PathBuf::from("/srv/mcp-work")),
+        "the declared directory must survive into the declaration the composition reads"
+    );
+}
+
+#[test]
+fn a_working_directory_with_a_control_character_is_refused_by_the_launcher() {
+    // **The content rule is not duplicated here, and this asserts that it is enforced somewhere.** The
+    // declaration checks the field's *shape* only; `McpLaunchSpec::validate` owns the token rule (a non-empty
+    // UTF-8 string with no control character, under the token bound). The refusal therefore comes from
+    // `launch_spec_for` rather than from `declarations()` — the same division the argument list follows, where
+    // the count is checked in two places and the content in one.
+    //
+    // The value below passes `to_declaration` (it is a non-empty string) and must fail `spec.validate()`. If
+    // that assertion ever inverts, the rule has been duplicated badly or lost.
+    let mut server = base_server();
+    server.working_directory = Some("/srv/bad\u{7}name".to_owned());
+    let declarations = section(vec![server])
+        .declarations()
+        .expect("the declaration's own shape rule does not cover control characters");
+    let secrets = crate::config::secret::MapSecretResolver::new();
+    secrets.insert("JARVIS_ACME_TOKEN", "s3cret");
+    let refusal = crate::mcp::composition::launch_spec_for(&declarations[0], &secrets)
+        .expect_err("the launcher must refuse a directory carrying a control character");
+    assert_eq!(
+        refusal.code(),
+        "mcp.working_directory_invalid",
+        "the launcher's own code travels rather than a declaration-level restatement"
     );
 }
 
@@ -297,4 +348,34 @@ program = "/usr/local/bin/mcp-server"
     );
     assert!(declaration.args.is_empty(), "args are optional");
     assert!(declaration.env.is_empty(), "env is optional");
+    // The directory is optional too, and its absence must be `None` rather than an empty path — an empty
+    // path would reach `current_dir` and fail the spawn with a message about the child.
+    assert_eq!(
+        declaration.working_dir, None,
+        "an absent working_directory must stay absent"
+    );
+}
+
+#[test]
+fn a_working_directory_is_read_from_a_profiles_toml() {
+    // **The direction the field exists for.** A profile is what an operator edits, so a field the code accepts
+    // but the deserializer drops would be a rule that passes every struct-literal test here while doing
+    // nothing in production. The key is `working_directory` — snake_case on the wire, like every other field in
+    // this table, and distinct from the launch specification's `working_dir`, which is an internal name an
+    // operator never types.
+    let text = r#"
+[[servers]]
+name = "acme-files"
+program = "/usr/local/bin/mcp-server"
+working_directory = "/srv/mcp-work"
+"#;
+    let parsed: McpSection = toml::from_str(text).expect("the profile must parse");
+    let declaration = &parsed
+        .declarations()
+        .expect("the declaration must be valid")[0];
+    assert_eq!(
+        declaration.working_dir,
+        Some(std::path::PathBuf::from("/srv/mcp-work")),
+        "the operator's directory must reach the declaration"
+    );
 }

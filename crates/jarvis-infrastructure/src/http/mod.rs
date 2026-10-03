@@ -1669,6 +1669,7 @@ pub(crate) mod tests {
                 "JARVIS_MCP_FIXTURE".to_owned(),
                 crate::config::secret::SecretReference::Env("JARVIS_FIXTURE_ACME_FILES".to_owned()),
             )]),
+            working_dir: None,
             enabled: true,
             startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
         };

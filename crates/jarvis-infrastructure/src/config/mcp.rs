@@ -62,6 +62,13 @@ pub struct McpServerDeclaration {
     pub args: Vec<String>,
     /// The environment the child may see, as references to be resolved at launch.
     pub env: BTreeMap<String, SecretReference>,
+    /// The directory the child runs in, when an operator named one.
+    ///
+    /// **`None` means the child inherits the daemon's working directory**, which is the honest default rather
+    /// than a good one: a server launched from wherever `jarvisd` happened to be started can read files it was
+    /// never granted. This field is how an operator removes that exposure — see [`McpServerSection::working_directory`]
+    /// for why it is opt-in rather than required.
+    pub working_dir: Option<PathBuf>,
     /// Whether this server should run.
     pub enabled: bool,
     /// How long the child may take to become usable.
@@ -98,6 +105,20 @@ pub struct McpServerSection {
     /// one-word change rather than a deletion that loses the reviewed record of what it was.
     #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
     pub enabled: bool,
+    /// The directory the child is launched in, when an operator names one.
+    ///
+    /// **Optional, and the reason is that requiring it would invent a path.** A default is not available —
+    /// there is no directory JARVIS may assume exists and is appropriate for a third-party server — and
+    /// naming one would either be wrong or create a directory an operator never asked for. So the field is
+    /// opt-in, and what makes that honest rather than lax is that the **absence is visible**: the launch
+    /// specification validates a directory when present, and the module doc records that the child otherwise
+    /// inherits the daemon's.
+    ///
+    /// A path rather than a reference: it is a location, not a secret. The launch layer still enforces its
+    /// own rules — a usable UTF-8 token under the token bound — so an operator cannot smuggle a control
+    /// character into a process table through this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
     /// How long the child may take to become usable, in milliseconds.
     ///
     /// Bounded by `McpLaunchSpec`'s own range rather than here, so the two cannot disagree about what is
@@ -180,6 +201,7 @@ impl McpServerSection {
             program: PathBuf::from(&self.program),
             args: self.args.clone(),
             env: self.env.clone(),
+            working_dir: self.working_directory.as_ref().map(PathBuf::from),
             enabled: self.enabled,
             startup_timeout_ms: self.startup_timeout_ms,
         })

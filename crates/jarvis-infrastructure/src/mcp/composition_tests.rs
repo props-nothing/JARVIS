@@ -46,6 +46,7 @@ fn declaration(name: &str) -> McpServerDeclaration {
             SecretReference::Env("JARVIS_ACME_TOKEN".to_owned()),
         )]),
         enabled: true,
+        working_dir: None,
         startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
     }
 }
@@ -71,6 +72,7 @@ fn unlaunchable(name: &str) -> McpServerDeclaration {
         args: Vec::new(),
         env: BTreeMap::new(),
         enabled: true,
+        working_dir: None,
         startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
     }
 }

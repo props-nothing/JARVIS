@@ -94,11 +94,22 @@ pub const FIXTURE_SLOW: &str = "slow";
 /// first. Chosen well inside that gap so neither side is a race.
 pub const FIXTURE_SLOW_DELAY_MS: u64 = 1_500;
 
+/// The variable's value for a peer whose only tool answers with **the child's own working directory**.
+///
+/// **This is how a launch directory is provable.** Nothing else can show that `current_dir` was applied: a
+/// specification field can be asserted, a built command can be inspected, but only a running process can say
+/// where it actually is — and "the argument was threaded through" is a different claim from "the child ran
+/// there". The tool reports the directory the operating system gave it rather than one it was told about.
+pub const FIXTURE_CWD: &str = "cwd";
+
 /// The tool name the standard and legacy fixtures offer.
 pub const FIXTURE_TOOL_NAME: &str = "read_file";
 
 /// The tool name the all-refused fixture offers.
 pub const FIXTURE_UNUSABLE_TOOL_NAME: &str = "Read File";
+
+/// The tool name the cwd fixture offers.
+pub const FIXTURE_CWD_TOOL_NAME: &str = "where_am_i";
 
 /// The text a fixture returns from a successful call.
 ///
@@ -127,6 +138,11 @@ struct FixtureServer {
     /// different behaviours — one never answers, the other answers late — and a single boolean would have to
     /// encode both.
     answer_after_ms: Option<u64>,
+    /// Whether a call answers with this process's own working directory.
+    ///
+    /// The child reports what the operating system gave it, so a test asserting the text is asserting where
+    /// the process actually is rather than what it was told.
+    report_cwd: bool,
 }
 
 impl ServerHandler for FixtureServer {
@@ -188,6 +204,7 @@ impl ServerHandler for FixtureServer {
         let tools = self.tools;
         let withhold = self.withhold_answer;
         let answer_after_ms = self.answer_after_ms;
+        let report_cwd = self.report_cwd;
         async move {
             if !tools.contains(&name.as_ref()) {
                 return Err(rmcp::ErrorData::new(
@@ -210,8 +227,17 @@ impl ServerHandler for FixtureServer {
             if let Some(delay) = answer_after_ms {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
+            // The process reports where it **is**, which is the only way to prove `current_dir` reached it.
+            let text = if report_cwd {
+                std::env::current_dir().map_or_else(
+                    |_| "cwd-unavailable".to_owned(),
+                    |directory| directory.display().to_string(),
+                )
+            } else {
+                FIXTURE_CALL_TEXT.to_owned()
+            };
             Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-                ContentBlock::Text(TextContent::new(FIXTURE_CALL_TEXT)),
+                ContentBlock::Text(TextContent::new(text)),
             ])))
         }
     }
@@ -230,18 +256,21 @@ fn selected_fixture() -> Option<FixtureServer> {
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
             answer_after_ms: None,
+            report_cwd: false,
         },
         FIXTURE_LEGACY => FixtureServer {
             supported: vec![FIXTURE_LEGACY_VERSION],
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
             answer_after_ms: None,
+            report_cwd: false,
         },
         FIXTURE_ALL_REFUSED => FixtureServer {
             supported: both,
             tools: &[FIXTURE_UNUSABLE_TOOL_NAME],
             withhold_answer: false,
             answer_after_ms: None,
+            report_cwd: false,
         },
         FIXTURE_PARTIAL => FixtureServer {
             supported: both,
@@ -250,18 +279,28 @@ fn selected_fixture() -> Option<FixtureServer> {
             tools: &[FIXTURE_TOOL_NAME, FIXTURE_UNUSABLE_TOOL_NAME],
             withhold_answer: false,
             answer_after_ms: None,
+            report_cwd: false,
         },
         FIXTURE_UNANSWERED => FixtureServer {
             supported: both,
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: true,
             answer_after_ms: None,
+            report_cwd: false,
         },
         FIXTURE_SLOW => FixtureServer {
             supported: both,
             tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
             answer_after_ms: Some(FIXTURE_SLOW_DELAY_MS),
+            report_cwd: false,
+        },
+        FIXTURE_CWD => FixtureServer {
+            supported: both,
+            tools: &[FIXTURE_CWD_TOOL_NAME],
+            withhold_answer: false,
+            answer_after_ms: None,
+            report_cwd: true,
         },
         _ => return None,
     };

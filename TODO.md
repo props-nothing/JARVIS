@@ -5548,6 +5548,31 @@ Dependencies: Milestone 2 exit gate.
     port's own promise is that a server which accepts a request and never answers cannot hold the dispatcher
     open with no clock. The pipeline always supplies a value, so this exercises the arm a caller outside it
     would reach.
+  - **Slice 26: a launch directory that `AGENTS.md` asks for was validated, applied by the launcher, and set by
+    nobody.** `McpLaunchSpec::working_dir` documents `None` as "the daemon's", `build_command` applies it via
+    `current_dir`, and it is checked against the token rule — but `compose_discovered` passed `None`
+    unconditionally, because `McpServerSection` had no such field. So "isolate process environment variables and
+    working directories" was **half achieved**: the environment was cleared explicitly (`env_clear` then the
+    declared pairs) and the directory was whatever `jarvisd` happened to be started in. Every MCP server ran in
+    the daemon's cwd.
+  - **The fix is a field through three layers**, `working_directory` (section, snake_case on the wire) →
+    `working_dir` (declaration) → `working_dir` (launch spec), with the content rule left where it already
+    lived: the declaration checks shape only and `McpLaunchSpec::validate` owns the token rule, so the
+    refusal for a control character comes from `launch_spec_for` with the launcher's own
+    `mcp.working_directory_invalid` code.
+  - **Optional rather than required, and that is a decision rather than an omission.** A default would have to
+    be invented — there is no directory JARVIS may assume exists and is appropriate for a third-party server —
+    and naming one would either be wrong or create a path an operator never asked for. So the field is opt-in,
+    and what makes that honest rather than lax is that the **absence stays visible**: it is asserted as `None`
+    in the accepting test and documented as the remaining exposure in the evidence note.
+  - **The e2e detector is a fixture that reports where it *is*.** A new `cwd` mode answers with
+    `std::env::current_dir()`, so the assertion is about a running process rather than about a value threaded
+    through — "the argument reached the specification" and "the child ran there" are different claims. The
+    falsification message is the finding: reverting the composition to `None` makes the child report
+    `C:\...\crates\jarvis-infrastructure`, i.e. **the crate directory**, which is exactly the exposure.
+  - **Asserted by a unique directory name rather than a resolved-path comparison**, because Windows reports a
+    canonicalized form whose prefix differs from `temp_dir()`'s spelling — a test that failed for that reason
+    would be reporting the platform rather than the defect.
   - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
     dies *during* a run is not yet noticed and quarantined; the executor refuses a dispatch to it and `health`
     reports it, but **nothing acts on it** — no pass prunes, quarantines, or re-launches, and a dispatch that
