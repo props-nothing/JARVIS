@@ -26,8 +26,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    InputKind, MAX_MRTR_ROUNDS, McpInvocationRefusal, authorizes_invocation, decide_input_request,
-    decide_input_round, next_round,
+    InputKind, McpInvocationRefusal, authorizes_invocation, decide_input_request,
+    decide_input_round,
 };
 use jarvis_domain::tool::identity::{
     SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
@@ -232,27 +232,15 @@ fn an_empty_round_is_refused_because_it_cannot_be_answered() {
     );
 }
 
-#[test]
-fn the_round_bound_is_reached_at_the_bound_and_not_before() {
-    // The bound, asserted from both sides so it is neither off by one nor absent. `next_round(0)` must
-    // succeed or no call could ever continue, and `next_round(MAX)` must fail or the bound does nothing.
-    assert_eq!(next_round(0), Ok(1));
-    assert_eq!(next_round(MAX_MRTR_ROUNDS - 1), Ok(MAX_MRTR_ROUNDS));
-    assert_eq!(
-        next_round(MAX_MRTR_ROUNDS),
-        Err(McpInvocationRefusal::RoundLimitExceeded {
-            max: MAX_MRTR_ROUNDS
-        })
-    );
-    // And one past the bound is still refused rather than wrapping.
-    assert!(next_round(MAX_MRTR_ROUNDS + 1).is_err());
-}
-
 // The relationship between JARVIS's round bound and the SDK's default is a **compile-time** assertion in
 // `invocation.rs` rather than a test, because both sides are constants and clippy rejects a runtime
 // comparison of them as "this assertion has a constant value" — correctly, since it cannot fail at run
 // time. Moving it to a `const` assertion strengthens it: it holds on every build, not only when the suite
 // runs. Checking it also corrected a wrong belief recorded in a comment there (the SDK default is 10).
+//
+// A `the_round_bound_is_reached_at_the_bound_and_not_before` test used to sit here, exercising a
+// `next_round` counter. Both were deleted with the function: nothing called it, and a test whose only
+// purpose is to keep a `pub fn` alive is exactly what made the dead code look exercised.
 
 #[test]
 fn every_refusal_code_is_namespaced_and_distinct() {
@@ -271,7 +259,6 @@ fn every_refusal_code_is_namespaced_and_distinct() {
             reason: "x",
         },
         McpInvocationRefusal::InputKindUnknown,
-        McpInvocationRefusal::RoundLimitExceeded { max: 3 },
     ];
     let codes: Vec<&str> = refusals.iter().map(McpInvocationRefusal::code).collect();
 

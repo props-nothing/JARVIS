@@ -60,6 +60,25 @@ const FIXTURE_UNANSWERED: &str = "unanswered";
 /// than by how long it waited.
 const FIXTURE_SLOW: &str = "slow";
 
+/// The fixture that accepts a call and answers with a **task handle** rather than a result.
+///
+/// Mirrored from the example. Its tool and timing are the ordinary ones, so the answer's shape is the only
+/// variable a test on it exercises.
+const FIXTURE_TASK: &str = "task";
+
+/// The fixture that answers every attempt with **`input_required`**, so a round is never fulfilled.
+///
+/// Mirrored from the example. Its tool is the ordinary one, so the only variable is that each answer is a
+/// further round — which is what makes a round cap observable.
+const FIXTURE_INPUT_REQUIRED: &str = "input-required";
+
+/// The fixture that answers with a **`request_state` and no request**, which is the only shape that reaches
+/// the round cap.
+///
+/// Mirrored from the example. The pair with [`FIXTURE_INPUT_REQUIRED`] is the point: one names a request and
+/// ends at JARVIS's own refusal, the other asks JARVIS nothing and ends at the SDK's cap.
+const FIXTURE_STATE_ONLY: &str = "state-only";
+
 /// The slow fixture's delay, mirrored from the example.
 ///
 /// A `u32` because [`std::time::Duration::from_millis`] takes one, and the example's constant is a `u64` for
@@ -145,10 +164,31 @@ async fn executor_over_fixture(
         >,
     >,
 )> {
+    executor_over_fixture_named(test, FIXTURE_STANDARD).await
+}
+
+/// The same join over **any** named fixture, so a test whose subject is the answer's shape can select one.
+///
+/// A parameter rather than a second copy of the registration path, because a duplicated join is how a suite
+/// starts proving something else: an executor built by a different sequence could pass an assertion that the
+/// daemon's own composition would fail.
+async fn executor_over_fixture_named(
+    test: &str,
+    fixture: &str,
+) -> Option<(
+    McpToolExecutor,
+    Vec<ToolIdentity>,
+    Arc<
+        rmcp::service::RunningService<
+            rmcp::RoleClient,
+            jarvis_infrastructure::mcp::client::JarvisClient,
+        >,
+    >,
+)> {
     let program = program_or_skip(test)?;
-    let discovered = discover_stdio_server(&standard_spec(program), SERVER_NAME)
+    let discovered = discover_stdio_server(&spec_for(program, fixture), SERVER_NAME)
         .await
-        .expect("the standard fixture must be discoverable");
+        .expect("the fixture must be discoverable");
 
     let server = ServerConfigId::new(SERVER_NAME).expect("the fixture name is a usable identity");
     let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
@@ -172,6 +212,54 @@ async fn executor_over_fixture(
 /// An argument document the fixture's schema accepts (it takes any object).
 fn arguments(document: &str) -> ToolArguments {
     ToolArguments::new(document).expect("the fixture arguments are usable text")
+}
+
+/// Builds an executor over the **task-handle** fixture, which offers the ordinary tool.
+async fn executor_over_task_fixture(
+    test: &str,
+) -> Option<(
+    McpToolExecutor,
+    Vec<ToolIdentity>,
+    Arc<
+        rmcp::service::RunningService<
+            rmcp::RoleClient,
+            jarvis_infrastructure::mcp::client::JarvisClient,
+        >,
+    >,
+)> {
+    executor_over_fixture_named(test, FIXTURE_TASK).await
+}
+
+/// Builds an executor over the **input-required** fixture, which offers the ordinary tool.
+async fn executor_over_input_required_fixture(
+    test: &str,
+) -> Option<(
+    McpToolExecutor,
+    Vec<ToolIdentity>,
+    Arc<
+        rmcp::service::RunningService<
+            rmcp::RoleClient,
+            jarvis_infrastructure::mcp::client::JarvisClient,
+        >,
+    >,
+)> {
+    executor_over_fixture_named(test, FIXTURE_INPUT_REQUIRED).await
+}
+
+/// Builds an executor over the **state-only** fixture, which offers the ordinary tool.
+async fn executor_over_state_only_fixture(
+    test: &str,
+) -> Option<(
+    McpToolExecutor,
+    Vec<ToolIdentity>,
+    Arc<
+        rmcp::service::RunningService<
+            rmcp::RoleClient,
+            jarvis_infrastructure::mcp::client::JarvisClient,
+        >,
+    >,
+)> {
+    executor_over_fixture_named(test, FIXTURE_STATE_ONLY).await
 }
 
 /// The instant a fixture call started at.
@@ -463,6 +551,228 @@ async fn a_dispatch_to_an_already_closed_session_is_settled_rather_than_ambiguou
 /// refuses — the same rule the fixture's `list_tools` follows by returning `impl Future` directly.
 fn executor_shutdown(executor: McpToolExecutor) {
     drop(executor);
+}
+
+/// Proves a server that tries to answer with a **task handle** is refused as `Unavailable` — *not* as the
+/// class JARVIS's own decision layer assigns that response, and not as `OutputInvalid` either.
+///
+/// **This test began as a wrong prediction and is worth keeping for what it corrected.** The adapter has a
+/// deliberate arm for this response: `call.rs`'s `decide_response` refuses a task handle with its own code,
+/// `mcp.response_not_complete`, classed `OutputInvalid` on the reading that answering one means polling a
+/// lifecycle this build does not implement. Reading that code, the obvious expectation is that a fixture
+/// returning `CallToolResponse::Task` produces `OutputInvalid`. **It produces `Unavailable`**, and the chain
+/// has two links, neither of them visible from `call.rs`:
+///
+/// 1. The SDK's **server** refuses to send a task handle at all unless the client declared the tasks
+///    extension capability — so a conforming server never emits one to JARVIS, whose `JarvisClient`
+///    deliberately declares no server-initiated capabilities.
+/// 2. The SDK's **client** helper also converts the response itself, returning
+///    `ServiceError::UnexpectedResponse` (SEP-2663: "this helper does not drive the task polling
+///    lifecycle"), so no JARVIS decision function is consulted.
+///
+/// What actually reaches the port arrives as the JSON-RPC code `-32021`
+/// (`MISSING_REQUIRED_CLIENT_CAPABILITY`), which `outcome::classify_error_code` maps to `Unavailable`. The
+/// assertion below therefore ties the observed class to that mapping rather than merely restating it, so the
+/// test fails if either the code path or the mapping moves.
+///
+/// **Why the difference matters rather than being a detail.** `OutputInvalid` is `Never` for retrying;
+/// `Unavailable` is `Safe`. A reader of `call.rs` would predict that a task handle is permanently
+/// unretryable, and the truth is the opposite posture. The class is also the *safer* of the two here for the
+/// reason the mapping gives — a request refused before dispatch cannot have duplicated an effect — and it is
+/// settled, so it does not send the recovery pass looking for an effect that cannot exist.
+#[tokio::test]
+async fn a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jarvis() {
+    let test = "a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jarvis";
+    let Some((executor, identities, session)) = executor_over_task_fixture(test).await else {
+        return;
+    };
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        timeout_ms: CALL_TIMEOUT_MS,
+    };
+
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("a task handle must not be served as a completed result");
+
+    // The literal class, asserted directly rather than through a lookup.
+    //
+    // **The first version of this test derived the expectation by calling `classify_error_code` with the code
+    // it expected, and that version was vacuous.** Mutating the code to a *different* one that shares the same
+    // class (`UNSUPPORTED_PROTOCOL_VERSION`, which is also `Unavailable`) left the test green — so the
+    // assertion tied nothing down and would have passed for any code in that class. What the port exposes is
+    // the **class**, not the code: `ToolExecutionError::Failed` carries `ToolErrorClass` and the JSON-RPC code
+    // the SDK consumed on the way is not observable here. So the class is written out, and the code is
+    // recorded in the prose above as the mechanism rather than asserted as if it were visible.
+    assert_eq!(
+        error,
+        ToolExecutionError::Failed(ToolErrorClass::Unavailable),
+        "the negotiated-capability refusal is classed `Unavailable`, not `OutputInvalid`"
+    );
+
+    // The correction, asserted so a future refactor cannot quietly restore the old expectation: the class
+    // `call.rs`'s task-handle arm assigns is a *different* one, so the documented answer and the delivered one
+    // are known to disagree here rather than assumed to agree.
+    assert_ne!(
+        ToolErrorClass::Unavailable,
+        ToolErrorClass::OutputInvalid,
+        "`call.rs` classes a task handle `OutputInvalid`; if that ever becomes the delivered class, the \
+         reachability note in `call.rs` is stale and must be updated with this test"
+    );
+    // Settled, and that is the safety property: the server answered, so nothing is in doubt and the recovery
+    // pass must not treat this as a possibly-existing effect.
+    assert!(
+        !ToolErrorClass::Unavailable.is_unsettled(),
+        "a refusal that reached this adapter as an error is settled"
+    );
+    // **The discriminator that makes `Unavailable` mean the guard rather than a dead socket.** `Unavailable`
+    // has three producers in this adapter — the `-32020`/`-32021` door refusals, a transport that could not
+    // send, and a session that has closed — so the class alone does not say which happened. A refusal the
+    // *server* sent is a JSON-RPC error response on a live session, so the session must still be open; a
+    // closed transport would have reported the same class for a different reason. Asserted rather than
+    // reasoned about, because this test's first version asserted a class that several paths produce and had to
+    // be rewritten for exactly that reason.
+    assert!(
+        !executor.is_closed(),
+        "the server refused the call rather than dropping the connection, so the session must still be open"
+    );
+
+    drop(session);
+    executor_shutdown(executor);
+}
+
+/// Proves a server naming an input request ends the call at **JARVIS's own refusal**, not at the round cap
+/// — and that the round cap is reachable only through a shape that asks JARVIS nothing.
+///
+/// **This test decided that a piece of code should be deleted rather than fixed, and the first version of it
+/// asserted the wrong class.** `invocation.rs` used to carry a `next_round` counter and a
+/// `McpInvocationRefusal::RoundLimitExceeded` variant whose doc said a caller would "refuse *before* handing
+/// the call over" so that "JARVIS's refusal is the one an operator sees". Two things were false about that,
+/// and only a live child could show either:
+///
+/// 1. **nothing called the counter** — the loop is the SDK's and is not interceptable per-round; and
+/// 2. **the code it produced (`mcp.round_limit_exceeded`) is not what an operator sees anyway.** A round that
+///    *names* a request is answered by `JarvisClient` with `-32602`, which propagates out of the SDK's loop as
+///    an error at **round one** — so the cap is never reached for a server that actually asks a question, and
+///    the class is `SchemaInvalid`. The cap is reachable only through a round carrying a `request_state` and
+///    no request, which consults no handler at all (asserted separately below).
+///
+/// My first prediction was `LimitExceeded` and it was wrong; the assertion is written to the observed class
+/// **plus** the discriminator that explains it, so a future change to either is a failure rather than a
+/// silent pass.
+#[tokio::test]
+async fn a_round_that_names_a_request_ends_at_jarvis_refusal_not_the_round_cap() {
+    let test = "a_round_that_names_a_request_ends_at_jarvis_refusal_not_the_round_cap";
+    let Some((executor, identities, session)) = executor_over_input_required_fixture(test).await
+    else {
+        return;
+    };
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        timeout_ms: CALL_TIMEOUT_MS,
+    };
+
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("a round the server never fulfils must not complete");
+
+    // The class, written literally rather than derived — computing the expectation through
+    // `classify_error_code` is the mistake a previous round's detector made, where the assertion stayed green
+    // under a mutation to a different code in the same class.
+    assert_eq!(
+        error,
+        ToolExecutionError::Failed(ToolErrorClass::SchemaInvalid),
+        "JARVIS's own `-32602` refusal for the named input kind is what ends this call, at round one"
+    );
+    // The explanation, asserted rather than assumed: this is JARVIS's answer to the request, so the class is
+    // the one a client-side `-32602` maps to and not a round limit.
+    assert_ne!(
+        ToolErrorClass::SchemaInvalid,
+        ToolErrorClass::LimitExceeded,
+        "a named request must not read as an exhausted round; if these ever coincide the doc above is stale"
+    );
+    // The session is live, which distinguishes "the handler refused" from "the transport died".
+    assert!(
+        !executor.is_closed(),
+        "the refusal came back over a live session; nothing about the transport failed"
+    );
+
+    drop(session);
+    executor_shutdown(executor);
+}
+
+/// Proves a server answering with a **`request_state` and no request** reaches the round cap as
+/// `LimitExceeded` — the class, and not the `mcp.round_limit_exceeded` a deleted JARVIS counter promised.
+///
+/// **This is the only shape that reaches the cap, which is the finding the sibling test above establishes.**
+/// A state-only round consults no `ClientHandler` method, so nothing refuses it: the SDK's loop retries with
+/// the echoed state until `max_rounds`, and the class comes from `classify_service_error`'s mapping of
+/// `InputRequiredRoundsExceeded` to `LimitExceeded` — whose contract code is `tool.limit_exceeded`.
+///
+/// **The fixture carries a `request_state`, and that is load-bearing.** With it the loop retries until its
+/// cap, which is the path under test; without it the helper rejects the answer as `UnexpectedResponse` before
+/// any retry, so a state-less fixture would pin a different defect than the cap.
+#[tokio::test]
+async fn a_state_only_round_reaches_the_round_cap_as_a_limit() {
+    let test = "a_state_only_round_reaches_the_round_cap_as_a_limit";
+    let Some((executor, identities, session)) = executor_over_state_only_fixture(test).await else {
+        return;
+    };
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        // Generous, so the round cap rather than the caller's bound is what ends the call. The rounds are
+        // driven locally, so this is not slow in wall-clock terms.
+        timeout_ms: CALL_TIMEOUT_MS,
+    };
+
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("a state-only round must not complete");
+
+    assert_eq!(
+        error,
+        ToolExecutionError::Failed(ToolErrorClass::LimitExceeded),
+        "the SDK's round cap is what ends this call, and it is classed a limit"
+    );
+    assert_eq!(
+        ToolErrorClass::LimitExceeded.as_contract_str(),
+        "tool.limit_exceeded",
+        "this is the code an operator greps for; `mcp.round_limit_exceeded` is produced by no code"
+    );
+    // Settled: the rounds happened locally and the loop stopped itself, so nothing is in doubt about an
+    // effect. A bound is not an ambiguity about what the server did.
+    assert!(
+        !ToolErrorClass::LimitExceeded.is_unsettled(),
+        "a round cap is a settled outcome, so the recovery pass must not reconcile it"
+    );
+    assert!(
+        !executor.is_closed(),
+        "the cap ended the call; the session was not the thing that failed"
+    );
+
+    drop(session);
+    executor_shutdown(executor);
 }
 
 /// Proves a call the server **accepted and never answered** reaches the port as `Ambiguous`.

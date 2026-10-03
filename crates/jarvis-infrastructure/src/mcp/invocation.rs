@@ -41,16 +41,23 @@ use rmcp::model::{InputRequest, InputRequests};
 ///
 /// Three, and bounded rather than configurable upward here: each round is a server-initiated request that
 /// JARVIS must decide, and an unbounded round count turns one tool call into an unbounded loop driven by
-/// the peer. The SDK enforces its own cap as well (`InputRequiredRoundsExceeded`), and this one exists so
-/// a caller can refuse *before* handing the call over rather than discovering the limit as an error.
+/// the peer.
+///
+/// **This is the value handed to the SDK's loop, and it is the only way JARVIS's bound takes effect.**
+/// `McpToolExecutor::invoke` passes it as `max_rounds` to `call_tool_with_mrtr_max_rounds`, so the SDK's
+/// loop stops at *this* number rather than at its own `DEFAULT_MRTR_MAX_ROUNDS` of 10.
+///
+/// A constant here used to be accompanied by a `next_round` function and a
+/// `McpInvocationRefusal::RoundLimitExceeded` variant — a counter that was supposed to refuse *before*
+/// handing the call over. Both were deleted: nothing called the function, because the loop that would
+/// count rounds belongs to the SDK and is not interceptable at that level. Its doc claimed a caller that
+/// did not exist and that JARVIS's refusal would be "the one an operator sees", and neither was true.
 pub const MAX_MRTR_ROUNDS: usize = 3;
 
-// **A compile-time invariant rather than a test, because both sides are constants.** JARVIS's bound must
-// sit *below* the SDK's own default so that JARVIS's refusal is the one an operator sees: at or above it,
-// a caller would instead meet `ServiceError::InputRequiredRoundsExceeded` — an error about the
-// dependency's cap rather than about JARVIS's, which sends an operator to the wrong system. A runtime
-// `assert!` on two constants is what clippy rejects as "this assertion has a constant value" and it is
-// right to: the comparison cannot fail at run time, so it belongs to the build.
+// **A compile-time invariant rather than a test, because both sides are constants.** JARVIS's bound is
+// passed to the SDK's loop as `max_rounds`, so it is the number the loop honours; the SDK's own default is
+// the fallback for callers that pass nothing. Keeping JARVIS's below it means the value in the launch path
+// is always the one in force rather than being silently superseded.
 const _: () = assert!(MAX_MRTR_ROUNDS < rmcp::model::DEFAULT_MRTR_MAX_ROUNDS);
 const _: () = assert!(MAX_MRTR_ROUNDS > 0);
 
@@ -135,12 +142,6 @@ pub enum McpInvocationRefusal {
     /// The server asked for an input request kind this build cannot classify.
     #[error("mcp input request could not be classified and is refused")]
     InputKindUnknown,
-    /// The call needed more continuations than [`MAX_MRTR_ROUNDS`].
-    #[error("mcp call needed more than {max} multi round-trip continuations")]
-    RoundLimitExceeded {
-        /// The bound that was exceeded.
-        max: usize,
-    },
 }
 
 impl McpInvocationRefusal {
@@ -151,7 +152,6 @@ impl McpInvocationRefusal {
             Self::ToolIdentityChanged => "mcp.tool_identity_changed",
             Self::InputRefused { kind, .. } => kind.code(),
             Self::InputKindUnknown => "mcp.input_kind_unknown",
-            Self::RoundLimitExceeded { .. } => "mcp.round_limit_exceeded",
         }
     }
 }
@@ -205,7 +205,15 @@ pub fn decide_input_request(request: &InputRequest) -> Result<(), McpInvocationR
 ///
 /// An **empty** round is refused too, and that is deliberate rather than a technicality: a server that
 /// answers `input_required` and then asks for nothing is not asking a question, and retrying on that
-/// basis would loop. See [`next_round`] for the bound that also applies.
+/// basis would loop.
+///
+/// **`call.rs` is the production caller, and it is reached only for a round that names at least one
+/// request.** The two other shapes never arrive here, and the reason differs by shape: a round that asks
+/// for something is refused by the SDK's *server* half before it is sent (the client declared no
+/// server-initiated capabilities), and an empty round is handled inside the SDK's own loop. So this
+/// function's empty-round arm and [`decide_input_request`] are both correct and both unreachable from a
+/// live session — see `client.rs`, whose handler overrides are what a server actually meets, and
+/// `mcp_executor_process`'s input-required tests, which pin what a caller really receives.
 ///
 /// # Errors
 ///
@@ -218,25 +226,6 @@ pub fn decide_input_round(requests: &InputRequests) -> Result<(), McpInvocationR
         return Err(McpInvocationRefusal::InputKindUnknown);
     };
     decide_input_request(first)
-}
-
-/// Advances the multi-round-trip counter, refusing past [`MAX_MRTR_ROUNDS`].
-///
-/// A separate function because the bound belongs in one place: a caller that incremented its own counter
-/// would each need the comparison, and one that forgot would loop until the SDK's own cap reported
-/// `InputRequiredRoundsExceeded` — an error about the SDK's limit rather than about JARVIS's, which
-/// sends an operator to the wrong system.
-///
-/// # Errors
-///
-/// Returns [`McpInvocationRefusal::RoundLimitExceeded`] when `completed` has reached the bound.
-pub fn next_round(completed: usize) -> Result<usize, McpInvocationRefusal> {
-    if completed >= MAX_MRTR_ROUNDS {
-        return Err(McpInvocationRefusal::RoundLimitExceeded {
-            max: MAX_MRTR_ROUNDS,
-        });
-    }
-    Ok(completed + 1)
 }
 
 #[cfg(test)]

@@ -375,6 +375,18 @@ pub fn classify_error_code(code: ErrorCode) -> ToolErrorClass {
         // capability JARVIS did not declare. Nothing was dispatched, so nothing can have been
         // duplicated.
         //
+        // **⚠ "Declared" is about the client's `_meta` capabilities, and `-32021` is the code an
+        // operator will actually see for a task handle.** `JarvisClient` declares no server-initiated
+        // capabilities, so a server that tries to answer a `tools/call` with a task handle is refused by
+        // the SDK's *server* half with exactly this code — verified against a real child in
+        // `mcp_executor_process`'s
+        // `a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jarvis`. That matters
+        // because `call.rs` has its own considered arm for a task handle, with its own code
+        // (`mcp.response_not_complete`, classed `OutputInvalid`), and a reader would reasonably predict
+        // *that* is what a caller meets. It is not: this arm is. Worth recording rather than deriving,
+        // because the two classes differ in retry posture (`Unavailable` is `Safe`, `OutputInvalid` is
+        // `Never`) and the guess is the wrong one.
+        //
         // `Unavailable` is the class the sibling `UNSUPPORTED_PROTOCOL_VERSION` already uses for the
         // same reason, and it is the one whose `Safe` posture asserts the thing that is certainly true
         // here: a request refused at the door took no effect. Grouping the three also means the

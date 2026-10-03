@@ -30,9 +30,9 @@
 use std::borrow::Cow;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-    TextContent, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CreateTaskResult,
+    Implementation, InputRequiredResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerConfig, TextContent, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, serve_server};
@@ -102,6 +102,46 @@ pub const FIXTURE_SLOW_DELAY_MS: u64 = 1_500;
 /// there". The tool reports the directory the operating system gave it rather than one it was told about.
 pub const FIXTURE_CWD: &str = "cwd";
 
+/// The variable's value for a peer that answers a call with **a task handle** rather than a result.
+///
+/// **It exists to show that JARVIS's own answer to a task handle is never the one a caller meets.** The
+/// adapter has a considered arm for this: `call.rs` refuses a task handle with its own code,
+/// `mcp.response_not_complete`, on the reading that answering one is polling a lifecycle this build does not
+/// implement. That arm is correct and it is **unreachable**, for two independent reasons — the SDK's client
+/// helper converts the response to `ServiceError::UnexpectedResponse` before any JARVIS decision function is
+/// consulted, and the SDK's *server* half refuses to emit a task handle at all unless the client declared the
+/// tasks extension capability, which `JarvisClient` deliberately does not. A fixture that can produce the
+/// response is the only way to observe which answer actually arrives.
+///
+/// The tool is the ordinary one, so nothing else about the session differs: only the answer's shape is the
+/// variable under test.
+pub const FIXTURE_TASK: &str = "task";
+
+/// The variable's value for a peer that answers a call with **`input_required`, forever**.
+///
+/// **It exists to pin which bound actually ends an exhausted round.** `MAX_MRTR_ROUNDS` is JARVIS's cap and
+/// is passed to the SDK's loop as `max_rounds`, so the loop stops at JARVIS's number — but the *class* a
+/// caller receives is neither JARVIS's `mcp.round_limit_exceeded` (which no longer exists) nor the class
+/// `call.rs` would assign an input round (which is never consulted). It is `tool.limit_exceeded`, because
+/// the SDK reports `InputRequiredRoundsExceeded` and `classify_service_error` maps it.
+///
+/// The answer carries a `request_state`, and that is load-bearing: a round with **no** requests and no state is
+/// rejected by the SDK's own loop as `UnexpectedResponse` before any retry, so a fixture without one would pin
+/// a different defect than the round cap.
+pub const FIXTURE_INPUT_REQUIRED: &str = "input-required";
+
+/// The variable's value for a peer that answers every attempt with **a `request_state` and no request**.
+///
+/// **This is the only shape that reaches the round cap, and that is the finding.** A round that *names* a
+/// request is answered by JARVIS's handler with `-32602`, which propagates out of the SDK's loop as an error
+/// before the next round — so the cap is never reached for a server that actually asks a question. A round
+/// carrying only a `request_state` consults no handler at all, so the loop retries until `max_rounds` and the
+/// cap is what ends the call.
+///
+/// So `FIXTURE_INPUT_REQUIRED` and this fixture exist as a **pair**: together they show that a bound JARVIS
+/// describes as its own is reachable only through a shape that asks JARVIS nothing.
+pub const FIXTURE_STATE_ONLY: &str = "state-only";
+
 /// The tool name the standard and legacy fixtures offer.
 pub const FIXTURE_TOOL_NAME: &str = "read_file";
 
@@ -119,6 +159,22 @@ pub const FIXTURE_CALL_TEXT: &str = "fixture result for read_file";
 
 /// The version the legacy fixture reports, and the only one it reports.
 pub const FIXTURE_LEGACY_VERSION: ProtocolVersion = ProtocolVersion::V_2025_06_18;
+
+/// How a fixture answers a call, for the shapes that are not a completed result.
+///
+/// An enum rather than two booleans, because only one of these can apply to a call and a pair of flags would
+/// make the impossible combination representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundAnswer {
+    /// Answer with a completed result, which is what most fixtures do.
+    Complete,
+    /// Answer `input_required` naming a request, which JARVIS refuses by kind.
+    Refuses,
+    /// Answer `input_required` carrying only a `request_state`, so no handler is consulted.
+    StateOnly,
+    /// Answer with a task handle rather than a result.
+    Task,
+}
 
 /// An MCP server that behaves as the selected fixture.
 #[derive(Debug, Clone)]
@@ -143,6 +199,11 @@ struct FixtureServer {
     /// The child reports what the operating system gave it, so a test asserting the text is asserting where
     /// the process actually is rather than what it was told.
     report_cwd: bool,
+    /// Whether a call answers with a **task handle** rather than a completed result.
+    ///
+    /// The multi-round-trip and task shapes are one field because they are one decision: what *kind* of
+    /// answer this fixture gives. Two booleans would let a caller set a combination that cannot happen.
+    answer: RoundAnswer,
 }
 
 impl ServerHandler for FixtureServer {
@@ -205,6 +266,7 @@ impl ServerHandler for FixtureServer {
         let withhold = self.withhold_answer;
         let answer_after_ms = self.answer_after_ms;
         let report_cwd = self.report_cwd;
+        let answer = self.answer;
         async move {
             if !tools.contains(&name.as_ref()) {
                 return Err(rmcp::ErrorData::new(
@@ -227,6 +289,43 @@ impl ServerHandler for FixtureServer {
             if let Some(delay) = answer_after_ms {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
+            // The two multi-round-trip shapes, and the difference between them is the whole finding: naming a
+            // request makes JARVIS's handler answer `-32602`, which ends the call at round one, while a
+            // `request_state` alone consults no handler and retries until the cap.
+            match answer {
+                RoundAnswer::Refuses => {
+                    let Ok(required) = input_required(Some(serde_json::json!({
+                        "roots": {"method": "roots/list", "params": {}},
+                    }))) else {
+                        return Err(fixture_build_failure());
+                    };
+                    return Ok(CallToolResponse::InputRequired(required));
+                }
+                RoundAnswer::StateOnly => {
+                    let Ok(required) = input_required(None) else {
+                        return Err(fixture_build_failure());
+                    };
+                    return Ok(CallToolResponse::InputRequired(required));
+                }
+                RoundAnswer::Task => {
+                    // Built from the **wire form** rather than a constructor, because `CreateTaskResult` has
+                    // no public constructor here — deserializing the documented shape is the only way this
+                    // fixture can produce the response a real server sends.
+                    let task: CreateTaskResult = match serde_json::from_value(serde_json::json!({
+                        "resultType": "task",
+                        "taskId": "fixture-task",
+                        "status": "working",
+                        "createdAt": "2026-10-03T00:00:00Z",
+                        "lastUpdatedAt": "2026-10-03T00:00:00Z",
+                        "ttlMs": null,
+                    })) {
+                        Ok(task) => task,
+                        Err(_) => return Err(fixture_build_failure()),
+                    };
+                    return Ok(CallToolResponse::Task(task));
+                }
+                RoundAnswer::Complete => {}
+            }
             // The process reports where it **is**, which is the only way to prove `current_dir` reached it.
             let text = if report_cwd {
                 std::env::current_dir().map_or_else(
@@ -243,6 +342,36 @@ impl ServerHandler for FixtureServer {
     }
 }
 
+/// The one failure a fixture can report about **its own** construction.
+///
+/// A construction site rather than three, so a broken literal reads the same wherever it is built. A fixture
+/// that could not build its own answer has no protocol-level explanation, so this is an internal error.
+fn fixture_build_failure() -> rmcp::ErrorData {
+    rmcp::ErrorData::new(
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "the fixture answer did not build",
+        None,
+    )
+}
+
+/// Builds an `input_required` answer, with a request when one is named.
+///
+/// The two shapes are one function because they differ by exactly one field, and the *field* is what the
+/// caller has to decide — passing `None` produces the state-only round that reaches the round cap, while a
+/// request produces the round JARVIS answers with `-32602`.
+fn input_required(
+    input_requests: Option<serde_json::Value>,
+) -> Result<InputRequiredResult, serde_json::Error> {
+    let mut answer = serde_json::json!({
+        "resultType": "input_required",
+        "requestState": "fixture-state",
+    });
+    if let Some(requests) = input_requests {
+        answer["inputRequests"] = requests;
+    }
+    serde_json::from_value(answer)
+}
+
 /// Selects the fixture named by the environment, or `None` when the variable is absent.
 ///
 /// `None` is **not** an error: it is how this program behaves when Cargo runs it as an example build, where
@@ -257,6 +386,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: None,
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_LEGACY => FixtureServer {
             supported: vec![FIXTURE_LEGACY_VERSION],
@@ -264,6 +394,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: None,
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_ALL_REFUSED => FixtureServer {
             supported: both,
@@ -271,6 +402,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: None,
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_PARTIAL => FixtureServer {
             supported: both,
@@ -280,6 +412,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: None,
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_UNANSWERED => FixtureServer {
             supported: both,
@@ -287,6 +420,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: true,
             answer_after_ms: None,
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_SLOW => FixtureServer {
             supported: both,
@@ -294,6 +428,7 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: Some(FIXTURE_SLOW_DELAY_MS),
             report_cwd: false,
+            answer: RoundAnswer::Complete,
         },
         FIXTURE_CWD => FixtureServer {
             supported: both,
@@ -301,6 +436,35 @@ fn selected_fixture() -> Option<FixtureServer> {
             withhold_answer: false,
             answer_after_ms: None,
             report_cwd: true,
+            answer: RoundAnswer::Complete,
+        },
+        // The ordinary tool and the ordinary timing, so the **answer's shape** is the only variable — which is
+        // what makes the resulting class attributable to the task handle rather than to anything else.
+        FIXTURE_TASK => FixtureServer {
+            supported: both,
+            tools: &[FIXTURE_TOOL_NAME],
+            withhold_answer: false,
+            answer_after_ms: None,
+            report_cwd: false,
+            answer: RoundAnswer::Task,
+        },
+        // The ordinary tool again, so the only variable is that every answer is a further round.
+        FIXTURE_INPUT_REQUIRED => FixtureServer {
+            supported: both,
+            tools: &[FIXTURE_TOOL_NAME],
+            withhold_answer: false,
+            answer_after_ms: None,
+            report_cwd: false,
+            answer: RoundAnswer::Refuses,
+        },
+        // And the same answer **without a request**, which is the only shape that reaches the round cap.
+        FIXTURE_STATE_ONLY => FixtureServer {
+            supported: both,
+            tools: &[FIXTURE_TOOL_NAME],
+            withhold_answer: false,
+            answer_after_ms: None,
+            report_cwd: false,
+            answer: RoundAnswer::StateOnly,
         },
         _ => return None,
     };

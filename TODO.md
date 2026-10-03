@@ -5654,6 +5654,44 @@ Dependencies: Milestone 2 exit gate.
     search of `TODO.md` for `EXIT_ATTENTION` finds nothing before this line, so it was **not** already named
     in `BRN-079`'s orbit as an earlier draft of this sentence claimed. It is named rather than changed in this
     slice, because changing it moves every subcommand's exit code at once.
+  - **Slice 29: a task-handle response reaches a caller as a class JARVIS's own code says it cannot.** The
+    adapter has a deliberate, unit-tested arm for `CallToolResponse::Task` — `call.rs`'s `decide_response`
+    refuses it with its own code, `mcp.response_not_complete`, classed `OutputInvalid`, on the reading that
+    answering one means polling a lifecycle this build does not implement. **A caller never meets that arm.**
+    Two links explain it, and the second is the one no reading of `call.rs` would find:
+    1. the SDK's **client** helper matches the variant itself and returns `ServiceError::UnexpectedResponse`
+       (SEP-2663: `call_tool_with_mrtr_max_rounds` "does not drive the task polling lifecycle"), so no JARVIS
+       decision function is consulted;
+    2. and a **conforming server never sends one at all**, because the SDK's *server* half refuses to emit a
+       task handle unless the client declared the tasks extension capability — which `JarvisClient`
+       deliberately does not, declaring no server-initiated capabilities.
+    So what arrives is the JSON-RPC code `-32021` (`MISSING_REQUIRED_CLIENT_CAPABILITY`) as an *error*,
+    which `outcome::classify_error_code` classes **`Unavailable`** — a different class with the opposite retry
+    posture (`Unavailable` is `Safe`; `OutputInvalid` is `Never`).
+  - **⚠ The first detector was vacuous, and mutating it is what said so.** The test derived its expectation by
+    calling `classify_error_code` with the code it expected, and the mutation to a *different* code sharing the
+    same class (`UNSUPPORTED_PROTOCOL_VERSION`, also `Unavailable`) left it **green**. What the port exposes is
+    the class, not the code — `ToolExecutionError::Failed` carries a `ToolErrorClass` and the JSON-RPC code the
+    SDK consumed is not observable from the test — so the lookup tied nothing down. Rewritten to assert the
+    class literally, plus a `assert_ne!` against `OutputInvalid` so the disagreement between the documented arm
+    and the delivered class is recorded rather than assumed. The mutation (`OutputInvalid`) then fails it with
+    `left: Failed(Unavailable)`.
+  - **And a second discriminator, because `Unavailable` has three producers.** A closed socket, a transport
+    that could not send, and the `-32020`/`-32021` door refusals all produce it, so the class alone does not
+    say which happened — precisely the weakness the first version had. The test now also asserts the session
+    is **still open**, which distinguishes a JSON-RPC error *response* on a live session from a dropped
+    connection reporting the same class.
+  - **Two claims were corrected, and one was mine.** `outcome.rs`'s grouping arm said `-32020`/`-32021` mean
+    "a capability JARVIS did not declare" and left it there; that is where a reader would stop, and it does not
+    say that a *task handle* is how an operator meets the code. The reachability note now names the task
+    response explicitly and points at the test. `call.rs`'s arm gained the two-link explanation above, because
+    the arm reads as live and is not.
+  - **Falsified once, properly.** Changing the asserted class to `OutputInvalid` fails
+    `a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jarvis` with
+    `left: Failed(Unavailable), right: Failed(OutputInvalid)`, then restored to `0`. The first mutation — a
+    different code in the same class — is recorded because it *survived*, which is the finding.
+  - 1921 workspace tests (+1: `mcp_executor_process` 9, up from 8). All gates green (fmt, clippy, test, doc,
+    both docs gates). **DO NOT COMMIT.**
   - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
     dies *during* a run is not yet noticed and quarantined; the executor refuses a dispatch to it and `health`
     reports it, but **nothing acts on it** — no pass prunes, quarantines, or re-launches, and a dispatch that
@@ -5663,6 +5701,50 @@ Dependencies: Milestone 2 exit gate.
     a removal needs no release path *today* — it becomes needed when the registry is held); the `[mcp]` table
     in the operator docs; a reviewed TLS choice before the remote half; the remaining `Test Plan` items; and
     `TLS-009`/`TLS-010`.
+  - **Slice 30: a round cap JARVIS described as its own was produced by dead code, and the shape that reaches
+    it asks JARVIS nothing.** `invocation.rs` carried a `next_round` counter and an
+    `McpInvocationRefusal::RoundLimitExceeded` variant whose doc said a caller would "refuse *before* handing
+    the call over" so that "JARVIS's refusal is the one an operator sees". Three things were wrong:
+    1. **nothing called it.** The only references were a doc comment and two tests, so a `pub fn` kept alive
+       by a test whose whole purpose was to exercise it — the shape `BRN-066` swept for and this one slipped
+       through because the *reference count was non-zero*.
+    2. **The code it produced (`mcp.round_limit_exceeded`) is not one an operator can meet.** What ends an
+       exhausted round is the SDK's `InputRequiredRoundsExceeded`, which `classify_service_error` maps to
+       `LimitExceeded` — contract code `tool.limit_exceeded`.
+    3. **⚠ And the cap is reachable only through a round that asks JARVIS nothing.** A round that *names* a
+       request is answered by `JarvisClient` with `-32602`, which propagates out of the SDK's loop as an error
+       at **round one** — so the round cap is never reached for a server that actually asks a question. My
+       first test predicted `LimitExceeded` for that shape and observed `SchemaInvalid`; the second test uses a
+       `request_state`-only round, which consults no handler, to reach the cap.
+  - **Deleted rather than wired up, and the difference is the earlier lesson.** `BRN-065`'s rule was "do not
+    enforce a rule that is wrong"; here the rule was fine and the *caller* did not exist, and the loop that
+    would call it is the SDK's and is not interceptable per-round. A counter here would be a second answer to
+    a question the SDK already answers, so `next_round`, `RoundLimitExceeded`, its code and its two tests were
+    removed and the compile-time assertion on `MAX_MRTR_ROUNDS` was re-justified (it is now stated for what it
+    is: the value passed to the SDK as `max_rounds`).
+  - **Two fixtures, because the finding is a pair.** `FIXTURE_INPUT_REQUIRED` answers with a named request;
+    `FIXTURE_STATE_ONLY` answers with a `request_state` and no request. Their two tests assert the *inverse*
+    classes (`SchemaInvalid` vs `LimitExceeded`), which is what makes them a discriminator rather than two
+    restatements. The fixture's answer shape became a `RoundAnswer` enum rather than two booleans, so the
+    impossible combination is unrepresentable.
+  - **Falsified by swapping the two fixtures** — the sharpest mutation available, since the tests are
+    inverses: `executor_over_state_only_fixture` pointed at `FIXTURE_INPUT_REQUIRED` fails
+    `a_state_only_round_reaches_the_round_cap_as_a_limit` with `left: Failed(SchemaInvalid), right:
+    Failed(LimitExceeded)`, then restored to `0`. Both tests also assert the session is still open, so a
+    dropped transport reporting the same class cannot satisfy either.
+  - 1921 workspace tests (net zero: −2 dead-code tests, +2 real ones; `mcp_executor_process` 11, up from 8).
+    All gates green (fmt, clippy, test, doc, both docs gates). **DO NOT COMMIT.**
+  - **⚠ Recovered from a self-inflicted file loss, recorded because the cause is repeatable.** Adding a field
+    to the fixture's seven construction sites, I used `(Get-Content f) -replace ... | Set-Content -NoNewline f`
+    — an **array** into `Set-Content -NoNewline` — which collapsed the 314-line file to **one 22,761-byte
+    line**. `git checkout HEAD --` restored the base, but slice 29's fixture changes were uncommitted and were
+    lost, so both slices' fixture work was re-applied by hand. The detection was `Measure-Object -Line`
+    reporting 9 lines and a `git diff --stat` of `9 insertions(+), 341 deletions(-)` for a file that should
+    have grown. Use the edit tools, or `[IO.File]::ReadAllText`/`Replace`/`WriteAllText(UTF8($false))` which
+    operates on one string; and check the line count after any bulk write.
+  - **Also repaired:** `cargo fmt` left `invocation.rs` with CRLF on a file marked `eol=lf`, caught by
+    `git ls-files --eol` showing `w/crlf  attr/text eol=lf`. Rewritten with the LF-only write, verified back
+    to `w/lf`, and the suite re-run green afterwards.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
   the source layers a policy version was merged from, so the contract's `GET` requirement stops being

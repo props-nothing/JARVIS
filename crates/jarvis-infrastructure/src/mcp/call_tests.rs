@@ -26,7 +26,7 @@
 use super::{
     McpCallRefusal, ResponseDecision, call_params, decide_response, normalize_response, wire_name,
 };
-use crate::mcp::invocation::{MAX_MRTR_ROUNDS, McpInvocationRefusal, next_round};
+use crate::mcp::invocation::McpInvocationRefusal;
 use crate::mcp::outcome::classify_service_error;
 use jarvis_domain::model::policy::Sensitivity;
 use jarvis_domain::tool::call::ToolArguments;
@@ -393,23 +393,6 @@ fn a_cancellation_is_the_callers_own_decision_rather_than_a_provider_fault() {
     let cancelled = classify_service_error(&rmcp::ServiceError::Cancelled { reason: None });
     assert_eq!(cancelled, ToolErrorClass::Cancelled);
     assert!(!cancelled.is_unsettled());
-}
-
-#[test]
-fn the_round_bound_is_the_guards_and_not_a_second_counter() {
-    // The bound belongs to `invocation.rs`, where it is asserted below the SDK's own cap at compile time.
-    // This test pins that the call layer *reaches* that bound rather than defining one: the same constant,
-    // and the same refusal carrying the same limit.
-    let refusal = next_round(MAX_MRTR_ROUNDS).expect_err("the bound must refuse at the limit");
-    assert_eq!(
-        refusal,
-        McpInvocationRefusal::RoundLimitExceeded {
-            max: MAX_MRTR_ROUNDS
-        }
-    );
-    assert_eq!(refusal.code(), "mcp.round_limit_exceeded");
-    // And one below the bound advances, so this is not a function that always refuses.
-    assert_eq!(next_round(0), Ok(1), "the first round must advance");
 }
 
 #[test]

@@ -30,11 +30,20 @@
 //! # What is decided here, and what is deliberately not
 //!
 //! Everything in this module is a pure function of values, so each decision is testable without a server —
-//! the split `client.rs` and `outcome.rs` already use. The one thing **not** here is the multi round-trip
-//! **loop**: driving it needs the SDK's client, so this module owns the per-response decision
-//! ([`decide_response`]) and leaves the round bound to [`super::invocation::next_round`], whose
-//! `MAX_MRTR_ROUNDS` is asserted below the SDK's own cap at compile time. A counter in this module would be
-//! a second answer to one question.
+//! the split `client.rs` and `outcome.rs` already use. The multi round-trip **loop** is the SDK's:
+//! driving it needs its client, and it is not interceptable per-round, which is why this module owns the
+//! per-response decision ([`decide_response`]) and nothing at all owns a round counter. JARVIS's
+//! contribution to the loop is the **cap** it passes — [`super::invocation::MAX_MRTR_ROUNDS`] — and the
+//! refusal *policy* for a round it is asked about.
+//!
+//! **Two of this module's arms are unreachable from a live session, and a reader must not treat them as
+//! live.** `decide_response` is not called on the call path at all — `McpToolExecutor::invoke` goes
+//! straight through `normalize_response` — and the SDK's loop is what meets a multi round-trip response:
+//! it converts a task handle itself, and for `input_required` it routes each request to `JarvisClient`,
+//! which refuses by kind. Both unreachable arms are nonetheless correct and kept, because they are the
+//! honest answer for the *response shape* and the fail-safe direction if the SDK's helper ever stops
+//! swallowing a variant. What a caller actually meets is pinned against a real child in
+//! `mcp_executor_process`.
 
 use jarvis_domain::tool::call::{ToolArguments, ToolResultBody};
 use jarvis_domain::tool::error_class::ToolErrorClass;
@@ -166,6 +175,13 @@ pub fn call_params(
 /// Two arms, and the second is why this type exists rather than a `bool`: "the server asked for input
 /// JARVIS will not provide" is a different operator fact from "the call failed", and a caller that
 /// collapsed them would report a policy refusal as a server fault.
+///
+/// **Neither arm is reached through the executor, which is the point of the type rather than a defect in
+/// it.** `McpToolExecutor::invoke` calls `normalize_response` directly — it never asks `decide_response` —
+/// so the decision below is a *policy* expression whose production consumers are the handler overrides in
+/// `client.rs` (same vocabulary, same codes) and the tests. Anything the loop cannot hand to the handler
+/// reaches the port as an error class instead, which is why the executor's own assertions are about
+/// [`ToolErrorClass`] and not about this enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseDecision {
     /// A completed result, ready for [`normalize_response`].
@@ -227,6 +243,27 @@ pub fn decide_response(
                 }),
             }
         }
+        // **Unreachable in the call path, for two reasons, and the second one is the interesting one.**
+        //
+        // The first is the same shape as the `InputRequired` arm above: the SDK's own loop matches these
+        // variants before any JARVIS decision function is consulted, and it converts a task handle to
+        // `ServiceError::UnexpectedResponse` (SEP-2663: `call_tool_with_mrtr_max_rounds` "does not drive the
+        // task polling lifecycle").
+        //
+        // The second is that **a conforming server never sends this at all**, because the SDK's server half
+        // refuses to emit a task handle unless the client declared the tasks extension capability — and
+        // `JarvisClient` deliberately declares no server-initiated capabilities. So what a non-conforming or
+        // older-peer server produces is the JSON-RPC code `-32021`
+        // (`MISSING_REQUIRED_CLIENT_CAPABILITY`), which reaches this adapter as an error rather than as a
+        // response, and `outcome::classify_error_code` classes it `Unavailable` — a *different* class from the
+        // `OutputInvalid` assigned below.
+        //
+        // **This arm is kept and is correct**: it is the honest answer for the response shape, it is
+        // unit-tested through `decide_response`, and it is the fail-safe direction if the SDK's helper ever
+        // stops swallowing the variant. But a reader must not conclude from it that a task handle reaches a
+        // caller as `mcp.response_not_complete`; `mcp_executor_process`'s
+        // `a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jarvis` pins what actually
+        // arrives, against a real child process.
         CallToolResponse::Task(_) => Err(McpCallRefusal::ResultRefused {
             code: "mcp.response_not_complete",
             reason: "the server returned a task handle rather than a result".to_owned(),
