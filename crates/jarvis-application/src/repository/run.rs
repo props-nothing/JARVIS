@@ -117,6 +117,12 @@ pub struct NewRun {
     pub conversation_id: ConversationId,
     /// The principal that requested it.
     pub principal_id: PrincipalId,
+    /// The run that delegated this one, when it is a sub-agent run.
+    ///
+    /// Stored in `agent_runs.parent_run_id`, a column the schema reserved from the start. A run with a parent is
+    /// governed exactly as any other — same principal, same policy pipeline — and the link exists so a display can
+    /// show the tree and a cancel can follow it.
+    pub parent_run_id: Option<RunId>,
     /// A bounded reference to the objective, or `None`.
     pub objective_ref: Option<String>,
     /// The instant the run was created.
@@ -184,6 +190,13 @@ impl NewRun {
         self
     }
 
+    /// Returns this request recorded as a sub-agent run of `parent`.
+    #[must_use]
+    pub const fn with_parent(mut self, parent: RunId) -> Self {
+        self.parent_run_id = Some(parent);
+        self
+    }
+
     /// Builds a run creation request under `budget`.
     ///
     /// The deadline is taken from the budget rather than passed separately, so a run
@@ -215,6 +228,7 @@ impl NewRun {
             workspace_id,
             conversation_id,
             principal_id,
+            parent_run_id: None,
             objective_ref,
             created_at,
             // The native runtime is the default because it is the only one this build can serve;
@@ -241,6 +255,8 @@ pub struct StoredRun {
     pub conversation_id: ConversationId,
     /// The requesting principal.
     pub principal_id: PrincipalId,
+    /// The run that delegated this one, when it is a sub-agent run.
+    pub parent_run_id: Option<RunId>,
     /// The current state.
     pub state: RunState,
     /// The optimistic version.
@@ -1115,6 +1131,7 @@ mod tests {
             workspace_id: workspace(),
             conversation_id: conversation(),
             principal_id: principal(),
+            parent_run_id: None,
             state: RunState::Completed,
             version: RunVersion::new(9),
             objective_ref: None,

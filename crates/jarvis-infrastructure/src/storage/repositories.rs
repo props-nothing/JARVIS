@@ -287,6 +287,12 @@ fn stored_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, RepositoryErro
                 column: "principal_id",
             }
         })?,
+        parent_run_id: opt_text(row, "parent_run_id")?
+            .map(|value| RunId::parse(&value))
+            .transpose()
+            .map_err(|_| RepositoryError::Corrupted {
+                column: "parent_run_id",
+            })?,
         state,
         version: RunVersion::new(
             u64::try_from(version_value)
@@ -347,7 +353,7 @@ fn stored_run(row: &sqlx::sqlite::SqliteRow) -> Result<StoredRun, RepositoryErro
 /// copy, and the failure appears in whichever one was forgotten.
 macro_rules! run_columns {
     () => {
-        "id, workspace_id, conversation_id, principal_id, state, version, \
+        "id, workspace_id, conversation_id, parent_run_id, principal_id, state, version, \
          objective_ref, created_at, started_at, updated_at, completed_at, \
          error_code, waiting_kind, waiting_ref, deadline_at, budget_json, \
          runtime_id, runtime_version"
@@ -429,11 +435,12 @@ async fn insert_run(
              id, workspace_id, conversation_id, parent_run_id, principal_id, \
              objective_ref, state, version, deadline_at, budget_json, \
              runtime_id, runtime_version, created_at, updated_at\
-         ) VALUES (?, ?, ?, NULL, ?, ?, 'received', 1, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, 'received', 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run.id.to_string())
     .bind(run.workspace_id.to_string())
     .bind(run.conversation_id.to_string())
+    .bind(run.parent_run_id.map(|parent| parent.to_string()))
     .bind(run.principal_id.to_string())
     .bind(run.objective_ref.as_deref())
     // The deadline column and the serialized budget come from the same value, so the

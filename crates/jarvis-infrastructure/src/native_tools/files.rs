@@ -256,7 +256,7 @@ pub fn definitions(roots: &[RootInfo]) -> Result<Vec<Definition>, DomainError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build(
+pub(super) fn build(
     capability: &str,
     schema: &str,
     display: &str,

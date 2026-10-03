@@ -129,6 +129,7 @@ async fn call(
 ) -> Result<jarvis_domain::tool::call::ToolResultBody, ToolExecutionError> {
     let arguments = ToolArguments::new("{}").expect("usable text");
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,

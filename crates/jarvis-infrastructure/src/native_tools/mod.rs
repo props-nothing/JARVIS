@@ -23,6 +23,7 @@
 //! `identity.capability.to_string()`, which includes the major version — so `clock.now@2` is a
 //! *different* tool and, with no arm for it, is refused rather than answered by `@1`.
 
+pub mod agents;
 pub mod clock;
 pub mod files;
 
@@ -90,22 +91,36 @@ impl Definition {
 /// Returns a construction refusal when a reviewed definition is inconsistent — a typo in a schema or
 /// a version whose major disagrees with its capability.
 pub fn definitions() -> Result<Vec<Definition>, jarvis_domain::error::DomainError> {
-    definitions_with(None)
+    definitions_with(NativeSurface::default())
 }
 
-/// As [`definitions`], plus the file tools when roots are configured.
+/// The optional native tool families a daemon composes beyond the clock.
 ///
-/// With `None` — the default profile — no filesystem capability is offered at all.
+/// One value rather than a parameter per family, because each new family would otherwise grow every composition
+/// function's argument list. **A family is present only when the profile asked for it**: the default surface
+/// offers the clock and nothing that touches files or spends model budget.
+#[derive(Clone, Copy, Default)]
+pub struct NativeSurface<'a> {
+    /// The opened file roots; their presence offers the file tools.
+    pub files: Option<&'a files::FileRoots>,
+    /// The delegation slot; its presence offers `agents.delegate@1`.
+    pub delegation: Option<&'a jarvis_application::run_service::delegation::DelegatorSlot>,
+}
+
+/// As [`definitions`], plus the tool families `surface` carries.
 ///
 /// # Errors
 ///
 /// Returns a construction refusal when a reviewed definition is inconsistent.
 pub fn definitions_with(
-    files: Option<&files::FileRoots>,
+    surface: NativeSurface<'_>,
 ) -> Result<Vec<Definition>, jarvis_domain::error::DomainError> {
     let mut all = vec![Definition::build(clock::definition, clock::INPUT_SCHEMA)?];
-    if let Some(roots) = files {
+    if let Some(roots) = surface.files {
         all.extend(files::definitions(&roots.info())?);
+    }
+    if surface.delegation.is_some() {
+        all.push(agents::definition()?);
     }
     Ok(all)
 }
@@ -137,6 +152,8 @@ pub struct NativeExecutor {
     clock: std::sync::Arc<dyn Clock>,
     /// The opened file roots, when the profile declares any. `None` means a file capability is refused.
     files: Option<files::FileRoots>,
+    /// The delegation slot, when sub-agents are enabled. `None` means `agents.delegate@1` is refused.
+    delegation: Option<jarvis_application::run_service::delegation::DelegatorSlot>,
 }
 
 impl std::fmt::Debug for NativeExecutor {
@@ -153,7 +170,21 @@ impl NativeExecutor {
     /// Builds an executor over `clock`.
     #[must_use]
     pub fn new(clock: std::sync::Arc<dyn Clock>) -> Self {
-        Self { clock, files: None }
+        Self {
+            clock,
+            files: None,
+            delegation: None,
+        }
+    }
+
+    /// Returns this executor serving `agents.delegate@1` through `slot`.
+    #[must_use]
+    pub fn with_delegation(
+        mut self,
+        slot: jarvis_application::run_service::delegation::DelegatorSlot,
+    ) -> Self {
+        self.delegation = Some(slot);
+        self
     }
 
     /// Returns this executor serving the file tools over `roots`.
@@ -170,7 +201,9 @@ impl NativeExecutor {
     #[must_use]
     pub fn supports(identity: &ToolIdentity) -> bool {
         let capability = identity.capability.to_string();
-        capability == clock::CAPABILITY || files::is_file_tool(&capability)
+        capability == clock::CAPABILITY
+            || files::is_file_tool(&capability)
+            || agents::is_agent_tool(&capability)
     }
 
     /// Returns the capability this executor refuses, for its own fail-closed assertion.
@@ -196,6 +229,21 @@ impl ToolExecutor for NativeExecutor {
                 return Err(ToolExecutionError::Cancelled);
             }
             let capability = request.identity.capability.to_string();
+            if agents::is_agent_tool(&capability) {
+                // Delegation waits on another run, so it is async and not a blocking-pool job; it is refused when
+                // no slot was composed, since the catalog does not offer the tool then.
+                let Some(slot) = self.delegation.as_ref() else {
+                    return Err(ToolExecutionError::Failed(ToolErrorClass::NotFound));
+                };
+                return agents::execute(
+                    slot,
+                    request.caller,
+                    request.arguments.as_str(),
+                    request.timeout_ms,
+                    cancel,
+                )
+                .await;
+            }
             if files::is_file_tool(&capability) {
                 // **Blocking filesystem work runs off the async threads**, and a file tool is refused when no
                 // root was composed — the catalog does not offer one then, so reaching here is a call to a

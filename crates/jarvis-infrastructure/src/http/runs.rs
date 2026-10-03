@@ -367,6 +367,7 @@ pub async fn read_run(
             &RunView {
                 run_id: stored.id.to_string(),
                 conversation_id: stored.conversation_id.to_string(),
+                parent_run_id: stored.parent_run_id.map(|parent| parent.to_string()),
                 state: wire_state(stored.state).to_owned(),
                 version: stored.version.get(),
                 created_at: stored.created_at.to_string(),
@@ -437,6 +438,7 @@ pub async fn list_runs(
                     .map(|run| ActiveRunView {
                         run_id: run.id.to_string(),
                         conversation_id: run.conversation_id.to_string(),
+                        parent_run_id: run.parent_run_id.map(|parent| parent.to_string()),
                         state: wire_state(run.state).to_owned(),
                         awaiting_approval: run.state == RunState::AwaitingApproval,
                         created_at: run.created_at.to_string(),

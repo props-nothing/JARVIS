@@ -414,6 +414,23 @@ pub struct ToolExecutionRequest<'a> {
     pub started_at: UtcTimestamp,
     /// The tool's declared timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Who the call is being made for, from **trusted context** (never from the arguments).
+    ///
+    /// Most tools do not need it. A tool that acts *as* the caller — delegating work to a sub-agent run under
+    /// the same principal and workspace — does, and it must take the identity from here rather than from
+    /// anything the model wrote. `None` only for a caller with no run, such as a test.
+    pub caller: Option<ToolCaller>,
+}
+
+/// The trusted identity of the run a tool call is made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCaller {
+    /// The workspace the run belongs to.
+    pub workspace: WorkspaceId,
+    /// The principal the run acts for.
+    pub principal: PrincipalId,
+    /// The run making the call.
+    pub run: RunId,
 }
 
 /// Performs the effect for one validated, authorized call.
@@ -853,6 +870,11 @@ impl ToolCallService {
             &definition,
             &identity,
             &intent.arguments,
+            ToolCaller {
+                workspace,
+                principal,
+                run,
+            },
             cancel,
         )
         .await
@@ -968,6 +990,11 @@ impl ToolCallService {
                     &definition,
                     &identity,
                     &intent.arguments,
+                    ToolCaller {
+                        workspace,
+                        principal,
+                        run,
+                    },
                     cancel,
                 )
                 .await
@@ -1076,6 +1103,7 @@ impl ToolCallService {
         definition: &ToolDefinition,
         identity: &ToolIdentity,
         arguments: &ToolArguments,
+        caller: ToolCaller,
         cancel: &CancellationScope,
     ) -> Result<ToolCallOutcome, ToolServiceError> {
         // The instant the decision was made is read again rather than threaded through, because the
@@ -1101,6 +1129,7 @@ impl ToolCallService {
                     arguments,
                     started_at,
                     timeout_ms: definition.execution.timeout_ms,
+                    caller: Some(caller),
                 },
                 cancel,
             )

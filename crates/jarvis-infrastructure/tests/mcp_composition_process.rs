@@ -155,6 +155,7 @@ async fn a_declared_working_directory_is_the_one_a_spawned_child_actually_runs_i
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "where_am_i",
         arguments: &arguments,
@@ -257,6 +258,7 @@ async fn a_declared_server_becomes_a_callable_tool_through_the_whole_chain() {
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -480,6 +482,7 @@ async fn an_identity_no_server_admitted_is_refused_rather_than_served_by_another
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity: &re_schemed,
         display_name: "read_file",
         arguments: &arguments,

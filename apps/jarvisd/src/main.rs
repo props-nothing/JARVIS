@@ -212,6 +212,7 @@ fn compose_provider(
         .with_reviewed_deny_rules(reviewed)
         .with_autonomy(layered.tools.autonomy)
         .with_file_roots(file_roots)
+        .with_agents(layered.tools.agents.enabled)
         .with_mcp_servers(mcp_servers))
 }
 

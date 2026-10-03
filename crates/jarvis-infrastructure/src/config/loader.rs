@@ -338,6 +338,32 @@ pub struct ToolsSection {
     /// root and a path inside it.
     #[serde(default, skip_serializing_if = "FilesSection::is_empty")]
     pub files: FilesSection,
+    /// Sub-agents: whether a run may delegate a task to another run.
+    ///
+    /// **Off by default**, because delegation spends model budget on the model's own initiative: one request
+    /// can become several runs. It is bounded (two levels deep, four children at once, the parent's deadline)
+    /// and adds no authority — a child is an ordinary run under the same principal, every tool call of which
+    /// is policy-checked and approved or refused on its own — but fanning out cost is a decision the operator
+    /// should make once, here, rather than discover.
+    #[serde(default, skip_serializing_if = "AgentsSection::is_default")]
+    pub agents: AgentsSection,
+}
+
+/// The `[tools.agents]` table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsSection {
+    /// Offer `agents.delegate@1` to the model.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl AgentsSection {
+    // `serde`'s `skip_serializing_if` calls the predicate with a reference, so the signature is not ours to change.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        !self.enabled
+    }
 }
 
 /// The `[tools.files]` table.

@@ -307,7 +307,8 @@ mod tests {
         // earlier version composed the fabric with one function and left the router inside it; the two are now
         // the caller's choice, so the MCP case is the same code path with one more kind registered.
         let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
-        let executor = crate::daemon::router_over(&clock, &[], None);
+        let executor =
+            crate::daemon::router_over(&clock, &[], crate::native_tools::NativeSurface::default());
         let (tools, grants) = crate::daemon::tool_fabric_with(
             database.pool().clone(),
             reviewed,
@@ -315,7 +316,7 @@ mod tests {
             clock,
             Vec::new(),
             jarvis_domain::tool::policy::AutonomyLevel::Ask,
-            None,
+            crate::native_tools::NativeSurface::default(),
         )
         .expect("the reviewed definitions are consistent");
         let repositories = Arc::new(crate::storage::repositories::SqliteRepositories::new(

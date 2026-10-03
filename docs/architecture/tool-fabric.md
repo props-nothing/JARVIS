@@ -174,6 +174,41 @@ are `ReadOnly`/`Low` (unprompted at `balanced`); writes are `Write`/`Moderate` (
 `autonomous` or under a standing approval). The approval prompt carries the root, path and the start of the content.
 Evidence and the open verification items: [filesystem-capability](../research/integrations/filesystem-capability.md).
 
+### Sub-Agents: A Run That Hands Work to Another Run
+
+`agents.delegate@1` lets a run give a **self-contained task** to a *child run* and use its answer, so one request can
+become a small staff. It is a native tool, offered only when the profile says so, because delegation spends model budget
+on the model's own initiative:
+
+```toml
+[tools.agents]
+enabled = true   # default: false
+```
+
+**Delegation adds cost and fan-out, never authority.** The child is an ordinary run with its own conversation: same
+workspace, same principal, same tool pipeline. Every tool call it makes is validated, policy-checked, and approved or
+refused on its own, and a call that needs a person parks the child like any other run. That is why the tool itself is
+classified `ReadOnly` / `Low` / `Allow` — it changes nothing in the world — and why a delegated task that wants to write a
+file still stops at the file tool's prompt.
+
+The bounds are rules, not hopes, and each is tested against a real daemon:
+
+- **Depth:** a run two levels down cannot delegate (`delegation.depth_exceeded`, class `limit_exceeded`). Depth is counted
+  from the stored `parent_run_id` links, never from anything the model said.
+- **Breadth:** at most four children of one run active at once (`delegation.too_many_children`).
+- **Time:** the child's deadline is clamped to its parent's, and the wait is bounded by the tool's own timeout (five
+  minutes); a wait that runs out stops the child (`timeout`).
+- **Cancellation:** cancelling the waiting parent stops its child, whichever way the child is waiting, including one
+  parked on an approval. The kill switch (`runs stop-all`) reaches children directly, because they are runs in the same
+  workspace.
+- **Identity:** who is delegating comes from the pipeline's trusted caller (workspace, principal, run), never from the
+  arguments, which carry only the task text.
+
+A child that *ends* failed or cancelled is returned to the delegating model as information (`state`, `error_code`), not
+as a tool fault, so it can retry differently or do the work itself. Children appear in `runs list`, the activity feed and
+`GET /api/v1/runs/{id}` with a `parent_run_id`, so a display can draw the tree. Not built: a child with a narrower
+toolset than its parent, per-child budgets, and sub-agents on external runtimes (Milestone 7).
+
 ### Grants Are Configuration, Not Code
 
 **A grant is a durable row an operator writes, and this section exists because it was not always so.** For

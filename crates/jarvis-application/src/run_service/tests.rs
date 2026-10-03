@@ -2290,3 +2290,303 @@ async fn the_feed_never_shows_another_workspaces_events() {
     assert!(page.events.is_empty());
     assert_eq!(page.next_cursor, 0);
 }
+
+/// A spawner that accepts a run and never drives it, so the run stays active for as long as a test needs.
+#[derive(Debug)]
+struct IdleSpawner;
+
+impl RunSpawner for IdleSpawner {
+    fn spawn(&self, _task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {}
+}
+
+mod delegation_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use jarvis_domain::run::state::RunState;
+
+    use super::super::delegation::{
+        DelegationError, DelegationRequest, Delegator, DelegatorSlot, MAX_ACTIVE_CHILDREN,
+        RunDelegator,
+    };
+    use super::super::{ParentLink, RunOptions, TokioSpawner};
+    use super::{Fixture, IdleSpawner, create, fixture, principal, workspace};
+    use crate::cancellation::CancellationScope;
+    use crate::repository::run::RunRepository as _;
+    use crate::tool_call::ToolCaller;
+
+    fn caller(run: jarvis_domain::ids::RunId) -> ToolCaller {
+        ToolCaller {
+            workspace: workspace(),
+            principal: principal(),
+            run,
+        }
+    }
+
+    fn request(run: jarvis_domain::ids::RunId, timeout: Duration) -> DelegationRequest<'static> {
+        DelegationRequest {
+            caller: caller(run),
+            task: "summarize the notes",
+            timeout,
+        }
+    }
+
+    /// A child of `parent`, created through the service and never driven.
+    async fn child_of(
+        fixture: &Fixture,
+        parent: jarvis_domain::ids::RunId,
+        key: &str,
+    ) -> jarvis_domain::ids::RunId {
+        fixture
+            .service
+            .create(
+                &super::context(),
+                None,
+                "child task",
+                key,
+                RunOptions::new().with_parent(ParentLink {
+                    run: parent,
+                    deadline: None,
+                }),
+                &fixture.spawner,
+            )
+            .await
+            .expect("the child is created")
+            .run_id
+    }
+
+    #[tokio::test]
+    async fn a_delegated_task_runs_as_a_child_run_and_its_answer_comes_back() {
+        let fixture = fixture();
+        let parent = create(&fixture, "parent", "k1").await;
+        let repositories = Arc::clone(&fixture.repositories);
+        let service = Arc::new(fixture.service);
+        let delegator = RunDelegator::new(&service, Arc::new(TokioSpawner));
+
+        let outcome = delegator
+            .delegate(
+                request(parent.run_id, Duration::from_secs(20)),
+                &CancellationScope::new(),
+            )
+            .await
+            .expect("the delegation completes");
+        assert_eq!(outcome.state, RunState::Completed);
+        assert_eq!(outcome.answer.as_deref(), Some("the answer"));
+
+        let child = repositories
+            .load(workspace(), outcome.child)
+            .await
+            .expect("loads");
+        assert_eq!(
+            child.parent_run_id,
+            Some(parent.run_id),
+            "the child records its parent"
+        );
+        assert_ne!(
+            child.conversation_id,
+            repositories
+                .load(workspace(), parent.run_id)
+                .await
+                .expect("loads")
+                .conversation_id,
+            "it has its own conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_at_the_depth_limit_cannot_delegate() {
+        let fixture = fixture();
+        let root = create(&fixture, "root", "k1").await;
+        let one = child_of(&fixture, root.run_id, "k2").await;
+        let two = child_of(&fixture, one, "k3").await;
+        let service = Arc::new(fixture.service);
+        let delegator = RunDelegator::new(&service, Arc::new(IdleSpawner));
+
+        let refused = delegator
+            .delegate(
+                request(two, Duration::from_secs(1)),
+                &CancellationScope::new(),
+            )
+            .await
+            .expect_err("a run two levels down is refused");
+        assert_eq!(refused, DelegationError::DepthExceeded);
+        assert_eq!(refused.code(), "delegation.depth_exceeded");
+    }
+
+    #[tokio::test]
+    async fn a_run_cannot_have_more_than_the_allowed_children_active() {
+        let fixture = fixture();
+        let root = create(&fixture, "root", "k0").await;
+        for index in 0..MAX_ACTIVE_CHILDREN {
+            child_of(&fixture, root.run_id, &format!("kid-{index}")).await;
+        }
+        let service = Arc::new(fixture.service);
+        let delegator = RunDelegator::new(&service, Arc::new(IdleSpawner));
+        let refused = delegator
+            .delegate(
+                request(root.run_id, Duration::from_secs(1)),
+                &CancellationScope::new(),
+            )
+            .await
+            .expect_err("the fifth child is refused");
+        assert_eq!(refused, DelegationError::TooManyChildren);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_waiting_parent_stops_the_child_it_started() {
+        let fixture = fixture();
+        let parent = create(&fixture, "parent", "k1").await;
+        let cancellations = Arc::clone(&fixture.cancellations);
+        let repositories = Arc::clone(&fixture.repositories);
+        let service = Arc::new(fixture.service);
+        let delegator = Arc::new(RunDelegator::new(&service, Arc::new(IdleSpawner)));
+        let scope = CancellationScope::new();
+
+        let waiting = {
+            let delegator = Arc::clone(&delegator);
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                delegator
+                    .delegate(request(parent.run_id, Duration::from_secs(30)), &scope)
+                    .await
+            })
+        };
+        let child = loop {
+            let active = repositories.active_runs(workspace()).await.expect("lists");
+            if let Some(found) = active
+                .runs
+                .iter()
+                .find(|run| run.parent_run_id == Some(parent.run_id))
+            {
+                break found.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        scope.cancel();
+        let result = waiting.await.expect("joins");
+        assert_eq!(result, Err(DelegationError::Cancelled));
+        assert!(
+            cancellations
+                .scope_of(child)
+                .is_some_and(|scope| scope.is_cancelled()),
+            "the child was signalled to stop",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_runs_out_stops_the_child_too() {
+        let fixture = fixture();
+        let parent = create(&fixture, "parent", "k1").await;
+        let cancellations = Arc::clone(&fixture.cancellations);
+        let repositories = Arc::clone(&fixture.repositories);
+        let service = Arc::new(fixture.service);
+        let delegator = RunDelegator::new(&service, Arc::new(IdleSpawner));
+
+        let result = delegator
+            .delegate(
+                request(parent.run_id, Duration::from_millis(250)),
+                &CancellationScope::new(),
+            )
+            .await;
+        assert_eq!(result, Err(DelegationError::TimedOut));
+        let active = repositories.active_runs(workspace()).await.expect("lists");
+        let child = active
+            .runs
+            .iter()
+            .find(|run| run.parent_run_id == Some(parent.run_id))
+            .expect("the child exists")
+            .id;
+        assert!(
+            cancellations
+                .scope_of(child)
+                .is_some_and(|scope| scope.is_cancelled())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_task_is_refused_before_any_run_is_created() {
+        let fixture = fixture();
+        let parent = create(&fixture, "parent", "k1").await;
+        let repositories = Arc::clone(&fixture.repositories);
+        let service = Arc::new(fixture.service);
+        let delegator = RunDelegator::new(&service, Arc::new(IdleSpawner));
+        for task in ["", "   ", "has\0nul"] {
+            let refused = delegator
+                .delegate(
+                    DelegationRequest {
+                        caller: caller(parent.run_id),
+                        task,
+                        timeout: Duration::from_secs(1),
+                    },
+                    &CancellationScope::new(),
+                )
+                .await
+                .expect_err("refused");
+            assert_eq!(refused, DelegationError::Invalid, "{task:?}");
+        }
+        let active = repositories.active_runs(workspace()).await.expect("lists");
+        assert!(
+            active.runs.iter().all(|run| run.parent_run_id.is_none()),
+            "no child was created"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_never_outlives_the_parent_it_is_waited_on_by() {
+        let fixture = fixture();
+        let parent = create(&fixture, "parent", "k1").await;
+        let repositories = Arc::clone(&fixture.repositories);
+        // A parent whose deadline is earlier than any default the child would get.
+        let parent_deadline = repositories
+            .load(workspace(), parent.run_id)
+            .await
+            .expect("loads")
+            .deadline_at
+            .expect("a created run carries a deadline");
+        let earlier =
+            jarvis_domain::time::UtcTimestamp::parse("2000-01-01T00:00:00Z").expect("parses");
+        assert!(earlier < parent_deadline);
+        let service = Arc::new(fixture.service);
+        let child = service
+            .create(
+                &super::context(),
+                None,
+                "child task",
+                "kid",
+                RunOptions::new().with_parent(ParentLink {
+                    run: parent.run_id,
+                    deadline: Some(earlier),
+                }),
+                &IdleSpawner,
+            )
+            .await
+            .expect("created");
+        let stored = repositories
+            .load(workspace(), child.run_id)
+            .await
+            .expect("loads");
+        assert_eq!(
+            stored.deadline_at,
+            Some(earlier),
+            "the child is held to the parent's earlier deadline"
+        );
+        assert_eq!(
+            stored.budget.deadline, stored.deadline_at,
+            "the budget and the column agree"
+        );
+    }
+
+    #[test]
+    fn the_slot_is_filled_once_and_an_empty_one_yields_nothing() {
+        let slot = DelegatorSlot::new();
+        assert!(slot.get().is_none());
+        let fixture = fixture();
+        let service = Arc::new(fixture.service);
+        let delegator: Arc<dyn Delegator> =
+            Arc::new(RunDelegator::new(&service, Arc::new(IdleSpawner)));
+        assert!(slot.bind(Arc::clone(&delegator)));
+        assert!(!slot.bind(delegator), "a second bind is refused");
+        assert!(slot.get().is_some());
+        assert!(slot.clone().get().is_some(), "clones share the slot");
+    }
+}

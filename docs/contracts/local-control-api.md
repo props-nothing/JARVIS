@@ -466,7 +466,8 @@ identifier to use either.
 
 `GET /api/v1/runs` lists the caller's workspace's runs that are **not yet terminal**, newest first, at most 100,
 as `{"runs":[{"run_id","conversation_id","state","awaiting_approval","created_at","updated_at","path"}],"bounded":false}`.
-A run parked on an approval is included, and `awaiting_approval` says so: the coarse wire `state` reads
+A sub-agent run carries `parent_run_id`, the run that delegated it (also on `GET /api/v1/runs/{run_id}`; absent for a
+top-level run), so a display can draw the tree. A run parked on an approval is included, and `awaiting_approval` says so: the coarse wire `state` reads
 `model_running` for it, and it is the run an operator most needs to find. The listing is scoped to the caller's
 workspace in the query, so another workspace's runs are never returned.
 

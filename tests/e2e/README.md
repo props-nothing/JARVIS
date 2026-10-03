@@ -385,6 +385,22 @@ run **continues**: the tool runs in the MCP child and the model answers with the
 produce — a real assertion, verified against `deepseek-v4.1-flash:cloud`. A model that declines to call the tool is
 a skip, never a failure: whether a model chooses a tool is its behaviour, not JARVIS's.
 
+## `delegation.mjs`
+
+Deterministic (no model, no network): a real `jarvisd` and CLI with a fake model that plays whichever agent is asking,
+keyed on the objective text. Default profile: the model is **not offered** `agents_delegate_1`. With `[tools.agents]
+enabled = true`: a "boss" run delegates, the child answers, and the child's answer reaches the boss as the tool result;
+`GET /api/v1/runs/{id}` shows the child's `parent_run_id` (and none on the boss) and its own conversation. **Depth:** a run
+that keeps delegating creates a root, a child and a grandchild, linked by stored parent links, and the grandchild's
+attempt to go deeper creates no run and is refused with a reason the model can read. **Cancellation:** a running
+delegation shows the child under its parent in `runs list`; cancelling the waiting parent stops the child; the kill
+switch signals both. Removing the cascade fails the child-stopped check (and a unit test); loosening the depth limit
+fails two checks and a unit test.
+
+```bash
+node tests/e2e/delegation.mjs target/debug
+```
+
 ## `activity-feed.mjs`
 
 Deterministic (no model, no network): the real daemon, CLI and MCP fixture child against a fake model. Opens

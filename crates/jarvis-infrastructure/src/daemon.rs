@@ -92,6 +92,8 @@ pub struct DaemonConfig {
     autonomy: jarvis_domain::tool::policy::AutonomyLevel,
     /// The file roots the profile declares, already validated. Empty means no file tool is offered.
     file_roots: Vec<crate::native_tools::files::RootDeclaration>,
+    /// Whether `agents.delegate@1` is offered.
+    agents_enabled: bool,
 }
 
 /// `Debug` is hand-written because the provider is a trait object: a derived implementation would
@@ -145,7 +147,21 @@ impl DaemonConfig {
             mcp_servers: Vec::new(),
             autonomy: jarvis_domain::tool::policy::AutonomyLevel::Ask,
             file_roots: Vec::new(),
+            agents_enabled: false,
         }
+    }
+
+    /// Supplies whether sub-agent delegation is enabled (`[tools.agents] enabled`).
+    #[must_use]
+    pub const fn with_agents(mut self, enabled: bool) -> Self {
+        self.agents_enabled = enabled;
+        self
+    }
+
+    /// Returns whether sub-agent delegation is enabled.
+    #[must_use]
+    pub const fn agents_enabled(&self) -> bool {
+        self.agents_enabled
     }
 
     /// Supplies the file roots the profile declares.
@@ -735,10 +751,8 @@ pub async fn start(
     // **One router, carrying whatever kinds the daemon can actually serve.** A profile with no `[mcp]` table
     // registers only `Native`, which is the common path — so the MCP kind appears only when a server composed,
     // and a router advertising a source it cannot serve is never built.
-    // The file roots are opened once, here, with the operator's own ambient authority; the tools hold only
-    // the directory capabilities from then on. A declared root that cannot be opened fails startup.
-    let file_roots = open_file_roots(config.file_roots())?;
-    let executor = router_over(&clock, mcp.servers(), file_roots.as_ref());
+    let native = NativeComposition::open(config)?;
+    let executor = router_over(&clock, mcp.servers(), native.surface());
     // The tool fabric is composed **once** and handed to both consumers; see `tool_fabric_with` for why
     // composing it twice would let a grant written through one surface be invisible to the pipeline the
     // other resolves against.
@@ -757,7 +771,7 @@ pub async fn start(
         clock,
         mcp_catalog_tools(&mcp),
         config.autonomy(),
-        file_roots.as_ref(),
+        native.surface(),
     )?;
     let ports = run_ports(
         Arc::clone(&repositories),
@@ -832,7 +846,7 @@ pub async fn start(
 
     // One memory service for the API and for run recall, so a memory written is the one recalled.
     let memories = memory_service_over(&database);
-    let runs = run_service_with(ports, &memories, &database);
+    let runs = run_service_with(ports, &memories, &database, native.delegation.as_ref());
 
     // The policy surface reads the same pool the run service writes, so the rules a route is
     // evaluated against are the ones this daemon stores. `repositories` here is the *same* value
@@ -880,8 +894,9 @@ fn run_service_with(
     ports: jarvis_application::run_service::RunPorts,
     memories: &Arc<jarvis_application::memory_service::MemoryService>,
     database: &crate::storage::Database,
+    delegation: Option<&jarvis_application::run_service::delegation::DelegatorSlot>,
 ) -> Arc<RunService> {
-    Arc::new(
+    let service = Arc::new(
         RunService::new(ports, Arc::new(RunCancellationRegistry::new()))
             .with_memories(Arc::clone(memories.store()))
             .with_resume_store(Arc::new(
@@ -889,7 +904,17 @@ fn run_service_with(
                     database.pool().clone(),
                 ),
             )),
-    )
+    );
+    // Sub-agent runs are driven on the daemon's own runtime, like a run a client created.
+    if let Some(slot) = delegation {
+        slot.bind(Arc::new(
+            jarvis_application::run_service::delegation::RunDelegator::new(
+                &service,
+                Arc::new(jarvis_application::run_service::TokioSpawner),
+            ),
+        ));
+    }
+    service
 }
 
 /// Builds the memory service over the daemon's own pool.
@@ -1138,7 +1163,7 @@ pub(crate) fn tool_fabric_with(
     clock: Arc<dyn jarvis_domain::clock::Clock>,
     extra_tools: Vec<jarvis_application::tool_call::ResolvedTool>,
     autonomy: jarvis_domain::tool::policy::AutonomyLevel,
-    files: Option<&crate::native_tools::files::FileRoots>,
+    surface: crate::native_tools::NativeSurface<'_>,
 ) -> Result<
     (
         Arc<jarvis_application::tool_call::ToolCallService>,
@@ -1152,7 +1177,7 @@ pub(crate) fn tool_fabric_with(
     use jarvis_application::tool_call::ToolCallService;
     use jarvis_application::tool_grant_service::ToolGrantService;
 
-    let definitions = crate::native_tools::definitions_with(files).map_err(|_| {
+    let definitions = crate::native_tools::definitions_with(surface).map_err(|_| {
         // A construction refusal from a reviewed definition is a packaging defect, reported as a
         // config fault so an operator knows to look at the build rather than at the request.
         StartupError::Config
@@ -1218,6 +1243,40 @@ pub(crate) fn tool_fabric_with(
     Ok((pipeline, surface))
 }
 
+/// The optional native tool families the profile asked for, opened once at startup.
+///
+/// Owns what [`crate::native_tools::NativeSurface`] borrows, so the opened file roots and the delegation slot live
+/// as long as the composition that uses them.
+struct NativeComposition {
+    files: Option<crate::native_tools::files::FileRoots>,
+    /// Present only when the profile enabled sub-agents. Filled after the run service is built, because the run
+    /// service is composed over the very pipeline whose executor holds this slot.
+    delegation: Option<jarvis_application::run_service::delegation::DelegatorSlot>,
+}
+
+impl NativeComposition {
+    /// Opens the declared file roots and creates the delegation slot when enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupError::Config`] when a declared root cannot be opened; see [`open_file_roots`].
+    fn open(config: &DaemonConfig) -> Result<Self, StartupError> {
+        Ok(Self {
+            files: open_file_roots(config.file_roots())?,
+            delegation: config
+                .agents_enabled()
+                .then(jarvis_application::run_service::delegation::DelegatorSlot::new),
+        })
+    }
+
+    /// The borrowed view the tool composition functions take.
+    fn surface(&self) -> crate::native_tools::NativeSurface<'_> {
+        crate::native_tools::NativeSurface {
+            files: self.files.as_ref(),
+            delegation: self.delegation.as_ref(),
+        }
+    }
+}
 /// Opens the declared file roots, or `None` when the profile declares none.
 ///
 /// # Errors
@@ -1256,14 +1315,17 @@ fn open_file_roots(
 pub(crate) fn router_over(
     clock: &Arc<dyn jarvis_domain::clock::Clock>,
     servers: &[crate::mcp::composition::ComposedMcpServer],
-    files: Option<&crate::native_tools::files::FileRoots>,
+    surface: crate::native_tools::NativeSurface<'_>,
 ) -> crate::tool_adapters::routing::RoutingExecutor {
     use crate::tool_adapters::routing::RoutingExecutor;
     use jarvis_domain::tool::identity::SourceKind;
 
     let mut native_executor = crate::native_tools::NativeExecutor::new(Arc::clone(clock));
-    if let Some(roots) = files {
+    if let Some(roots) = surface.files {
         native_executor = native_executor.with_files(roots.clone());
+    }
+    if let Some(slot) = surface.delegation {
+        native_executor = native_executor.with_delegation(slot.clone());
     }
     let native: Arc<dyn jarvis_application::tool_call::ToolExecutor> = Arc::new(native_executor);
     if servers.is_empty() {
@@ -1812,7 +1874,8 @@ mod tests {
         use jarvis_domain::tool::identity::SourceKind;
 
         let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
-        let routed = super::router_over(&clock, &[], None).routed_kinds();
+        let routed = super::router_over(&clock, &[], crate::native_tools::NativeSurface::default())
+            .routed_kinds();
         assert_eq!(
             routed,
             vec![SourceKind::Native],
@@ -1892,7 +1955,7 @@ mod tests {
         use jarvis_application::tool_call::ToolExecutor as _;
 
         let clock: Arc<dyn jarvis_domain::clock::Clock> = Arc::new(crate::time::SystemClock::new());
-        let router = super::router_over(&clock, &[], None);
+        let router = super::router_over(&clock, &[], crate::native_tools::NativeSurface::default());
         // The canonical definition the catalog offers, so the identity is the one a real dispatch carries
         // rather than a fixture that happens to satisfy the lookup.
         let definition = crate::native_tools::definitions()
@@ -1906,6 +1969,7 @@ mod tests {
             .expect("the fixture arguments are usable");
         let cancel = jarvis_application::cancellation::CancellationScope::new();
         let request = jarvis_application::tool_call::ToolExecutionRequest {
+            caller: None,
             identity: &definition.identity,
             display_name: &definition.display_name,
             arguments: &arguments,

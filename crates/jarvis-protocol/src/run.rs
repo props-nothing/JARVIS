@@ -163,6 +163,9 @@ pub struct ActiveRunView {
     pub run_id: String,
     /// The conversation it belongs to.
     pub conversation_id: String,
+    /// The run that delegated this one, when it is a sub-agent run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
     /// Its client-visible state.
     pub state: String,
     /// Whether the run is parked on an approval a person has not decided.
@@ -310,6 +313,9 @@ pub struct RunView {
     pub run_id: String,
     /// The conversation it belongs to.
     pub conversation_id: String,
+    /// The run that delegated this one, when it is a sub-agent run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
     /// Its client-visible state.
     pub state: String,
     /// The monotonically increasing resource version.
@@ -801,6 +807,7 @@ mod tests {
         let view = RunView {
             run_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ee".to_owned(),
             conversation_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ef".to_owned(),
+            parent_run_id: None,
             state: "received".to_owned(),
             version: 1,
             created_at: "2026-09-20T12:35:10Z".to_owned(),
@@ -833,6 +840,7 @@ mod tests {
         let view = RunView {
             run_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ee".to_owned(),
             conversation_id: "0195f4f0-4c13-7bf4-89fb-f067adac13ef".to_owned(),
+            parent_run_id: None,
             state: "failed".to_owned(),
             version: 3,
             created_at: "2026-09-20T12:35:10Z".to_owned(),

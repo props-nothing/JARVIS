@@ -111,6 +111,7 @@ async fn run(
 ) -> Result<ToolResultBody, ToolExecutionError> {
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "fixture",
         arguments,

@@ -289,6 +289,7 @@ async fn the_executor_calls_a_real_server_through_the_tool_executor_port() {
     let cancel = CancellationScope::new();
 
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -350,6 +351,7 @@ async fn an_identity_the_executor_may_not_call_is_refused_with_the_guards_own_cl
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity: &re_schemed,
         display_name: "read_file",
         arguments: &arguments,
@@ -391,6 +393,7 @@ async fn a_cancelled_scope_ends_the_call_as_cancelled_rather_than_as_a_provider_
     cancel.cancel();
 
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -428,6 +431,7 @@ async fn a_non_object_argument_document_is_refused_as_invalid_arguments() {
     let cancel = CancellationScope::new();
 
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -508,6 +512,7 @@ async fn a_dispatch_to_an_already_closed_session_is_settled_rather_than_ambiguou
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -590,6 +595,7 @@ async fn a_task_handle_answer_is_refused_at_the_negotiated_capability_not_by_jar
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -678,6 +684,7 @@ async fn a_round_that_names_a_request_ends_at_jarvis_refusal_not_the_round_cap()
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -736,6 +743,7 @@ async fn a_state_only_round_reaches_the_round_cap_as_a_limit() {
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -819,6 +827,7 @@ async fn a_call_the_server_never_answers_reaches_the_port_as_ambiguous() {
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -892,6 +901,7 @@ async fn the_requests_own_bound_is_what_a_call_is_measured_against() {
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,
@@ -951,6 +961,7 @@ async fn a_request_without_a_bound_falls_back_rather_than_becoming_unbounded() {
     let arguments = arguments("{}");
     let cancel = CancellationScope::new();
     let request = ToolExecutionRequest {
+        caller: None,
         identity,
         display_name: "read_file",
         arguments: &arguments,

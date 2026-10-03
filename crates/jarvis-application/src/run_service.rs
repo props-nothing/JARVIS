@@ -281,6 +281,19 @@ pub struct CreatedRun {
     pub replayed: bool,
 }
 
+/// What stopping one run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOne {
+    /// The run was executing and was signalled.
+    Signalled,
+    /// The run was parked on an approval and was cancelled directly.
+    ParkedCancelled,
+    /// The run has no task in this process, so nothing could be signalled.
+    Unsignalled,
+    /// The run moved on before the stop reached it.
+    AlreadyEnded,
+}
+
 /// What a stop-everything command did, run by run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StopSummary {
@@ -493,6 +506,21 @@ pub struct RunOptions {
     /// applies [`RetryPolicy::default_for_run`]; a caller wanting no retries states
     /// [`RetryPolicy::none`], which is a decision rather than an absence.
     pub retry: Option<RetryPolicy>,
+    /// The run delegating this one, when this is a sub-agent run.
+    ///
+    /// Set only by the delegation path, never from a client request: it is trusted context. It records the parent
+    /// on the run and **clamps the child's deadline to the parent's**, so a child can never outlive the run that
+    /// is waiting for it.
+    pub parent: Option<ParentLink>,
+}
+
+/// The parent a sub-agent run is created under.
+#[derive(Debug, Clone, Copy)]
+pub struct ParentLink {
+    /// The delegating run.
+    pub run: RunId,
+    /// The delegating run's deadline, which the child may not exceed.
+    pub deadline: Option<jarvis_domain::time::UtcTimestamp>,
 }
 
 impl RunOptions {
@@ -513,6 +541,13 @@ impl RunOptions {
     #[must_use]
     pub fn with_retry(mut self, retry: Option<RetryPolicy>) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Returns these options for a sub-agent run delegated by `parent`.
+    #[must_use]
+    pub const fn with_parent(mut self, parent: ParentLink) -> Self {
+        self.parent = Some(parent);
         self
     }
 }
@@ -663,7 +698,10 @@ impl RunService {
         let route = self
             .select_route(context, resolved.clone(), OBJECTIVE_SENSITIVITY, created_at)
             .await?;
-        let budget = budget_for(created_at, resolved, route, options.retry)?;
+        let budget = clamp_to_parent(
+            budget_for(created_at, resolved, route, options.retry)?,
+            options.parent,
+        );
 
         // The key is checked *before* anything is created, because a replay must not
         // leave an orphan conversation behind. The digest is over the inputs that
@@ -700,6 +738,18 @@ impl RunService {
         };
 
         let digest = request_digest(&conversation.id, objective);
+        let mut new_run = NewRun::with_budget(
+            run_id,
+            context.workspace_id,
+            conversation.id,
+            context.principal_id,
+            // A bounded reference, never the objective text: large content
+            // belongs in artifacts, and the column is bounded.
+            Some(truncate_reference(objective)),
+            created_at,
+            budget,
+        )?;
+        new_run.parent_run_id = options.parent.map(|link| link.run);
         // The run, its opening event, and the idempotency record commit together, so a
         // key cannot be claimed by a command whose run was never written, and a run
         // cannot be created twice by two requests that both passed the check above.
@@ -707,34 +757,9 @@ impl RunService {
             .ports
             .runs
             .create_run_idempotent(
-                NewRun::with_budget(
-                    run_id,
-                    context.workspace_id,
-                    conversation.id,
-                    context.principal_id,
-                    // A bounded reference, never the objective text: large content
-                    // belongs in artifacts, and the column is bounded.
-                    Some(truncate_reference(objective)),
-                    created_at,
-                    budget,
-                )?,
+                new_run,
                 run_received_event(run_id, created_at),
-                NewIdempotencyRecord {
-                    key: idempotency_key.to_owned(),
-                    workspace_id: context.workspace_id,
-                    principal_id: context.principal_id,
-                    // The context carries a **digest**, never the credential, and an absent one is an
-                    // in-process caller rather than an empty credential — so the recorded scope states
-                    // which of the two it was instead of collapsing them.
-                    client_credential: context
-                        .client_credential
-                        .clone()
-                        .unwrap_or_else(|| UNCREDENTIALED_CLIENT.to_owned()),
-                    operation: CREATE_OPERATION.to_owned(),
-                    request_digest: digest,
-                    run_id,
-                    created_at,
-                },
+                creation_record(context, idempotency_key, digest, run_id, created_at),
             )
             .await?
         {
@@ -1154,31 +1179,45 @@ impl RunService {
             ..StopSummary::default()
         };
         for stored in active.runs {
-            if self
-                .cancellations
-                .cancel_with_reason(stored.id, Some(reason))
-            {
-                summary.signalled += 1;
-                continue;
-            }
-            if stored.state != RunState::AwaitingApproval {
-                // Active in the store but with no task to signal: an orphan this process does not own.
-                // It is reported rather than hidden, because the person pressing stop needs to know.
-                summary.unsignalled += 1;
-                continue;
-            }
-            match self
-                .controller()
-                .cancel_parked(context.workspace_id, stored.id, reason)
-                .await
-            {
-                Ok(()) => summary.parked_cancelled += 1,
-                Err(_) => summary.already_ended += 1,
+            match self.stop_active_run(context, &stored, reason).await {
+                StopOne::Signalled => summary.signalled += 1,
+                StopOne::ParkedCancelled => summary.parked_cancelled += 1,
+                StopOne::Unsignalled => summary.unsignalled += 1,
+                StopOne::AlreadyEnded => summary.already_ended += 1,
             }
         }
         Ok(summary)
     }
 
+    /// Stops one active run, whichever way it is waiting.
+    ///
+    /// Shared by the kill switch and by a delegating run that is itself cancelled, so a stop means the same
+    /// thing from both: an executing run is signalled, a run parked on an approval is cancelled directly with its
+    /// approval withdrawn, and a run this process has no task for is reported rather than hidden.
+    pub(crate) async fn stop_active_run(
+        &self,
+        context: &RequestContext,
+        stored: &crate::repository::run::StoredRun,
+        reason: &str,
+    ) -> StopOne {
+        if self
+            .cancellations
+            .cancel_with_reason(stored.id, Some(reason))
+        {
+            return StopOne::Signalled;
+        }
+        if stored.state != RunState::AwaitingApproval {
+            return StopOne::Unsignalled;
+        }
+        match self
+            .controller()
+            .cancel_parked(context.workspace_id, stored.id, reason)
+            .await
+        {
+            Ok(()) => StopOne::ParkedCancelled,
+            Err(_) => StopOne::AlreadyEnded,
+        }
+    }
     /// Reads one run in the caller's scope.
     ///
     /// # Errors
@@ -1741,6 +1780,42 @@ fn budget_for(
     })
 }
 
+/// Bounds a sub-agent run's budget by its parent's deadline, so a child never outlives the run waiting for it.
+fn clamp_to_parent(mut budget: RunBudget, parent: Option<ParentLink>) -> RunBudget {
+    if let Some(deadline) = parent.and_then(|link| link.deadline)
+        && budget.deadline.is_none_or(|own| deadline < own)
+    {
+        budget.deadline = Some(deadline);
+    }
+    budget
+}
+
+/// The idempotency record that claims a create command's key.
+fn creation_record(
+    context: &RequestContext,
+    key: &str,
+    request_digest: String,
+    run_id: RunId,
+    created_at: jarvis_domain::time::UtcTimestamp,
+) -> NewIdempotencyRecord {
+    NewIdempotencyRecord {
+        key: key.to_owned(),
+        workspace_id: context.workspace_id,
+        principal_id: context.principal_id,
+        // The context carries a **digest**, never the credential, and an absent one is an in-process caller
+        // rather than an empty credential — so the recorded scope states which of the two it was instead of
+        // collapsing them.
+        client_credential: context
+            .client_credential
+            .clone()
+            .unwrap_or_else(|| UNCREDENTIALED_CLIENT.to_owned()),
+        operation: CREATE_OPERATION.to_owned(),
+        request_digest,
+        run_id,
+        created_at,
+    }
+}
+
 /// Starts a background task for a run.
 ///
 /// A trait rather than a direct `tokio::spawn` so a test can drive the future to
@@ -1851,6 +1926,8 @@ pub fn api_request_context(
 // ought to heed, which is exactly the shape that makes a dead function read as load-bearing.
 // When the manifest is persisted, the read of a stored run is where the `Option` belongs — not a
 // free function returning a constant.
+
+pub mod delegation;
 
 #[cfg(test)]
 mod tests;
