@@ -57,8 +57,13 @@ use rmcp::model::{Tool, ToolAnnotations};
 
 use crate::tool_schema::ToolSchema;
 
+pub mod call;
+pub mod client;
+pub mod discovery;
+pub mod invocation;
 pub mod outcome;
 pub mod process;
+pub mod registration;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -198,8 +203,22 @@ pub struct RejectedTool {
 pub struct NormalizedCatalog {
     /// The server identity every accepted tool carries.
     pub source: Option<ToolSource>,
-    /// The accepted tools, ordered by capability so the answer is stable across calls.
+    /// The accepted definitions, ordered by capability so the answer is stable across calls.
     pub tools: Vec<ToolDefinition>,
+    /// The accepted tools' **input schema documents**, aligned index-for-index with [`Self::tools`].
+    ///
+    /// **The schema text is carried, not discarded, and that is a correction rather than a
+    /// convenience.** [`normalize_tool`] parses the schema to fingerprint it — and an earlier version
+    /// then dropped the text, which left a discovered MCP tool with no schema at all. Downstream a
+    /// `ResolvedTool` with `input_schema: None` is refused by the argument validator as
+    /// `tool.schema_absent`, so a tool this adapter had just accepted would register and then be
+    /// **uncallable** — a defect that would not appear until the call path resolved it, which is the
+    /// "a value nothing consults" shape this project keeps closing one layer later.
+    ///
+    /// The text is the **validated** document, which is also what `ToolSchema::confirms` requires: the
+    /// fingerprint in each definition is computed from exactly these bytes, so a caller that stored a
+    /// different document under that identity would fail its own consistency check.
+    pub schemas: Vec<String>,
     /// The refused tools, in the order the server listed them.
     pub rejected: Vec<RejectedTool>,
 }
@@ -231,6 +250,7 @@ pub fn normalize_catalog(server: &str, tools: &[Tool]) -> NormalizedCatalog {
         return NormalizedCatalog {
             source: None,
             tools: Vec::new(),
+            schemas: Vec::new(),
             rejected: tools
                 .iter()
                 .map(|tool| RejectedTool {
@@ -251,36 +271,49 @@ pub fn normalize_catalog(server: &str, tools: &[Tool]) -> NormalizedCatalog {
             continue;
         }
         match normalize_tool(&source, tool) {
-            Ok(definition) => accepted.push(definition),
+            Ok(pair) => accepted.push(pair),
             Err(rejection) => rejected.push(RejectedTool {
                 name: tool.name.to_string(),
                 rejection,
             }),
         }
     }
-    accepted.sort_by(|left, right| left.identity.cmp(&right.identity));
+    // Sorted as **pairs**, then split, so the definitions and their schemas cannot drift out of
+    // alignment. Sorting two parallel vectors separately would leave the invariant held by convention,
+    // which is the class of ordering mistake this repository has recorded more than once.
+    accepted.sort_by(|left, right| left.0.identity.cmp(&right.0.identity));
+    let (tools, schemas) = accepted.into_iter().unzip();
     NormalizedCatalog {
         source: Some(source),
-        tools: accepted,
+        tools,
+        schemas,
         rejected,
     }
 }
 
-/// Normalizes one MCP tool into a canonical definition.
+/// Normalizes one MCP tool into a canonical definition **and the validated schema it came from**.
+///
+/// Returns the pair rather than the definition alone, because the schema text is needed downstream and
+/// recovering it from the parsed `serde_json::Map` would produce a *different* string than the one that
+/// was fingerprinted — see [`NormalizedCatalog::schemas`].
 ///
 /// # Errors
 ///
-/// Returns a [`McpToolRejection`] when the name is unusable, the schema is one this workspace does
-/// not implement, the annotations contradict each other, or the assembled definition fails the
-/// domain's cross-field rules.
+/// Returns a [`McpToolRejection`] when the name is unusable, the schema is one this workspace does not
+/// implement, the annotations contradict each other, or the assembled definition fails the domain's
+/// cross-field rules.
 pub fn normalize_tool(
     source: &ToolSource,
     tool: &Tool,
-) -> Result<ToolDefinition, McpToolRejection> {
+) -> Result<(ToolDefinition, String), McpToolRejection> {
     let capability = capability_for(tool.name.as_ref())?;
     let purpose = purpose_for(tool)?;
     let schema_text = serde_json::Value::Object((*tool.input_schema).clone()).to_string();
     let schema = ToolSchema::parse(&schema_text).map_err(|_| McpToolRejection::SchemaRejected)?;
+    // Taken from the **parsed** value rather than from `schema_text`, so the document returned is the
+    // one the fingerprint was computed over. They are the same bytes today; taking it here is what keeps
+    // them the same if the parser ever normalizes, which is the whole reason `ToolSchema::text` exists.
+    let validated_schema = schema.text().to_owned();
     let effects = effects_for(tool.annotations.as_ref())?;
     let risk = risk_of(&effects);
     let identity = ToolIdentity {
@@ -288,7 +321,7 @@ pub fn normalize_tool(
         source: source.clone(),
         schema_fingerprint: *schema.fingerprint(),
     };
-    ToolDefinition::new(
+    let definition = ToolDefinition::new(
         identity,
         tool.name.as_ref(),
         purpose,
@@ -322,7 +355,8 @@ pub fn normalize_tool(
         _ => McpToolRejection::DefinitionInvalid {
             field: "definition",
         },
-    })
+    })?;
+    Ok((definition, validated_schema))
 }
 
 /// Builds the canonical capability for a tool name, refusing rather than transforming.

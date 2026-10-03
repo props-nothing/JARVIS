@@ -114,11 +114,13 @@ exist behind the selected features rather than merely being documented:
 ## First Slice Shipped, and What It Changed
 
 The implemented slices are `crates/jarvis-infrastructure/src/mcp/` — `mod.rs` normalizes what a
-server *offers*, `outcome.rs` normalizes what it *returns*, and `process.rs` launches it — with 52
-tests between them. The two mapping layers are pure and do no I/O, for the reason the
-OpenAI-compatible adapter records: the provider-shaped traps are in the mapping, and code reachable
-only through a live socket is the least tested code in an adapter. `jarvis-domain` gained no MCP
-dependency.
+server *offers*, `outcome.rs` normalizes what it *returns*, `process.rs` launches it, `client.rs`
+decides which versions to negotiate and what a failed startup means, and `invocation.rs` guards a call
+and its continuations — with 75 unit tests plus 5 end-to-end tests against a real fixture server in
+`crates/jarvis-infrastructure/tests/mcp_conversation.rs`. The decision/mapping layers are pure and do no
+I/O, for the reason the OpenAI-compatible adapter records: the provider-shaped traps are in the mapping,
+and code reachable only through a live socket is the least tested code in an adapter. `jarvis-domain`
+gained no MCP dependency.
 
 Three findings from building it narrow the plan rather than merely annotating it:
 
@@ -171,6 +173,171 @@ review:
   `cmd.exe` synthesises `COMSPEC`, `PATHEXT`, and `PROMPT` for its children regardless, which the
   assertion accounts for by name.
 
+### Startup decisions, and why two questions are not one
+
+`client.rs` answers the two things a *connection* raises that the layers above do not: which protocol
+versions to offer, and what a failed startup means. `rmcp` surfaces the latter as an eleven-variant
+`ClientInitializeError` with no mapping into JARVIS terms, so without this module every startup failure
+would reach an operator as the same undifferentiated string — and this note's own error table has a row
+for exactly that case.
+
+The separation that matters: a failed startup asks **may this be retried?** (`ToolErrorClass`, whose
+posture is about effect duplication) and **could a retry ever succeed?** (a separate permanence flag).
+Reading only the class loops forever against a server whose `supportedVersions` excludes ours, because
+`Unavailable`'s posture is legitimately `Safe` — nothing ran, so nothing can be duplicated. Treating
+every failure as permanent does the opposite damage, quarantining a server that was merely restarting.
+
+Three things were delegated to the SDK after reading it rather than assumed:
+
+- Version **selection** is the SDK's `select_protocol_version`; JARVIS's only contribution is the
+  preference order in `preferred_protocol_versions`.
+- The **set** of older versions to offer is derived from `ProtocolVersion::KNOWN_VERSIONS` with the
+  target pinned first, because a hand-written list is a second source of truth that fails quietly: an
+  SDK upgrade adding a revision would leave this function offering the old set with nothing reported.
+- The session-shape question is `requires_initialize_handshake`, delegating to `has_initialize()` rather
+  than comparing against the target revision. The two are not the same test — a *newer* revision than
+  the target also has no handshake — and the comparison would tell a caller to wait for an exchange that
+  never comes.
+
+### Registration: where untrusted data meets the trusted claim
+
+`registration.rs` is the join the earlier slices left open — a discovered catalog either enters the
+`ToolRegistry` or is refused **by name**. Two properties make it the security-relevant step rather than
+plumbing:
+
+- **The trusted identity is a parameter, never derived.** `RegisteredTool` distinguishes them itself:
+  `server` is "the configured server that supplied it. **Trusted**, unlike `definition.identity.source`".
+  So `register_catalog` takes the `ServerConfigId` from JARVIS's own configuration and compares it against
+  the catalog's declared owner, refusing a mismatch as `mcp.source_mismatch`. A helper that derived the
+  trusted id from the catalog would agree by construction and be **unfalsifiable** — the mutation that
+  disables the check fails three tests, one of which asserts that an impostor does not poison the
+  registry's own **first-wins** source claim (and thereby lock the real server out permanently).
+- **A *replacement* is unrepresentable.** Every registration uses `RegistrationRequest::new`, which refuses
+  a change to a known identity; `replacing` is never called. That matters because a replacement keeps the
+  identity, so "every approval recorded against it still matches, while the implementation behind it is
+  new" — `ACC-024` verbatim. There is deliberately no flag to widen this: a re-registration after a
+  reviewed change is a different operation with its own review.
+
+One finding came from a test premise I got wrong. I asserted a *changed schema* is refused at registration;
+it is not, and correctly so — a schema change moves the fingerprint, so it moves the **identity**, and only
+a same-identity-different-content change is refused. The real consequence is that one capability can hold
+**two identities**, which the registry permits deliberately. `RegistryCatalog` is keyed by **capability
+string**, so building one from such definitions would silently drop a tool, and a call resolving it would
+report `tool.not_found` for a registered tool. The publish join therefore **refuses** a duplicate capability
+rather than producing a lossy catalog.
+
+### Publishing reads the registry, not the catalog — and the difference is a security property
+
+The first version of the publish join (`catalog_pairs`) converted the **offered** catalog into
+`(ToolDefinition, Option<String>)` pairs. That is a defect, not a simplification: the catalog is what the
+server *offered* while the registry is what was **admitted**, and the two sets differ exactly where the
+refusals are. Publishing the offered set would serve tools `register_catalog` had just refused:
+
+- A tool refused as `IdentityChanged` is `ACC-024` — its schema moved under an identity approvals are
+  recorded against. Publishing it dispatches an implementation no approval was ever matched to.
+- A catalog refused as `SourceMismatch` is an **impersonation**. Publishing it dispatches that server's
+  tools while the only record saying it was refused sits beside a catalog serving it.
+
+`publishable_pairs(registry, server, catalog)` therefore filters by **identity *and* attribution**.
+The identity half covers a changed definition (a different identity, simply absent); the attribution half
+(`registered.server == server`) covers what identity alone cannot — a second server declaring the first's
+source and producing a byte-identical definition resolves to the *first* server's registration, and it was
+refused as `SourceClaimed`.
+
+The filtering is not the silent drop a filter usually is: every excluded tool was already reported in the
+`RegistrationReport` returned alongside, with its capability and reason, so a caller that ignores the report
+gets a *smaller* catalog — the fail-closed direction.
+
+Three mutations falsify this, each in its own test: removing the admission filter entirely; dropping the
+attribution half; and checking the capability collision over the admitted subset rather than the offered
+catalog.
+
+⚠ **The third of those found a wrong fixture rather than a missing guard.** My first collision test
+registered *both* identities and then claimed an admitted-subset check would pass — it would not, because
+both were admitted and the filter changed nothing. The mutation was caught by the *older* collision test
+instead. The fixture now registers one identity and offers two, so the subset check genuinely sees one tool;
+re-running the mutation then killed the corrected test as well. **A test whose name names a state its fixture
+does not create proves nothing about that state.**
+
+### The catalog carries its schemas, and the reason is one layer downstream
+
+`NormalizedCatalog` returns `schemas: Vec<String>` alongside `tools`. This closes a defect that no test in
+this adapter could have caught, because it manifests in the *next* layer: `normalize_tool` parsed each
+`inputSchema` to fingerprint it and then **discarded the text**, and a `ResolvedTool` whose
+`input_schema` is `None` is refused by the argument validator as `tool.schema_absent`. So a tool this
+adapter had just accepted would register and then be **uncallable** — the "a value nothing consults"
+shape, one layer along. The finding came from reading `RegistryCatalog`, which is constructed from exactly
+`(ToolDefinition, Option<String>)` pairs, and noticing the adapter produced no such pair.
+
+Three properties, each asserted:
+
+- **Alignment by construction.** Definitions and schemas are sorted **as pairs** and then unzipped, so
+  they cannot drift apart. A test with **distinct** schemas pins the association — the first version used
+  one shared schema, which made a reversal unobservable and let the mis-alignment mutant **survive**.
+- **The carried text is the validated one** (`ToolSchema::text`), so it is byte-identical to what the
+  identity's fingerprint was computed over. `ToolSchema::confirms` is what a caller storing it will be
+  checked against, and that is asserted end to end against a real server.
+- **Key order does not change the identity.** `serde_json::Map` is a `BTreeMap`, so a schema is
+  re-serialized with sorted keys before fingerprinting. That is a property rather than a nuisance: a
+  server reordering its schema's keys does not present a new tool (which would invalidate every grant for
+  it), and two spellings of one schema cannot look like two tools. `a_reordered_schema_presents_the_same_identity`
+  asserts it directly.
+
+### A real conversation, and the bug that made one necessary
+
+`crates/jarvis-infrastructure/tests/mcp_conversation.rs` runs JARVIS's client against a **hand-written
+fixture `ServerHandler` over a real duplex pipe** — five tests that no unit test can replace, because
+discovery is a lifecycle an in-memory fixture cannot exercise. `rmcp`'s `server` feature is enabled for
+**dev-dependencies only**, so the shipped binary stays client-only (`client`, `transport-io`,
+`transport-child-process`) while the test build can run a genuine peer.
+
+What they prove: discovery really reaches a server and reports its identity and versions; a tool the
+server *actually listed* normalizes to the same canonical values the in-memory fixtures assert; a call's
+content normalizes to a bounded body; a `METHOD_NOT_FOUND` a real peer returns classifies as `NotFound`
+rather than `ProviderError`; and a peer that shares no version fails as a **permanent** startup failure.
+
+**The fixture's first version was wrong, and the failure mode is worth recording.** It ran the server as
+`let _ = serve_server(..).await` — which does not hold the `RunningService`, it **drops it immediately**,
+and its `Drop` cancels the connection. Discovery still passed, because it is the first message and won the
+race; every later call failed `TransportClosed`. The fix is to await `service.waiting()`, which both keeps
+the service alive and ends the task when the connection does. Confirmed by mutation: re-introducing
+`let _ = service.waiting()` fails exactly the three tests that exercise the conversation *after* the
+handshake, while discovery keeps passing — which is precisely the signature of the original bug.
+
+### The multi-round-trip refusal is a decision, not a gap
+
+`invocation.rs` implements the sentence `outcome.rs` refused with ("it needs JARVIS policy and approval
+routing for the requested input, and a bounded round count") — and building it produced the finding that
+makes the refusal correct rather than merely unimplemented.
+
+**Every MRTR input request is a capability JARVIS must not lend out.** `InputRequest` has exactly three
+variants, and each is a feature this note already records as unsupported:
+
+| Variant | What it asks the *client* to do | Note's existing status |
+| --- | --- | --- |
+| `CreateMessage` (sampling) | Run a model call, return the completion | Deprecated, SEP-2577 |
+| `ListRoots` (roots) | Return the client's directory list | Deprecated, SEP-2577 |
+| `Elicitation` | Prompt the client's user for input | Replaced by this very pattern |
+
+None is a data interchange: each asks JARVIS to spend something it owns on a server's behalf — **model
+budget**, the **shape of the filesystem**, or the **user's attention and consent**. `ListRoots` in
+particular is a remote server enumerating the workspace layout, which is an information-disclosure
+primitive dressed as a convenience. So the default is *refuse by name*, and a future version servicing
+one would be adding a capability with its own research gate rather than filling in a stub. The note's
+"Explicitly unsupported" list is therefore **stronger than it claimed**: these are not merely unadopted
+features, they are the exact set of things an MRTR continuation can ask for.
+
+Two further decisions in that module:
+
+- **The tool invoked must be the tool authority was recorded against**, delegated to
+  `ToolIdentity::authorizes` rather than compared here — discovery is untrusted and a server can re-schema
+  a tool between the listing and the call, so the check is made at invocation time. The mutant that
+  compares only the capability is killed by two tests, one of them the `ACC-024` schema case.
+- **The round bound is a compile-time assertion, not a test.** JARVIS's bound must sit below the SDK's
+  default so JARVIS's refusal is the one an operator sees; both sides are constants, so clippy rejects a
+  runtime comparison as "this assertion has a constant value" — correctly, since it cannot fail at run
+  time. Checking it also corrected a wrong belief: the SDK default is **10**, not 3.
+
 Findings that change the adapter's shape:
 
 - **`rmcp` requires a Tokio runtime to construct a transport.** Calling
@@ -202,6 +369,77 @@ Findings that change the adapter's shape:
 This discharges the gate item, but the `Test Plan` below remains the acceptance
 work: the build and the three layers prove the types, the mappings, and the launch,
 not that a live client behaves.
+
+### Discovery: the caller, and the three assumptions it corrected
+
+`discovery.rs` is the piece the slices above left open — it spawns a local server, drives the discovery
+handshake, lists its tools, and returns the normalized catalog beside a still-live client. It is exercised
+against a **real child process** (`tests/mcp_discovery_process.rs` spawning `examples/mcp_fixture_server.rs`),
+because the spawn is exactly what a duplex-pipe fixture cannot falsify. An example rather than a `[[bin]]`:
+the `server` feature is a *dev*-dependency, so only an example can both exist and speak the server protocol
+(and the harness is off, since libtest's stdout banner would interleave with the JSON-RPC framing).
+
+Writing it disproved three things the note had implied:
+
+- **An older peer is discovered, not refused.** `Discover` resolves a version from the intersection of
+  `preferred_versions` and the peer's set, so a peer reporting **only** `2025-06-18` is a legitimate session
+  at that version — the same lifecycle the note records as lacking per-request `_meta`. There is no floor.
+  The version is therefore **recorded** (`DiscoveredServer::protocol_version`) instead of promised, and a
+  test named for the rule asserts the downward negotiation.
+- **"The server offers nothing" and "the server offers nothing usable" are different facts**, and both
+  arrive as an empty `tools` vector. The second is `mcp.no_usable_tools`, carries the first rejection so the
+  message names the field at fault, and is permanent.
+- **The identity cannot come from the launch spec.** `McpLaunchSpec` holds a program, arguments, and an
+  environment — no name. A path-derived name is not a usable owner, and slugging the path is the silent
+  transformation that makes two servers' tools share an owner. The configured name is a parameter.
+
+Two further properties, each falsified by mutation rather than asserted by inspection:
+
+| Property | Why it is load-bearing | Mutation that fails it |
+| --- | --- | --- |
+| Both name rules are checked, **before** the spawn | An identity-valid name can be an owner-invalid one; the symptom would be an all-refused catalog for a name-shaped cause | Delete the owner check → `a_name_that_is_a_valid_identity_but_not_a_valid_owner_is_refused_up_front`; move both after the spawn → `an_unusable_configured_name_is_refused_before_any_process_is_spawned` reports `Launch { code: "mcp.spawn_failed" }` |
+| A failure carries the child's stderr | `into_transport` consumes the process, so the diagnostics would be dropped with it and a failed server would explain nothing | Empty the refusal's `diagnostics` → `a_child_that_is_not_a_server_fails_as_a_startup_refusal_carrying_its_stderr` |
+
+One documented behavior is recorded rather than worked around: **`Peer::list_tools` consults a
+per-connection response cache** before the wire, honouring the server's `ttlMs`/`cacheScope`. A discovery
+reflects the current listing or a cached one within that TTL; because the cache is per-connection and a
+discovery's connection is new, only a *re*-listing on a live connection could be served from it.
+
+### The call path: one derived name, one repeated guard, and a wiring test that had to be reordered
+
+`call.rs` gives `invocation.rs` and `outcome.rs` their first production caller — until it existed, both
+modules' decisions were tested and **unreached**. Four pure functions, so each decision is testable without
+a server:
+
+| Function | Decision |
+| --- | --- |
+| `wire_name` | canonical `mcp.<name>@1` → the server's own `<name>`, or a refusal |
+| `call_params` | the `tools/call` request, refusing a non-object argument document |
+| `decide_response` | complete, or refused — with the identity guard on **every** response |
+| `normalize_response` | a body, or the class a reported failure carries |
+
+**The name is derived, not guessed, and the refusal is two-sided.** The mapping reverses
+`capability_for` through the domain's own accessors, and refuses a foreign **namespace** *and* a different
+**major** — so an implementation that stripped a prefix from any capability cannot pass. Dropping only the
+namespace check fails its own test; always refusing kills four others.
+
+**The identity guard repeats per response, on purpose.** A multi round-trip continuation is a fresh request
+against the same identity, so a guard run once at the start leaves every later round unchecked — and a
+server can re-schema a tool between the listing and the call. This is `ACC-024` at invocation time.
+
+**The transport classes stay in `outcome.rs`.** `TransportSend` → `Unavailable` (nothing ran) is a different
+row from `TransportClosed` → `ProviderError` (may have executed; unsettled). A lost response reported as
+`Unavailable` tells a caller a write can be safely repeated when it may already have happened, so this
+module neither restates nor re-exports the mapping. Three one-line delegations authored first were deleted
+for the same reason: **a second spelling of one fact is this workspace's most-repeated defect.**
+
+⚠ **The wiring test was wrong on the first attempt, and the reordering is the finding.** Sending the
+canonical string instead of the wire name is the mutant that matters, and the first end-to-end version
+asserted `params.name == TOOL_NAME` *before* calling — so the mutant died on the test's own assertion and the
+exchange was never exercised. With the call made first and required to **succeed**, the fixture — which
+refuses any name it did not list — answers `McpError(ErrorCode(-32601), "no such tool")` under the same
+mutation. **A wiring test must let the peer detect the fault; an assertion placed before the call makes it a
+second copy of the unit test.**
 
 ## Version Matrix
 
@@ -427,3 +665,4 @@ not that a live client behaves.
 | --- | --- | --- |
 | 2026-09-20 | Initial architecture review | Official spec/index and Rust SDK repository |
 | 2026-10-03 | Specification and SDK refresh: pinned `rmcp 3.5.0` and spec `2026-07-28`; corrected the lifecycle to stateless `server/discover`; recorded `subscriptions/listen`, MRTR, caching, standard headers, and the error-code renumbering; recorded the SEP-2577 deprecation of Roots/Sampling/Logging and the removal of `ping`/`logging/setLevel`; answered the open questions on SDK version and legacy SSE | `https://modelcontextprotocol.io/specification/2026-07-28/changelog.md`, `.../deprecated.md`, `https://crates.io/api/v1/crates/rmcp`, `https://github.com/modelcontextprotocol/rust-sdk` (`crates/rmcp/CHANGELOG.md`, `tests/test_client_lifecycle_modes.rs`, `tests/test_subscriptions*.rs`) |
+| 2026-10-03 | `discovery.rs`: the spawn-to-catalog caller, verified against a real child process. Corrected three assumptions — discovery accepts a peer one revision behind (no floor), an all-refused catalog is a named refusal rather than an empty one, and the server identity cannot be derived from a launch spec. Recorded the per-connection response cache that `list_tools` consults | Pinned SDK sources: `src/service/client.rs` (`serve_with_discover`, `list_tools`, `list_response_cache_key`), `src/service.rs` (`ServiceError`), `src/model.rs` (`DiscoverResult`, `ServerPeerInfo`), `src/handler/client.rs` (`ClientHandler` default), `src/transport/io.rs` (`stdio`) |

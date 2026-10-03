@@ -35,5 +35,16 @@ uuid.workspace = true
 http-body-util.workspace = true
 serde_json.workspace = true
 tower.workspace = true
+# The `server` feature is enabled **for tests only**, so an end-to-end test can run a fixture MCP server
+# over a real duplex pipe and exercise the client and the mapping layers against it. The shipped binary
+# stays client-only: `default-features = false` and the three client features are what `[dependencies]`
+# carries, and a dev-dependency feature addition is unified only into the test build. `AsyncRwTransport::new_server`
+# is gated behind this feature, which is what made the in-process fixture possible at all.
+rmcp = { version = "=3.5.0", default-features = false, features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-child-process",
+] }
 [lints]
 workspace = true

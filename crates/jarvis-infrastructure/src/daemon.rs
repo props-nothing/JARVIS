@@ -572,14 +572,13 @@ pub async fn start(
     // composing it twice would let a grant written through one surface be invisible to the pipeline the
     // other resolves against.
     //
-    // **The reviewed deny rules are empty, and that is the honest current state rather than a placeholder.**
-    // There is no `[tools]` configuration section, so no shipped profile declares a reviewable refusal yet —
-    // and the alternative, omitting the parameter, would make the plumbing between a reviewed refusal and
-    // the evaluator something nothing at all exercises. Passing the empty vector keeps that path composed
-    // and asserted (the journey in `http::tool_grant_journey_tests`, and the adapter tests in
-    // `tool_adapters::tests`) so adding the config field is a field and a read, not a new wire. The stored
-    // deny rules — which an operator *can* write today, through `/api/v1/tool-grants/deny-rules` — reach the
-    // evaluator independently, from the same store handle.
+    // The reviewed refusals come from `config`, which `jarvisd`'s composition root validated before the
+    // daemon was built (see `main.rs`: a profile with a broken refusal fails startup rather than running with
+    // one that silently does nothing). **This comment said "there is no `[tools]` configuration section" and
+    // that was false** — `ToolsSection` exists, `reviewed_rules()` validates it, and `DaemonConfig` carries
+    // the result here. What is true is narrower and worth stating: the *default* profile ships no refusals, so
+    // every existing configuration loads unchanged, and the stored deny rules an operator writes through
+    // `/api/v1/tool-grants/deny-rules` reach the evaluator independently from the same store handle.
     let (tools, tool_grants) = tool_fabric_over(
         database.pool().clone(),
         config.reviewed_deny_rules().to_vec(),

@@ -126,7 +126,6 @@ fn annotations_that_are_read_only_and_open_world_are_refused_rather_than_trimmed
         &mcp_tool("search", OBJECT_SCHEMA, Some(conflicting)),
     )
     .expect_err("a contradictory pair must be refused");
-
     assert_eq!(rejection, McpToolRejection::AnnotationsConflict);
     assert_eq!(rejection.code(), "mcp.annotations_conflict");
 
@@ -136,6 +135,150 @@ fn annotations_that_are_read_only_and_open_world_are_refused_rather_than_trimmed
     assert_eq!(
         open_world_only.tools[0].effects,
         vec![Effect::Write, Effect::ExternalCommunication]
+    );
+}
+
+#[test]
+fn an_accepted_tool_carries_its_validated_schema_so_the_call_path_can_validate_arguments() {
+    // **The gap this closes:** an accepted tool used to arrive with no schema at all, because the
+    // adapter parsed the schema to fingerprint it and then dropped the text. Downstream, a
+    // `ResolvedTool` whose `input_schema` is `None` is refused as `tool.schema_absent` — so a tool this
+    // adapter had just accepted would register and then be uncallable. The assertion is on the *pair*
+    // being present and consistent, since neither half alone is enough.
+    let catalog = accepted("read_file", None);
+
+    assert_eq!(
+        catalog.tools.len(),
+        catalog.schemas.len(),
+        "must be aligned"
+    );
+    let schema = &catalog.schemas[0];
+    assert!(!schema.is_empty(), "an accepted tool must carry a schema");
+    // The text must be the document the fingerprint was computed over, which is what
+    // `ToolSchema::confirms` will require of a caller that stores it: re-parsing the schema and
+    // fingerprinting *that* is the only way to check the pair agrees, and it is what the call path
+    // does. A schema substituted from elsewhere under the same identity is the defect this prevents.
+    let parsed =
+        crate::tool_schema::ToolSchema::parse(schema).expect("the carried schema must parse");
+    parsed
+        .confirms(&catalog.tools[0].identity.schema_fingerprint)
+        .expect("the carried schema must be the one that was fingerprinted");
+}
+
+#[test]
+fn a_carried_schema_stays_aligned_with_its_tool_under_reordering() {
+    // The ordering invariant, asserted where it could break. Definitions and schemas are sorted as
+    // **pairs** and then split, so the alignment is structural rather than conventional — but a future
+    // refactor that sorted each vector separately would still compile, and this is the test that fails
+    // when it does.
+    //
+    // ⚠ **The two tools must have DIFFERENT schemas, and the first version of this test did not.** With
+    // one schema shared by both, reversing the schema list is unobservable and the mutant that mis-aligns
+    // them **survived** — the test passed for a reason it was not about. Distinct schemas make the
+    // association directly checkable, which is what turns this from a description into a detector.
+    let alpha_schema = r#"{"type":"object","properties":{"alpha":{"type":"string"}},"additionalProperties":false}"#;
+    let zebra_schema = r#"{"type":"object","properties":{"zebra":{"type":"integer"}},"additionalProperties":false}"#;
+    let catalog = normalize_catalog(
+        "acme-files",
+        &[
+            // Zebra first, so the input order is *opposite* to capability order — an implementation that
+            // relied on the server's order would pair them the other way round.
+            mcp_tool("zebra", zebra_schema, None),
+            mcp_tool("alpha", alpha_schema, None),
+        ],
+    );
+
+    assert_eq!(catalog.tools.len(), 2);
+    assert_eq!(catalog.schemas.len(), 2);
+    assert_eq!(
+        catalog.tools[0].capability().to_string(),
+        "mcp.alpha@1",
+        "the definitions must be in capability order"
+    );
+    // The direct association, asserted **through the schema's content rather than its bytes.**
+    //
+    // ⚠ A first version compared the carried text to the input literal and failed, and the reason is worth
+    // keeping: `serde_json::Map` is a `BTreeMap`, so the document is re-serialized with **sorted keys**
+    // before it is carried and fingerprinted. That is a property rather than a nuisance — it makes the
+    // identity canonical, so a server reordering its schema's keys does not present a new tool — but it
+    // means byte equality against the offered text is the wrong assertion. The property is which tool the
+    // schema describes, so that is what is checked.
+    let alpha: serde_json::Value =
+        serde_json::from_str(&catalog.schemas[0]).expect("the carried schema must be JSON");
+    let zebra: serde_json::Value =
+        serde_json::from_str(&catalog.schemas[1]).expect("the carried schema must be JSON");
+    assert!(
+        alpha["properties"].get("alpha").is_some(),
+        "the first tool is `alpha`, so the first schema must be the alpha one: {}",
+        catalog.schemas[0]
+    );
+    assert!(
+        zebra["properties"].get("zebra").is_some(),
+        "the second tool is `zebra`, so the second schema must be the zebra one: {}",
+        catalog.schemas[1]
+    );
+    // And the fingerprint consistency follows from it rather than substituting for it.
+    for (definition, schema) in catalog.tools.iter().zip(&catalog.schemas) {
+        crate::tool_schema::ToolSchema::parse(schema)
+            .expect("every carried schema must parse")
+            .confirms(&definition.identity.schema_fingerprint)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the schema carried beside {} must be its own",
+                    definition.capability()
+                )
+            });
+    }
+}
+
+#[test]
+fn a_reordered_schema_presents_the_same_identity() {
+    // The consequence of the canonicalization above, asserted separately because it is a security-relevant
+    // property rather than a detail: if key order affected the fingerprint, a server could reorder its
+    // schema's keys to present a *new* tool identity while changing nothing that matters — invalidating
+    // every existing grant for it (fail-closed, but noisy) or, worse in the other direction, making two
+    // spellings of one schema look like two tools.
+    let source = server_source("acme-files").expect("the fixture server name is usable");
+    let ordered = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+    let reordered = r#"{"properties":{"a":{"type":"string"}},"type":"object"}"#;
+
+    let (first, first_schema) =
+        normalize_tool(&source, &mcp_tool("read", ordered, None)).expect("accepted");
+    let (second, second_schema) =
+        normalize_tool(&source, &mcp_tool("read", reordered, None)).expect("accepted");
+
+    assert_eq!(
+        first.identity.schema_fingerprint, second.identity.schema_fingerprint,
+        "key order must not change the identity"
+    );
+    assert_eq!(
+        first_schema, second_schema,
+        "the canonical text must be equal"
+    );
+    assert!(
+        first.is_same_tool_as(&second),
+        "a reordered schema is the same tool"
+    );
+}
+
+#[test]
+fn a_refused_tool_contributes_no_schema() {
+    // The complement, so the assertion above is not satisfied by a catalog that carries a schema for
+    // every offered tool regardless of acceptance — which would leave a refused tool's schema in a list
+    // whose index no longer means anything.
+    let catalog = normalize_catalog(
+        "acme-files",
+        &[
+            mcp_tool("good", OBJECT_SCHEMA, None),
+            mcp_tool("bad", r#"{"type":"object","pattern":"x"}"#, None),
+        ],
+    );
+
+    assert_eq!(catalog.tools.len(), 1);
+    assert_eq!(
+        catalog.schemas.len(),
+        1,
+        "only accepted tools contribute a schema"
     );
 }
 
@@ -160,10 +303,14 @@ fn a_changed_input_schema_is_a_different_identity() {
     // `ACC-024`: replacing a tool's schema behind the same name must not be covered by the approval
     // recorded for the original.
     let source = server_source("acme-files").expect("the fixture server name is usable");
-    let first = normalize_tool(&source, &mcp_tool("read", OBJECT_SCHEMA, None)).expect("accepted");
+    // `normalize_tool` returns the definition **and its validated schema**; the definition is what this
+    // test is about, so the pair is destructured rather than the return type being widened back.
+    let (first, first_schema) =
+        normalize_tool(&source, &mcp_tool("read", OBJECT_SCHEMA, None)).expect("accepted");
     let widened =
         r#"{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}"#;
-    let second = normalize_tool(&source, &mcp_tool("read", widened, None)).expect("accepted");
+    let (second, second_schema) =
+        normalize_tool(&source, &mcp_tool("read", widened, None)).expect("accepted");
 
     assert_eq!(
         first.capability().to_string(),
@@ -178,6 +325,18 @@ fn a_changed_input_schema_is_a_different_identity() {
         !first.is_same_tool_as(&second),
         "a schema change must not read as the same tool"
     );
+    // And each definition's own fingerprint still describes its own carried schema, so the widening is
+    // reflected in the pair rather than only in the identity.
+    assert_ne!(
+        first_schema, second_schema,
+        "the two schemas must differ, or the fingerprints differed for some other reason"
+    );
+    for (definition, schema) in [(&first, &first_schema), (&second, &second_schema)] {
+        crate::tool_schema::ToolSchema::parse(schema)
+            .expect("the carried schema must parse")
+            .confirms(&definition.identity.schema_fingerprint)
+            .expect("the carried schema must be the one that was fingerprinted");
+    }
 }
 
 #[test]

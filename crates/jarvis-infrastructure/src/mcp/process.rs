@@ -322,6 +322,22 @@ impl McpServerProcess {
         &self.transport
     }
 
+    /// Returns a handle to the child's bounded stderr tail.
+    ///
+    /// **Exists so a caller that consumes the process can still report why it died.** `into_transport`
+    /// consumes the struct and leaves the transport, which is what a discovery needs — but the diagnostics
+    /// live in a field that would then be dropped, leaving a failed server with no explanation. The handle
+    /// shares the same `Arc`, so the tail read after the transport is in use is the tail the child wrote.
+    ///
+    /// The transport **kills its child when it is dropped**, so a caller that holds both is holding the
+    /// transport for as long as it wants the process alive.
+    #[must_use]
+    pub fn diagnostics_handle(&self) -> McpDiagnostics {
+        McpDiagnostics {
+            tail: Arc::clone(&self.diagnostics),
+        }
+    }
+
     /// Takes the transport, for handing it to the SDK's client entry point.
     #[must_use]
     pub fn into_transport(self) -> TokioChildProcess {
@@ -371,6 +387,52 @@ impl McpServerProcess {
         } = self;
         drop(drain);
         shutdown
+    }
+}
+
+/// A shareable handle to a child's bounded stderr tail.
+///
+/// Handed out by [`McpServerProcess::diagnostics_handle`] so the tail outlives the struct that owns the
+/// transport. Its `Debug` reports the **size**, never the content — the same rule the process type follows,
+/// because the text is an untrusted server's output.
+#[derive(Clone)]
+pub struct McpDiagnostics {
+    tail: Arc<Mutex<StderrTail>>,
+}
+
+impl McpDiagnostics {
+    /// Returns the retained tail as text, or an empty string when the lock is poisoned.
+    ///
+    /// A poisoned lock yields nothing rather than propagating: diagnostics are not worth failing a
+    /// discovery over, and a panic in the draining task means the child is already gone.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.tail
+            .lock()
+            .map_or_else(|_| String::new(), |tail| tail.text())
+    }
+
+    /// Returns how many bytes are retained.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tail.lock().map_or(0, |tail| tail.bytes.len())
+    }
+
+    /// Returns whether nothing has been retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for McpDiagnostics {
+    /// Reports the retained **size**, never the content: an untrusted server's stderr must not reach a log
+    /// line through a `{:?}` nobody meant to be a disclosure.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpDiagnostics")
+            .field("bytes", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
