@@ -12,6 +12,11 @@ has implementation evidence.
 - [Release readiness and owner decisions](release-readiness.md)
 - [CI gates and native lanes](ci-gates.md)
 
+## Runbooks
+
+- [MCP servers](mcp-servers.md) — setup, health, refusal codes, containment, and
+  the supervision gap that bounds what recovery can do
+
 ## Required Before Each Product Surface Ships
 
 The owning milestone must add or update runbooks for:

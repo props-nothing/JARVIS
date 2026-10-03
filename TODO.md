@@ -5573,6 +5573,87 @@ Dependencies: Milestone 2 exit gate.
   - **Asserted by a unique directory name rather than a resolved-path comparison**, because Windows reports a
     canonicalized form whose prefix differs from `temp_dir()`'s spelling — a test that failed for that reason
     would be reporting the platform rather than the defect.
+  - **Slice 27: the reference CLI could not see the MCP half of the status response.** The daemon has served
+    `mcp.servers` and `mcp.refused` since the status surface gained them, and the CLI's `StatusBody` parsed a
+    subset — so an operator running `jarvis status` saw storage and instance but nothing about the servers,
+    and the only way to the facts was hand-writing an authenticated request. The **same half-a-feature shape
+    `BRN-079` recorded for `--risk`**: the daemon grew a capability and its own reference client could not
+    reach it. `StatusBody` now carries the `mcp` object and `jarvis status` prints the servers, their tool and
+    refusal counts, their `closed` flag, and each refused server with its code and permanence.
+  - **`mcp` is parsed as `Option` rather than required, and the difference is a real state.** The daemon omits
+    the object while it is draining (it has *taken* its composition), so a client that made the field required
+    would fail to read a status response at exactly the moment an operator is most likely to be reading one —
+    during a shutdown they did not expect.
+  - **Falsified by asserting the wrong tool count**, which fails the parsing test — so the assertion is about
+    the value surviving the client's own deserialization rather than about a type that merely compiles.
+  - **The operator runbook `docs/operations/README.md` requires now exists.** That index lists
+    "MCP/runtime/plugin — install, scope grant, health, quarantine, upgrade, removal" as required evidence
+    before the surface ships, and `docs/research/integrations/mcp.md` carried "Operator runbook for auth and
+    transport failures" as an unchecked readiness item: a required document cited in two places and written in
+    none. [`docs/operations/mcp-servers.md`](docs/operations/mcp-servers.md) follows the template in that index
+    — scope and verification date, symptoms and safe diagnostics, containment, ordered recovery, risks, and the
+    automated scenario for each procedure.
+  - **Every claim in the runbook was read off the code rather than composed.** The refusal codes are the ones
+    `code()` actually returns (35 `mcp.*` values, transcribed from the match arms), the log lines are the exact
+    `log::warn!`/`log::info!` strings, and the three status readings (`closed=true`, a `refused=N` count, a row
+    under `mcp refused`) are the three genuinely different operator situations. The runbook also states the
+    **supervision gap** as its own limit, because a recovery procedure that implied a re-launch would be
+    promising something no code does.
+  - **A validator rule caught two real mistakes, which is what a gate is for.** `validate-docs.mjs` refused the
+    new file twice: an unlinked document in `docs/README.md` (the index must link every page) and a wrong
+    relative path in the evidence note. Both were genuine — a runbook nothing points at is a runbook nobody
+    finds.
+  - **Slice 28: the reference CLI could not reach the model data policy, the third instance of the same shape.**
+    The daemon serves `GET`/`PUT /api/v1/model-data-policy` and `GET …/effective`, advertises `policy.read` and
+    `policy.write` in `SYSTEM_CAPABILITIES`, and stores immutable versions behind an `expected_version`
+    precondition — and `jarvis-cli` had no `policy` subcommand at all. So the *entire* control plane for the
+    policy the daemon enforces was hand-written HTTP. `BRN-079` found this for `--risk`, slice 27 for the `mcp`
+    status field, and this for a whole surface: **a served capability the reference client cannot reach is the
+    feature's client half missing, not a separate feature.**
+
+  - **The command is written to the wire's shape, and the wire's shape is checked rather than remembered.**
+    `PutPolicyRequest` has **no `version` field** (a caller proposes, the store assigns), takes `rules` as a
+    nested object, and spells seven fields plus two optional lists — so `policy_body` emits `rules` nested with
+    the seven always present and `allowed_providers`/`allowed_models` **only when non-empty**, and the `PUT`
+    carries `expected_version`. The `effective` path is a pure function (`effective_policy_path`) so the query
+    string is asserted without a daemon, the same technique `list_path` uses.
+  - **An absent list and an empty list are different requests, and the difference is the reason the body is a
+    function rather than a `serde_json::json!` literal.** `allowed_providers: null` and `allowed_providers: []`
+    both decode, but one says "no provider restriction at this layer" and the other says "no provider at all" —
+    a policy that permits nothing. `skip_serializing_if = "Option::is_none"` on the daemon side is an
+    instruction to omit, and a client that sent `[]` for an unset `--allow-provider` would be **widening the
+    request into a refusal**, i.e. a narrowing only in appearance. Falsified by always emitting both lists,
+    which fails `an_unset_policy_list_is_absent_rather_than_empty`.
+  - **`policy put` requires `--expected-version` with no default**, so a write cannot silently be a
+    last-writer-wins overwrite: the operator must have read a version to name one, and `0` is the explicit
+    spelling of "create the first". A bare `jarvis policy` prints nothing and changes nothing — the read/write
+    split every mutating surface here uses, asserted by `a_bare_policy_command_changes_nothing`.
+  - **⚠ A refactor was believed to have fixed a lint that it had not.** Eleven flags were moved onto a
+    `#[command(flatten)] PolicyRulesArgs` partly *hoping* it would settle `clippy::large_enum_variant`; clippy
+    still fired (`Show` ≥ 24 bytes vs `Put` ≥ 244). The lint is now allowed on `PolicyAction` **with its
+    reason** — the size difference is inherent (a write carries nine rules, a read none) and boxing would add
+    clap-derive machinery for a value parsed once and never stored. Both the doc comment that had claimed the
+    refactor sufficed and `PolicyRulesArgs`'s own doc now state that it does not, because the plausible-sounding
+    version of that sentence is the false one.
+  - **The runbook gained the command it would otherwise omit.** An operator reading
+    [`docs/operations/mcp-servers.md`](docs/operations/mcp-servers.md) to contain a misbehaving server reaches
+    for a tool grant; the page now also names the model data policy and says plainly that the two are
+    **different surfaces** (which model a call may route to vs which tool may run), with the `show`-then-`put`
+    pair and a narrowing-only write. A containment page that named only one of the two refusal layers would
+    leave an operator to guess which one their problem belongs to.
+  - 1920 workspace tests (+4: cli 53). All gates green (fmt, clippy, test, doc, both docs gates).
+    **DO NOT COMMIT.**
+  - **Not done, and named:** the daemon clamps `effective`'s classification (`PROBE_SENSITIVITY`), so
+    `--sensitivity` there is a request label rather than a lever — stated in the flag's help rather than
+    quietly ignored. `policy put` submits all nine rules and has **no partial update**, and no `--allow-region`
+    alias exists for the wire's `allowed_residency_regions`. Separately, and CLI-wide rather than mine:
+    **`jarvis <cmd> --help` exits `1`**, because `main` maps every clap error to `EXIT_ATTENTION` through
+    `try_parse`, and `help_and_version_are_reported_through_clap_errors` asserts that shape deliberately (the
+    alternative, `error.exit()`, calls `exit` inside the parser). That is a defensible trade and a real
+    wart — a caller doing CI on `--help` sees failure — and it is **recorded here for the first time**: a
+    search of `TODO.md` for `EXIT_ATTENTION` finds nothing before this line, so it was **not** already named
+    in `BRN-079`'s orbit as an earlier draft of this sentence claimed. It is named rather than changed in this
+    slice, because changing it moves every subcommand's exit code at once.
   - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
     dies *during* a run is not yet noticed and quarantined; the executor refuses a dispatch to it and `health`
     reports it, but **nothing acts on it** — no pass prunes, quarantines, or re-launches, and a dispatch that

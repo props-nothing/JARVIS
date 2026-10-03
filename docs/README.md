@@ -66,6 +66,11 @@ documents.
 - [Testing strategy](testing/strategy.md)
 - [Acceptance scenarios](testing/acceptance.md)
 
+## Operations
+
+- [Operations index](operations/README.md)
+- [MCP servers runbook](operations/mcp-servers.md)
+
 ## Planning
 
 - [Planning index](planning/README.md)

@@ -134,6 +134,18 @@ enum Command {
         #[command(subcommand)]
         action: GrantsAction,
     },
+    /// Read the workspace's model data policy, or put a new version in force.
+    ///
+    /// **The control plane for the policy the daemon already enforces, and it exists for the same reason
+    /// `grants` does.** `GET`/`PUT /api/v1/model-data-policy` and `GET .../effective` have been served since
+    /// `BRN-013`, and the status endpoint advertises `policy.read`/`policy.write` — but no command reached
+    /// them, so a capability the daemon advertised had no client in the product's own CLI. `show` and
+    /// `effective` are read-only; the write is its own named action, so a bare `jarvis policy` can never
+    /// change what the workspace permits.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Inspect the resolved configuration without printing secret values.
     Config,
     /// List local log files.
@@ -289,6 +301,7 @@ async fn run(cli: Cli) -> ExitCode {
         Command::Runs { action } => runs(paths, action).await,
         Command::Approvals { action } => approvals(paths, action).await,
         Command::Grants { action } => grants(paths, action).await,
+        Command::Policy { action } => policy(paths, action).await,
         Command::Config => config(paths),
         Command::Logs => logs(paths),
         Command::Service { action } => service(action).await,
@@ -500,6 +513,95 @@ enum GrantsAction {
         #[command(subcommand)]
         action: DenyAction,
     },
+}
+
+/// What a caller can ask of the model data policy.
+///
+/// **The two reads are separated from the write by construction**, like every other mutating surface here:
+/// a bare `jarvis policy` prints nothing and changes nothing, and putting a version in force is its own
+/// named action carrying the version it believes is current.
+///
+/// **`large_enum_variant` is allowed with a reason rather than satisfied by boxing.** The difference is
+/// inherent to the domain: a write carries nine rules and a read carries none, so no grouping makes the two
+/// variants comparable. Boxing the rules would need `Box` to round-trip through clap's `flatten` derive —
+/// machinery for a value that is **constructed once per process, at argument-parse time, and never stored in
+/// a collection or moved in a loop**, which is the cost the lint exists to catch. An allow with its reason is
+/// the honest form of that; a `Box` here would be indirection an operator pays for and never benefits from.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Subcommand)]
+enum PolicyAction {
+    /// Print the workspace's active policy version and its rules.
+    Show,
+    /// Ask the daemon which candidate a classification and capability query would route to.
+    ///
+    /// Diagnostic, and the daemon clamps what it will examine: the request carries a **classification**
+    /// rather than prompt content, so this reports the policy rather than probing it with a document.
+    Effective {
+        /// The content classification to evaluate, one of `public`, `internal`, `confidential`,
+        /// `restricted`.
+        #[arg(long, value_name = "LEVEL", default_value = "internal")]
+        sensitivity: String,
+    },
+    /// Put a new policy version in force. **Narrowing only** — the daemon merges the submission with what
+    /// is already stored, so a body cannot widen a policy.
+    Put {
+        /// The operator-facing name for this version.
+        #[arg(long, value_name = "TEXT")]
+        name: String,
+        /// The version `show` printed, or `0` to create the first policy.
+        #[arg(long, value_name = "N")]
+        expected_version: u32,
+        /// The rules to put in force. Flattened, so these appear as `--locality`, `--retention`, and so on
+        /// on the command line rather than behind a second subcommand.
+        #[command(flatten)]
+        rules: PolicyRulesArgs,
+    },
+}
+
+/// The policy rules a write may submit.
+///
+/// **A struct rather than nine flags on the command, and the grouping is the wire's rather than the CLI's:**
+/// the request body is `{name, rules: {...}, expected_version}` and this mirrors `rules`, so the flags a
+/// caller types and the object they become are the same shape. Flattening it into `Put` is what keeps that
+/// shape visible at the call site rather than one opaque string.
+///
+/// **This does *not* by itself satisfy `clippy::large_enum_variant`** — it was written hoping to, and it
+/// does not: nine fields including three `Vec<String>` leave `Put` roughly ten times the size of `Show`, so
+/// the lint still fires and is allowed on `PolicyAction` with its reason. Recorded because the opposite
+/// claim is the plausible one to believe about a refactor like this, and it was believed here for a moment.
+#[derive(Debug, clap::Args)]
+struct PolicyRulesArgs {
+    /// Where inputs and outputs may go: `local_only`, `private_network_allowed`,
+    /// `approved_cloud_allowed`.
+    #[arg(long, value_name = "VALUE")]
+    locality: String,
+    /// The required documented provider retention: `none_documented`, `bounded_documented`,
+    /// `provider_default_allowed`.
+    #[arg(long, value_name = "VALUE")]
+    retention: String,
+    /// The required documented provider training use: `disallowed_documented`,
+    /// `account_policy_allowed`, `provider_default_allowed`.
+    #[arg(long, value_name = "VALUE")]
+    training_use: String,
+    /// Whether JARVIS telemetry may be emitted: `disabled`, `local_only`.
+    #[arg(long, value_name = "VALUE")]
+    telemetry: String,
+    /// The most sensitive content this policy permits: `public`, `internal`, `confidential`,
+    /// `restricted`.
+    #[arg(long, value_name = "LEVEL")]
+    sensitivity: String,
+    /// Whether a compliant fallback is permitted: `denied`, `compliant_only`.
+    #[arg(long, value_name = "VALUE")]
+    fallback: String,
+    /// A residency region the content may be processed in. Repeatable; absent permits none.
+    #[arg(long = "region", value_name = "REGION")]
+    region: Vec<String>,
+    /// A provider the policy permits. Repeatable; absent means no provider restriction at this layer.
+    #[arg(long = "allow-provider", value_name = "PROVIDER")]
+    allow_provider: Vec<String>,
+    /// A model the policy permits. Repeatable; absent means no model restriction at this layer.
+    #[arg(long = "allow-model", value_name = "MODEL")]
+    allow_model: Vec<String>,
 }
 
 /// Operator-refusal inspection and change a caller can request.
@@ -1352,6 +1454,132 @@ fn print_daemon_response(result: Result<(u16, String), ClientError>) -> ExitCode
     }
 }
 
+/// The model data policy surface, reached over the local control API.
+///
+/// **A thin client like `grants`, and deliberately so.** The merge that makes a write narrowing-only, the
+/// precondition on the version, and the refusal of an unsupported spelling are all decided by the daemon —
+/// `PolicyService::put` merges through `PolicyRules::merge_stricter`, and the handler parses each rule into a
+/// typed domain value rather than storing text. A client-side copy of any of those rules would be a second
+/// implementation, and the one that disagreed would be the one an operator trusted.
+async fn policy(paths: &ProfilePaths, action: PolicyAction) -> ExitCode {
+    let state = match daemon_client(paths) {
+        Ok(state) => state,
+        Err(error) => return report_client_error(&error),
+    };
+    match action {
+        PolicyAction::Show => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                "/api/v1/model-data-policy",
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        PolicyAction::Effective { sensitivity } => print_daemon_response(
+            get_with_status(
+                &state.discovered,
+                &state.credential,
+                &effective_policy_path(&sensitivity),
+                API_MAJOR,
+                "",
+            )
+            .await,
+        ),
+        // The write is the only mutating arm, and it is last so the two reads sit together.
+        PolicyAction::Put {
+            name,
+            expected_version,
+            rules,
+        } => {
+            let body = policy_body(
+                &name,
+                expected_version,
+                &rules.locality,
+                &rules.retention,
+                &rules.training_use,
+                &rules.telemetry,
+                &rules.sensitivity,
+                &rules.fallback,
+                &rules.region,
+                &rules.allow_provider,
+                &rules.allow_model,
+            );
+            print_daemon_response(
+                send_authenticated(
+                    &state.discovered,
+                    &state.credential,
+                    "PUT",
+                    "/api/v1/model-data-policy",
+                    API_MAJOR,
+                    &idempotency_header(),
+                    Some(&body),
+                )
+                .await,
+            )
+        }
+    }
+}
+
+/// Builds the effective-route probe path.
+///
+/// The query carries a **classification**, not prompt content: the contract says `effective` "evaluates a
+/// bounded, schema-defined classification/capability query without accepting arbitrary prompt content". The
+/// daemon clamps the sensitivity it will actually probe with, so this value is a request rather than a
+/// control, and it is emitted verbatim because the daemon refuses an unknown value by name.
+fn effective_policy_path(sensitivity: &str) -> String {
+    format!("/api/v1/model-data-policy/effective?sensitivity={sensitivity}")
+}
+
+/// Builds the `PUT /api/v1/model-data-policy` body.
+///
+/// **The version is a precondition and never an instruction**, which is why it is `expected_version` and
+/// why the body has no `version` field at all: the contract makes the version an *output* of a write, since
+/// a client that could name the version it was creating could skip numbers or reuse one for different rules
+/// and make a past route decision unexplainable. `0` means "no policy exists yet".
+///
+/// The optional lists are **absent rather than empty** when no flag was passed, and that is a distinction the
+/// daemon acts on: `allowed_providers` absent means "no provider restriction at this layer", while an empty
+/// list means "no provider is permitted". Emitting `[]` for an unset flag would turn "do not constrain this
+/// here" into "permit nothing", which is the widening direction's opposite and would refuse every model.
+#[allow(clippy::too_many_arguments)]
+fn policy_body(
+    name: &str,
+    expected_version: u32,
+    locality: &str,
+    retention: &str,
+    training_use: &str,
+    telemetry: &str,
+    sensitivity: &str,
+    fallback: &str,
+    regions: &[String],
+    allow_providers: &[String],
+    allow_models: &[String],
+) -> String {
+    let mut rules = serde_json::json!({
+        "locality": locality,
+        "maximum_provider_retention": retention,
+        "provider_training_use": training_use,
+        "telemetry": telemetry,
+        "allowed_residency_regions": regions,
+        "maximum_sensitivity": sensitivity,
+        "allow_fallback": fallback,
+    });
+    if !allow_providers.is_empty() {
+        rules["allowed_providers"] = serde_json::json!(allow_providers);
+    }
+    if !allow_models.is_empty() {
+        rules["allowed_models"] = serde_json::json!(allow_models);
+    }
+    serde_json::json!({
+        "name": name,
+        "rules": rules,
+        "expected_version": expected_version,
+    })
+    .to_string()
+}
+
 /// The tool-authorization surface, reached over the local control API.
 ///
 /// **The control plane for what a principal may use, and it is deliberately a thin client.** Every rule —
@@ -1907,6 +2135,32 @@ async fn status(paths: &ProfilePaths) -> ExitCode {
                     status.storage.kind, status.storage.status
                 );
                 println!("pid:        {}", discovered.pid);
+                // **The MCP servers, when the daemon holds a composition.** The daemon has served `mcp` since
+                // the status surface gained it, and this client could not print it — the same half-a-feature
+                // shape `--risk` had: a fact an operator can only reach by hand-writing a request. Printed
+                // only when present, because an absent field means the daemon is draining rather than that it
+                // declared no servers (`compose_mcp_servers` always returns a composition, so a running daemon
+                // always has one).
+                if let Some(mcp) = &status.mcp {
+                    println!("mcp servers: {}", mcp.servers.len());
+                    for server in &mcp.servers {
+                        println!(
+                            "  {:<20} tools={} refused={} closed={}",
+                            server.name, server.tools, server.refused_tools, server.closed
+                        );
+                    }
+                    // A refused server is the reason an operator reads this line at all, so it is printed
+                    // rather than counted: "where is my third server" is answered by name and code.
+                    if !mcp.refused.is_empty() {
+                        println!("mcp refused: {}", mcp.refused.len());
+                        for server in &mcp.refused {
+                            println!(
+                                "  {:<20} code={} permanent={}",
+                                server.name, server.code, server.permanent
+                            );
+                        }
+                    }
+                }
                 ExitCode::from(EXIT_OK)
             }
             Err(error) => report_client_error(&error),
@@ -1923,6 +2177,42 @@ struct StatusBody {
     api_major: u32,
     state: String,
     storage: StorageBody,
+    /// The daemon's MCP servers, **absent while the daemon is draining**.
+    ///
+    /// `Option` because the field is omitted rather than emptied — see the contract. Parsing it as a
+    /// required field would make the client reject a status response from a daemon mid-shutdown, which is
+    /// exactly when an operator might be reading one.
+    #[serde(default)]
+    mcp: Option<McpBody>,
+}
+
+/// The MCP half of the status body.
+#[derive(Debug, serde::Deserialize)]
+struct McpBody {
+    servers: Vec<McpServerBody>,
+    refused: Vec<McpRefusedServerBody>,
+}
+
+/// One composed MCP server, as the status surface reports it.
+///
+/// **Fields the client does not print are still named**, rather than omitted with a `deny_unknown_fields`
+/// posture: the daemon may add a field, and a client that rejected a response for carrying one would be
+/// version-locked to the build it shipped with. `protocol_version` is the case in point — it is parsed so the
+/// shape is documented here, and printed only when a diagnostic needs it.
+#[derive(Debug, serde::Deserialize)]
+struct McpServerBody {
+    name: String,
+    tools: usize,
+    refused_tools: usize,
+    closed: bool,
+}
+
+/// One declared MCP server that did not compose.
+#[derive(Debug, serde::Deserialize)]
+struct McpRefusedServerBody {
+    name: String,
+    code: String,
+    permanent: bool,
 }
 
 /// The bounded storage sub-object.
@@ -2710,10 +3000,11 @@ fn discovery_path_for(paths: &ProfilePaths) -> PathBuf {
 mod tests {
     use super::{
         ApprovalsAction, AttemptAfter, AttemptReport, Cli, ClientErrorKind, ClientState, Command,
-        FollowStep, InstallAction, RiskArg, STREAM_ATTEMPTS, SequenceCheck, SequenceWatcher,
-        SseFrame, SseParser, StatusBody, ask_body, deny_rule_body, deny_rules_list_path,
-        event_stream_headers, follow_after, follow_run, follow_step, grant_body, grants_list_path,
-        idempotency_key, json_string, list_path, parse_status,
+        FollowStep, InstallAction, PolicyAction, RiskArg, STREAM_ATTEMPTS, SequenceCheck,
+        SequenceWatcher, SseFrame, SseParser, StatusBody, ask_body, deny_rule_body,
+        deny_rules_list_path, effective_policy_path, event_stream_headers, follow_after,
+        follow_run, follow_step, grant_body, grants_list_path, idempotency_key, json_string,
+        list_path, parse_status, policy_body,
     };
     use clap::Parser as _;
     use jarvis_infrastructure::client::Discovered;
@@ -3150,6 +3441,116 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_body_carries_a_precondition_and_no_version_to_create() {
+        // **The contract's rule, asserted on the document this client builds.** `expected_version` is a
+        // precondition and the body has no `version` field at all: the version is an *output* of a write,
+        // because a client that could name the version it was creating could skip numbers or reuse one for
+        // different rules, which would make a past route decision unexplainable. A body that carried
+        // `"version"` would be refused by the daemon's `deny_unknown_fields`, so this assertion is the one
+        // that catches the client inventing one.
+        let body = policy_body(
+            "strict",
+            4,
+            "local_only",
+            "none_documented",
+            "disallowed_documented",
+            "disabled",
+            "confidential",
+            "denied",
+            &["eu".to_owned()],
+            &[],
+            &[],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        assert_eq!(parsed["expected_version"], 4);
+        assert!(
+            parsed.get("version").is_none(),
+            "the version is an output, never an input: {body}"
+        );
+        assert_eq!(parsed["rules"]["locality"], "local_only");
+        assert_eq!(parsed["rules"]["maximum_sensitivity"], "confidential");
+        assert_eq!(parsed["rules"]["allowed_residency_regions"][0], "eu");
+    }
+
+    #[test]
+    fn an_unset_policy_list_is_absent_rather_than_empty() {
+        // **The distinction the daemon acts on, and the one that makes this direction dangerous.**
+        // `allowed_providers` absent means "no provider restriction at this layer"; an empty array means "no
+        // provider is permitted". Emitting `[]` for an unset flag would turn "do not constrain this here" into
+        // "permit nothing", so a policy written that way would refuse every model — and the operator would
+        // have no reason to connect the refusal to a flag they did not pass.
+        let unset = policy_body(
+            "n",
+            0,
+            "local_only",
+            "none_documented",
+            "disallowed_documented",
+            "disabled",
+            "public",
+            "denied",
+            &[],
+            &[],
+            &[],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&unset).expect("JSON");
+        assert!(
+            parsed["rules"].get("allowed_providers").is_none(),
+            "an unset provider list must be absent, not empty: {unset}"
+        );
+        assert!(
+            parsed["rules"].get("allowed_models").is_none(),
+            "and the same for models: {unset}"
+        );
+
+        // The complement, so the assertions above cannot be satisfied by a builder that never emits the
+        // fields at all: when a flag *is* passed, the list must be there.
+        let set = policy_body(
+            "n",
+            0,
+            "local_only",
+            "none_documented",
+            "disallowed_documented",
+            "disabled",
+            "public",
+            "denied",
+            &[],
+            &["local.ollama".to_owned()],
+            &["example-model".to_owned()],
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&set).expect("JSON");
+        assert_eq!(parsed["rules"]["allowed_providers"][0], "local.ollama");
+        assert_eq!(parsed["rules"]["allowed_models"][0], "example-model");
+    }
+
+    #[test]
+    fn the_effective_probe_path_carries_a_classification_and_not_content() {
+        // The contract says `effective` evaluates "a bounded, schema-defined classification/capability query
+        // without accepting arbitrary prompt content" — it is diagnostic rather than a way to force a route.
+        // The path therefore carries a classification value and nothing else; a path builder that could carry
+        // text would be the shape that makes the probe a content oracle.
+        let path = effective_policy_path("confidential");
+        assert_eq!(
+            path, "/api/v1/model-data-policy/effective?sensitivity=confidential",
+            "the query is the classification, emitted verbatim so the daemon's own refusal names an \
+             unknown value rather than a value this client rewrote"
+        );
+    }
+
+    #[test]
+    fn a_bare_policy_command_changes_nothing() {
+        // The same rule every mutating surface here follows: the shortest form of the command is read-only.
+        // Asserted by parsing rather than by running, because the property is about what the *command* is.
+        let cli = Cli::try_parse_from(["jarvis", "policy", "show"]).expect("parses");
+        let Command::Policy { action } = cli.command else {
+            unreachable!("expected a policy action");
+        };
+        assert!(matches!(action, PolicyAction::Show));
+        // And `policy` alone is refused rather than defaulting to something: a subcommand is required, so
+        // there is no bare form that could be mistaken for a write.
+        assert!(Cli::try_parse_from(["jarvis", "policy"]).is_err());
+    }
+
+    #[test]
     fn the_event_stream_request_states_the_media_type_the_contract_requires() {
         // The contract requires `Accept: text/event-stream` on the events route, and this client is
         // the reference implementation of that surface. It sent **no** `Accept` header at all until
@@ -3228,6 +3629,7 @@ mod tests {
                 Command::Runs { .. } => "runs",
                 Command::Approvals { .. } => "approvals",
                 Command::Grants { .. } => "grants",
+                Command::Policy { .. } => "policy",
             };
             assert_eq!(actual, expected);
         }
@@ -3491,7 +3893,8 @@ mod tests {
                     | Command::Ask { .. }
                     | Command::Runs { .. }
                     | Command::Approvals { .. }
-                    | Command::Grants { .. } => String::from("unexpected"),
+                    | Command::Grants { .. }
+                    | Command::Policy { .. } => String::from("unexpected"),
                 }
             })
             .collect();
@@ -3549,6 +3952,47 @@ mod tests {
         assert_eq!(parsed.api_major, 1);
         assert_eq!(parsed.storage.kind, "sqlite");
         assert_eq!(parsed.state, "ready");
+        // **Absent `mcp` must parse, and that is a real state rather than a truncated fixture.** The daemon
+        // omits the object while it is draining (it has *taken* its composition), so a client that made the
+        // field required would fail to read a status response at exactly the moment an operator is most likely
+        // to be reading one.
+        assert!(
+            parsed.mcp.is_none(),
+            "a body without an mcp object is a draining daemon, not an invalid response"
+        );
+    }
+
+    #[test]
+    fn the_mcp_half_of_a_status_body_parses_with_its_refusals() {
+        // The half the CLI could not see before this round: the daemon has served `mcp.servers` and
+        // `mcp.refused` since the status surface gained them, and `StatusBody` dropped both on the floor —
+        // the same "a feature the reference client cannot reach" shape `--risk` had. Asserted with **one
+        // running and one refused** server, because either half alone would be satisfied by a type that
+        // parsed only that half.
+        let body = r#"{"instance_id":"0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09",
+            "server_version":"0.1.0","api_major":1,"state":"ready",
+            "profile":"default","storage":{"kind":"sqlite","status":"ready"},
+            "capabilities":["system.status"],
+            "mcp":{"servers":[{"name":"acme-files","tools":1,"refused_tools":1,
+                    "closed":false,"protocol_version":"2026-07-28"}],
+                   "refused":[{"name":"other-files","code":"mcp.spawn_failed","permanent":false}]}}"#;
+        let parsed: StatusBody = parse_status(body).expect("the mcp half must parse");
+        let mcp = parsed.mcp.expect("the object is present");
+        assert_eq!(mcp.servers.len(), 1);
+        assert_eq!(mcp.servers[0].name, "acme-files");
+        assert_eq!(mcp.servers[0].tools, 1);
+        assert_eq!(
+            mcp.servers[0].refused_tools, 1,
+            "a partial refusal must survive the client's own parsing, since it is the \
+             operator fact the composition carries separately from its registrations"
+        );
+        assert!(!mcp.servers[0].closed);
+        assert_eq!(mcp.refused.len(), 1);
+        assert_eq!(mcp.refused[0].code, "mcp.spawn_failed");
+        assert!(
+            !mcp.refused[0].permanent,
+            "a transient refusal is one the composition already re-attempted, which the flag records"
+        );
     }
 
     #[test]
