@@ -196,6 +196,34 @@ pub struct RejectedTool {
     pub rejection: McpToolRejection,
 }
 
+/// One offered tool that never became callable, with the stable reason code.
+///
+/// **A canonical form of the two ways a tool can be dropped**, and it exists because both were previously
+/// expressible only inside one layer. A tool is refused either by the **normalizer** (its name or schema was
+/// unusable — see [`RejectedTool`]) or by **registration** (its identity changed, a source was claimed — see
+/// [`registration::RefusedRegistration`]). The normalizer's half was carried on the catalog and then dropped
+/// by the composition, so a malformed tool was invisible for any server that also offered a usable one: the
+/// server composed, `is_clean()` was true, and no log line mentioned the omission.
+///
+/// A `code` rather than the enum, because a caller holding this value reports it — the code is what an
+/// operator greps for in the evidence note's error tables, and both source enums already define theirs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolRefusal {
+    /// The tool as the server named it.
+    pub name: String,
+    /// The stable `mcp.*` code for why it was refused.
+    pub code: &'static str,
+}
+
+/// Builds the canonical refusal for a tool the **normalizer** refused.
+#[must_use]
+pub fn refusal_for_rejected(tool: &RejectedTool) -> McpToolRefusal {
+    McpToolRefusal {
+        name: tool.name.clone(),
+        code: tool.rejection.code(),
+    }
+}
+
 /// The canonical tools one MCP server offered, and the ones it offered that were refused.
 ///
 /// Both halves are returned rather than only the accepted tools, because "the server has three

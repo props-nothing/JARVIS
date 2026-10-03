@@ -278,7 +278,10 @@ async fn a_disabled_server_is_never_spawned() {
         composition.refused()
     );
     assert!(composition.servers().is_empty(), "nothing was launched");
-    assert!(composition.admitted_identities().is_empty());
+    assert!(
+        composition.health().is_empty(),
+        "a disabled server composes nothing, so the probe has no row"
+    );
     assert!(registry.is_empty());
 }
 
@@ -312,8 +315,14 @@ async fn every_server_in_one_profile_dispatches_to_its_own_session() {
     assert!(composition.is_clean(), "{:?}", composition.refused());
     assert_eq!(composition.servers().len(), 2);
     // Two identities, one capability each but different owners — so the two servers offer the *same tool name*
-    // and are still distinct.
-    let admitted = composition.admitted_identities();
+    // and are still distinct. **Walked from the servers rather than from a flattened composition accessor,
+    // because the flattened form was removed**: it had one caller (here) and existed only to be asserted on,
+    // so the property is now stated against the servers the dispatcher is actually built from.
+    let admitted: Vec<_> = composition
+        .servers()
+        .iter()
+        .flat_map(|server| server.admitted().iter().cloned())
+        .collect();
     assert_eq!(admitted.len(), 2, "both servers admitted one tool each");
     assert_eq!(
         admitted[0].capability, admitted[1].capability,
@@ -322,11 +331,6 @@ async fn every_server_in_one_profile_dispatches_to_its_own_session() {
     assert_ne!(
         admitted[0].source.owner, admitted[1].source.owner,
         "and the owners must differ, which is what makes the identities distinct"
-    );
-    assert_eq!(
-        composition.source_kinds(),
-        std::iter::once(jarvis_domain::tool::identity::SourceKind::McpServer).collect(),
-        "every MCP server shares one source kind — the fact the fan-out lives inside"
     );
 
     let dispatcher = ComposedMcpExecutor::over(&composition);
@@ -372,7 +376,7 @@ async fn an_identity_no_server_admitted_is_refused_rather_than_served_by_another
     let dispatcher = ComposedMcpExecutor::over(&composition);
     // The admitted identity has a fingerprint from the fixture; this one differs by fingerprint only, which is
     // the shape a re-schema has — the identity authority was recorded against is no longer this tool.
-    let admitted = composition.admitted_identities();
+    let admitted = composition.servers()[0].admitted().to_vec();
     let mut re_schemed = admitted[0].clone();
     re_schemed.schema_fingerprint =
         jarvis_domain::tool::identity::SchemaFingerprint::from_bytes([0x5a; 32]);
@@ -503,6 +507,103 @@ async fn a_lifecycle_probe_records_each_servers_health() {
             "a stopped session must report itself closed"
         );
     }
+}
+
+#[tokio::test]
+async fn a_partially_refused_catalog_is_reported_beside_the_tool_that_was_admitted() {
+    // **The operator fact the composition's own types were built to expose, and nothing could see it.** A
+    // server offering one usable tool and one malformed one composes *successfully* — `is_clean()` is true,
+    // because the refusal that matters to it is a whole-server one — so before this round the malformed tool
+    // left no trace anywhere: not in `McpComposition::refused`, and not in any log. The only signal was a
+    // capability missing from a catalog an operator would have to diff by hand.
+    //
+    // `ComposedMcpServer::report` was carried for exactly this and had no production caller; the daemon now
+    // reads it at startup. This asserts the half a daemon-side log line cannot prove: that the report the
+    // composition *holds* distinguishes "one tool" from "two offered, one refused".
+    let Some(program) = program_or_skip(
+        "a_partially_refused_catalog_is_reported_beside_the_tool_that_was_admitted",
+    ) else {
+        return;
+    };
+    let section = McpSection {
+        servers: vec![declaration_for("acme-files", &program, "partial")],
+    };
+    let declarations = section.enabled_declarations().expect("valid");
+    let secrets = resolver_for(&[("acme-files", "partial")]);
+    let mut registry = ToolRegistry::new();
+    let composition = compose_declared_servers(&mut registry, &declarations, &secrets)
+        .await
+        .expect("valid");
+
+    // The server composed, so the partial refusal is invisible at the composition level — which is the whole
+    // reason the per-server report has to be read.
+    assert!(
+        composition.is_clean(),
+        "a server with one usable tool is not a whole-server refusal: {:?}",
+        composition.refused()
+    );
+    assert_eq!(composition.servers().len(), 1);
+
+    let server = &composition.servers()[0];
+    let report = server.report();
+    assert_eq!(
+        report.added, 1,
+        "the usable tool must be registered, or this is the all-refused case instead"
+    );
+    // **The registration report is empty here, and that is the defect this test was written to expose.**
+    // The malformed tool was refused by the *normalizer*, so registration never saw it and `is_clean()` stayed
+    // true. Asserting zero is deliberate: it documents why a registration-only check cannot answer the
+    // question, so a future reader does not "fix" this assertion into a false one.
+    assert_eq!(
+        report.refused.len(),
+        0,
+        "registration never saw the malformed tool — it was refused upstream"
+    );
+
+    let refusals = server.refusals();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the malformed tool must be reported through the unified accessor rather than dropped"
+    );
+    // The refusal names the tool the *server* used and carries a stable code, so an operator can find the
+    // listing entry rather than a position in it.
+    assert!(
+        refusals[0].name.contains("Read File"),
+        "the refusal must name the offered tool, got {:?}",
+        refusals[0].name
+    );
+    assert_eq!(
+        refusals[0].code, "mcp.tool_name_invalid",
+        "a name with a space is refused for its shape, and the code says so"
+    );
+    // And the admitted set is exactly the usable tool, so the report and the callable set agree.
+    assert_eq!(server.admitted().len(), 1);
+    assert_eq!(
+        report.registered() + refusals.len(),
+        2,
+        "the server offered two tools: one registered, one refused, and the two must sum to the listing"
+    );
+
+    // **The probe's own count had the same defect this round fixed, independently.** `McpServerHealth::refused`
+    // was fed from `report.refused.len()` — registration's half — so on this very server it read **0** while a
+    // tool was refused. A probe built to report a server's health undercounting its refusals is the same "the
+    // fact is recorded where nothing can check it" shape one layer up, and this is the assertion that catches
+    // it: the row must agree with the accessor, not with the stage that happens to be visible to it.
+    let rows = composition.health();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].refused,
+        refusals.len(),
+        "the health row must count every refusal stage, not only registration's"
+    );
+    assert_ne!(
+        rows[0].refused,
+        report.refused.len(),
+        "and it must disagree with the registration-only count here — otherwise this test proves nothing"
+    );
+
+    let _ = composition.shutdown().await;
 }
 
 #[tokio::test]

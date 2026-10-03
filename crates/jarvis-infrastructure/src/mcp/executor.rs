@@ -131,6 +131,18 @@ impl McpToolExecutor {
         self.callable.len()
     }
 
+    /// Returns whether the session has closed — the child is gone or its transport ended.
+    ///
+    /// **The one thing a caller can ask before dispatching, and the caller that must is the one deciding**
+    /// whether to route a call here at all. `McpComposition::health` reports the same fact in bulk; this is
+    /// the single-server form so a router or a supervisor can consult it without holding a composition.
+    /// Delegated to the session's own `is_closed` rather than tracked here: a cached flag beside a live
+    /// signal is a second answer to one question, and the stale one is the one that gets read.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
     /// Sends one `tools/call` and normalizes what comes back.
     ///
     /// # Errors
@@ -158,6 +170,18 @@ impl McpToolExecutor {
             return Err(class_of_refusal(&McpCallRefusal::Refused {
                 refusal: McpInvocationRefusal::ToolIdentityChanged,
             }));
+        }
+        // **Liveness next, and the class it produces is the whole point of the check.** A session whose
+        // worker has already finished — the child died, or its transport closed — cannot deliver anything, so
+        // sending to it would fail as `TransportClosed`, which `outcome.rs` classifies `ProviderError`: an
+        // *unsettled* outcome that sends the recovery pass looking for an effect that was never produced. The
+        // call certainly did nothing, so `Unavailable` (settled, `Safe`) is the honest class.
+        //
+        // This is **not** a health monitor — it cannot see a child that died after the check, and a race is
+        // still correctly reported as unsettled. It removes the *wrong* answer for the case the session
+        // already knows, which is what a dispatch to a server known to be gone was reporting.
+        if self.is_closed() {
+            return Err(ToolErrorClass::Unavailable);
         }
         let params = match call_params(identity, arguments) {
             Ok(params) => params,

@@ -346,6 +346,100 @@ async fn a_non_object_argument_document_is_refused_as_invalid_arguments() {
     executor_shutdown(executor);
 }
 
+/// Proves a dispatch to a session that has **already closed** is a settled refusal, not an ambiguous one.
+///
+/// **The defect this closes is the same class as the error-code round, one layer out.** A dispatch to a dead
+/// session cannot be delivered, so the transport reports `TransportClosed`, which `outcome.rs` classifies
+/// `ProviderError` — an *unsettled* outcome. That class is what sends a call to reconciliation, so a call
+/// that certainly did nothing would enter a pass that exists for calls which might have run. The executor now
+/// asks the session before sending and answers `Unavailable`, which is settled and `Safe`.
+///
+/// The session is closed here by **dropping the only other owner** of the running service, which is exactly
+/// how a child dies in production: the handle is released and the worker loop ends. No supervisor is invented
+/// for the test — the assertion is about what the executor answers, not about how a death is detected.
+///
+/// The mutation is removing the `is_closed` guard in `McpToolExecutor::invoke`: the call then reaches the
+/// transport and this fails on `Ambiguous`, naming the direction rather than only the class.
+#[tokio::test]
+async fn a_dispatch_to_an_already_closed_session_is_settled_rather_than_ambiguous() {
+    let Some(program) =
+        program_or_skip("a_dispatch_to_an_already_closed_session_is_settled_rather_than_ambiguous")
+    else {
+        return;
+    };
+    let discovered = discover_stdio_server(&standard_spec(program), SERVER_NAME)
+        .await
+        .expect("the standard fixture must be discoverable");
+    let server = ServerConfigId::new(SERVER_NAME).expect("the fixture name is a usable identity");
+    let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
+    let report = register_catalog(&mut registry, &server, discovered.catalog());
+    assert!(report.is_clean(), "the fixture must register: {report:?}");
+    let pairs = publishable_pairs(&registry, &server, discovered.catalog())
+        .expect("the fixture offers distinct capabilities");
+    let identities: Vec<ToolIdentity> = pairs
+        .iter()
+        .map(|(definition, _)| definition.identity.clone())
+        .collect();
+    let (session, _, _) = discovered.into_session();
+    let executor = McpToolExecutor::new(Arc::clone(&session), identities.clone(), CALL_TIMEOUT_MS);
+
+    // Open before the shutdown, so "closed after" is a change rather than a default — the round's own rule
+    // that an assertion about a transition must establish the starting state.
+    assert!(
+        !executor.is_closed(),
+        "the session must be live before it is closed, or this proves nothing"
+    );
+    // Cancel and drop the owning handle: the worker loop ends, so the session reports itself closed.
+    session.cancellation_token().cancel();
+    drop(session);
+    // Bounded wait rather than a sleep, so a slow machine does not make this flaky — and so a session that
+    // never closes fails loudly here instead of surfacing as a confusing class mismatch below.
+    let bound = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !executor.is_closed() && tokio::time::Instant::now() < bound {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        executor.is_closed(),
+        "the cancelled session must report itself closed before the dispatch"
+    );
+
+    let identity = &identities[0];
+    let arguments = arguments("{}");
+    let cancel = CancellationScope::new();
+    let request = ToolExecutionRequest {
+        identity,
+        display_name: "read_file",
+        arguments: &arguments,
+        started_at: fixture_instant(),
+        timeout_ms: CALL_TIMEOUT_MS,
+    };
+    let error = executor
+        .execute(request, &cancel)
+        .await
+        .expect_err("a closed session cannot serve a call");
+    // **A settled class, and asserted by its two properties rather than only by value** — the same shape the
+    // error-code round used, because the harm is the *unsettled* reading and a value assertion would let a
+    // different unsettled class satisfy it.
+    assert_eq!(
+        error,
+        ToolExecutionError::Failed(ToolErrorClass::Unavailable),
+        "a call that provably never left must not report an ambiguous outcome"
+    );
+    assert_ne!(
+        error,
+        ToolExecutionError::Ambiguous,
+        "an undeliverable call is not an ambiguous one"
+    );
+    if let ToolExecutionError::Failed(class) = error {
+        assert!(
+            !class.is_unsettled(),
+            "an already-closed session means nothing was sent, so the outcome is not ambiguous"
+        );
+    }
+
+    executor_shutdown(executor);
+}
+
 /// Shuts an executor's session down by dropping it, **inside a runtime**.
 ///
 /// A named helper rather than an inline `drop`, so the requirement is stated once: `rmcp`'s child transport

@@ -5347,8 +5347,149 @@ Dependencies: Milestone 2 exit gate.
     classifying everything as settled. The legacy-code test asserts the **literal** `-32002` rather than
     `ErrorCode::RESOURCE_NOT_FOUND`, because the constant *is* that number and asserting through it would test
     nothing about the value the renumbering moved.
+  - **Slice 19: a dispatch to a session already known to be dead was reported as an *ambiguous* outcome.** The
+    same defect class as slice 18, one layer out: `TransportClosed` is classified `ProviderError`, which is
+    `is_unsettled`, so the recovery pass was sent looking for an effect that was never produced — for a request
+    the client provably never sent, because the session's worker had already finished. `McpToolExecutor::invoke`
+    now asks the session before sending (`is_closed`) and answers `tool.unavailable`: settled and `Safe`.
+  - **The guard is explicitly *not* a supervisor, and saying so is part of the fix.** It cannot see a child that
+    dies a moment later, and a race is still correctly reported as unsettled. What it removes is the *wrong*
+    answer for the case the session already knows — dispatching to a server that is known to be gone.
+  - **Falsified by `&& false` on the guard, and the mutant's output is the finding:** the call then reaches the
+    transport and the new test fails with `left: Ambiguous, right: Failed(Unavailable)` — the unsettled reading,
+    which is exactly the harm. The **control in the same run is what makes it a boundary rather than a
+    constant**: `a_call_the_server_never_answers_reaches_the_port_as_ambiguous` stayed green, so the guard does
+    not swallow a genuinely unsettled outcome.
+  - **A probe I added one round earlier had no production caller, and that is the round's second finding.**
+    `McpComposition::health()` was reachable from a test alone — the very "a value nothing consults" shape it
+    was written to close. It now has one: `daemon::stop_mcp_servers` reads it before the drain, so the
+    `stopped N mcp server(s)` line is a fact about the *run* rather than about the declaration (a child that
+    died during the session is still in the composition, because nothing prunes it), and each server already
+    gone is named at `warn`. The doc now states what the probe does **not** do — it reports, it does not act.
+  - **Slice 20: a malformed tool on an otherwise healthy MCP server was silently discarded, and the fixture
+    could not even express the case.** `NormalizedCatalog` carries its refusals and its own doc says the two
+    halves exist because "the server has three tools" and "the server has three tools and one was dropped" are
+    different operator facts — and then `compose_discovered` cloned the catalog, built the registration report
+    from it, and **dropped `rejected` on the floor**. So a tool refused for an unusable name or schema left no
+    trace anywhere: the server composed, `McpComposition::is_clean()` was true (it only speaks about
+    whole-server refusals), and the registration report is empty for a tool registration never saw. The only
+    signal was a capability missing from a catalog an operator would have to diff by hand.
+  - **The detector had to be built before the fix could be trusted, and building it is what proved the defect.**
+    Every fixture offered exactly **one** tool, so a partial refusal was not expressible: one unusable tool is
+    the whole-server path, and one usable tool is the clean path. `examples/mcp_fixture_server.rs` gained a
+    `partial` mode (one usable tool, one unusable) and now holds a tool **slice** rather than a single name. The
+    new e2e test failed on its first run with `left: 0, right: 1` — the defect, reproduced before a line of the
+    fix was written.
+  - **The fix is a carrier, not a log line.** `ComposedMcpServer` gained `normalized_refusals` and a
+    `refusals()` accessor that returns **both** stages, because they answer one question: registration's
+    refusals name a canonical capability (what the server *could* have served) and the normalizer's name the
+    server's own spelling (what it has to find in the listing). A registration-only report would still have
+    missed this case. `McpToolRefusal { name, code }` is the canonical pair, built from either source enum, so
+    the two stages cannot drift into two spellings of one fact.
+  - **The test asserts the registration report is *empty* here, deliberately.** That documents why a
+    registration-only check cannot answer the question, so a later reader does not "fix" the assertion into a
+    false one — and it is the half a daemon-side log line could never prove.
+  - **`ComposedMcpServer::report()`'s doc promised an operator could tell "forty offered" from "thirty-nine
+    registered" and nothing read it, so it had no consumer either.** `daemon::compose_mcp_servers` now reads
+    both: every refusal at `warn` with the server, the tool, and its stable code, and the per-server totals at
+    `debug` — the counts are the answer to "did this server end up with the tools it listed", which was
+    otherwise unanswerable.
+  - **Falsified by emptying `normalized_refusals`**, which fails the new test with `left: 0, right: 1` naming
+    the unified accessor. The fixture change is what makes that mutation possible to run at all.
+  - **Slice 21: swept my own module for the defect class I had just hit four times, and found a fifth instance
+    plus three dead items.** After four rounds of "a value nothing consults", the sweep was the obvious next
+    step rather than waiting to trip over a sixth. Two findings.
+  - **`McpServerHealth::refused` was fed from `report.refused.len()` — registration's half — so the probe built
+    to report a server's health read `0` for a server with a refused tool.** This is the slice-20 defect one
+    layer up and it was introduced by the same round that fixed the layer below: slice 20 added `refusals()` and
+    gave the health row the value it always had, rather than the accessor that now existed. A probe that
+    undercounts exactly the case it was written to surface. It now reads `server.refusals().len()`, and the
+    partial-refusal test asserts the row agrees with the accessor **and** disagrees with the registration-only
+    count — a `assert_ne!` there so the assertion cannot be satisfied by the two happening to agree.
+  - **Three public items had no consumer anywhere in the workspace, verified across every crate, both apps,
+    the examples, and the e2e tests.** `McpComposition::admitted_identities` and `::source_kinds` were each
+    referenced only by tests (2 and 3 sites, all test-side), and `composition::startup_code` had **zero**
+    references outside its own definition — not even a test. All three were re-exported public API that nothing
+    in the workspace called, which is the "a value nothing consults" shape wearing a `pub` costume: a reader
+    sees the API surface and concludes the fabric can answer those questions, when it never asks them.
+  - **The removals are the smaller half of that finding, and the reason is worth stating.** `source_kinds`' own
+    doc admitted it "exists to make a caller's assumption checkable rather than to be interesting" — which is a
+    description of a test helper, in the public API of a production crate. `admitted_identities`' doc said the
+    set "is what a router is built from" and the router is built from `ComposedMcpServer`s instead; the flattened
+    form was never the input. A doc that names a consumer which does not exist is a claim, and both made one.
+  - **The one genuinely test-only helper was kept and relabelled, not deleted.** `classification_helpers`
+    (`is_permanent_startup_failure`, `requires_initialize_handshake`, `is_retryable_for`, `negotiate_...`) are
+    *seams* into a decision the production path does make — `discovery` uses `preferred_protocol_versions` and
+    `StartupFailure::is_permanent`, and records `permanent` on the refusal. Those are not the same as
+    `source_kinds`, which no path ever needed. The distinction: **an unused seam into a live decision is not the
+    same as an unused accessor over a value nobody reads.**
+  - **Falsified by restoring `report.refused.len()` in the health row**, which fails the partial-refusal test
+    with `left: 0, right: 1` naming the health count. The `assert_ne!` is what makes the assertion about the
+    *stage* rather than about the number.
+  - **Slice 22: the startup-retry decision was designed, computed through two layers, logged, and applied
+    nowhere.** `McpStartupRefusal::is_permanent()` has existed since `discovery.rs` was written;
+    `McpCompositionRefusal::is_permanent()` delegates to it; `daemon::compose_mcp_servers` prints it. So the note's
+    own advice — *"do not loop against a server whose `supportedVersions` excludes ours"* — was a comment about a
+    policy no code implemented, and the opposite defect was live at the same time: a **transient** failure (a
+    child that lost a race with its own socket) cost the whole session, because nothing re-attempted it.
+  - **The retry now exists, bounded and classified.** `compose_declared_servers` attempts a transient failure
+    twice, `RETRY_BACKOFF` (250 ms) apart, and a permanent one once; a repeated transient failure is reported, so
+    `permanent=false` in the log becomes **evidence that two attempts failed** rather than the classifier's
+    prediction. Quarantine is still the *report*, not a state machine — the honest scope, since a supervisor
+    does not exist.
+  - **The detector needed a seam, and inventing it was the round's design work.** A test cannot assert a retry by
+    elapsed time: a mutation that removed the retry entirely would still satisfy a loose timing bound. `Backoff`
+    is an enum with one production variant (`Real`) and one test variant (`Recording`), counted behind a leaked
+    `AtomicU32` the test holds; the assertion is on the **count**, which a single attempt cannot satisfy. The
+    counting constructor is `#[cfg(test)]`, so no production path can read the shared state.
+  - **`attempts` is a parameter for the same reason** — `compose_declared_servers_with(..., attempts)` lets the
+    control pass `1` (no retry) where the transient test passes `2`. Two tests, two claims: the first would be
+    satisfied by an implementation that retried *everything*, which is the defect class this project has named
+    before (a `Result::Err` carrying a reason makes every absence masquerade as a cause).
+  - **Falsified by `attempt >= attempts` → `attempts >= 0`**, which never retries: the test fails
+    `left: 0, right: 1` on the backoff count. The control's count must stay `0` at `attempts = 1`, so the two
+    tests cannot both be satisfied by a retry-everything or a retry-nothing implementation.
+  - **The fixture is a missing program, chosen for its classification rather than its convenience.**
+    `spawn_stdio_server` reports an unspawnable program as `McpStartupRefusal::Launch`, one of the two variants
+    `is_permanent()` answers `false` for — so the transient path is reachable without a live server, and the
+    assertion is on the *decision* rather than on a process. (The code that travels is `mcp.spawn_failed`, the
+    launcher's own, not `mcp.program_invalid`.)
+  - **Slice 23: MCP server health had no operational surface, so the only moment an operator could learn a
+    server had died was while the daemon was exiting.** `McpComposition::health()` had exactly one production
+    caller — the drain's log line — while `GET /api/v1/system/status` reported storage and capabilities and
+    said nothing about the servers the daemon had launched. `health` was therefore a probe whose one reader
+    ran at the moment its answer stopped mattering, which is the "a value nothing consults" shape in its most
+    awkward form: consulted, but only when it is too late to act.
+  - **The status surface now reports both halves of the composition.** `mcp.servers` (name, admitted tool
+    count, refused count, `closed`, negotiated protocol version) and `mcp.refused` (name, stable code,
+    `permanent`) — the second half because a list of what is *running* cannot answer "where is the server I
+    declared", so its absence would be the only signal and would leave an operator to infer it.
+  - **Read per request, never snapshotted, and that is the slice's load-bearing decision.** `ApiState` is built
+    once by `RunningDaemon::api_state()` and the router then serves for the daemon's life, so a `Vec<Row>`
+    captured at build time would freeze the health of that instant — and for a server that dies later, that is
+    precisely the fact that stopped being true. `McpHealthSource` holds the **same `Arc<Mutex<Option<..>>>`
+    the drain takes from**, so a status request answers about now, and after a drain reports the field
+    **absent** rather than reporting sessions that have already been cancelled.
+  - **The detector closes a session and re-requests, which is what a snapshot cannot pass.** The e2e test
+    composes a real fixture child, asserts a live row, then *takes* the composition exactly as the drain does
+    and asserts the field is gone. An implementation that captured rows at build time would answer both
+    requests identically — so the test would fail, and that is the assertion that makes "read per request" a
+    measured property rather than a comment. Falsified by zeroing the tool count in the mapping, which fails on
+    `left: Number(0), right: 1`.
+  - **A claim I wrote and then corrected in the same round.** The first version of `McpHealthSource::report`'s
+    doc said `None` means "a profile with no `[mcp]` table". That is **false**:
+    `compose_mcp_servers` returns a default composition rather than nothing, so the daemon always holds one
+    until the drain, and "nothing declared" is told apart from "everything refused" by `refused` being empty
+    rather than by the field's presence. The doc now says `None` means a drain, and the contract says the same.
+  - **Scope, because this is a read surface and nothing more.** It does not supervise, prune, quarantine, or
+    re-launch. What changed is that the facts exist outside the daemon's own log: an operator can now ask a
+    *live* daemon which servers are up, which were refused, and whether a retry could help. The supervisor is
+    still the next unnamed slice.
   - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
-    dies *during* a run is not yet noticed and quarantined; `health` reports it but nothing acts on it);
+    dies *during* a run is not yet noticed and quarantined; the executor refuses a dispatch to it and `health`
+    reports it, but **nothing acts on it** — no pass prunes, quarantines, or re-launches, and a dispatch that
+    races the death is still reported unsettled, correctly; the startup retry covers the **startup path only**,
+    so a server that starts successfully and then dies is not re-attempted);
     deregistration when a server is removed from configuration (the registry is built per start and dropped, so
     a removal needs no release path *today* — it becomes needed when the registry is held); the `[mcp]` table
     in the operator docs; a reviewed TLS choice before the remote half; the remaining `Test Plan` items; and

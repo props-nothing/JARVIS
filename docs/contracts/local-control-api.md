@@ -202,7 +202,15 @@ through authenticated status/doctor paths.
     "runs.events",
     "policy.read",
     "policy.write"
-  ]
+  ],
+  "mcp": {
+    "servers": [
+      {"name":"acme-files","tools":1,"refused_tools":0,"closed":false,"protocol_version":"2026-07-28"}
+    ],
+    "refused": [
+      {"name":"other-files","code":"mcp.spawn_failed","permanent":false}
+    ]
+  }
 }
 ```
 
@@ -212,8 +220,18 @@ serving a route, so it cannot be used to grant or withhold anything, and a clien
 a refusal from any route it calls. The daemon's list is asserted against its own route table by a
 test, so a route added without its capability fails rather than being discovered by probing.
 
+`mcp` reports the configured MCP servers and is **read per request**, not captured when the daemon
+started: `closed` says the child is gone *now*, so a client polling this learns a server died without
+waiting for the daemon to exit. `servers` lists what composed; `refused` lists what did not, with the
+stable code and whether a retry could help (`permanent: false` means the composition already
+re-attempted once and it failed the same way). Both halves are present because a list of running
+servers cannot answer "where is the server I declared" — the omission would be an inference from an
+absence. The object is **absent** only while the daemon is draining, when it holds no composition.
+
 The response never includes filesystem paths, secret references, connection
-strings, environment values, raw internal errors, or another client's data.
+strings, environment values, raw internal errors, MCP refusal messages, or another
+client's data. A server's `name` is its configured identity rather than text a
+server chose, and a refusal travels as a code rather than as prose.
 
 ## Run Resources
 

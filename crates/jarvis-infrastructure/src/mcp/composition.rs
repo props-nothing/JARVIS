@@ -42,10 +42,10 @@
 //! is not callable — the same distinction `registration.rs` makes one layer down, carried through to the
 //! thing that would dispatch it.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use jarvis_domain::tool::identity::{SourceKind, ToolIdentity};
+use jarvis_domain::tool::identity::ToolIdentity;
 use jarvis_domain::tool::registry::{ServerConfigId, ToolRegistry};
 
 use super::discovery::{DiscoveredServer, McpStartupRefusal, discover_stdio_server};
@@ -149,6 +149,13 @@ pub struct ComposedMcpServer {
     /// offers forty tools" and "thirty-nine were registered and one had a changed schema", and a caller
     /// holding only the executor cannot tell them apart.
     report: RegistrationReport,
+    /// Tools the **normalizer** refused before registration ever saw them.
+    ///
+    /// Separate from `report.refused` because the two happen at different stages and only this one can be
+    /// missing while the server still composes: a normalization refusal means the offered entry was never a
+    /// candidate, so `register_catalog` had nothing to refuse and `is_clean()` stayed true. Without this field
+    /// a malformed tool on an otherwise healthy server left no trace at all.
+    normalized_refusals: Vec<super::McpToolRefusal>,
     /// The identities that are now callable, which is what a router is built from.
     admitted: Vec<ToolIdentity>,
 }
@@ -163,6 +170,7 @@ impl std::fmt::Debug for ComposedMcpServer {
             .field("added", &self.report.added)
             .field("unchanged", &self.report.unchanged)
             .field("refused", &self.report.refused.len())
+            .field("normalized_refusals", &self.normalized_refusals.len())
             .finish_non_exhaustive()
     }
 }
@@ -180,7 +188,14 @@ impl ComposedMcpServer {
         &self.executor
     }
 
-    /// Returns what registration did.
+    /// Returns what registration did, including the per-tool refusals.
+    ///
+    /// **The read that makes a partial refusal visible, and until it had a caller the report was carried for
+    /// nothing.** `is_clean()` is true for any server that admitted at least one tool, so a catalog of forty
+    /// where one was refused produced a server that looked healthy while offering thirty-nine — the operator
+    /// fact this report exists to distinguish. `daemon::compose_mcp_servers` now reads it at startup: each
+    /// refusal is logged at `warn` with its capability and stable code, and the totals at `debug`. A refusal
+    /// that is *not* a whole-server one would otherwise leave no trace at all.
     #[must_use]
     pub fn report(&self) -> &RegistrationReport {
         &self.report
@@ -190,6 +205,28 @@ impl ComposedMcpServer {
     #[must_use]
     pub fn admitted(&self) -> &[ToolIdentity] {
         &self.admitted
+    }
+
+    /// Returns every offered tool that never became callable, from **both** stages.
+    ///
+    /// Registration's refusals first (they name a canonical capability), then the normalizer's (they name the
+    /// server's own spelling, which is what an operator has to find in the server's listing). Both are
+    /// returned rather than one, because a caller asking "what did this server offer that I cannot call" is
+    /// asking about the whole set — returning only registration's would answer with the tools the server could
+    /// have served and not the ones it named badly enough to be unusable.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<super::McpToolRefusal> {
+        let mut refusals: Vec<super::McpToolRefusal> = self
+            .report
+            .refused
+            .iter()
+            .map(|refused| super::McpToolRefusal {
+                name: refused.capability.clone(),
+                code: refused.refusal.code(),
+            })
+            .collect();
+        refusals.extend(self.normalized_refusals.iter().cloned());
+        refusals
     }
 
     /// Returns the live session.
@@ -288,18 +325,6 @@ impl McpComposition {
         self.refused.is_empty()
     }
 
-    /// Returns every identity across every composed server.
-    ///
-    /// The set a router is built from. Collected here rather than by the caller so the "admitted only" rule
-    /// has one implementation: each server contributes exactly what `publishable_pairs` produced for it.
-    #[must_use]
-    pub fn admitted_identities(&self) -> Vec<ToolIdentity> {
-        self.composed
-            .iter()
-            .flat_map(|server| server.admitted.iter().cloned())
-            .collect()
-    }
-
     /// Reports each server's name, tool count, negotiated version, and whether its session is closed.
     ///
     /// **The probe the note's operational section asks for, and it reports what the session says rather than
@@ -311,6 +336,13 @@ impl McpComposition {
     /// Deliberately **not** named `health` with a boolean: a closed session is not a failure the daemon can
     /// repair — it is a fact reported beside the version and the count, and a caller deciding whether to
     /// quarantine acts on all three.
+    ///
+    /// **It reports; it does not act, and that limit is the honest part.** Calling this does not prune, stop,
+    /// or quarantine anything, and it cannot see a child that dies a moment later. There is no supervisor yet,
+    /// so the two places a death is currently observable are a drain (`daemon::stop_mcp_servers` reads this to
+    /// report which servers were already gone) and the single-server form a dispatch path can consult
+    /// ([`McpToolExecutor::is_closed`]). A pass that *acts* on a closed row — quarantine, deregistration,
+    /// re-launch — is the supervisor this does not claim to be.
     #[must_use]
     pub fn health(&self) -> Vec<McpServerHealth> {
         self.composed
@@ -323,22 +355,8 @@ impl McpComposition {
                     .peer_info()
                     .map(|info| info.protocol_version.to_string()),
                 closed: server.session.is_closed(),
-                refused: server.report.refused.len(),
+                refused: server.refusals().len(),
             })
-            .collect()
-    }
-
-    /// Returns the distinct source kinds the composed servers produced.
-    ///
-    /// Every MCP server's tools share the `McpServer` kind, so this exists to make a caller's assumption
-    /// checkable rather than to be interesting: a router registering these needs **one** executor per kind, and
-    /// a test can assert that the kind is what it expects.
-    #[must_use]
-    pub fn source_kinds(&self) -> BTreeSet<SourceKind> {
-        self.composed
-            .iter()
-            .flat_map(|server| server.admitted.iter())
-            .map(|identity| identity.source.kind)
             .collect()
     }
 }
@@ -405,6 +423,15 @@ pub fn compose_discovered(
     let name = discovered.server().as_str().to_owned();
     let server = discovered.server().clone();
     let catalog = discovered.catalog().clone();
+    // **The normalizer's refusals are captured before the catalog is consumed, because nothing else carries
+    // them.** `register_catalog` only ever sees tools that survived normalization, so a malformed entry is
+    // invisible to the registration report — and the server still composes, which is what made the omission
+    // silent. Taken here so the refusals travel with the server they belong to.
+    let normalized_refusals: Vec<super::McpToolRefusal> = catalog
+        .rejected
+        .iter()
+        .map(super::refusal_for_rejected)
+        .collect();
     let report = register_catalog(registry, &server, &catalog);
     // **The publish set is the admitted set**, filtered by the registry rather than taken from the catalog —
     // see `registration::publishable_pairs` for what publishing the offered set would serve.
@@ -450,8 +477,106 @@ pub fn compose_discovered(
         session,
         executor,
         report,
+        normalized_refusals,
         admitted,
     })
+}
+
+/// How long to wait before re-spawning a server whose first attempt failed transiently.
+///
+/// **A real delay, not a yield**, and short because it is bounded work on the startup path: the daemon is
+/// still coming up, and a server that needs longer than this to become startable is one an operator should
+/// hear about rather than wait on. The purpose is not to outlast a long outage — that is the supervisor this
+/// module still does not have — but to stop a *transient* failure (a child that lost a race with its own
+/// socket, a machine briefly out of file descriptors) from costing the whole session.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How many times a **transient** startup failure is attempted before the server is reported refused.
+///
+/// One retry rather than a loop: `is_permanent()` already filters the failures a retry cannot fix, so what
+/// remains here is the genuinely transient kind, and a second attempt is the cheap way to absorb it. A
+/// repeated failure is treated as evidence that the fault is not transient after all — which is the same
+/// conclusion `is_permanent` would have reached had the classifier known the difference.
+const TRANSIENT_STARTUP_ATTEMPTS: u32 = 2;
+
+/// The sleep a retry waits before a re-spawn, in a form a deterministic test can replace.
+///
+/// **Injectable, and that is required rather than tidy.** The test that exercises the retry must not spend
+/// [`RETRY_BACKOFF`] of real time, and more importantly must not *depend* on a real delay for its meaning: a
+/// mutation that removed the retry would still pass a test that only asserted elapsed time loosely. An enum
+/// with one production variant and one test variant makes "did it retry" an observable fact — the recording
+/// sleep counts, so the assertion is on the count rather than on a clock.
+#[derive(Debug, Clone, Copy, Default)]
+enum Backoff {
+    /// The real delay, used by every production path.
+    #[default]
+    Real,
+    /// A no-op that records how many times it was called — test-only, and never constructed in production.
+    ///
+    /// The counter lives behind a leaked `Box` because the value is held by a `&` inside the retry loop and
+    /// must outlive it; a test that wants the count reaches it through [`Backoff::counting`]'s returned
+    /// handle rather than through the enum, so the shared state cannot be read by a path that has no test.
+    #[cfg(test)]
+    Recording(&'static std::sync::atomic::AtomicU32),
+}
+
+impl Backoff {
+    /// Returns a recording backoff and the counter it writes to.
+    ///
+    /// The counter is leaked deliberately: it must outlive the composition's local scope, and a test that
+    /// leaked one `AtomicU32` is not a leak that matters.
+    #[cfg(test)]
+    fn counting() -> (Self, &'static std::sync::atomic::AtomicU32) {
+        let counter: &'static std::sync::atomic::AtomicU32 =
+            Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)));
+        (Self::Recording(counter), counter)
+    }
+
+    /// Waits the backoff, or records the intent to.
+    async fn wait(self) {
+        match self {
+            Self::Real => tokio::time::sleep(RETRY_BACKOFF).await,
+            #[cfg(test)]
+            Self::Recording(counter) => {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Attempts one declaration, retrying **only** a transient failure.
+///
+/// Returns the discovered server, or the refusal to report. `attempts` is how many spawns are permitted, and
+/// is a parameter rather than the constant so the retry is a property this module can test with one attempt
+/// (no retry) as its control.
+async fn discover_with_retry(
+    declaration: &McpServerDeclaration,
+    spec: &McpLaunchSpec,
+    backoff: Backoff,
+    attempts: u32,
+) -> Result<DiscoveredServer, McpStartupRefusal> {
+    let mut attempt = 1;
+    loop {
+        match discover_stdio_server(spec, &declaration.name).await {
+            Ok(discovered) => return Ok(discovered),
+            Err(refusal) => {
+                // **The classifier's own answer decides, and it is asked in one place.** A permanent failure
+                // means a retry cannot help — the peer implements the version set it implements, the catalog
+                // it sent is the one that was refused — so the server is quarantined by *reporting* it rather
+                // than by a state machine that does not exist yet. A transient one is retried, bounded.
+                if refusal.is_permanent() || attempt >= attempts {
+                    return Err(refusal);
+                }
+                log::warn!(
+                    "mcp server startup failed transiently, retrying: server={} attempt={attempt} code={}",
+                    declaration.name,
+                    refusal.code()
+                );
+                attempt += 1;
+                backoff.wait().await;
+            }
+        }
+    }
 }
 
 /// Composes every enabled declaration in a profile.
@@ -472,6 +597,32 @@ pub async fn compose_declared_servers(
     declarations: &[McpServerDeclaration],
     secrets: &dyn SecretResolver,
 ) -> Result<McpComposition, ConfigError> {
+    compose_declared_servers_with(
+        registry,
+        declarations,
+        secrets,
+        Backoff::Real,
+        TRANSIENT_STARTUP_ATTEMPTS,
+    )
+    .await
+}
+
+/// Composes the declared servers with an explicit backoff and attempt count.
+///
+/// Exists so a test can exercise the **retry decision** without spending the real delay, and so
+/// `attempts = 1` gives that test its control: one attempt means no retry, which is what makes "did the
+/// retry happen" a difference the test observes rather than something both paths happen to do.
+///
+/// # Errors
+///
+/// As [`compose_declared_servers`].
+async fn compose_declared_servers_with(
+    registry: &mut ToolRegistry,
+    declarations: &[McpServerDeclaration],
+    secrets: &dyn SecretResolver,
+    backoff: Backoff,
+    attempts: u32,
+) -> Result<McpComposition, ConfigError> {
     let mut composition = McpComposition::default();
     for declaration in declarations {
         // A disabled declaration is skipped **here rather than filtered by the caller**, so the rule lives
@@ -490,7 +641,7 @@ pub async fn compose_declared_servers(
                 continue;
             }
         };
-        let discovered = match discover_stdio_server(&spec, &declaration.name).await {
+        let discovered = match discover_with_retry(declaration, &spec, backoff, attempts).await {
             Ok(discovered) => discovered,
             Err(refusal) => {
                 composition.refused.push((
@@ -512,15 +663,6 @@ pub async fn compose_declared_servers(
         }
     }
     Ok(composition)
-}
-
-/// Returns the refusal a `McpStartupRefusal` maps to, for a caller that wants the code without the enum.
-///
-/// Exposed so a composition test can assert the mapping without constructing a live server, and so the
-/// mapping has one definition rather than being written out at each call site.
-#[must_use]
-pub fn startup_code(refusal: &McpStartupRefusal) -> &'static str {
-    refusal.code()
 }
 
 /// One executor over **every** composed server, dispatching by identity.
@@ -621,10 +763,10 @@ impl ComposedMcpExecutor {
 /// Short, and deliberately shorter than the daemon's own grace window: a server that will not stop must not
 /// hold the drain open, and the caller reports it rather than waiting. One second is enough for a local child
 /// whose transport has been closed, and a server that needs longer is a fact worth surfacing.
-const SHUTDOWN_POLL_BOUND: std::time::Duration = std::time::Duration::from_millis(1_000);
+const SHUTDOWN_POLL_BOUND: Duration = Duration::from_millis(1_000);
 
 /// How often the worker's state is checked while waiting.
-const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Waits, to a bound, for a cancelled session's worker to finish.
 ///

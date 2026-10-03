@@ -430,7 +430,14 @@ impl RunningDaemon {
             .with_runs(Arc::clone(&self.runs))
             .with_policies(Arc::clone(&self.policies), Arc::clone(&self.inventory))
             .with_approvals(Arc::clone(&self.approvals))
-            .with_tool_grants(Arc::clone(&self.tool_grants)),
+            .with_tool_grants(Arc::clone(&self.tool_grants))
+            // **The composition the drain takes from is the one the status reads**, deliberately the same
+            // `Arc`. A second holder would report a composition the drain could have already stopped, and
+            // `McpHealthSource::rows` returning `None` after the take is what makes "the daemon is shutting
+            // down" visible in the status rather than indistinguishable from a healthy daemon.
+            .with_mcp(crate::http::McpHealthSource::new(Arc::clone(
+                &self.mcp_servers,
+            ))),
         ))
     }
 
@@ -800,10 +807,28 @@ async fn stop_mcp_servers(
     let Some(composition) = taken else {
         return;
     };
+    // **The health probe gets its first production caller here, and reporting what it finds is the point.**
+    // A server whose child died during the session is still in the composition — nothing prunes it, because
+    // there is no supervisor yet — so without reading the sessions the drain would log "stopped 3 mcp
+    // server(s)" for children that were already gone. The count is corrected rather than left as a fact about
+    // the declaration, and the servers that went away are named, because an operator seeing this line is the
+    // only place the death is currently visible: no heartbeat notices it and no dispatch is refused for it
+    // until the next call reaches that server.
+    let rows = composition.health();
+    let already_gone = rows.iter().filter(|row| row.closed).count();
+    for row in &rows {
+        if row.closed {
+            log::warn!(
+                "mcp server was already closed before the drain: server={} tools={}",
+                row.name,
+                row.tools
+            );
+        }
+    }
     let servers = composition.servers().len();
     let unclean = composition.shutdown().await;
     if servers > 0 {
-        log::info!("stopped {servers} mcp server(s) during drain");
+        log::info!("stopped {servers} mcp server(s) during drain; {already_gone} already closed");
     }
     for name in unclean {
         log::warn!("mcp server did not stop cleanly: server={name}");
@@ -1080,8 +1105,6 @@ pub(crate) fn router_over(
 async fn compose_mcp_servers(
     declared: &[crate::config::mcp::McpServerDeclaration],
 ) -> Result<crate::mcp::composition::McpComposition, StartupError> {
-    use crate::config::secret::EnvSecretResolver;
-
     if declared.is_empty() {
         return Ok(crate::mcp::composition::McpComposition::default());
     }
@@ -1095,17 +1118,52 @@ async fn compose_mcp_servers(
     let composition = crate::mcp::composition::compose_declared_servers(
         &mut registry,
         declared,
-        &EnvSecretResolver::new(),
+        &crate::config::secret::EnvSecretResolver::new(),
     )
     .await
     .map_err(|_| StartupError::Config)?;
     for (server, refusal) in composition.refused() {
         // The **code**, never the refusal's message: a message may carry operator text, and the code is what
         // an operator greps for in the note's error table.
+        //
+        // **`permanent` is now a fact about what already happened, not a plan.** The composition retries a
+        // transient startup failure once before reporting it, so `permanent=false` here means "it was retried
+        // and failed the same way again" — which is stronger evidence than the classifier's own prediction, and
+        // it is why the flag is worth logging: the operator learns whether a single attempt is what failed or
+        // two.
         log::warn!(
             "mcp server refused at startup: server={server} code={} permanent={}",
             refusal.code(),
             refusal.is_permanent()
+        );
+    }
+    // **A server that started with a shorter tool list than it offered is reported, because until this
+    // line nothing said so.** `ComposedMcpServer`'s own doc gives the reason the registration report is
+    // carried — "forty offered" and "thirty-nine registered" are different operator facts — and `is_clean`
+    // is true for *every* server that admitted at least one tool, so a partial refusal produced no output
+    // at all. Its `refusals()` covers **both** stages: a tool the normalizer refused for its shape never
+    // reached registration, so a registration-only check would still have missed it, and that was the case
+    // with genuinely no trace. The only remaining signal was a tool missing from a catalog an operator
+    // would have to diff by hand.
+    for server in composition.servers() {
+        for refusal in server.refusals() {
+            log::warn!(
+                "mcp tool refused at startup: server={} tool={} code={}",
+                server.server(),
+                refusal.name,
+                refusal.code
+            );
+        }
+        let report = server.report();
+        // A `debug` line rather than `info`: a healthy server's counts are not an event, but they are the
+        // answer to "did this server end up with the tools it listed", which is otherwise unanswerable.
+        log::debug!(
+            "mcp server registered: server={} added={} unchanged={} refused={} normalized_refusals={}",
+            server.server(),
+            report.added,
+            report.unchanged,
+            report.refused.len(),
+            server.refusals().len() - report.refused.len(),
         );
     }
     Ok(composition)

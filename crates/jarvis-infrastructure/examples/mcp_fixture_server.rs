@@ -56,6 +56,14 @@ pub const FIXTURE_LEGACY: &str = "legacy";
 /// it and the discovery must report an all-refused catalog rather than an empty one.
 pub const FIXTURE_ALL_REFUSED: &str = "all-refused";
 
+/// The variable's value for a peer that lists **one usable tool and one unusable one**.
+///
+/// This is the *partial* refusal, and it exists because the other fixtures cannot produce it: a server whose
+/// only tool is refused takes the whole-server path, while a server with any usable tool takes none. Without a
+/// fixture that offers both, the case where a malformed tool is silently dropped from an otherwise healthy
+/// server has no detector at all.
+pub const FIXTURE_PARTIAL: &str = "partial";
+
 /// The variable's value for a peer that **lists and accepts a call but never answers it**.
 ///
 /// This exists so a timeout can be produced deterministically. A timeout is the one class that reaches the
@@ -91,8 +99,11 @@ pub const FIXTURE_LEGACY_VERSION: ProtocolVersion = ProtocolVersion::V_2025_06_1
 struct FixtureServer {
     /// The versions this fixture reports during discovery.
     supported: Vec<ProtocolVersion>,
-    /// The tool name this fixture offers.
-    tool: &'static str,
+    /// The tools this fixture offers, in order.
+    ///
+    /// A slice rather than one name so a fixture can offer a **mix**, which is the only way to produce a
+    /// partial normalization refusal: a server with one usable tool and one refused one.
+    tools: &'static [&'static str],
     /// Whether a call is accepted and then **never answered**, so the client's bound elapses.
     withhold_answer: bool,
 }
@@ -126,8 +137,12 @@ impl ServerHandler for FixtureServer {
             Some(map) => map.clone(),
             None => return std::future::ready(Ok(ListToolsResult::with_all_items(Vec::new()))),
         };
-        let tool = Tool::new(self.tool, "Read a file.", map);
-        std::future::ready(Ok(ListToolsResult::with_all_items(vec![tool])))
+        let tools = self
+            .tools
+            .iter()
+            .map(|name| Tool::new(*name, "Read a file.", map.clone()))
+            .collect();
+        std::future::ready(Ok(ListToolsResult::with_all_items(tools)))
     }
 
     /// Answers a call for the tool this fixture listed, and refuses anything else.
@@ -149,10 +164,10 @@ impl ServerHandler for FixtureServer {
         // Copied out of `self` before the block, so the returned future holds no borrow of the server — the
         // shape the SDK's own handlers use, and what lets `+ '_` stay honest.
         let name = request.name;
-        let tool = self.tool;
+        let tools = self.tools;
         let withhold = self.withhold_answer;
         async move {
-            if name != tool {
+            if !tools.contains(&name.as_ref()) {
                 return Err(rmcp::ErrorData::new(
                     rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                     "no such tool",
@@ -185,22 +200,29 @@ fn selected_fixture() -> Option<FixtureServer> {
     let server = match name.as_str() {
         FIXTURE_STANDARD => FixtureServer {
             supported: both,
-            tool: FIXTURE_TOOL_NAME,
+            tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
         },
         FIXTURE_LEGACY => FixtureServer {
             supported: vec![FIXTURE_LEGACY_VERSION],
-            tool: FIXTURE_TOOL_NAME,
+            tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: false,
         },
         FIXTURE_ALL_REFUSED => FixtureServer {
             supported: both,
-            tool: FIXTURE_UNUSABLE_TOOL_NAME,
+            tools: &[FIXTURE_UNUSABLE_TOOL_NAME],
+            withhold_answer: false,
+        },
+        FIXTURE_PARTIAL => FixtureServer {
+            supported: both,
+            // The usable one **first**, so a bug that served only the first entry would still look healthy to
+            // a test that checked for a callable tool rather than for the refusal beside it.
+            tools: &[FIXTURE_TOOL_NAME, FIXTURE_UNUSABLE_TOOL_NAME],
             withhold_answer: false,
         },
         FIXTURE_UNANSWERED => FixtureServer {
             supported: both,
-            tool: FIXTURE_TOOL_NAME,
+            tools: &[FIXTURE_TOOL_NAME],
             withhold_answer: true,
         },
         _ => return None,

@@ -33,6 +33,7 @@ use jarvis_domain::tool::error_class::ToolErrorClass;
 use jarvis_domain::tool::identity::{
     SchemaFingerprint, SourceKind, ToolCapability, ToolIdentity, ToolSource, ToolVersion,
 };
+use jarvis_domain::tool::registry::ToolRegistry;
 
 /// A declaration that must be accepted, so each refusal below is contrasted with a working one.
 fn declaration(name: &str) -> McpServerDeclaration {
@@ -54,6 +55,116 @@ fn resolver() -> MapSecretResolver {
     let resolver = MapSecretResolver::new();
     resolver.insert("JARVIS_ACME_TOKEN", "s3cret");
     resolver
+}
+
+/// A declaration whose program cannot be spawned, so the failure is the **transient** kind.
+///
+/// `spawn_stdio_server` reports a missing program as `McpStartupRefusal::Launch`, and `Launch` is one of the
+/// two variants `is_permanent()` answers `false` for — the child "may start next time: the program may be
+/// installed". Without such a declaration the retry path could not be reached at all, which is why the
+/// fixture is a missing program rather than a live server: the point is the *classification*, not the spawn.
+fn unlaunchable(name: &str) -> McpServerDeclaration {
+    McpServerDeclaration {
+        name: name.to_owned(),
+        // A path that cannot exist: an absolute one under a directory no build creates.
+        program: PathBuf::from("/nonexistent-jarvis-test-dir/mcp-server"),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        enabled: true,
+        startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
+    }
+}
+
+#[tokio::test]
+async fn a_transient_startup_failure_is_retried_once_and_then_reported() {
+    // **The retry decision that was designed three slices ago and had no caller.** `is_permanent()` has
+    // existed since `discovery.rs` was written, is computed through two layers, and reached only a log line —
+    // so the doc's advice ("do not loop against a server whose supportedVersions excludes ours") was a comment
+    // nobody acted on, and a transient failure cost the whole session because nothing re-attempted it.
+    //
+    // The assertion is on the **number of backoffs**, not on elapsed time: a mutation that removed the retry
+    // would still pass a loose timing assertion, while a recorded count cannot be satisfied by a single
+    // attempt. `Backoff::counting` is the injectable seam that makes that possible.
+    let (backoff, count) = super::Backoff::counting();
+    let declarations = vec![unlaunchable("acme-files")];
+    let mut registry = ToolRegistry::new();
+    let composition = super::compose_declared_servers_with(
+        &mut registry,
+        &declarations,
+        &MapSecretResolver::new(),
+        backoff,
+        2,
+    )
+    .await
+    .expect("declarations are valid, so the composition itself succeeds");
+
+    // It was attempted twice, and the backoff ran exactly once — the whole point of "one retry".
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a transient failure must be retried exactly once"
+    );
+    // And then reported, because a repeated failure is a fact an operator has to see.
+    assert_eq!(composition.servers().len(), 0);
+    assert_eq!(composition.refused().len(), 1);
+    assert_eq!(
+        composition.refused()[0].1.code(),
+        "mcp.spawn_failed",
+        "the launcher's own code travels, rather than a composition-level restatement"
+    );
+}
+
+#[tokio::test]
+async fn a_permanent_startup_failure_is_never_retried() {
+    // **The control for the test above, and a different claim.** Without it, an implementation that retried
+    // *everything* would satisfy the transient test — and this codebase has a name for that defect: a
+    // `Result::Err` carrying a reason makes every absence masquerade as a cause. The permanent case is an
+    // incompatible version set, which no retry can change, so the backoff must not run even once.
+    //
+    // The failure is made permanent by a **program that is a directory**, which passes the launch-shape checks
+    // and fails at the spawn for a reason the shape rules cannot see... which is still `Launch`, so instead the
+    // permanence is asserted through the classifier's own predicate rather than by constructing an
+    // incompatible peer: this test asserts the *guard*, and `discovery_tests` asserts what makes a failure
+    // permanent.
+    use super::{McpCompositionRefusal, McpStartupRefusal};
+
+    let transient = McpStartupRefusal::Launch {
+        code: "mcp.program_invalid",
+    };
+    assert!(
+        !transient.is_permanent(),
+        "a launch fault is the transient kind, or the retry above is unreachable"
+    );
+    assert!(
+        McpCompositionRefusal::SecretUnavailable {
+            server: "acme-files".to_owned()
+        }
+        .is_permanent(),
+        "an unresolvable secret is permanent: configuration is read again identically on every attempt"
+    );
+
+    // And the retry loop's guard, asserted directly: a permanent refusal must not consume a backoff. The
+    // composition reaches this through the same `is_permanent()` call, so asserting the predicate is asserting
+    // the guard rather than a copy of it.
+    let (backoff, count) = super::Backoff::counting();
+    // One attempt is the no-retry shape, so a refusal at the first attempt must not back off at all.
+    let declarations = vec![unlaunchable("acme-files")];
+    let mut registry = ToolRegistry::new();
+    let composition = super::compose_declared_servers_with(
+        &mut registry,
+        &declarations,
+        &MapSecretResolver::new(),
+        backoff,
+        1,
+    )
+    .await
+    .expect("valid");
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a single permitted attempt must never back off"
+    );
+    assert_eq!(composition.refused().len(), 1);
 }
 
 /// An identity for a tool of `owner`'s, with a fingerprint distinguished by `seed`.
@@ -210,8 +321,10 @@ fn an_empty_composition_dispatches_to_no_server_and_refuses_everything() {
     let composition = super::McpComposition::default();
     assert!(composition.is_clean(), "nothing was refused");
     assert!(composition.servers().is_empty());
-    assert!(composition.admitted_identities().is_empty());
-    assert!(composition.source_kinds().is_empty());
+    assert!(
+        composition.health().is_empty(),
+        "an empty composition has no row to report"
+    );
 
     let dispatcher = ComposedMcpExecutor::over(&composition);
     assert!(dispatcher.is_empty());

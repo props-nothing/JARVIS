@@ -176,6 +176,91 @@ pub struct ApiState {
     /// *waiting*, so a production value would make its test take as long as the bound. `ApiState::new`
     /// uses [`DEFAULT_STREAM_OVERRUN_TIMEOUT`], which is what a daemon serves.
     pub stream_overrun_timeout: Duration,
+    /// The live MCP server health, when this daemon launched any.
+    ///
+    /// **A query rather than a snapshot, and that is the whole point.** A daemon holds its composition for
+    /// its lifetime and `ApiState` is rebuilt by `RunningDaemon::api_state()`, so storing a `Vec` of rows at
+    /// build time would report the health of the moment the router was built — which, for a server that dies
+    /// later, is exactly the fact that stopped being true. Holding the composition behind an `Arc` and reading
+    /// it per request means the status answers about *now*.
+    ///
+    /// Optional because a profile with no `[mcp]` table composes nothing, and a status response should then
+    /// omit the field rather than report an empty list — the same distinction the composition itself keeps
+    /// between "no server was declared" and "every declared server failed".
+    pub mcp: Option<McpHealthSource>,
+}
+
+/// A per-request reader of the daemon's MCP server health.
+///
+/// A newtype over the composition, rather than `ApiState` holding `McpComposition` directly, so the HTTP
+/// layer's dependency on the adapter is one named type instead of a field whose methods are the composition's
+/// whole public surface. It exposes exactly one operation because a status response needs exactly one — see
+/// the note on `SystemStatus::mcp`.
+pub struct McpHealthSource {
+    /// The composition, read through the same holder the drain takes from.
+    composition: Arc<tokio::sync::Mutex<Option<crate::mcp::composition::McpComposition>>>,
+}
+
+impl std::fmt::Debug for McpHealthSource {
+    /// Reports whether a composition is still held, never its contents.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpHealthSource")
+            .finish_non_exhaustive()
+    }
+}
+
+impl McpHealthSource {
+    /// Wraps the holder the daemon's composition lives in.
+    #[must_use]
+    pub fn new(
+        composition: Arc<tokio::sync::Mutex<Option<crate::mcp::composition::McpComposition>>>,
+    ) -> Self {
+        Self { composition }
+    }
+
+    /// Returns the daemon's MCP state, or `None` when no composition is held.
+    ///
+    /// `None` **only after a drain**, because the drain *takes* the composition: a status request arriving while
+    /// the daemon is shutting down must say "there is no composition" rather than report the health of sessions
+    /// that have already been cancelled. Before a drain the holder is always `Some`, including for a profile
+    /// with no `[mcp]` table — `compose_mcp_servers` returns a default composition rather than nothing, so
+    /// "nothing declared" and "everything refused" are told apart by `refused` being empty or not, not by the
+    /// field's presence.
+    ///
+    /// Takes the lock rather than being lock-free, and the contention is uninteresting: the holder is written
+    /// twice in a daemon's life (once at startup, once at the drain), so a status read effectively never waits.
+    pub async fn report(&self) -> Option<McpStatus> {
+        let guard = self.composition.lock().await;
+        let composition = guard.as_ref()?;
+        Some(McpStatus {
+            servers: composition
+                .health()
+                .into_iter()
+                .map(|row| McpServerStatus {
+                    name: row.name,
+                    tools: row.tools,
+                    refused_tools: row.refused,
+                    closed: row.closed,
+                    protocol_version: row.version,
+                })
+                .collect(),
+            // **The refused servers, which is the half a list of running servers cannot answer.** A status
+            // naming only what is running leaves an operator asking "where is my third server?", and the answer
+            // — a stable code — is what the startup log already has. Codes and names only: a refusal's
+            // *message* may carry operator text and never travels, and the `permanent` flag is exactly the
+            // decision this round's predecessor made actionable.
+            refused: composition
+                .refused()
+                .iter()
+                .map(|(server, refusal)| McpRefusedServerStatus {
+                    name: server.clone(),
+                    code: refusal.code(),
+                    permanent: refusal.is_permanent(),
+                })
+                .collect(),
+        })
+    }
 }
 
 /// How often a live event stream emits a keepalive comment.
@@ -303,6 +388,7 @@ impl ApiState {
             spawner: Arc::new(jarvis_application::run_service::TokioSpawner),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             stream_overrun_timeout: DEFAULT_STREAM_OVERRUN_TIMEOUT,
+            mcp: None,
         }
     }
 
@@ -323,6 +409,17 @@ impl ApiState {
     #[must_use]
     pub const fn with_stream_overrun_timeout(mut self, timeout: Duration) -> Self {
         self.stream_overrun_timeout = timeout;
+        self
+    }
+
+    /// Reports the daemon's MCP servers in the status response.
+    ///
+    /// A builder rather than a `new` argument, matching the pattern every other optional service here
+    /// follows: the Foundation surface must build without an MCP composition, and a profile with no `[mcp]`
+    /// table must keep answering `status` rather than becoming unroutable.
+    #[must_use]
+    pub fn with_mcp(mut self, mcp: McpHealthSource) -> Self {
+        self.mcp = Some(mcp);
         self
     }
 
@@ -454,6 +551,92 @@ struct SystemStatus {
     profile: &'static str,
     storage: StorageStatus,
     capabilities: &'static [&'static str],
+    /// The MCP servers this daemon launched, or absent when no composition is held.
+    ///
+    /// **`skip_serializing_if` rather than an empty object, and the difference is an operator fact.** Absent
+    /// means the daemon holds no composition — it is draining. A present object with an empty `servers` array
+    /// means every declared server was refused, which is a different situation, and `refused` carries the
+    /// reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<McpStatus>,
+}
+
+/// The daemon's MCP servers: the ones running, and the ones that were refused.
+///
+/// **Both halves, because a list of what is running cannot answer what is missing.** The composition returns
+/// exactly these two sets — see `McpComposition` — so the wire shape mirrors it rather than flattening them,
+/// which would make "the server you declared is not here" an inference from an absence.
+#[derive(Debug, Serialize)]
+pub struct McpStatus {
+    /// One row per composed server, in declaration order.
+    servers: Vec<McpServerStatus>,
+    /// One row per server that did not compose, with its stable code.
+    refused: Vec<McpRefusedServerStatus>,
+}
+
+impl McpStatus {
+    /// Returns the composed rows.
+    #[must_use]
+    pub fn servers(&self) -> &[McpServerStatus] {
+        &self.servers
+    }
+
+    /// Returns the refused rows.
+    #[must_use]
+    pub fn refused(&self) -> &[McpRefusedServerStatus] {
+        &self.refused
+    }
+}
+
+/// A declared MCP server that did not compose.
+#[derive(Debug, Serialize)]
+pub struct McpRefusedServerStatus {
+    name: String,
+    code: &'static str,
+    /// Whether a retry could ever succeed — the same flag the startup log prints, and the one the retry
+    /// decision is made from. `false` means the composition already re-attempted it once and it failed the
+    /// same way.
+    permanent: bool,
+}
+
+impl McpRefusedServerStatus {
+    /// Returns the configured server name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the stable refusal code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// Returns whether the refusal is permanent.
+    #[must_use]
+    pub const fn permanent(&self) -> bool {
+        self.permanent
+    }
+}
+
+/// One MCP server's lifecycle row, as `GET /api/v1/system/status` reports it.
+///
+/// **Deliberately not the adapter's `McpServerHealth`**, for two reasons: the wire type belongs to the
+/// surface that serializes it, and naming the fields here is what makes the contract's field list checkable
+/// against a type rather than transcribed from it. The mapping is one function and is asserted.
+///
+/// Every field is bounded or already a plain value: a server **name** is a configured identity rather than
+/// text a server chose, and the protocol version is a revision string the SDK parsed. No path, environment
+/// value, or refusal message travels — the refusal *count* does, because "this server offered three tools and
+/// one was refused" is the operator fact and the reason is available in the daemon's log.
+#[derive(Debug, Serialize)]
+pub struct McpServerStatus {
+    name: String,
+    tools: usize,
+    refused_tools: usize,
+    /// Whether the server's session has closed — the child is gone or its transport ended.
+    closed: bool,
+    protocol_version: Option<String>,
 }
 
 /// The bounded storage status sub-object.
@@ -1088,6 +1271,16 @@ async fn system_status(State(state): State<Arc<ApiState>>) -> Json<SystemStatus>
             status: "ready",
         },
         capabilities: &SYSTEM_CAPABILITIES,
+        // **Read per request, not snapshotted at build time.** `RunningDaemon::api_state()` runs once and the
+        // router then serves for the daemon's life, so a `Vec` captured here would freeze the health of the
+        // instant the router was built — and for a server that dies later, that is exactly the fact that
+        // stopped being true. The composition is behind the same holder the drain takes from, so this answers
+        // about now, and `None` after a drain means "there is no composition" rather than reporting the health
+        // of sessions already cancelled.
+        mcp: match &state.mcp {
+            Some(source) => source.report().await,
+            None => None,
+        },
     })
 }
 
@@ -1306,8 +1499,8 @@ mod tool_grant_journey_tests;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        ApiState, AuthenticatedClient, DEFAULT_STREAM_OVERRUN_TIMEOUT, ProviderInventory,
-        REQUEST_ID_HEADER, Readiness, authority_of, router,
+        ApiState, AuthenticatedClient, DEFAULT_STREAM_OVERRUN_TIMEOUT, McpHealthSource,
+        ProviderInventory, REQUEST_ID_HEADER, Readiness, authority_of, router,
     };
     use crate::auth::{ClientCredentialPath, ClientRegistry, enroll_owner_client};
     use crate::http::runs::FOLLOW_CHANNEL_DEPTH;
@@ -1346,6 +1539,9 @@ pub(crate) mod tests {
         app: axum::Router,
         token: String,
         readiness: Arc<Readiness>,
+        /// Kept so a test can build a **second** router over the same credentials, which is what an
+        /// additional service on the status surface needs to be exercised without enrolling a second client.
+        clients: Arc<ClientRegistry>,
         dir: std::path::PathBuf,
     }
 
@@ -1357,10 +1553,11 @@ pub(crate) mod tests {
 
         let mut clients = ClientRegistry::new();
         clients.register(registered);
+        let clients = Arc::new(clients);
         let readiness = Arc::new(Readiness::new());
 
         let state = Arc::new(ApiState::new(
-            Arc::new(clients),
+            Arc::clone(&clients),
             Arc::clone(&readiness),
             "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
@@ -1370,8 +1567,26 @@ pub(crate) mod tests {
             app: router(state),
             token: credential.to_presentation_text(),
             readiness,
+            clients,
             dir,
         }
+    }
+
+    /// The absolute path of the MCP fixture example for this profile, if it is built.
+    ///
+    /// Derived from this test executable's own location rather than from a `CARGO_BIN_EXE_*` variable, because
+    /// examples have none. A missing example is a **skip with a printed reason**: running this test target alone
+    /// does not build examples, and a failure for an unrelated reason trains a reader to ignore it.
+    fn mcp_fixture_program() -> Option<std::path::PathBuf> {
+        let current = std::env::current_exe().ok()?;
+        let profile = current.parent()?.parent()?;
+        let name = if cfg!(windows) {
+            "mcp_fixture_server.exe"
+        } else {
+            "mcp_fixture_server"
+        };
+        let candidate = profile.join("examples").join(name);
+        candidate.is_file().then_some(candidate)
     }
 
     /// Sends a request with a valid `Host`, which every other test relies on.
@@ -1420,6 +1635,111 @@ pub(crate) mod tests {
             .await
             .expect("body readable");
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The status surface reports the MCP servers, and it reports what the *session* says.
+    ///
+    /// **The gap this closes was operational rather than structural.** `McpComposition::health` had exactly one
+    /// production caller and it was a drain log line, so the only moment an operator could learn a server had
+    /// died was while the daemon was exiting — the one moment the answer no longer mattered. The status route is
+    /// authenticated and already answers "is this daemon ready", so reporting the servers beside the storage
+    /// status is where the question belongs.
+    ///
+    /// Asserted against a **real spawned child over a real composition**, because the property is that the row
+    /// is read from a live session rather than from a value captured when the router was built: this test closes
+    /// the session and re-requests, so the second response must differ from the first. A snapshot would answer
+    /// both requests identically.
+    #[tokio::test]
+    async fn the_status_surface_reports_mcp_servers_and_follows_their_health() {
+        let Some(program) = mcp_fixture_program() else {
+            println!(
+                "SKIP the_status_surface_reports_mcp_servers_and_follows_their_health: \
+                 examples/mcp_fixture_server is not built for this profile"
+            );
+            return;
+        };
+        // The fixture's selector is a **literal environment pair**, and `McpLaunchSpec` carries literals while
+        // `McpServerDeclaration` carries references — so the declaration holds a reference and the resolver
+        // holds the value, which is the same two-layer shape a real profile has.
+        let declaration = crate::config::mcp::McpServerDeclaration {
+            name: "acme-files".to_owned(),
+            program,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::from([(
+                "JARVIS_MCP_FIXTURE".to_owned(),
+                crate::config::secret::SecretReference::Env("JARVIS_FIXTURE_ACME_FILES".to_owned()),
+            )]),
+            enabled: true,
+            startup_timeout_ms: crate::mcp::process::DEFAULT_MCP_STARTUP_TIMEOUT_MS,
+        };
+        let secrets = crate::config::secret::MapSecretResolver::new();
+        secrets.insert("JARVIS_FIXTURE_ACME_FILES", "standard");
+        let mut registry = jarvis_domain::tool::registry::ToolRegistry::new();
+        let composition = crate::mcp::composition::compose_declared_servers(
+            &mut registry,
+            std::slice::from_ref(&declaration),
+            &secrets,
+        )
+        .await
+        .expect("the declaration is usable");
+        assert!(
+            composition.is_clean(),
+            "the fixture must compose, or this tests the refusal path: {:?}",
+            composition.refused()
+        );
+        // The holder the drain would take from, wrapped exactly as the daemon wraps it.
+        let holder = Arc::new(tokio::sync::Mutex::new(Some(composition)));
+
+        let fixture = fixture("mcp_status");
+        let state = Arc::new(
+            ApiState::new(
+                Arc::clone(&fixture.clients),
+                Arc::clone(&fixture.readiness),
+                "0195f4e8-7f6a-7c21-8ab5-4f0f80fd7e09".to_owned(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 43127),
+            )
+            .with_mcp(McpHealthSource::new(Arc::clone(&holder))),
+        );
+        let app = router(state);
+        let authorization = format!("Bearer {}", fixture.token);
+        let headers = [
+            ("authorization", authorization.as_str()),
+            ("jarvis-api-version", "1"),
+        ];
+
+        let (status, body) = get(&app, "/api/v1/system/status", &headers).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        let mcp = parsed.get("mcp").expect("the mcp object must be present");
+        let servers = mcp["servers"].as_array().expect("servers is an array");
+        assert_eq!(servers.len(), 1, "{body}");
+        assert_eq!(servers[0]["name"], "acme-files");
+        assert_eq!(servers[0]["tools"], 1, "the fixture offers one usable tool");
+        assert_eq!(servers[0]["closed"], false, "the child is alive: {body}");
+        assert!(
+            servers[0]["protocol_version"].as_str().is_some(),
+            "a live session reports the version it negotiated: {body}"
+        );
+        assert_eq!(
+            mcp["refused"].as_array().map(Vec::len),
+            Some(0),
+            "nothing was refused: {body}"
+        );
+
+        // **Now take the composition and ask again — the half a snapshot cannot pass.** Taking is how the drain
+        // removes it, so the second request must find no composition at all rather than a stale row.
+        let taken = { holder.lock().await.take() };
+        let composition = taken.expect("the composition was held");
+        let _ = composition.shutdown().await;
+
+        let (status, body) = get(&app, "/api/v1/system/status", &headers).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("the body is JSON");
+        assert!(
+            parsed.get("mcp").is_none(),
+            "after a drain the daemon holds no composition, so the field is absent rather than stale: {body}"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
     #[tokio::test]
