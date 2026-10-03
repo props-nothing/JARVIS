@@ -56,8 +56,13 @@ what the model is **told** about them: for each name, a `description` and the to
 advertising a tool is not a grant to execute it. A description originating from an MCP server is untrusted text
 that goes into a prompt, so the catalog bounds it (512 characters) and strips control characters before it is
 offered. An adapter ignores an offer whose name is not in `tools`, and sends a bare object schema for a tool it
-has no offer for. Provider-safe tool *names* are a separate gap: the canonical names contain `.` and `@`, which a
-strict provider (OpenAI's own API requires `^[a-zA-Z0-9_-]+$`) refuses, while Ollama accepts them.
+has no offer for. **Names are a transport concern of the adapter, not of this contract.** The canonical names contain `.` and `@`,
+which a strict provider refuses (the Chat Completions function name is limited to letters, digits, underscores
+and dashes, at most 64 characters), while Ollama accepts them. The OpenAI-compatible adapter therefore sends a
+sanitized spelling (`mcp.read_file@1` becomes `mcp_read_file_1`), keeps lookalikes apart with a numeric suffix,
+and reports the **canonical** name on `tool.call.added`; the table is derived per request, so a name the model
+sends back is resolved against exactly what it was shown, and a name in no table reaches the tool pipeline as
+written and is refused there. Nothing above the adapter ever sees a sanitized name.
 
 Principal/workspace/security context is trusted application context and not an
 arbitrary request body field.

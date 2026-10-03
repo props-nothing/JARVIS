@@ -49,7 +49,8 @@ server's tool, the run parks on a durable approval, and `jarvis approvals approv
 in the server and the model answers from its result (proven against a real daemon with a fake model, and live against
 `deepseek-v4.1-flash:cloud`). Reaching it fixed two defects beneath it — a run needing approval never actually parked, and
 a decided approval (a rejected one included) was never usable or spent. A run parked on an approval survives a daemon restart, and an undecided prompt that lapses no longer leaves its run
-waiting for ever.
+waiting for ever. Tool names are sent in the form strict providers accept (OpenAI's function-name rule), mapped
+back to the canonical names on the way in.
 
 Milestones are ordered by dependency and proof, not feature excitement. A later
 milestone may begin early only when it does not weaken an earlier boundary or

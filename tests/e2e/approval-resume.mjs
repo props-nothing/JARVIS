@@ -92,7 +92,7 @@ const fake = http
           index: 0,
           id: `call-${requests.length}`,
           type: "function",
-          function: { name: "mcp.read_file@1", arguments: '{"path":"notes.txt"}' },
+          function: { name: "mcp_read_file_1", arguments: '{"path":"notes.txt"}' },
         };
         res.write(`data: ${JSON.stringify({ id: "1", choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: null }] })}\n\n`);
         res.write(`data: ${JSON.stringify({ id: "1", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
@@ -221,6 +221,8 @@ try {
   });
   check(finished, "the approved run continued and completed");
   const second = requests[1];
+  const replayed = second?.messages?.find((m) => m.role === "assistant" && m.tool_calls)?.tool_calls?.[0]?.function?.name;
+  check(replayed === "mcp_read_file_1", "the replayed call uses the provider-safe name the model was shown", String(replayed));
   const carried = second && toolMessages(second).some((message) => JSON.stringify(message).includes(SENTENCE));
   check(carried, "the model's second request carries the tool's own output (it ran in the MCP child after approval)",
     JSON.stringify(second?.messages?.slice(-2)));

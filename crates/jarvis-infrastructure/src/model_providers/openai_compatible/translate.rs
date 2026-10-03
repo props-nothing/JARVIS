@@ -91,6 +91,8 @@ pub struct ChunkTranslator {
     /// used as the **canonical** call identifier, because it is the value a later transcript
     /// continuation must echo.
     tool_calls: std::collections::BTreeMap<u64, AnnouncedToolCall>,
+    /// The names the request offered, so a provider-safe name is reported as the canonical one.
+    tool_names: super::tool_names::ToolNames,
 }
 
 /// One tool call a provider has announced, and how much of its argument text has arrived.
@@ -127,7 +129,15 @@ impl ChunkTranslator {
             reasoning_chunks_ignored: 0,
             model: None,
             tool_calls: std::collections::BTreeMap::new(),
+            tool_names: super::tool_names::ToolNames::default(),
         }
+    }
+
+    /// Reads tool names against `names`, the table the request was built with.
+    #[must_use]
+    pub fn with_tool_names(mut self, names: super::tool_names::ToolNames) -> Self {
+        self.tool_names = names;
+        self
     }
 
     /// Returns how many output deltas were translated.
@@ -422,7 +432,10 @@ impl ChunkTranslator {
             // action in it.
             if !entry.announced && !entry.name.is_empty() {
                 entry.announced = true;
-                let (call_id, tool_name) = (entry.call_id.clone(), entry.name.clone());
+                let (call_id, tool_name) = (
+                    entry.call_id.clone(),
+                    self.tool_names.canonical(&entry.name),
+                );
                 events.push(ModelStreamEventKind::ToolCallAdded { call_id, tool_name });
             }
 

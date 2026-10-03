@@ -7153,7 +7153,10 @@ Dependencies: Milestone 2 exit gate.
   prompt of a cancelled run stayed `pending`). Evidence: seven controller/service tests, a real-SQL exclusion test,
   and the kill-and-restart scenario in `tests/e2e/approval-resume.mjs`, falsified by breaking the exclusion.
   **Still open:** approvals decided by a principal other than the requester are not seen by policy; the sweep is
-  bounded to 200 records; provider-safe tool names for strict providers.
+  bounded to 200 records. **Provider-safe tool names (2026-10-03):** the OpenAI-compatible adapter now sends
+  `mcp.read_file@1` as `mcp_read_file_1` and resolves the model's answer back to the canonical name, per request
+  (`tool_names.rs`; claim `OC-C016`, constraint verified against OpenAI's official OpenAPI document). Every e2e
+  journey and `mcp-live` against a real model pass on the sanitized names.
   **The native route is now
   proven and reachable; the MCP and runtime routes do not exist yet, so their proof is not
   attempted.** The native proof is not a test over a hypothetical path — it is the only path a

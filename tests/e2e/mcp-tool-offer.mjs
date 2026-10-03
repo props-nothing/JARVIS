@@ -125,7 +125,7 @@ try {
     } else {
       for (let i = 0; i < 100 && captured === null; i += 1) await sleep(100);
       const tools = captured ? JSON.parse(captured).tools : undefined;
-      const mcp = tools?.find((tool) => tool.function.name === "mcp.read_file@1");
+      const mcp = tools?.find((tool) => tool.function.name === "mcp_read_file_1");
       if (!mcp) {
         fail("the model was not offered the MCP server's tool", JSON.stringify(tools?.map((t) => t.function.name)));
       } else {
@@ -142,7 +142,7 @@ try {
           fail("the offered tool's parameters are not the tool's schema", JSON.stringify(mcp.function.parameters));
         }
       }
-      if (!tools?.some((tool) => tool.function.name === "clock.now@1")) {
+      if (!tools?.some((tool) => tool.function.name === "clock_now_1")) {
         fail("the native tool disappeared from the offer", JSON.stringify(tools?.map((t) => t.function.name)));
       } else {
         pass("the native tool is still offered beside it");

@@ -52,9 +52,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
 pub mod sse;
+pub mod tool_names;
 pub mod translate;
 
 use sse::{FrameRead, SseBuffer, SseFrame};
+use tool_names::ToolNames;
 use translate::{ChunkTranslator, Translated};
 
 /// The path appended to the configured base when none is given.
@@ -487,6 +489,17 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &ModelCallRequest,
     ) -> Result<serde_json::Value, ProviderError> {
+        self.build_exchange(request).map(|(body, _)| body)
+    }
+
+    /// Builds the request body and the tool-name table the response is read against.
+    ///
+    /// One function produces both, so the names offered to the model and the names resolved from its
+    /// answer cannot come from two derivations.
+    fn build_exchange(
+        &self,
+        request: &ModelCallRequest,
+    ) -> Result<(serde_json::Value, ToolNames), ProviderError> {
         // The routed model must be one this adapter serves. Substituting another would answer with a
         // model the data policy did not select.
         if !self.models.iter().any(|served| served == &request.model) {
@@ -505,6 +518,25 @@ impl OpenAiCompatibleProvider {
         if request.tools.len() > MAX_TOOLS {
             return Err(ProviderError::InvalidRequest);
         }
+
+        // Offered tools first, then the offers' own names, then whatever a replayed transcript calls, so
+        // a tool being offered never loses its plain spelling to a lookalike from history.
+        let history = request
+            .input
+            .as_slice()
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::ToolCall { tool_name, .. } => Some(tool_name.as_str()),
+                _ => None,
+            });
+        let tool_names = ToolNames::new(
+            request
+                .tools
+                .iter()
+                .map(String::as_str)
+                .chain(request.tool_offers.iter().map(|offer| offer.name.as_str()))
+                .chain(history),
+        );
 
         let mut messages = Vec::new();
         for item in request.input.as_slice() {
@@ -551,7 +583,7 @@ impl OpenAiCompatibleProvider {
                         "tool_calls": [{
                             "id": call_id,
                             "type": "function",
-                            "function": { "name": tool_name, "arguments": raw },
+                            "function": { "name": tool_names.wire(tool_name), "arguments": raw },
                         }],
                     }));
                 }
@@ -587,25 +619,7 @@ impl OpenAiCompatibleProvider {
             // Declared so a stored transcript that contains tool calls can be continued. The names
             // are the canonical ones the tool fabric owns; this adapter only transports them, and
             // advertising a tool is not a grant to execute it.
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|name| {
-                    let offer = request.tool_offers.iter().find(|offer| &offer.name == name);
-                    let mut function = serde_json::json!({
-                        "name": name,
-                        "parameters": offer_parameters(offer),
-                    });
-                    if let Some(description) = offer
-                        .map(|offer| offer.description.as_str())
-                        .filter(|d| !d.is_empty())
-                    {
-                        function["description"] = serde_json::Value::String(description.to_owned());
-                    }
-                    serde_json::json!({ "type": "function", "function": function })
-                })
-                .collect();
-            body["tools"] = serde_json::Value::Array(tools);
+            body["tools"] = serde_json::Value::Array(tool_declarations(request, &tool_names));
         }
 
         // The run's output ceiling, forwarded so the provider is **told** the bound rather than
@@ -631,8 +645,30 @@ impl OpenAiCompatibleProvider {
             body["max_completion_tokens"] = serde_json::json!(limit);
         }
 
-        Ok(body)
+        Ok((body, tool_names))
     }
+}
+
+/// The `tools` array: each offered tool under its provider-safe name, with its description and schema.
+fn tool_declarations(request: &ModelCallRequest, names: &ToolNames) -> Vec<serde_json::Value> {
+    request
+        .tools
+        .iter()
+        .map(|name| {
+            let offer = request.tool_offers.iter().find(|offer| &offer.name == name);
+            let mut function = serde_json::json!({
+                "name": names.wire(name),
+                "parameters": offer_parameters(offer),
+            });
+            if let Some(description) = offer
+                .map(|offer| offer.description.as_str())
+                .filter(|d| !d.is_empty())
+            {
+                function["description"] = serde_json::Value::String(description.to_owned());
+            }
+            serde_json::json!({ "type": "function", "function": function })
+        })
+        .collect()
 }
 
 /// Returns the text of a message's blocks, or `None` when any block has no text form.
@@ -701,8 +737,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
             // The body is built **before** the connection, so a request this adapter cannot express
             // is an `open` error rather than a call that connected and then failed. An operator sees
             // "this build cannot serve that request" instead of a protocol fault.
-            let body = self.build_body(request)?;
+            let (body, tool_names) = self.build_exchange(request)?;
             let plan = ExchangePlan {
+                tool_names,
                 host: self.host.clone(),
                 port: self.port,
                 path: self.completions_path(),
@@ -739,6 +776,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 /// service and installer code use. The `Debug` is deliberately absent so a plan cannot be formatted —
 /// it holds the credential, and a derived `Debug` is how a secret reaches a log line.
 struct ExchangePlan {
+    /// The names the model was shown, so its answer is read against the same table.
+    tool_names: ToolNames,
     host: String,
     port: u16,
     /// The full request path, base and route together, already validated.
@@ -879,7 +918,7 @@ where
         return Err(map_status(head.status, &body));
     }
 
-    let mut translator = ChunkTranslator::new();
+    let mut translator = ChunkTranslator::new().with_tool_names(plan.tool_names.clone());
     pump_body(&mut reader, sender, stamper, &mut translator).await
 }
 
@@ -1840,6 +1879,48 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn tools_are_offered_under_names_a_strict_endpoint_accepts_and_answers_map_back() {
+        use super::{ChunkTranslator, Translated};
+        use jarvis_domain::model::stream::ModelStreamEventKind;
+        let adapter = provider();
+        let mut request = request_for(&adapter);
+        request.tools = vec!["mcp.read_file@1".to_owned(), "clock.now@1".to_owned()];
+        let (body, names) = adapter.build_exchange(&request).expect("builds");
+        let offered: Vec<&str> = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(offered, ["mcp_read_file_1", "clock_now_1"]);
+        for name in &offered {
+            assert!(
+                name.len() <= 64
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{name} is not a name the Chat Completions schema accepts"
+            );
+        }
+
+        // The model answers with the name it was shown; the stream reports the canonical one.
+        let mut translator = ChunkTranslator::new().with_tool_names(names);
+        let frame = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"mcp_read_file_1","arguments":"{}"}}]},"finish_reason":null}]}"#;
+        let Translated::Events(events) =
+            translator.translate(Some(&serde_json::from_str(frame).expect("valid json")))
+        else {
+            unreachable!("a tool call frame translates");
+        };
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ModelStreamEventKind::ToolCallAdded { tool_name, .. } if tool_name == "mcp.read_file@1"
+            )),
+            "{events:?}"
+        );
+    }
+
     /// Builds a minimal valid request for `adapter`'s served model.
     fn request_for(adapter: &OpenAiCompatibleProvider) -> ModelCallRequest {
         use jarvis_domain::ids::{ModelCallId, RunId};
