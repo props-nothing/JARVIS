@@ -304,6 +304,16 @@ pub fn classify_service_error(error: &ServiceError) -> ToolErrorClass {
 /// **Every code the specification defines is mapped, and the mapping is written out rather than
 /// defaulted**, so a code added by a future revision lands in the documented `ProviderError` branch
 /// knowingly instead of inheriting a meaning.
+///
+/// "Every code the specification defines" is **nine values, not every integer in the reserved range**:
+/// JSON-RPC 2.0's five general codes (`-32700`, `-32600`..`-32603`), this revision's three
+/// (`-32020`, `-32021`, `-32022`), and the legacy `-32002` a `2025-11-25` peer may still send. The
+/// surrounding range is deliberately *not* a vocabulary to enumerate: `-32096`..`-32099` is reserved
+/// for **implementations** and this specification says nothing about it, and implementations **MUST
+/// NOT** emit a code from `-32020`..`-32095` that the specification does not define — so for either
+/// sub-range the fallback is the only honest answer and exhaustiveness is not a property this table
+/// can have. (The first spelling of this doc said "every code the specification defines", which was
+/// true, and read as "every code", which is not.)
 #[must_use]
 pub fn classify_error_code(code: ErrorCode) -> ToolErrorClass {
     match code {
@@ -318,13 +328,68 @@ pub fn classify_error_code(code: ErrorCode) -> ToolErrorClass {
         // separately rather than forced into an existing one.
         ErrorCode::UNSUPPORTED_PROTOCOL_VERSION => ToolErrorClass::Unavailable,
         // The tool, resource, or method is not there.
+        //
+        // **This arm catches the *legacy* number, and that is required rather than tidy.** `2026-07-28`
+        // renumbered resource-not-found from `-32002` to `-32602` "to align with JSON-RPC" (SEP-2164)
+        // while keeping the old code reserved, and says clients "SHOULD still accept `-32002` ... from
+        // servers implementing earlier versions". Discovery accepts a peer one revision behind by
+        // design, so a not-found from such a peer arrives as `-32002` — the number the pinned SDK's own
+        // `ErrorCode::RESOURCE_NOT_FOUND` still holds, because a constant is what a client uses to
+        // *recognize* the legacy code. Dropping this arm would classify a legacy peer's not-found as a
+        // provider fault. The *modern* number is handled in the next arm, where its second meaning is
+        // discussed.
+        //
+        // `METHOD_NOT_FOUND` shares this arm because on this revision a missing *tool* is answered
+        // that way (the tool-name path of a `tools/call`), while `RESOURCE_NOT_FOUND` covers
+        // resources — both are "the thing you named is not there".
         ErrorCode::RESOURCE_NOT_FOUND | ErrorCode::METHOD_NOT_FOUND => ToolErrorClass::NotFound,
         // The request or its arguments were rejected at the door.
+        //
+        // **`-32602` carries two meanings on this revision and both land here.** Because SEP-2164
+        // moved resource-not-found onto `-32602`, the same number now signals either an unsatisfiable
+        // argument document or a missing resource, and only the *message* distinguishes them.
+        // `NotFound` is the wrong arm for the argument case — a caller shown `tool.not_found` for a
+        // tool that is listed and callable is sent to look for something absent instead of to fix its
+        // input — and a *reserved*-resource class does not exist in the fabric yet, so the argument
+        // meaning wins and the ambiguity is stated rather than hidden.
+        //
+        // **A JARVIS-side cause lands here too, and that is the honest reading rather than a
+        // misclassification.** A request missing a required per-request `_meta` field
+        // (`io.modelcontextprotocol/protocolVersion` or `.../clientCapabilities`) is answered
+        // `-32602` with HTTP `400` — the server saying JARVIS sent a malformed request, which *is* a
+        // schema problem with the request. The SDK seeds those fields itself (`ClientRequestMetadata`,
+        // set from `server/discover` or `initialize`), so this arm is not reached for the transports
+        // this adapter uses; naming it keeps the class from looking like a claim that every `-32602`
+        // came from the server's view of the arguments.
         ErrorCode::INVALID_PARAMS | ErrorCode::INVALID_REQUEST | ErrorCode::PARSE_ERROR => {
             ToolErrorClass::SchemaInvalid
         }
-        // The peer said its own request was malformed, admitted it needs a capability we did not
-        // declare, reported an internal failure, or sent a code added by a future revision.
+        // The peer refused the request **at the door**, before doing anything with it.
+        //
+        // **Three codes, one meaning, and grouping them is the correction rather than a tidy-up.**
+        // `-32020` and `-32021` were falling into the catch-all below and therefore classified
+        // `ProviderError` — retryable for an idempotent tool and *unsettled*, so a call that provably
+        // never ran entered reconciliation and could be repeated against a server that had refused it
+        // outright. Both are the peer stating a fact about the **request** rather than reporting a
+        // failure it incurred: a required header was missing or wrong, or processing needs a client
+        // capability JARVIS did not declare. Nothing was dispatched, so nothing can have been
+        // duplicated.
+        //
+        // `Unavailable` is the class the sibling `UNSUPPORTED_PROTOCOL_VERSION` already uses for the
+        // same reason, and it is the one whose `Safe` posture asserts the thing that is certainly true
+        // here: a request refused at the door took no effect. Grouping the three also means the
+        // note's own error table's "Retry? **No**" column has one implementation instead of a
+        // per-code decision three call sites could get differently.
+        //
+        // Two of the three are defects in *this* adapter rather than at the peer — a header mismatch
+        // and a missing declared capability both mean JARVIS sent something it should not have — and
+        // `Safe` does **not** say "retry will help". It says a retry cannot duplicate an effect, and
+        // whether one can succeed at all is the health layer's separate, permanent-failure question
+        // (the same division of labour the incompatible-version arm documents above).
+        ErrorCode::HEADER_MISMATCH | ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY => {
+            ToolErrorClass::Unavailable
+        }
+        // The peer reported a failure of its own, or sent a code added by a future revision.
         //
         // **Deliberately one arm.** Every code the specification defines is either named above or
         // belongs here, and an unclassified code joins rather than gaining an arm with the same body:
@@ -335,9 +400,8 @@ pub fn classify_error_code(code: ErrorCode) -> ToolErrorClass {
         // delivered, which this code cannot know about a failure the peer reported after receiving the
         // request.
         //
-        // Two of these are defects in *this* adapter rather than at the peer: a header mismatch and a
-        // missing declared capability both mean JARVIS sent something it should not have, and both sit
-        // on the `Never`-for-an-unproven-tool side of the posture.
+        // `INTERNAL_ERROR` reaches here and is the clearest case for the arm: the peer accepted the
+        // request and then failed, so the request may have been executed.
         _ => ToolErrorClass::ProviderError,
     }
 }

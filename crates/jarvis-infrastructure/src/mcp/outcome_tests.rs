@@ -273,8 +273,8 @@ fn a_bound_exhaustion_is_a_limit_and_not_a_provider_fault() {
 #[test]
 fn every_specified_error_code_is_classified_deliberately() {
     // Each code is asserted by value rather than by "something was returned", so the fallback arm
-    // cannot satisfy the table. Three codes deliberately share the `ProviderError` meaning and are
-    // asserted separately from the fallback below, so that "landed in the catch-all" and "was named"
+    // cannot satisfy the table. The one code that shares the `ProviderError` meaning is asserted both
+    // here and separately from the fallback below, so that "landed in the catch-all" and "was named"
     // are distinguishable statements.
     let table = [
         (
@@ -286,12 +286,14 @@ fn every_specified_error_code_is_classified_deliberately() {
         (ErrorCode::INVALID_PARAMS, ToolErrorClass::SchemaInvalid),
         (ErrorCode::INVALID_REQUEST, ToolErrorClass::SchemaInvalid),
         (ErrorCode::PARSE_ERROR, ToolErrorClass::SchemaInvalid),
-        // The three that share the fallback's meaning.
-        (ErrorCode::HEADER_MISMATCH, ToolErrorClass::ProviderError),
+        // The two the peer states about the **request** before doing anything with it. Grouped with the
+        // version refusal above because all three are refused at the door.
+        (ErrorCode::HEADER_MISMATCH, ToolErrorClass::Unavailable),
         (
             ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
-            ToolErrorClass::ProviderError,
+            ToolErrorClass::Unavailable,
         ),
+        // The one that reported a failure of its own after accepting the request.
         (ErrorCode::INTERNAL_ERROR, ToolErrorClass::ProviderError),
     ];
     for (code, expected) in table {
@@ -317,6 +319,39 @@ fn an_unrecognised_error_code_defaults_pessimistically_rather_than_to_unavailabl
 }
 
 #[test]
+fn the_legacy_resource_not_found_code_is_classified_as_not_found() {
+    // **The assertion an earlier spelling of this module's doc made impossible to write.** The
+    // surrounding range is partly implementation-reserved (this file's own `-32050` control is in that
+    // part), so "every code" is not a total property — but `-32002` is one the specification *names*,
+    // and `2026-07-28` renumbered it to `-32602` while telling clients they "SHOULD still accept
+    // `-32002` from servers implementing earlier versions". Discovery accepts such a peer by design.
+    // Removing the legacy arm is the mutation: a legacy server's not-found would then read as a
+    // provider fault, so the detector names the direction rather than only the value.
+    //
+    // **Asserted on the literal, not on the SDK constant.** `ErrorCode::RESOURCE_NOT_FOUND` *is*
+    // `-32002`, so asserting through it would test nothing about the number the renumbering moved —
+    // and the literal is what the spec text actually names.
+    let legacy = classify_error_code(ErrorCode(-32002));
+    assert_eq!(
+        legacy,
+        ToolErrorClass::NotFound,
+        "a legacy peer's not-found must not read as a provider fault"
+    );
+    assert!(!legacy.is_unsettled());
+
+    // The modern number carries **two** meanings, and this pins that the argument meaning is the one
+    // chosen: a caller shown `tool.not_found` for a listed tool is sent hunting for something absent
+    // instead of fixing its input. The renumbered pair is genuinely distinct at the wire level, which
+    // is why the two arms above cannot be collapsed into one.
+    assert_eq!(ErrorCode(-32002).0, -32002);
+    assert_ne!(
+        ErrorCode(-32002),
+        ErrorCode::INVALID_PARAMS,
+        "the legacy and current codes must remain distinguishable to a client"
+    );
+}
+
+#[test]
 fn an_unsupported_version_is_not_unsettled_and_may_be_retried() {
     // The one classification that is a judgement: an incompatible peer cannot be *served* by a
     // retry, but the class's posture is about effect duplication, which is certainly impossible
@@ -325,6 +360,47 @@ fn an_unsupported_version_is_not_unsettled_and_may_be_retried() {
     let class = classify_error_code(ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
     assert_eq!(class.retry_posture(), RetryPosture::Safe);
     assert!(!class.is_unsettled());
+}
+
+#[test]
+fn a_request_refused_at_the_door_is_never_reported_as_unsettled() {
+    // **The property, asserted separately from the values, because the values alone let the defect
+    // back in one arm at a time.** A header mismatch and a missing client capability both mean the
+    // peer refused the request before dispatching it, so the one thing that must hold is that such a
+    // call is **not unsettled** — `is_unsettled` is what routes a call to reconciliation, and a call
+    // the server never accepted must not enter a pass that exists for calls that might have run.
+    //
+    // This is the assertion that fails under the mutation this round fixed: restoring either code to
+    // the `ProviderError` catch-all makes its class unsettled, and the loop names which code did it.
+    // `Unavailable`, the class they now share with the version refusal, is `Safe` and settled.
+    for code in [
+        ErrorCode::UNSUPPORTED_PROTOCOL_VERSION,
+        ErrorCode::HEADER_MISMATCH,
+        ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
+    ] {
+        let class = classify_error_code(code);
+        assert!(
+            !class.is_unsettled(),
+            "code {} was refused at the door, so its outcome is not ambiguous",
+            code.0
+        );
+        assert_eq!(
+            class.retry_posture(),
+            RetryPosture::Safe,
+            "code {} ran nothing, so a retry cannot duplicate an effect",
+            code.0
+        );
+    }
+
+    // The control, so the assertions above cannot be satisfied by classifying *everything* as
+    // settled-and-safe: a peer that accepted the request and then failed its own way **is** unsettled,
+    // which is the fact that makes this a boundary rather than a constant.
+    let internal = classify_error_code(ErrorCode::INTERNAL_ERROR);
+    assert!(
+        internal.is_unsettled(),
+        "a failure reported after the request was accepted may already have taken effect"
+    );
+    assert_ne!(internal.retry_posture(), RetryPosture::Safe);
 }
 
 #[test]

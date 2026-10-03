@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use jarvis_application::cancellation::CancellationScope;
 use jarvis_application::tool_call::{ToolExecutionError, ToolExecutionRequest, ToolExecutor};
@@ -340,7 +341,7 @@ async fn every_server_in_one_profile_dispatches_to_its_own_session() {
         .executor_for(&admitted[1])
         .expect("the second server's identity must resolve");
     assert!(
-        !std::sync::Arc::ptr_eq(first, second),
+        !Arc::ptr_eq(first, second),
         "each server's tools must reach their own session, not a shared one"
     );
 
@@ -404,6 +405,104 @@ async fn an_identity_no_server_admitted_is_refused_rather_than_served_by_another
     );
 
     drop(composition);
+}
+
+#[tokio::test]
+async fn shutting_a_composition_down_closes_every_session() {
+    // **The lifecycle property, and its absence was a real gap.** Composing a server and dropping the
+    // composition would leave each child alive only as long as the *dispatcher's* `Arc` happened to, and nothing
+    // could ask them to stop — the drain would exit with the processes still running, which for a supervised
+    // server means it is orphaned rather than shut down. This asserts the explicit stop closes each session.
+    let Some(program) = program_or_skip("shutting_a_composition_down_closes_every_session") else {
+        return;
+    };
+    let section = McpSection {
+        servers: vec![
+            declaration_for("acme-files", &program, FIXTURE_STANDARD),
+            declaration_for("other-files", &program, FIXTURE_STANDARD),
+        ],
+    };
+    let declarations = section.enabled_declarations().expect("valid");
+    let secrets = resolver_for(&[
+        ("acme-files", FIXTURE_STANDARD),
+        ("other-files", FIXTURE_STANDARD),
+    ]);
+    let mut registry = ToolRegistry::new();
+    let composition = compose_declared_servers(&mut registry, &declarations, &secrets)
+        .await
+        .expect("valid");
+    assert!(composition.is_clean(), "{:?}", composition.refused());
+    assert_eq!(composition.servers().len(), 2);
+
+    // The sessions are open before the shutdown, so "closed after" is a change rather than a default.
+    for server in composition.servers() {
+        assert!(
+            !server.session().is_closed(),
+            "a composed server's session must be open before the drain"
+        );
+    }
+
+    // A dispatcher is built and **kept** across the shutdown, because that is the arrangement a daemon has:
+    // the router holds the executor while the composition is stopped. A shutdown that required sole ownership
+    // of the session would fail here, which is what makes this a test of the real shape.
+    let dispatcher = ComposedMcpExecutor::over(&composition);
+    let unclean = composition.shutdown().await;
+    assert!(
+        unclean.is_empty(),
+        "the fixture's servers must stop cleanly, got {unclean:?}"
+    );
+    // And the dispatcher is still usable as a value — it holds its own `Arc`, so a shutdown must not have
+    // required consuming it.
+    assert_eq!(dispatcher.servers(), 2);
+}
+
+#[tokio::test]
+async fn a_lifecycle_probe_records_each_servers_health() {
+    // The `list` probe from the note's operational section, over the composed servers. Asserted with a live
+    // child because `health` reports what the *session* says, and a fixture that never spawned could only
+    // report a constant.
+    let Some(program) = program_or_skip("a_lifecycle_probe_records_each_servers_health") else {
+        return;
+    };
+    let section = McpSection {
+        servers: vec![declaration_for("acme-files", &program, FIXTURE_STANDARD)],
+    };
+    let declarations = section.enabled_declarations().expect("valid");
+    let secrets = resolver_for(&[("acme-files", FIXTURE_STANDARD)]);
+    let mut registry = ToolRegistry::new();
+    let composition = compose_declared_servers(&mut registry, &declarations, &secrets)
+        .await
+        .expect("valid");
+    assert!(composition.is_clean(), "{:?}", composition.refused());
+
+    let report = composition.health();
+    assert_eq!(report.len(), 1, "one server, one row");
+    let row = &report[0];
+    assert_eq!(row.name, "acme-files");
+    assert_eq!(row.tools, 1, "the row reports what registration admitted");
+    assert!(
+        row.version.is_some(),
+        "a live session must report the version it negotiated"
+    );
+    assert!(
+        !row.closed,
+        "and it must not be closed while the composition is alive"
+    );
+
+    // The complement: after the shutdown the same probe reports the server closed, so `closed` is a state the
+    // probe reads rather than a constant it prints.
+    let sessions: Vec<_> = composition
+        .servers()
+        .iter()
+        .map(|server| Arc::clone(server.session()))
+        .collect();
+    let _ = composition.shutdown().await;
+    for session in &sessions {
+        assert!(
+            session.is_closed(),
+            "a stopped session must report itself closed"
+        );
+    }
 }
 
 #[tokio::test]

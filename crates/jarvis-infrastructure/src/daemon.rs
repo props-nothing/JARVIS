@@ -328,6 +328,19 @@ pub struct RunningDaemon {
     /// looks like *any other busy key*. Reporting it or not is the difference between an operator
     /// learning from a crash and having to infer it from calls that fail to start.
     tool_recovery: jarvis_application::tool_recovery::ToolRecoveryReport,
+    /// The launched MCP servers, held so their children outlive composition and can be stopped deliberately.
+    ///
+    /// **A session dropped is a child killed, so this field is a lifecycle rather than storage.** Composing
+    /// the servers and discarding the composition would leave each child alive only as long as the dispatcher's
+    /// `Arc` happened to, and nothing could *ask* them to stop — the drain would exit with the processes still
+    /// running, which for a supervised server means it is orphaned rather than shut down. Held here,
+    /// `serve_until` stops them as part of the drain.
+    ///
+    /// An `Arc<Mutex<Option<..>>>` because the drain takes it while `serve_until` holds `&self` — a plain field
+    /// would make the shutdown an `&mut self` method unreachable after the daemon is moved into its serving
+    /// loop — and the `Option` makes a second stop a no-op, which matters because the drain can be entered
+    /// twice (a serve error, then a normal drain).
+    mcp_servers: Arc<tokio::sync::Mutex<Option<crate::mcp::composition::McpComposition>>>,
     guard: InstanceGuard,
 }
 
@@ -446,6 +459,9 @@ impl RunningDaemon {
             discovery_path: self.discovery_path.clone(),
             instance_id: self.instance_id.clone(),
         };
+        // The MCP servers are taken **before** the move for the same reason, and the clone is of the `Arc`
+        // rather than of the composition: the sessions must be stopped through the one value that owns them.
+        let mcp_servers = Arc::clone(&self.mcp_servers);
 
         // Readiness was set before `start` returned, so the surface is ready the
         // moment it accepts a connection. Graceful shutdown stops new admission
@@ -455,14 +471,22 @@ impl RunningDaemon {
         if serving.await.is_err() {
             // A serve error is not a successful drain.
             let _ = drain.begin();
+            stop_mcp_servers(&mcp_servers).await;
             return false;
         }
 
         // Stop admitting and unpublish after connections have drained, so no
         // client discovers a daemon that is already stopping.
         if drain.begin().is_err() {
+            stop_mcp_servers(&mcp_servers).await;
             return false;
         }
+
+        // **The launched servers are stopped inside the drain, before the grace window.** They are children of
+        // this process, so exiting without asking them to stop orphans them — and for a supervised server an
+        // orphan is the state a supervisor cannot distinguish from a crash loop. Stopping them here also means
+        // the grace window below bounds *their* shutdown as well as the application's.
+        stop_mcp_servers(&mcp_servers).await;
 
         // The bound covers remaining application work after connection drain, so
         // a stuck task cannot block exit indefinitely.
@@ -752,8 +776,38 @@ pub async fn start(
         tool_grants,
         recovery,
         tool_recovery: tool_report,
+        mcp_servers: Arc::new(tokio::sync::Mutex::new(Some(mcp))),
         guard,
     })
+}
+
+/// Stops every launched MCP server, taking the composition out of the holder.
+///
+/// **Takes rather than borrows**, so a second call is a no-op instead of a second cancel: `serve_until` may
+/// stop them on a serve error and again on a normal drain, and cancelling an already-cancelled session twice
+/// would report a failure that is not one. The `Option` is what makes that idempotent.
+///
+/// Failures are logged with the server name rather than returned. A server that will not stop is a fact an
+/// operator should see, but it is not something a drain can act on — the process is exiting either way, and a
+/// drain that *failed* because a child was slow would turn a clean shutdown into a reported error.
+async fn stop_mcp_servers(
+    holder: &Arc<tokio::sync::Mutex<Option<crate::mcp::composition::McpComposition>>>,
+) {
+    let taken = {
+        let mut guard = holder.lock().await;
+        guard.take()
+    };
+    let Some(composition) = taken else {
+        return;
+    };
+    let servers = composition.servers().len();
+    let unclean = composition.shutdown().await;
+    if servers > 0 {
+        log::info!("stopped {servers} mcp server(s) during drain");
+    }
+    for name in unclean {
+        log::warn!("mcp server did not stop cleanly: server={name}");
+    }
 }
 
 /// Builds the approval surface's service over the daemon's own pool.
@@ -1516,6 +1570,39 @@ mod tests {
             !routed.contains(&SourceKind::McpServer),
             "registering the MCP kind with no server would advertise a source the daemon cannot serve"
         );
+    }
+
+    /// The drain's stop step is idempotent, because `serve_until` can reach it twice.
+    ///
+    /// **The `Option` is the whole mechanism, so it is what gets asserted.** `serve_until` stops the servers on
+    /// a serve error, then again on the normal drain path — the same function, twice, for one composition. If
+    /// the take were a borrow instead, the second call would cancel sessions that had already stopped, and any
+    /// report from that is a failure an operator would chase for no reason. This proves the second call is
+    /// silent and that the composition is gone after the first.
+    #[tokio::test]
+    async fn stopping_the_servers_twice_stops_them_once() {
+        let holder = Arc::new(tokio::sync::Mutex::new(Some(
+            crate::mcp::composition::McpComposition::default(),
+        )));
+        super::stop_mcp_servers(&holder).await;
+        assert!(
+            holder.lock().await.is_none(),
+            "the stop must take the composition, not borrow it"
+        );
+        // The second call has nothing to take, which is the path a double drain relies on.
+        super::stop_mcp_servers(&holder).await;
+    }
+
+    /// A drain with no MCP servers configured stops nothing and does not panic.
+    ///
+    /// The default path, and it is not the same claim as the test above: `Some(composition)` taken twice versus
+    /// a holder that was never filled. A profile with no `[mcp]` table leaves the holder `None`, and that is the
+    /// shape almost every daemon run actually has.
+    #[tokio::test]
+    async fn a_drain_with_no_servers_stops_nothing() {
+        let holder = Arc::new(tokio::sync::Mutex::new(None));
+        super::stop_mcp_servers(&holder).await;
+        assert!(holder.lock().await.is_none(), "still empty, still silent");
     }
 
     /// The router is the executor `start` hands the pipeline, and it answers for a native identity.

@@ -5280,11 +5280,79 @@ Dependencies: Milestone 2 exit gate.
     tools, so `compose_mcp_servers` reports each refusal at `warn` with its **stable code** (never the
     message, which may carry operator text). A composition *error* is still `StartupError::Config`, which can
     only mean the caller passed declarations that did not come from `McpSection::declarations`.
-  - **Still to do (`TLS-008` and sibling items):** heartbeat/idle/shutdown supervision for launched servers;
-    deregistration when a server is removed from configuration (the registry is built per start and dropped,
-    so a removal needs no release path *today* — it becomes needed when the registry is held); the `[mcp]`
-    table in the operator docs; a reviewed TLS choice before the remote half; the remaining `Test Plan`
-    items; and `TLS-009`/`TLS-010`.
+  - **Slice 17: the daemon stops the servers it launched, closing the drain half of `TLS-008`.** Finding it
+    required asking who owned the running composition: `start` built it as a **local** and handed only the
+    router to the pipeline, so the composition was dropped at the end of `start` while the *dispatcher's*
+    executor `Arc` was what kept each child alive. Nothing could ask a server to stop, so a daemon exiting
+    normally would leave every MCP child running — orphaned, not shut down. `RunningDaemon` now holds
+    `Arc<Mutex<Option<McpComposition>>>` and `serve_until` stops them on the serve-error path, the
+    drain-failure path, and the normal drain path.
+  - **`Option` is the mechanism, not decoration.** `serve_until` can reach the stop step twice for one
+    composition — once for a serve error and again on the way out — so the holder is *taken* rather than
+    borrowed, which makes the second call a no-op instead of a second cancel of an already-stopped session.
+    Asserted directly: `stopping_the_servers_twice_stops_them_once` requires the holder to be empty after the
+    first call and silent after the second, and `a_drain_with_no_servers_stops_nothing` covers the `None`
+    holder nearly every real run has — a different claim from "taken twice", which is why it is its own test.
+  - **The stop uses `cancellation_token().cancel()`, and that choice is forced rather than preferred.**
+    `RunningService::cancel(self)` consumes the service and `close` needs `&mut`; the session `Arc` is shared
+    with the dispatcher's `McpToolExecutor`, so it can be neither moved out of nor borrowed mutably — three
+    compile errors established that before the token was tried. The token owns a clone of the signal, which is
+    the one non-consuming stop. The cost is that it does not await, so `shutdown` **polls `is_closed` to a
+    1-second bound** and reports a server it could not confirm stopped: a cancel that silently assumed success
+    would be exactly the kind of unverified claim the drain exists to avoid.
+  - **The lifecycle probe is `McpComposition::health`, and it reads the session rather than the assumption.**
+    A composed server is a child process, so "is it still there" has to come from `is_closed()`, and the
+    version comes from `peer_info()` — a child that died after composition leaves a handle that looks healthy
+    until something asks it. Deliberately **not** a boolean `healthy`: a closed session is a fact to report
+    beside the tool count and the negotiated version, not a failure the daemon can repair.
+  - **Falsified by making the cancel a no-op**, which fails exactly the two new e2e tests
+    (`shutting_a_composition_down_closes_every_session`, `a_lifecycle_probe_records_each_servers_health`) and
+    no others — so the detector is where the claim is, not merely somewhere in the suite. The e2e shutdown test
+    **keeps the dispatcher alive across the stop**, because that is the arrangement a daemon has; a shutdown
+    that needed sole ownership would fail there, which is what makes it a test of the real shape rather than of
+    a convenient one.
+  - **Slice 18: two error-mapping defects, found by checking the note's own claim against the pinned SDK.**
+    The evidence note's Error Classes table named `-32020`, `-32021`, `-32022`, and `-32602` as its test plan,
+    and the module doc claimed "every code the specification defines is mapped". Both were partly wrong.
+  - **The substantive finding: `-32020` and `-32021` were classified `tool.provider_error`**, which is
+    *unsettled* and retryable for an idempotent tool — for requests the peer had refused **before dispatching
+    them**. So a call that provably never ran entered the reconciliation pass that exists for calls that might
+    have run, and could be repeated against a server that refused it outright. Both are the peer stating a fact
+    about the *request* (a required header was missing/wrong; processing needs a capability JARVIS did not
+    declare), so nothing was dispatched and nothing can have been duplicated. They now share
+    `tool.unavailable` with `-32022`, which is the class whose `Safe` posture asserts exactly that.
+  - **The note's own table already said "Retry? No" for both, and the classifier said the opposite.** That is
+    the defect shape this project keeps finding — a fact recorded in a document and not enforced anywhere —
+    except here the two *disagreed*, which no check compared. `Safe` does **not** mean "a retry will help"; it
+    means a retry cannot duplicate an effect, and whether one can succeed is the health layer's separate
+    permanent-failure question (the same division `-32022` already documented).
+  - **The second finding is a doc claim that read as total.** "Every code the specification defines is mapped"
+    is true of the nine named values and reads as "every code". The reserved range is only partly enumerable:
+    `-32096`..`-32099` is reserved for *implementations* and says nothing to a client, and implementations
+    **MUST NOT** emit an undefined code from `-32020`..`-32095` — so the fallback is the only honest answer and
+    exhaustiveness is not a property the table can have. The wording now states the nine and why.
+  - **A third correction, from re-deriving rather than trusting my own earlier note:** `2026-07-28` *renumbered*
+    resource-not-found from `-32002` to `-32602` (SEP-2164) while keeping the old code reserved and telling
+    clients they "SHOULD still accept `-32002` ... from servers implementing earlier versions". The pinned SDK's
+    `ErrorCode::RESOURCE_NOT_FOUND` still holds `-32002` for precisely that client-side recognition. So the
+    legacy arm is reached — discovery accepts a peer one revision behind by design — and `-32602` now carries
+    **two** meanings on this revision, only the message distinguishing them. The argument meaning wins, because
+    a caller shown `tool.not_found` for a listed, callable tool is sent hunting for something absent instead of
+    fixing its input, and no *reserved-resource* class exists in the fabric yet.
+  - **Falsified two ways, each naming its code.** Restoring either code to the catch-all fails
+    `a_request_refused_at_the_door_is_never_reported_as_unsettled` — which asserts the *property* (settled and
+    `Safe`) rather than the value, so one arm cannot be fixed while the sibling stays wrong — and also
+    `every_specified_error_code_is_classified_deliberately`, which asserts each code's class. A control in the
+    same test requires `-32603` to stay **unsettled**, so the property assertions cannot be satisfied by
+    classifying everything as settled. The legacy-code test asserts the **literal** `-32002` rather than
+    `ErrorCode::RESOURCE_NOT_FOUND`, because the constant *is* that number and asserting through it would test
+    nothing about the value the renumbering moved.
+  - **Still to do (`TLS-008` and sibling items):** heartbeat and idle supervision beyond the drain (a child that
+    dies *during* a run is not yet noticed and quarantined; `health` reports it but nothing acts on it);
+    deregistration when a server is removed from configuration (the registry is built per start and dropped, so
+    a removal needs no release path *today* — it becomes needed when the registry is held); the `[mcp]` table
+    in the operator docs; a reviewed TLS choice before the remote half; the remaining `Test Plan` items; and
+    `TLS-009`/`TLS-010`.
 - [ ] `TLS-009` Implement scoped authenticated MCP server export.
 - [x] `BRN-057` Close the layer-provenance gap `BRN-056` named: record, persist, read back, and serve
   the source layers a policy version was merged from, so the contract's `GET` requirement stops being

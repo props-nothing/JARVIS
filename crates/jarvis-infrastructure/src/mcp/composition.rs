@@ -201,6 +201,24 @@ impl ComposedMcpServer {
     }
 }
 
+/// One server's lifecycle row, as reported by [`McpComposition::health`].
+///
+/// A plain data record rather than a formatted string: a drain logs it and an operator probe prints it, and a
+/// caller that wants a summary should not have to parse one back out of prose.
+#[derive(Debug, Clone)]
+pub struct McpServerHealth {
+    /// The declared name.
+    pub name: String,
+    /// How many identities registration admitted for this server.
+    pub tools: usize,
+    /// The protocol version the session negotiated, or `None` when the session recorded none.
+    pub version: Option<String>,
+    /// Whether the session reports itself closed.
+    pub closed: bool,
+    /// How many offered tools were refused for this server.
+    pub refused: usize,
+}
+
 /// What composing a profile's declared servers produced.
 ///
 /// Both halves are returned rather than only the successes, because "the operator declared three servers" and
@@ -228,6 +246,42 @@ impl McpComposition {
         &self.refused
     }
 
+    /// Stops every composed server's session, **inside the runtime**.
+    ///
+    /// Consumes the composition, because a session that has been cancelled must not be dispatched to and an
+    /// `Arc` left behind would keep the child alive. The sessions are cancelled rather than merely dropped, and
+    /// the difference is what a drain needs: `rmcp` kills the child from `Drop`, which cannot report a failure
+    /// and cannot be waited for, while `cancel()` stops the service's worker first — so the child is asked to
+    /// terminate through the protocol before the transport reaps it.
+    ///
+    /// Returns the servers whose session would not stop cleanly, so a caller can log them. A failure to stop is
+    /// **not** an error a caller can act on during a drain: the process is exiting, and the alternative to
+    /// reporting it is discarding it.
+    pub async fn shutdown(self) -> Vec<String> {
+        let mut unclean = Vec::new();
+        for server in self.composed {
+            let name = server.server.as_str().to_owned();
+            // **The cancellation token, not `cancel`.** `RunningService::cancel(self)` consumes the service and
+            // `close` needs `&mut`, and neither is reachable here: the session is shared with the dispatcher's
+            // executor, so the `Arc` has two holders and can be neither moved out of nor borrowed mutably.
+            // `cancellation_token()` hands back a token that *owns a clone of the signal*, which is the one
+            // non-consuming way to stop the worker — and stopping the worker closes the transport, which is what
+            // kills the child.
+            let token = server.session.cancellation_token();
+            // The executor goes first, so a dispatch cannot be admitted after the cancel is signalled.
+            drop(server.executor);
+            token.cancel();
+            // **A bounded wait for the worker, so the caller learns whether the child actually stopped.** The
+            // token does not await, and a drain that assumed it had would exit while the child might still be
+            // running. `is_closed` is the service's own answer to "has the worker finished", polled to a bound
+            // rather than waited on indefinitely: a server that will not stop must not hold the drain open past
+            // its grace window, and the fact is reported instead.
+            if !wait_until_closed(&server.session).await {
+                unclean.push(name);
+            }
+        }
+        unclean
+    }
     /// Returns whether every declared server composed.
     #[must_use]
     pub fn is_clean(&self) -> bool {
@@ -243,6 +297,34 @@ impl McpComposition {
         self.composed
             .iter()
             .flat_map(|server| server.admitted.iter().cloned())
+            .collect()
+    }
+
+    /// Reports each server's name, tool count, negotiated version, and whether its session is closed.
+    ///
+    /// **The probe the note's operational section asks for, and it reports what the session says rather than
+    /// what the composition assumed.** A composed server is a child process, so the questions an operator has
+    /// are "is it still there", "which protocol version did it agree to", and "how many tools did it
+    /// contribute" — and the first of those has to come from the session, because a child that died after
+    /// composition leaves a handle that looks healthy until something asks it.
+    ///
+    /// Deliberately **not** named `health` with a boolean: a closed session is not a failure the daemon can
+    /// repair — it is a fact reported beside the version and the count, and a caller deciding whether to
+    /// quarantine acts on all three.
+    #[must_use]
+    pub fn health(&self) -> Vec<McpServerHealth> {
+        self.composed
+            .iter()
+            .map(|server| McpServerHealth {
+                name: server.server.as_str().to_owned(),
+                tools: server.admitted.len(),
+                version: server
+                    .session
+                    .peer_info()
+                    .map(|info| info.protocol_version.to_string()),
+                closed: server.session.is_closed(),
+                refused: server.report.refused.len(),
+            })
             .collect()
     }
 
@@ -532,6 +614,36 @@ impl ComposedMcpExecutor {
             .find(|(_, identities)| identities.contains(identity))
             .map(|(executor, _)| executor)
     }
+}
+
+/// How long a drain waits for one server's worker to finish after it is cancelled.
+///
+/// Short, and deliberately shorter than the daemon's own grace window: a server that will not stop must not
+/// hold the drain open, and the caller reports it rather than waiting. One second is enough for a local child
+/// whose transport has been closed, and a server that needs longer is a fact worth surfacing.
+const SHUTDOWN_POLL_BOUND: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+/// How often the worker's state is checked while waiting.
+const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Waits, to a bound, for a cancelled session's worker to finish.
+///
+/// Returns `true` when the session reports itself closed and `false` when the bound elapsed. Polling rather
+/// than awaiting because the one non-consuming shutdown the SDK offers is a cancel signal, which does not
+/// produce a future to await — see [`McpComposition::shutdown`] for why the consuming form is unreachable.
+async fn wait_until_closed(
+    session: &rmcp::service::RunningService<rmcp::RoleClient, super::client::JarvisClient>,
+) -> bool {
+    let bound = tokio::time::Instant::now() + SHUTDOWN_POLL_BOUND;
+    while tokio::time::Instant::now() < bound {
+        if session.is_closed() {
+            return true;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
+    // A last check, because the worker may have finished during the final sleep — reporting a server unclean
+    // because the poll interval landed unluckily would be a false alarm an operator would chase.
+    session.is_closed()
 }
 
 impl jarvis_application::tool_call::ToolExecutor for ComposedMcpExecutor {

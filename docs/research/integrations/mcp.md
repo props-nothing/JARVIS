@@ -605,6 +605,47 @@ Two smaller decisions worth recording:
 A per-server failure is **logged, not fatal**: one unreachable server must not deny the daemon its own tools,
 so each refusal is reported at `warn` with its stable code — never the message, which may carry operator text.
 
+### Drain: stopping the children the daemon started
+
+The composition's owner was the wrong one, and finding that required asking who held it. `start` built the
+`McpComposition` as a **local** and handed only the router to the pipeline, so the composition was dropped when
+`start` returned while each child stayed alive through the *dispatcher's* `Arc<McpToolExecutor>`. Nothing could
+ask a server to stop, which means a daemon exiting normally would leave every MCP child running — orphaned
+rather than shut down. `RunningDaemon` now holds `Arc<Mutex<Option<McpComposition>>>`, and `serve_until` stops
+them on the serve-error path, the drain-failure path, and the normal drain path.
+
+**The `Option` is the mechanism, not decoration.** `serve_until` can reach the stop step twice for one
+composition — once on a serve error and again on the way out — so the holder is *taken*, which makes the second
+call a no-op instead of a second cancel of a session that has already stopped. Both directions are asserted:
+`stopping_the_servers_twice_stops_them_once` requires the holder to be empty after the first call and silent
+after the second, and `a_drain_with_no_servers_stops_nothing` covers the `None` holder that nearly every real
+run has.
+
+**The stop is `cancellation_token().cancel()`, and that form is forced.** `RunningService::cancel(self)`
+consumes the service and `close` needs `&mut`, and neither is reachable: the session `Arc` is shared with the
+dispatcher's executor, so it can be neither moved out of nor borrowed mutably. Three compile errors (`E0507`
+among them) established that before the token was tried. The token owns a clone of the signal, which is the one
+non-consuming stop. The cost is that it does not await, so `shutdown` **polls `is_closed` to a one-second
+bound** and reports any server it could not confirm stopped — a cancel that silently assumed success would be
+the class of unverified claim the drain exists to remove.
+
+**`McpComposition::health` is the lifecycle probe, and it reads the session rather than the assumption.** A
+composed server is a child process, so "is it still there" has to come from `is_closed()` and the protocol
+version from `peer_info()`; a child that died after composition leaves a handle that looks healthy until
+something asks it. Deliberately **not** a boolean `healthy`: a closed session is a fact to report beside the
+tool count and the negotiated version, not a failure the daemon can repair.
+
+**Falsified by making the cancel a no-op**, which fails exactly the two new e2e tests
+(`shutting_a_composition_down_closes_every_session`, `a_lifecycle_probe_records_each_servers_health`) and no
+others — the detector sits where the claim is. The e2e shutdown test keeps the dispatcher **alive across the
+stop**, because that is the arrangement a daemon has; a shutdown needing sole ownership would fail there, which
+is what makes it a test of the real shape rather than of a convenient one.
+
+**Still open.** A child that dies *during* a run is not yet noticed and quarantined — `health` reports it but
+nothing acts on it; there is no heartbeat or idle supervision beyond the drain. Deregistration when a server is
+removed from configuration is unnecessary *today* because the registry is built per start and dropped, and
+becomes necessary the moment the registry is held.
+
 ## Version Matrix
 
 | Component | JARVIS target | Documentation target | Compatibility status |
@@ -701,11 +742,12 @@ so each refusal is reported at `warn` with its stable code — never the message
 | Condition | Provider signal | Retry? | JARVIS behavior |
 | --- | --- | --- | --- |
 | Incompatible protocol | `UnsupportedProtocolVersionError` (-32022) on a request or `server/discover` | No | Mark incompatible, record the server's `supportedVersions`, explain supported versions |
-| Header mismatch | `HeaderMismatchError` (-32020) | No | Adapter bug; fail the call and surface a diagnostic, do not retry |
-| Missing client capability | `MissingRequiredClientCapability` (-32021) | No | Do not silently downgrade the request; report the unmet capability |
+| Header mismatch | `HeaderMismatchError` (-32020) | No | Adapter bug; fail the call and surface a diagnostic, do not retry. Classified `tool.unavailable` — refused at the door, so settled |
+| Missing client capability | `MissingRequiredClientCapability` (-32021) | No | Do not silently downgrade the request; report the unmet capability. Classified `tool.unavailable` for the same reason |
 | Authorization required | HTTP 401 / challenge / typed SDK error | After auth flow | Do not loop; surface setup/reauth. Validate `iss` before redeeming |
 | Tool schema invalid | Invalid list/call data | No | Hide tool, degrade server |
-| Resource not found | `-32602` (changed from `-32002` in `2026-07-28`) | No | Classify as not-found, not as an internal error |
+| Resource not found (legacy) | `-32002`, from a `2025-11-25` or earlier peer | No | Classify `tool.not_found`. Clients **SHOULD** still accept it, and discovery accepts an older peer by design, so this path is reached |
+| Resource not found (current) | `-32602` after the SEP-2164 renumbering | No | **This number now carries two meanings** and only the message distinguishes them: classify `tool.schema_invalid`, because the argument meaning is the one a caller can act on, and no *reserved-resource* class exists in the fabric yet |
 | Input required | `resultType: "input_required"` + `requestState` | Yes, one bounded round | Route `inputRequests` through JARVIS policy/approval, echo `requestState` unmodified, cap the round count |
 | Transport closed | EOF/network close | Conditional | Per `2026-07-28` there is no resumability: re-issue the request with a new ID; reconcile side effects by idempotency key |
 | Timeout/cancel | Deadline/cancellation | No automatic side-effect replay | Cancel, classify outcome, reconcile if ambiguous |
@@ -768,7 +810,13 @@ so each refusal is reported at `warn` with its stable code — never the message
 - [ ] `cacheScope: "public"` result is never served to or from a
   workspace-scoped cache
 - [ ] Authorization/export scope
-- [ ] Error mapping for `-32020`, `-32021`, `-32022`, and `-32602`
+- [x] Error mapping for `-32020`, `-32021`, `-32022`, and `-32602` — plus the legacy `-32002`. The
+  distinction that matters is **whether the peer processed the request**: every door-refusal is settled
+  (`-32022`/`-32020`/`-32021` → `tool.unavailable`; `-32602`/`-32600`/`-32700` → `tool.schema_invalid`;
+  `-32601`/`-32002` → `tool.not_found`), while `-32603`, or any code the table does not recognise, is
+  `tool.provider_error` and **unsettled** because the peer may already have executed the request.
+  Falsified by restoring either capability/header code to the catch-all, which fails
+  `a_request_refused_at_the_door_is_never_reported_as_unsettled` naming the code
 - [ ] MRTR round: `input_required` -> approval -> retry, with a bounded round
   count and an opaque, echoed `requestState`
 - [ ] A tampered `requestState` is refused, not merged into JARVIS state
@@ -830,3 +878,4 @@ so each refusal is reported at `warn` with its stable code — never the message
 | 2026-09-20 | Initial architecture review | Official spec/index and Rust SDK repository |
 | 2026-10-03 | Specification and SDK refresh: pinned `rmcp 3.5.0` and spec `2026-07-28`; corrected the lifecycle to stateless `server/discover`; recorded `subscriptions/listen`, MRTR, caching, standard headers, and the error-code renumbering; recorded the SEP-2577 deprecation of Roots/Sampling/Logging and the removal of `ping`/`logging/setLevel`; answered the open questions on SDK version and legacy SSE | `https://modelcontextprotocol.io/specification/2026-07-28/changelog.md`, `.../deprecated.md`, `https://crates.io/api/v1/crates/rmcp`, `https://github.com/modelcontextprotocol/rust-sdk` (`crates/rmcp/CHANGELOG.md`, `tests/test_client_lifecycle_modes.rs`, `tests/test_subscriptions*.rs`) |
 | 2026-10-03 | `discovery.rs`: the spawn-to-catalog caller, verified against a real child process. Corrected three assumptions — discovery accepts a peer one revision behind (no floor), an all-refused catalog is a named refusal rather than an empty one, and the server identity cannot be derived from a launch spec. Recorded the per-connection response cache that `list_tools` consults | Pinned SDK sources: `src/service/client.rs` (`serve_with_discover`, `list_tools`, `list_response_cache_key`), `src/service.rs` (`ServiceError`), `src/model.rs` (`DiscoverResult`, `ServerPeerInfo`), `src/handler/client.rs` (`ClientHandler` default), `src/transport/io.rs` (`stdio`) |
+| 2026-10-03 | Corrected two claims in the error mapping. (1) `-32020`/`-32021` were classified `tool.provider_error` — **unsettled and retryable for an idempotent tool** — for requests the peer refused before dispatching; both are now `tool.unavailable` with the version refusal, so a call that provably never ran cannot enter reconciliation. (2) The module doc's "every code the specification defines is mapped" was true of the nine named codes and read as "every code"; the reserved range is only partly enumerable, so the wording now states the nine and why the rest cannot be. Also recorded that resource-not-found moved from `-32002` to `-32602` (SEP-2164) and that `-32602` therefore carries two meanings | Official spec `https://modelcontextprotocol.io/specification/2026-07-28/basic/index.md` (Error Codes: the `-32000`..`-32019` legacy vs `-32020`..`-32099` reserved partition; "Clients SHOULD still accept `-32002`"; required `_meta` fields rejected `-32602` with HTTP `400`); `.../changelog.md` minor change 6 and 12; pinned SDK `rmcp 3.5.0` `src/model.rs` (`ErrorCode` constants at lines 624-633, `ErrorData::resource_not_found` doc "upgraded to `INVALID_PARAMS` (`-32602`)"), `src/service/client.rs` (`ClientRequestMetadata` seeding at 281/929) |
